@@ -462,13 +462,41 @@ async function listCustomerDocuments(customerId) {
 }
 
 // ─── Document upload (CAC certificate, ID, etc.) ────────────────────────────
-// Anchor's KYB review requires document uploads. Endpoint:
+// Anchor's KYB review requires document submissions. Endpoint:
 //   POST /api/v1/documents/upload-document/{customerId}/{documentId}
-// where {documentId} comes from `listCustomerDocuments`. Accepts a Buffer
-// (preferred) or a base64 string.
-async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, filename, contentType }) {
+// where {documentId} comes from `listCustomerDocuments`.
+//
+// Two upload formats per document slot (the format is on the Document resource):
+//   FILE → multipart/form-data with field name "fileData"
+//   TEXT → no body; the value goes as ?textData=... in the query string
+//
+// Accepts either a Buffer, base64 string, OR a textData string. Trying to
+// upload a file to a TEXT slot returns 400 "Missing text data" (and vice versa).
+async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, textData, filename, contentType }) {
   ensureConfigured();
-  // Accept either a Buffer or a base64 string (with optional data: URI prefix).
+
+  // TEXT slot: send as query param, no body.
+  if (textData != null && String(textData).length > 0) {
+    const url = `${BASE()}/documents/upload-document/${encodeURIComponent(customerId)}/${encodeURIComponent(documentId)}?textData=${encodeURIComponent(textData)}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "x-anchor-key": API_KEY(), Accept: "application/json" },
+    });
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+    if (!res.ok) {
+      const err = new Error(
+        data.errors?.[0]?.detail || data.message || `Anchor document upload failed (${res.status})`,
+      );
+      err.httpStatus = res.status;
+      err.anchorErrors = data.errors;
+      throw err;
+    }
+    return data;
+  }
+
+  // FILE slot: multipart/form-data with "fileData" field.
   let buf = fileBuffer;
   let ctype = contentType;
   if (!buf && fileBase64) {
@@ -480,10 +508,8 @@ async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, 
     }
     buf = Buffer.from(b64, "base64");
   }
-  if (!buf) throw new Error("uploadDocument: fileBuffer or fileBase64 required");
+  if (!buf) throw new Error("uploadDocument: fileBuffer, fileBase64, or textData required");
 
-  // Anchor expects the field name to be "fileData" (per /reference/upload-document).
-  // Sending it as "file" returns 400 "Missing upload data".
   const form = new FormData();
   const blob = new Blob([buf], { type: ctype || "application/octet-stream" });
   form.append("fileData", blob, filename || "document");

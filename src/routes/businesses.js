@@ -482,16 +482,20 @@ router.get("/:id/required-documents", async (req, res) => {
 });
 
 // POST /businesses/:id/upload-kyb-document
-// body: { documentId, fileBase64: "data:image/...;base64,..." }
-// Forwards the file to Anchor's /documents/upload-document endpoint so the
-// document slot is marked submitted and KYB can proceed to review.
+// body: { documentId, fileBase64?, textData? }
+// Forwards the document to Anchor's /documents/upload-document endpoint so the
+// slot is marked submitted and KYB can proceed to review.
+// Each slot is either FILE (send fileBase64) or TEXT (send textData) — the
+// client uses the format field returned by GET /:id/required-documents to
+// pick which one to send.
 router.post("/:id/upload-kyb-document", async (req, res) => {
   if (req.user.accountType === "staff") {
     return res.status(403).json({ error: "Staff cannot upload KYB documents" });
   }
-  const { documentId, fileBase64 } = req.body;
+  const { documentId, fileBase64, textData } = req.body;
   if (!documentId) return res.status(400).json({ error: "documentId is required" });
-  if (!fileBase64) return res.status(400).json({ error: "fileBase64 is required" });
+  if (!fileBase64 && !textData)
+    return res.status(400).json({ error: "fileBase64 or textData is required" });
 
   try {
     const biz = await prisma.business.findFirst({
@@ -506,6 +510,7 @@ router.post("/:id/upload-kyb-document", async (req, res) => {
       customerId: user.anchorCustomerId,
       documentId,
       fileBase64,
+      textData,
       filename: `kyb-${documentId}`,
     });
     res.json({ status: "submitted", documentId });
