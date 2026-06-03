@@ -435,17 +435,24 @@ function verifyWebhook(rawBody, headers) {
   return false;
 }
 
-// ─── Document upload (CAC certificate, ID, etc.) ────────────────────────────
-// Anchor's KYB review requires document uploads in live mode. Endpoint:
-//   POST /api/v1/documents/upload-document/{customerId}/{documentId}
-// where {documentId} is one of Anchor's pre-defined slot IDs returned with
-// the BusinessCustomer (under verification.documents). For now we accept the
-// caller-resolved documentId.
-async function uploadDocument({ customerId, documentId, fileBuffer, filename, contentType }) {
+ 
   ensureConfigured();
-  // multipart/form-data using native FormData / Blob (Node 18+)
+  // Accept either a Buffer or a base64 string (with optional data: URI prefix).
+  let buf = fileBuffer;
+  let ctype = contentType;
+  if (!buf && fileBase64) {
+    let b64 = fileBase64;
+    const m = /^data:([^;]+);base64,(.*)$/.exec(b64);
+    if (m) {
+      ctype = ctype || m[1];
+      b64 = m[2];
+    }
+    buf = Buffer.from(b64, "base64");
+  }
+  if (!buf) throw new Error("uploadDocument: fileBuffer or fileBase64 required");
+
   const form = new FormData();
-  const blob = new Blob([fileBuffer], { type: contentType || "application/octet-stream" });
+  const blob = new Blob([buf], { type: ctype || "application/octet-stream" });
   form.append("file", blob, filename || "document");
 
   const res = await fetch(
@@ -483,5 +490,6 @@ module.exports = {
   createCounterparty,
   createTransfer,
   verifyWebhook,
+  listCustomerDocuments,
   uploadDocument,
 };

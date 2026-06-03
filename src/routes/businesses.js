@@ -458,6 +458,65 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
   }
 });
 
+// GET /businesses/:id/required-documents
+// Returns the list of Anchor document slots for the user's BusinessCustomer
+// (each with documentId, documentType, description, submitted, verified).
+// Client uses this to show the "Documents needed" UI during pending KYB.
+router.get("/:id/required-documents", async (req, res) => {
+  try {
+    const biz = await prisma.business.findFirst({
+      where: { id: req.params.id, userId: getTargetUserId(req) },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+    const user = await prisma.user.findUnique({ where: { id: getTargetUserId(req) } });
+    if (!user?.anchorCustomerId) return res.json({ documents: [] });
+
+    const docs = await anchor.listCustomerDocuments(user.anchorCustomerId);
+    res.json({ documents: docs });
+  } catch (err) {
+    if (err.code === "ANCHOR_NOT_CONFIGURED")
+      return res.status(503).json({ error: "Anchor not configured." });
+    console.error("[required-documents] failed:", err.message);
+    res.status(500).json({ error: err.message || "Failed to fetch documents" });
+  }
+});
+
+// POST /businesses/:id/upload-kyb-document
+// body: { documentId, fileBase64: "data:image/...;base64,..." }
+// Forwards the file to Anchor's /documents/upload-document endpoint so the
+// document slot is marked submitted and KYB can proceed to review.
+router.post("/:id/upload-kyb-document", async (req, res) => {
+  if (req.user.accountType === "staff") {
+    return res.status(403).json({ error: "Staff cannot upload KYB documents" });
+  }
+  const { documentId, fileBase64 } = req.body;
+  if (!documentId) return res.status(400).json({ error: "documentId is required" });
+  if (!fileBase64) return res.status(400).json({ error: "fileBase64 is required" });
+
+  try {
+    const biz = await prisma.business.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user?.anchorCustomerId)
+      return res.status(400).json({ error: "No Anchor customer for this user" });
+
+    await anchor.uploadDocument({
+      customerId: user.anchorCustomerId,
+      documentId,
+      fileBase64,
+      filename: `kyb-${documentId}`,
+    });
+    res.json({ status: "submitted", documentId });
+  } catch (err) {
+    if (err.code === "ANCHOR_NOT_CONFIGURED")
+      return res.status(503).json({ error: "Anchor not configured." });
+    console.error("[upload-kyb-document] failed:", err.message);
+    res.status(400).json({ error: err.message || "Failed to upload document" });
+  }
+});
+
 // POST /businesses/:id/upload-cac
 // body: { fileBase64: "data:image/jpeg;base64,..." }
 // Uploads the CAC certificate (photo/PDF) to Cloudinary and persists the URL
