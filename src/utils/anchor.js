@@ -475,12 +475,19 @@ async function listCustomerDocuments(customerId) {
 async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, textData, filename, contentType }) {
   ensureConfigured();
 
-  // TEXT slot: send as query param, no body.
+  // TEXT slot: send as query param, no body. Anchor still requires a
+  // Content-Type header even for empty-body POSTs ("Content-Type is not
+  // supported" otherwise) — application/json is accepted.
   if (textData != null && String(textData).length > 0) {
     const url = `${BASE()}/documents/upload-document/${encodeURIComponent(customerId)}/${encodeURIComponent(documentId)}?textData=${encodeURIComponent(textData)}`;
     const res = await fetch(url, {
       method: "POST",
-      headers: { "x-anchor-key": API_KEY(), Accept: "application/json" },
+      headers: {
+        "x-anchor-key": API_KEY(),
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: "{}",
     });
     const text = await res.text();
     let data;
