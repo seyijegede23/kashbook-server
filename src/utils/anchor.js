@@ -246,13 +246,18 @@ async function triggerKYB(customerId) {
 
 // ─── Deposit account ─────────────────────────────────────────────────────────
 // Must be called AFTER customer.identification.approved fires.
-// productName: "SAVINGS" or "CURRENT"
+// productName: "SAVINGS" (IndividualCustomer only) or "CURRENT" (both types).
 // customerType: "BusinessCustomer" (default) or "IndividualCustomer"
-async function createDepositAccount({ customerId, productName = "SAVINGS", customerType = "BusinessCustomer" }) {
+// Anchor rejects SAVINGS on BusinessCustomer with "The product SAVINGS is not
+// allowed for the selected customer type", so default by customer type.
+async function createDepositAccount({ customerId, productName, customerType = "BusinessCustomer" }) {
+  const product =
+    productName ||
+    (customerType === "BusinessCustomer" ? "CURRENT" : "SAVINGS");
   const body = {
     data: {
       type: "DepositAccount",
-      attributes: { productName },
+      attributes: { productName: product },
       relationships: {
         customer: { data: { type: customerType, id: customerId } },
       },
