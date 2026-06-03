@@ -1,0 +1,469 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                   String         @id @default(uuid())
+  firstName            String
+  lastName             String
+  businessName         String
+  phone                String?        @unique
+  email                String?        @unique
+  password             String?
+  plan                 Plan           @default(FREE)
+  role                 Role           @default(USER)
+  accountType          AccountType    @default(OWNER)
+  employerId           String?
+  profileImage         String?        @db.Text
+  googleId             String?        @unique
+  avatarUrl            String?
+  expoPushToken        String?
+  language             String         @default("en")
+  currency             String         @default("NGN")
+  notificationsEnabled Boolean        @default(true)
+  biometricEnabled     Boolean        @default(false)
+  failedLoginAttempts  Int            @default(0)
+  lockedUntil          DateTime?
+  dateOfBirth          DateTime?
+  gender               String?
+  anchorCustomerId     String?
+  paystackCustomerCode String?
+  kycStatus            String         @default("unverified")
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  businesses           Business[]
+  customers            Customer[]
+  transactions         Transaction[]
+  sales                Sales[]
+  expenses             Expense[]
+  businessDebts        BusinessDebt[]
+  suggestions          Suggestion[]
+  reminders            Reminder[]
+  inventoryItems       InventoryItem[]
+  notifications        AppNotification[]
+  recurringExpenses    RecurringExpense[]
+}
+
+model AppNotification {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String   @db.Text
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, read])
+}
+
+model Business {
+  id               String          @id @default(uuid())
+  userId           String
+  user             User            @relation(fields: [userId], references: [id])
+  name             String
+  emoji            String          @default("🛍️")
+  color            String          @default("#6C3FC5")
+  logoUrl          String?
+  receiptFooter    String?
+  invoiceTemplate  String          @default("classic")
+  invoiceFooter    String?
+  bankName         String?
+  bankAccountNumber String?
+  bankAccountName  String?
+  invoiceCounter       Int             @default(0)
+  virtualAccountRef    String?
+  virtualAccountId     String?
+  virtualAccountNumber String?
+  virtualAccountBank   String?
+  virtualAccountName   String?
+  anchorAccountId      String?
+  paystackDvaId        String?
+  bankAccountType      String          @default("SAVINGS")
+  kycBvn               String?
+  kycCacNumber         String?
+  kycBusinessType      String?  @default("sole_proprietor")
+  cacCertificateUrl    String?
+  description          String?
+  industry             String?
+  registrationType     String?
+  dateOfRegistration   DateTime?
+  addressState         String?
+  addressLine1         String?
+  addressLine2         String?
+  addressCity          String?
+  addressPostalCode    String?
+  directorAddressSame  Boolean  @default(true)
+  directorAddressLine1 String?
+  directorAddressState String?
+  directorAddressCity  String?
+  createdAt            DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  transactions      Transaction[]
+  sales             Sales[]
+  expenses          Expense[]
+  businessDebts     BusinessDebt[]
+  customCategories  CustomCategory[]
+  inventoryItems    InventoryItem[]
+  customers         Customer[]
+  reminders         Reminder[]
+  payables          Payable[]
+  invoices          Invoice[]
+  recurringExpenses RecurringExpense[]
+
+  @@index([userId])
+  @@index([virtualAccountRef])
+}
+
+model CustomCategory {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  label      String
+  value      String
+  icon       String   @default("pricetag-outline")
+}
+
+model Customer {
+  id              String      @id @default(uuid())
+  userId          String
+  user            User        @relation(fields: [userId], references: [id])
+  businessId      String?
+  business        Business?   @relation(fields: [businessId], references: [id])
+  name            String
+  phone           String?
+  totalOwed       Float       @default(0)
+  reminderEnabled Boolean     @default(false)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  debts           Debt[]
+  sales           Sales[]
+  transactions    Transaction[]
+  invoices        Invoice[]
+
+  @@unique([userId, phone])
+  @@index([userId, businessId])
+  @@index([businessId, updatedAt])
+}
+
+model Debt {
+  id         String        @id @default(uuid())
+  customerId String
+  customer   Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  amount     Float
+  paidAmount Float         @default(0)
+  paid       Boolean       @default(false)
+  note       String        @default("")
+  date       DateTime      @default(now())
+  payments   DebtPayment[]
+
+  @@index([customerId, paid])
+}
+
+model DebtPayment {
+  id     String   @id @default(uuid())
+  debtId String
+  debt   Debt     @relation(fields: [debtId], references: [id], onDelete: Cascade)
+  amount Float
+  note   String   @default("")
+  date   DateTime @default(now())
+}
+
+model Payable {
+  id           String           @id @default(uuid())
+  businessId   String
+  business     Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  creditorName String
+  category     String           @default("other")
+  amount       Float
+  paidAmount   Float            @default(0)
+  dueDate      DateTime?
+  note         String?
+  date         DateTime         @default(now())
+  paid         Boolean          @default(false)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  payments     PayablePayment[]
+
+  @@index([businessId, paid])
+}
+
+model PayablePayment {
+  id        String   @id @default(uuid())
+  payableId String
+  payable   Payable  @relation(fields: [payableId], references: [id], onDelete: Cascade)
+  amount    Float
+  note      String?
+  date      DateTime @default(now())
+}
+
+model BusinessDebt {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId      String?
+  business        Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  name            String
+  type            String   @default("other")
+  originalAmount  Float
+  remainingAmount Float
+  dueDate         DateTime?
+  note            String?
+  status          String   @default("unpaid")
+  reminderEnabled Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId, businessId])
+  @@index([userId, status])
+  @@index([businessId, updatedAt])
+}
+
+model Sales {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customerId     String?
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  businessId     String?
+  business       Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  amount         Float
+  paymentMethod        String    @default("cash")
+  isCredit             Boolean   @default(false)
+  notes                String?
+  matchedTransactionId String?
+  recordedBy           String?
+  recordedByName       String?
+  date                 DateTime  @default(now())
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([userId, businessId])
+  @@index([businessId, date])
+  @@index([businessId, updatedAt])
+}
+
+model Expense {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId    String?
+  business      Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  category      String    @default("other")
+  amount        Float
+  paymentMethod String    @default("cash")
+  date          DateTime  @default(now())
+  notes         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId, businessId])
+  @@index([businessId, date])
+  @@index([businessId, updatedAt])
+}
+
+model Transaction {
+  id             String    @id @default(uuid())
+  businessId     String
+  business       Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type           String
+  amount         Float
+  description    String?
+  category       String?
+  customerId     String?
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  date           DateTime
+  paymentMethod        String    @default("cash")
+  matchedSaleId        String?
+  matchedCustomerId    String?
+  recordedBy           String?
+  recordedByName       String?
+  userId               String?
+  user                 User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  source               String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([businessId, date])
+  @@index([userId])
+  @@index([businessId, updatedAt])
+}
+
+model InventoryItem {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId     String?
+  business       Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  name           String
+  description    String?
+  unit           String    @default("piece")
+  price          Float
+  cost           Float?
+  quantity       Int       @default(0)
+  lowStockAlert  Int       @default(5)
+  category       String?
+  sku            String?
+  barcode        String?
+  image          String?
+  lastRestocked  DateTime?
+  createdBy      String?
+  createdByName  String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([userId, businessId])
+  @@index([businessId, updatedAt])
+}
+
+model RecurringExpense {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId    String?
+  business      Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  category      String    @default("other")
+  amount        Float
+  paymentMethod String    @default("cash")
+  notes         String?
+  frequency     String    @default("monthly")
+  nextDue       DateTime
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId, active])
+  @@index([nextDue, active])
+}
+
+model OtpCode {
+  id         String   @id @default(uuid())
+  identifier String
+  type       String
+  code       String
+  expiresAt  DateTime
+  used       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([identifier, type])
+}
+
+model Reminder {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId    String?
+  business      Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  targetId      String?
+  type          String    @default("debt")
+  amount        Float     @default(0)
+  recipientName String    @default("")
+  phone         String?
+  message       String?   @db.Text
+  channel       String    @default("sms")
+  status        String    @default("pending")
+  scheduledFor  DateTime
+  sentAt        DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status, scheduledFor])
+  @@index([userId])
+}
+
+model Suggestion {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String   @default("feature")
+  content   String   @db.Text
+  status    String   @default("new")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Invoice {
+  id             String           @id @default(uuid())
+  businessId     String
+  business       Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customerId     String?
+  customer       Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  userId         String
+  invoiceNumber  String
+  status         InvoiceStatus    @default(DRAFT)
+  issueDate      String
+  dueDate        String?
+  currency       String           @default("NGN")
+  subtotal       Float            @default(0)
+  taxRate        Float            @default(0)
+  taxAmount      Float            @default(0)
+  discountType   String?
+  discountValue  Float            @default(0)
+  discountAmount Float            @default(0)
+  total          Float            @default(0)
+  amountPaid     Float            @default(0)
+  notes          String?
+  terms          String?
+  template       String           @default("classic")
+  items          InvoiceItem[]
+  payments       InvoicePayment[]
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@index([businessId, userId])
+  @@index([businessId, status])
+  @@index([businessId, updatedAt])
+}
+
+model InvoiceItem {
+  id          String   @id @default(uuid())
+  invoiceId   String
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  quantity    Float    @default(1)
+  rate        Float    @default(0)
+  amount      Float    @default(0)
+}
+
+model InvoicePayment {
+  id        String   @id @default(uuid())
+  invoiceId String
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  amount    Float
+  method    String   @default("cash")
+  note      String?
+  date      DateTime @default(now())
+  createdAt DateTime @default(now())
+}
+
+enum Plan {
+  FREE
+  PREMIUM
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum AccountType {
+  OWNER
+  STAFF
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  PAID
+  OVERDUE
+  VOID
+}

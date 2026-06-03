@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KashBook Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .badge-premium { background: #FEF3C7; color: #92400E; }
+    .badge-free    { background: #F3F4F6; color: #6B7280; }
+    .badge-admin   { background: #EDE9FE; color: #5B21B6; }
+    .stat-card     { transition: transform .15s; }
+    .stat-card:hover { transform: translateY(-2px); }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<!-- ── Login Screen ─────────────────────────────────────────────────── -->
+<div id="loginScreen" class="flex items-center justify-center min-h-screen">
+  <div class="bg-white rounded-2xl shadow-lg p-8 w-full max-w-sm">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">📊</div>
+      <h1 class="text-2xl font-bold text-gray-900">KashBook Admin</h1>
+      <p class="text-gray-500 text-sm mt-1">Sign in with your admin account</p>
+    </div>
+    <div id="loginError" class="hidden bg-red-50 text-red-600 text-sm rounded-lg p-3 mb-4"></div>
+    <form id="loginForm" class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+        <input id="email" type="email" required
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          placeholder="admin@kashbook.com" />
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+        <input id="password" type="password" required
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          placeholder="••••••••" />
+      </div>
+      <button type="submit"
+        class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-xl transition">
+        Sign In
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- ── Dashboard ────────────────────────────────────────────────────── -->
+<div id="dashboard" class="hidden">
+  <!-- Navbar -->
+  <nav class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between sticky top-0 z-10">
+    <div class="flex items-center gap-2">
+      <span class="text-xl font-bold text-indigo-600">KashBook</span>
+      <span class="text-xs bg-indigo-100 text-indigo-600 px-2 py-0.5 rounded-full font-semibold">Admin</span>
+    </div>
+    <div class="flex items-center gap-4">
+      <span id="adminName" class="text-sm text-gray-600"></span>
+      <button onclick="logout()" class="text-sm text-red-500 hover:text-red-700 font-medium">Sign out</button>
+    </div>
+  </nav>
+
+  <!-- Global error banner -->
+  <div id="globalError" class="hidden bg-red-50 border-b border-red-200 px-6 py-3 flex items-center justify-between">
+    <span id="globalErrorMsg" class="text-sm text-red-700 font-medium"></span>
+    <button onclick="document.getElementById('globalError').classList.add('hidden')" class="text-red-400 hover:text-red-600 text-lg font-bold leading-none">✕</button>
+  </div>
+
+  <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
+
+    <!-- Stats cards -->
+    <section>
+      <h2 class="text-lg font-semibold text-gray-800 mb-4">Overview</h2>
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div class="stat-card bg-white rounded-2xl p-5 shadow-sm border border-gray-100 col-span-1">
+          <p class="text-xs text-gray-500 font-medium uppercase tracking-wide">Total Users</p>
+          <p id="statTotalUsers" class="text-3xl font-bold text-gray-900 mt-1">—</p>
+        </div>
+        <div class="stat-card bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <p class="text-xs text-gray-500 font-medium uppercase tracking-wide">Premium</p>
+          <p id="statPremium" class="text-3xl font-bold text-indigo-600 mt-1">—</p>
+        </div>
+        <div class="stat-card bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <p class="text-xs text-gray-500 font-medium uppercase tracking-wide">New Today</p>
+          <p id="statNewToday" class="text-3xl font-bold text-emerald-600 mt-1">—</p>
+        </div>
+        <div class="stat-card bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <p class="text-xs text-gray-500 font-medium uppercase tracking-wide">Invoices</p>
+          <p id="statInvoices" class="text-3xl font-bold text-amber-600 mt-1">—</p>
+        </div>
+        <div class="stat-card bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+          <p class="text-xs text-gray-500 font-medium uppercase tracking-wide">Total Revenue</p>
+          <p id="statRevenue" class="text-2xl font-bold text-gray-900 mt-1">—</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Revenue Chart -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <h2 class="text-lg font-semibold text-gray-800 mb-4">Revenue (Last 30 Days)</h2>
+      <canvas id="revenueChart" height="90"></canvas>
+    </section>
+
+    <!-- Push Notification Broadcast -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <h2 class="text-lg font-semibold text-gray-800 mb-4">📣 Broadcast Notification</h2>
+      <div id="notifySuccess" class="hidden bg-green-50 text-green-700 text-sm rounded-lg p-3 mb-4"></div>
+      <div id="notifyError" class="hidden bg-red-50 text-red-600 text-sm rounded-lg p-3 mb-4"></div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <input id="broadcastTitle" type="text" placeholder="Notification title"
+          class="border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        <input id="broadcastBody" type="text" placeholder="Message body"
+          class="border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        <button onclick="sendBroadcast()"
+          class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-xl transition">
+          Send to All Users
+        </button>
+      </div>
+    </section>
+
+    <!-- Users Table -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-800">Users</h2>
+        <input id="userSearch" type="text" placeholder="Search name or email…"
+          oninput="filterUsers()"
+          class="border border-gray-300 rounded-xl px-4 py-2 text-sm w-64 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+      </div>
+
+      <!-- Per-user notification form -->
+      <div id="notifyUserPanel" class="hidden bg-indigo-50 border border-indigo-100 rounded-xl p-4 mb-4">
+        <p class="text-sm font-medium text-indigo-800 mb-2">Send notification to <span id="notifyUserName" class="font-bold"></span></p>
+        <div class="flex gap-3">
+          <input id="userNotifyTitle" type="text" placeholder="Title"
+            class="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          <input id="userNotifyBody" type="text" placeholder="Message"
+            class="flex-1 border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          <button onclick="sendUserNotification()"
+            class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-4 py-2 rounded-xl transition">Send</button>
+          <button onclick="closeNotifyPanel()"
+            class="text-gray-500 hover:text-gray-700 text-sm px-3">Cancel</button>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-xs text-gray-500 uppercase tracking-wide border-b border-gray-100">
+              <th class="text-left py-3 pr-4">Name</th>
+              <th class="text-left py-3 pr-4">Email</th>
+              <th class="text-left py-3 pr-4">Plan</th>
+              <th class="text-left py-3 pr-4">Businesses</th>
+              <th class="text-left py-3 pr-4">Joined</th>
+              <th class="text-left py-3">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="usersTableBody" class="divide-y divide-gray-50"></tbody>
+        </table>
+        <div id="noUsers" class="hidden text-center text-gray-400 py-8">No users found</div>
+      </div>
+    </section>
+
+    <!-- Recent Activity -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <h2 class="text-lg font-semibold text-gray-800 mb-4">Recent Activity</h2>
+      <div id="activityFeed" class="space-y-2"></div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  const BASE = window.location.origin;
+  let token = localStorage.getItem("kb_admin_token") || null;
+  let allUsers = [];
+  let notifyTargetUserId = null;
+  let revenueChart = null;
+
+  // ── Auth ──────────────────────────────────────────────────────────────
+  document.getElementById("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email    = document.getElementById("email").value;
+    const password = document.getElementById("password").value;
+    const errEl    = document.getElementById("loginError");
+    errEl.classList.add("hidden");
+
+    try {
+      const res  = await fetch(`${BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identifier: email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Login failed");
+
+      if (data.user?.role !== "ADMIN") throw new Error("Access denied. Admin accounts only.");
+      token = data.token;
+      localStorage.setItem("kb_admin_token", token);
+      document.getElementById("adminName").textContent = data.user?.name || email;
+      await showDashboard();
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    }
+  });
+
+  function logout() {
+    localStorage.removeItem("kb_admin_token");
+    token = null;
+    document.getElementById("dashboard").classList.add("hidden");
+    document.getElementById("loginScreen").classList.remove("hidden");
+  }
+
+  function showError(msg) {
+    const el = document.getElementById("globalError");
+    document.getElementById("globalErrorMsg").textContent = msg;
+    el.classList.remove("hidden");
+    setTimeout(() => el.classList.add("hidden"), 8000);
+  }
+
+  async function apiFetch(path, opts = {}) {
+    const res = await fetch(`${BASE}${path}`, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        ...(opts.headers || {}),
+      },
+    });
+    if (res.status === 403) throw new Error("Not authorised — admin role required");
+    if (res.status === 401) { logout(); throw new Error("Session expired"); }
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    return data;
+  }
+
+  // ── Dashboard ─────────────────────────────────────────────────────────
+  async function showDashboard() {
+    document.getElementById("loginScreen").classList.add("hidden");
+    document.getElementById("dashboard").classList.remove("hidden");
+    await Promise.all([loadStats(), loadUsers(), loadRevenue(), loadActivity()]);
+  }
+
+  async function loadStats() {
+    try {
+      const s = await apiFetch("/admin-api/stats");
+      document.getElementById("statTotalUsers").textContent = s.totalUsers.toLocaleString();
+      document.getElementById("statPremium").textContent    = s.premiumUsers.toLocaleString();
+      document.getElementById("statNewToday").textContent   = s.newToday.toLocaleString();
+      document.getElementById("statInvoices").textContent   = s.totalInvoices.toLocaleString();
+      document.getElementById("statRevenue").textContent    = formatMoney(s.totalRevenue);
+    } catch (err) {
+      showError("Failed to load stats: " + err.message);
+    }
+  }
+
+  async function loadUsers() {
+    try {
+      allUsers = await apiFetch("/admin-api/users");
+      renderUsers(allUsers);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  function renderUsers(users) {
+    const tbody = document.getElementById("usersTableBody");
+    const noEl  = document.getElementById("noUsers");
+    tbody.innerHTML = "";
+
+    if (!users.length) {
+      noEl.classList.remove("hidden");
+      return;
+    }
+    noEl.classList.add("hidden");
+
+    users.forEach((u) => {
+      const tr = document.createElement("tr");
+      tr.className = "hover:bg-gray-50";
+      const safeId = esc(u.id);
+      const safePlan = esc(u.plan);
+      const safeName = esc(u.name);
+      tr.innerHTML = `
+        <td class="py-3 pr-4 font-medium text-gray-800">${safeName}</td>
+        <td class="py-3 pr-4 text-gray-500">${esc(u.email)}</td>
+        <td class="py-3 pr-4">
+          <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold ${u.plan === 'PREMIUM' ? 'badge-premium' : 'badge-free'}">
+            ${safePlan}
+          </span>
+          ${u.role === 'ADMIN' ? '<span class="ml-1 px-2.5 py-0.5 rounded-full text-xs font-semibold badge-admin">ADMIN</span>' : ''}
+        </td>
+        <td class="py-3 pr-4 text-gray-600">${Number(u.businessCount)}</td>
+        <td class="py-3 pr-4 text-gray-500">${new Date(u.createdAt).toLocaleDateString()}</td>
+        <td class="py-3 flex items-center gap-2">
+          ${u.role !== 'ADMIN' ? (u.plan !== 'PREMIUM'
+            ? `<button onclick="upgradeUser('${safeId}', this)"
+                class="text-xs bg-amber-500 hover:bg-amber-600 text-white font-semibold px-3 py-1.5 rounded-lg transition">
+                Upgrade
+               </button>`
+            : `<button onclick="downgradeUser('${safeId}', this)"
+                class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold px-3 py-1.5 rounded-lg transition">
+                Downgrade
+               </button>`) : ''}
+          <button onclick="openNotifyPanel('${safeId}', '${safeName}')"
+            class="text-xs bg-indigo-100 hover:bg-indigo-200 text-indigo-700 font-semibold px-3 py-1.5 rounded-lg transition">
+            Notify
+          </button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+
+  function filterUsers() {
+    const q = document.getElementById("userSearch").value.toLowerCase();
+    renderUsers(allUsers.filter((u) =>
+      u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
+    ));
+  }
+
+  async function upgradeUser(userId, btn) {
+    btn.disabled = true;
+    btn.textContent = "…";
+    try {
+      await apiFetch(`/admin-api/users/${userId}/upgrade`, { method: "PATCH" });
+      const u = allUsers.find((x) => x.id === userId);
+      if (u) u.plan = "PREMIUM";
+      renderUsers(allUsers);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Upgrade";
+      showError("Upgrade failed: " + err.message);
+    }
+  }
+
+  async function downgradeUser(userId, btn) {
+    if (!confirm("Downgrade this user to FREE?")) return;
+    btn.disabled = true;
+    btn.textContent = "…";
+    try {
+      await apiFetch(`/admin-api/users/${userId}/downgrade`, { method: "PATCH" });
+      const u = allUsers.find((x) => x.id === userId);
+      if (u) u.plan = "FREE";
+      renderUsers(allUsers);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Downgrade";
+      showError("Downgrade failed: " + err.message);
+    }
+  }
+
+  // ── Per-user notification ─────────────────────────────────────────────
+  function openNotifyPanel(userId, name) {
+    notifyTargetUserId = userId;
+    document.getElementById("notifyUserName").textContent = name;
+    document.getElementById("notifyUserPanel").classList.remove("hidden");
+    document.getElementById("userNotifyTitle").focus();
+  }
+
+  function closeNotifyPanel() {
+    notifyTargetUserId = null;
+    document.getElementById("notifyUserPanel").classList.add("hidden");
+    document.getElementById("userNotifyTitle").value = "";
+    document.getElementById("userNotifyBody").value  = "";
+  }
+
+  async function sendUserNotification() {
+    const title = document.getElementById("userNotifyTitle").value.trim();
+    const body  = document.getElementById("userNotifyBody").value.trim();
+    if (!title || !body) return alert("Title and message required");
+    try {
+      const r = await apiFetch("/admin-api/notify", {
+        method: "POST",
+        body: JSON.stringify({ userId: notifyTargetUserId, title, body }),
+      });
+      closeNotifyPanel();
+      alert(`Notification saved! Delivered to ${r.saved} user(s).`);
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+
+  // ── Broadcast notification ────────────────────────────────────────────
+  async function sendBroadcast() {
+    const title   = document.getElementById("broadcastTitle").value.trim();
+    const body    = document.getElementById("broadcastBody").value.trim();
+    const succEl  = document.getElementById("notifySuccess");
+    const errEl2  = document.getElementById("notifyError");
+    succEl.classList.add("hidden");
+    errEl2.classList.add("hidden");
+    if (!title || !body) { errEl2.textContent = "Title and message required"; errEl2.classList.remove("hidden"); return; }
+    try {
+      const r = await apiFetch("/admin-api/notify", {
+        method: "POST",
+        body: JSON.stringify({ title, body }),
+      });
+      succEl.textContent = `Notification saved! ✓  Delivered to ${r.saved} user(s).`;
+      succEl.classList.remove("hidden");
+      document.getElementById("broadcastTitle").value = "";
+      document.getElementById("broadcastBody").value  = "";
+    } catch (err) {
+      errEl2.textContent = err.message;
+      errEl2.classList.remove("hidden");
+    }
+  }
+
+  // ── Revenue chart ─────────────────────────────────────────────────────
+  async function loadRevenue() {
+    try {
+      const data = await apiFetch("/admin-api/revenue");
+      const labels = data.map((d) => {
+        const dt = new Date(d.date);
+        return dt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      });
+      const totals = data.map((d) => d.total);
+
+      const ctx = document.getElementById("revenueChart").getContext("2d");
+      if (revenueChart) revenueChart.destroy();
+      revenueChart = new Chart(ctx, {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [{
+            label: "Revenue",
+            data: totals,
+            backgroundColor: "rgba(99, 102, 241, 0.7)",
+            borderRadius: 6,
+          }],
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            y: { beginAtZero: true, grid: { color: "#F3F4F6" } },
+            x: { grid: { display: false } },
+          },
+        },
+      });
+    } catch (err) {
+      console.error("Revenue chart error:", err);
+    }
+  }
+
+  // ── Activity feed ─────────────────────────────────────────────────────
+  async function loadActivity() {
+    try {
+      const items = await apiFetch("/admin-api/activity");
+      const feed  = document.getElementById("activityFeed");
+      feed.innerHTML = "";
+      items.forEach((t) => {
+        const isIncome = t.type === "income";
+        const div = document.createElement("div");
+        div.className = "flex items-center justify-between py-2 border-b border-gray-50 last:border-0";
+        div.innerHTML = `
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm
+              ${isIncome ? 'bg-emerald-100 text-emerald-600' : 'bg-red-100 text-red-500'}">
+              ${isIncome ? '↑' : '↓'}
+            </div>
+            <div>
+              <p class="text-sm font-medium text-gray-800">${esc(t.description || '—')}</p>
+              <p class="text-xs text-gray-400">${esc(t.businessName)} · ${esc(t.userName)}</p>
+            </div>
+          </div>
+          <div class="text-right">
+            <p class="text-sm font-semibold ${isIncome ? 'text-emerald-600' : 'text-red-500'}">
+              ${isIncome ? '+' : '-'}${formatMoney(t.amount)}
+            </p>
+            <p class="text-xs text-gray-400">${new Date(t.date).toLocaleDateString()}</p>
+          </div>
+        `;
+        feed.appendChild(div);
+      });
+    } catch (err) {
+      console.error("Activity error:", err);
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────
+  function formatMoney(n) {
+    if (n >= 1_000_000) return "$" + (n / 1_000_000).toFixed(1) + "M";
+    if (n >= 1_000)     return "$" + (n / 1_000).toFixed(1) + "K";
+    return "$" + Number(n || 0).toFixed(2);
+  }
+
+  function esc(str) {
+    return String(str || "")
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // ── Auto-login if token exists ─────────────────────────────────────────
+  if (token) {
+    showDashboard().catch(() => {
+      localStorage.removeItem("kb_admin_token");
+      token = null;
+    });
+  }
+</script>
+</body>
+</html>
