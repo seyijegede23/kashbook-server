@@ -97,26 +97,19 @@ router.post("/", async (req, res) => {
         try {
           const acc = await anchor.createDepositAccount({
             customerId,
-            productName: biz.bankAccountType || "SAVINGS",
+            customerType: "BusinessCustomer",
+            productName: biz.bankAccountType,
           });
+          // Only the deposit-account ID is reliable from the sync create.
+          // The real virtual NUBAN + bank land via accountNumber.created.
           await prisma.business.update({
             where: { id: biz.id },
             data: {
               anchorAccountId: acc.accountId,
               virtualAccountId: acc.accountId,
               virtualAccountRef: acc.accountId,
-              virtualAccountNumber: acc.accountNumber || null,
-              virtualAccountBank: acc.bankName || "Anchor",
-              virtualAccountName: acc.accountName || biz.name,
             },
           });
-          if (acc.accountNumber) {
-            await pushTo(
-              user.id,
-              "Bank account ready 🎉",
-              `${biz.name}'s bank account is active.`,
-            );
-          }
         } catch (err) {
           console.error(
             `[Anchor webhook] createDepositAccount failed for ${biz.id}:`,
@@ -249,6 +242,11 @@ router.post("/", async (req, res) => {
         return;
       }
 
+      // Dedup the "Bank account ready" push: only fire if the NUBAN was
+      // previously unset on the business row. Anchor often re-delivers this
+      // event and we don't want to spam the user with notifications.
+      const wasReady = !!biz.virtualAccountNumber;
+
       await prisma.business.update({
         where: { id: biz.id },
         data: {
@@ -258,11 +256,13 @@ router.post("/", async (req, res) => {
         },
       });
 
-      await pushTo(
-        biz.userId,
-        "Bank account ready 🎉",
-        `${biz.name}'s bank account is active.`,
-      );
+      if (!wasReady) {
+        await pushTo(
+          biz.userId,
+          "Bank account ready 🎉",
+          `${biz.name}'s bank account is active.`,
+        );
+      }
       return;
     }
 
@@ -313,16 +313,19 @@ router.post("/", async (req, res) => {
         where: { anchorAccountId: linkedAccountId },
       });
       if (!biz) return;
+      const wasReady = !!biz.virtualAccountNumber;
 
       await prisma.business.update({
         where: { id: biz.id },
         data: { virtualAccountNumber: virtualNuban },
       });
-      await pushTo(
-        biz.userId,
-        "Bank account ready 🎉",
-        `${biz.name}'s bank account is active.`,
-      );
+      if (!wasReady) {
+        await pushTo(
+          biz.userId,
+          "Bank account ready 🎉",
+          `${biz.name}'s bank account is active.`,
+        );
+      }
       return;
     }
 
