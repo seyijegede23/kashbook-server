@@ -435,7 +435,38 @@ function verifyWebhook(rawBody, headers) {
   return false;
 }
 
- 
+// ─── List a customer's document slots ────────────────────────────────────────
+// Returns the pre-created Document resources Anchor expects to be filled before
+// KYB can complete. Each Document has:
+//   id           — slot id used in the upload URL
+//   documentType — e.g. "CERTIFICATE_OF_BUSINESS_NAME"
+//   description, submitted, verified, format
+async function listCustomerDocuments(customerId) {
+  const res = await anchorFetch(
+    `/customers/${encodeURIComponent(customerId)}?include=Document`,
+  );
+  const docRels = res.data?.relationships?.documents?.data || [];
+  const included = Array.isArray(res.included) ? res.included : [];
+  return docRels.map((ref) => {
+    const full = included.find((r) => r.type === "Document" && r.id === ref.id);
+    const a = full?.attributes || {};
+    return {
+      documentId: ref.id,
+      documentType: a.documentType,
+      description: a.description,
+      submitted: !!a.submitted,
+      verified: !!a.verified,
+      format: a.format || "FILE",
+    };
+  });
+}
+
+// ─── Document upload (CAC certificate, ID, etc.) ────────────────────────────
+// Anchor's KYB review requires document uploads. Endpoint:
+//   POST /api/v1/documents/upload-document/{customerId}/{documentId}
+// where {documentId} comes from `listCustomerDocuments`. Accepts a Buffer
+// (preferred) or a base64 string.
+async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, filename, contentType }) {
   ensureConfigured();
   // Accept either a Buffer or a base64 string (with optional data: URI prefix).
   let buf = fileBuffer;
