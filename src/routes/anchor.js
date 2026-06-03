@@ -289,6 +289,28 @@ router.post("/", async (req, res) => {
       return;
     }
 
+    // ── KYB waiting on document upload — surface to the user ───────────────
+    if (eventType === "customer.identification.awaitingDocument") {
+      const customerId = rels.customer?.data?.id || event.data?.id;
+      if (!customerId) return;
+      const user = await prisma.user.findFirst({
+        where: { anchorCustomerId: customerId },
+      });
+      if (!user) return;
+      const reqDocs = (attrs.requiredDocuments || [])
+        .map((d) => d.type || d.name || "")
+        .filter(Boolean)
+        .join(", ");
+      await pushTo(
+        user.id,
+        "Documents needed",
+        reqDocs
+          ? `KYB is waiting on: ${reqDocs}.`
+          : "Your business verification is waiting on additional documents.",
+      );
+      return;
+    }
+
     // ── Informational lifecycle events (no DB action needed) ───────────────
     if (
       eventType === "account.initiated" ||

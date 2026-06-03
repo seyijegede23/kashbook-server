@@ -148,7 +148,9 @@ async function createBusinessCustomer({
         address: { country: "NG", state: bizAddr.state },
         basicDetail: {
           industry: industry || "Retail",
-          registrationType: registrationType || "Private_Incorporated",
+          // Default to "Business_Name" — sandbox-friendly (single CAC BN cert)
+          // vs "Private_Incorporated" which needs TIN + Cert of Inc + RC + MEMART.
+          registrationType: registrationType || "Business_Name",
           country: "NG",
           businessName,
           businessBvn: businessBvn || user.bvn,
