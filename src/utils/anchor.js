@@ -482,9 +482,11 @@ async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, 
   }
   if (!buf) throw new Error("uploadDocument: fileBuffer or fileBase64 required");
 
+  // Anchor expects the field name to be "fileData" (per /reference/upload-document).
+  // Sending it as "file" returns 400 "Missing upload data".
   const form = new FormData();
   const blob = new Blob([buf], { type: ctype || "application/octet-stream" });
-  form.append("file", blob, filename || "document");
+  form.append("fileData", blob, filename || "document");
 
   const res = await fetch(
     `${BASE()}/documents/upload-document/${encodeURIComponent(customerId)}/${encodeURIComponent(documentId)}`,
