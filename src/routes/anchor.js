@@ -168,47 +168,24 @@ router.post("/", async (req, res) => {
     }
 
     // ── Deposit account opened ──────────────────────────────────────────────
+    // NOTE: account.opened's payload carries the DepositAccount's own (masked)
+    // accountNumber + underlying bank (e.g. CORESTEP MFB shell). We do NOT
+    // write those — the real virtual NUBAN comes via accountNumber.created.
+    // Just verify the business exists and log; the NUBAN handler will do the
+    // actual update + push notification.
     if (eventType === "account.opened") {
       const accountId = rels.account?.data?.id || event.data?.id;
       if (!accountId) return;
-
       const biz = await prisma.business.findFirst({
         where: { anchorAccountId: accountId },
       });
-      if (!biz) return;
-
-      let accountNumber = attrs.accountNumber;
-      let accountName = attrs.accountName;
-      let bankName = attrs.bank?.name || "Anchor";
-
-      // If the event payload doesn't include the NUBAN, fetch it from Anchor.
-      if (!accountNumber) {
-        try {
-          const fresh = await anchor.getAccount(accountId);
-          accountNumber = fresh.accountNumber || accountNumber;
-          accountName = fresh.accountName || accountName;
-          bankName = fresh.bankName || bankName;
-        } catch (e) {
-          console.warn("[Anchor webhook] getAccount fallback failed:", e.message);
-        }
-      }
-
-      await prisma.business.update({
-        where: { id: biz.id },
-        data: {
-          virtualAccountNumber: accountNumber,
-          virtualAccountBank: bankName,
-          virtualAccountName: accountName || biz.name,
-        },
-      });
-
-      if (accountNumber) {
-        await pushTo(
-          biz.userId,
-          "Bank account ready 🎉",
-          `${biz.name}'s bank account is active.`,
+      if (!biz) {
+        console.warn(
+          `[Anchor webhook] account.opened — no business for ${accountId}`,
         );
       }
+      // Don't update virtualAccountNumber/Bank/Name here. accountNumber.created
+      // will land within ~1s and write the real PROVIDUS NUBAN.
       return;
     }
 
