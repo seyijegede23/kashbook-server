@@ -275,11 +275,17 @@ async function createDepositAccount({ customerId, productName, customerType = "B
 }
 
 async function getAccountBalance(accountId) {
+  // Response shape (non-JSON:API): { data: { availableBalance, ledgerBalance, hold, pending } }
+  // Values are returned in KOBO — divide by 100 to expose naira to callers.
   const res = await anchorFetch(`/accounts/balance/${accountId}`);
-  const attrs = res.data?.attributes ?? {};
+  const d = res.data ?? {};
+  const koboBalance = Number(d.availableBalance ?? d.balance ?? 0);
   return {
-    balance: Number(attrs.availableBalance ?? attrs.balance ?? 0),
-    accountNumber: attrs.accountNumber,
+    balance: koboBalance / 100,
+    ledgerBalance: Number(d.ledgerBalance ?? 0) / 100,
+    hold: Number(d.hold ?? 0) / 100,
+    pending: Number(d.pending ?? 0) / 100,
+    accountNumber: d.accountNumber,
   };
 }
 
