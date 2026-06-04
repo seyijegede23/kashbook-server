@@ -77,15 +77,36 @@ router.post("/", async (req, res) => {
       eventType === "business.verification.approved"
     ) {
       const customerId = rels.customer?.data?.id || event.data?.id;
-      if (!customerId) return;
+      if (!customerId) {
+        console.warn(`[Anchor webhook] approved event with no customerId`);
+        return;
+      }
 
-      const user = await prisma.user.update({
+      // Look up first, then update — so we can distinguish "no matching user"
+      // (which used to fail silently via .catch) from "DB write error".
+      const user = await prisma.user.findFirst({
         where: { anchorCustomerId: customerId },
-        data: { kycStatus: "verified" },
-      }).catch(() => null);
-      if (!user) return;
+      });
+      if (!user) {
+        console.warn(
+          `[Anchor webhook] approved for unknown anchorCustomerId=${customerId} — no local user. Possible race with /virtual-account POST persistence.`,
+        );
+        return;
+      }
 
-      // Open deposit accounts for any business that requested one but doesn't have one yet
+      try {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { kycStatus: "verified" },
+        });
+      } catch (err) {
+        console.error(
+          `[Anchor webhook] failed to set kycStatus=verified for user ${user.id}:`,
+          err.message,
+        );
+      }
+
+      // Open deposit accounts for any business that's missing one.
       const pending = await prisma.business.findMany({
         where: {
           userId: user.id,
@@ -93,6 +114,9 @@ router.post("/", async (req, res) => {
           virtualAccountNumber: null,
         },
       });
+      console.log(
+        `[Anchor webhook] approved ${customerId} → opening ${pending.length} deposit account(s)`,
+      );
       for (const biz of pending) {
         try {
           const acc = await anchor.createDepositAccount({
@@ -110,10 +134,14 @@ router.post("/", async (req, res) => {
               virtualAccountRef: acc.accountId,
             },
           });
+          console.log(
+            `[Anchor webhook] DepositAccount ${acc.accountId} opened for ${biz.name}`,
+          );
         } catch (err) {
           console.error(
-            `[Anchor webhook] createDepositAccount failed for ${biz.id}:`,
+            `[Anchor webhook] createDepositAccount failed for biz ${biz.id} (${biz.name}):`,
             err.message,
+            err.anchorErrors ? JSON.stringify(err.anchorErrors) : "",
           );
         }
       }
@@ -131,13 +159,26 @@ router.post("/", async (req, res) => {
     ) {
       const customerId = rels.customer?.data?.id || event.data?.id;
       if (!customerId) return;
-      const user = await prisma.user
-        .update({
-          where: { anchorCustomerId: customerId },
+      const user = await prisma.user.findFirst({
+        where: { anchorCustomerId: customerId },
+      });
+      if (!user) {
+        console.warn(
+          `[Anchor webhook] rejected for unknown anchorCustomerId=${customerId}`,
+        );
+        return;
+      }
+      try {
+        await prisma.user.update({
+          where: { id: user.id },
           data: { kycStatus: "rejected" },
-        })
-        .catch(() => null);
-      if (!user) return;
+        });
+      } catch (err) {
+        console.error(
+          `[Anchor webhook] kycStatus=rejected update failed for ${user.id}:`,
+          err.message,
+        );
+      }
       const reason =
         attrs.reason || attrs.message || "Identity verification failed.";
       await pushTo(user.id, "Verification failed", reason);
