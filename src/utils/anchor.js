@@ -350,7 +350,39 @@ async function createCounterparty({ accountNumber, bankId, accountName }) {
   return { counterpartyId: res.data?.id };
 }
 
-// ─── Transfer (NIP) ──────────────────────────────────────────────────────────
+// ─── Book Transfer (internal: between two DepositAccounts on this org) ──────
+// Cheaper + instant compared to NIP. Use when destination is another KashBook
+// business whose DepositAccount lives on the same Anchor organization.
+//
+// POST /transfers  data.type=BookTransfer
+// Amount is in KOBO per Anchor convention.
+async function createBookTransfer({
+  fromAccountId,
+  toAccountId,
+  amount, // in naira (we convert to kobo here)
+  reason = "Transfer",
+  reference,
+}) {
+  const body = {
+    data: {
+      type: "BookTransfer",
+      attributes: {
+        currency: "NGN",
+        amount: Math.round(Number(amount) * 100),
+        reason,
+        reference,
+      },
+      relationships: {
+        account: { data: { type: "DepositAccount", id: fromAccountId } },
+        destinationAccount: { data: { type: "DepositAccount", id: toAccountId } },
+      },
+    },
+  };
+  const res = await anchorFetch("/transfers", { method: "POST", body });
+  return { transferId: res.data?.id, raw: res.data };
+}
+
+// ─── Transfer (NIP — external, to any Nigerian bank) ────────────────────────
 async function createTransfer({
   fromAccountId,
   counterpartyId,
@@ -565,6 +597,7 @@ module.exports = {
   verifyCounterparty,
   createCounterparty,
   createTransfer,
+  createBookTransfer,
   verifyWebhook,
   listCustomerDocuments,
   uploadDocument,

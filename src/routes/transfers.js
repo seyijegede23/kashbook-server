@@ -91,38 +91,65 @@ router.post("/send", async (req, res) => {
       });
     }
 
-    // Resolve recipient name if not provided
+    const reference = `kashbook_tf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+    // Auto-detect internal vs external. If the destination NUBAN belongs to
+    // another KashBook business that has a DepositAccount on the same Anchor
+    // org, use BookTransfer (free + instant). Otherwise fall back to NIP.
+    const internalDest = await prisma.business.findFirst({
+      where: {
+        virtualAccountNumber: accountNumber,
+        anchorAccountId: { not: null },
+        NOT: { id: businessId }, // can't book-transfer to yourself
+      },
+      select: { id: true, name: true, anchorAccountId: true, virtualAccountName: true },
+    });
+
     let resolvedName = accountName;
-    if (!resolvedName) {
-      const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
-      if (!ne.accountName)
-        return res.status(400).json({ error: "Could not resolve recipient account" });
-      resolvedName = ne.accountName;
+    let resolvedBank = bankName;
+    let route;
+
+    if (internalDest) {
+      resolvedName = resolvedName || internalDest.virtualAccountName || internalDest.name;
+      resolvedBank = "KashBook (internal)";
+      route = "book";
+      await anchor.createBookTransfer({
+        fromAccountId: biz.anchorAccountId,
+        toAccountId: internalDest.anchorAccountId,
+        amount: Number(amount),
+        reason: narration || `Transfer from ${biz.name}`,
+        reference,
+      });
+    } else {
+      // External NIP path
+      if (!resolvedName) {
+        const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
+        if (!ne.accountName)
+          return res.status(400).json({ error: "Could not resolve recipient account" });
+        resolvedName = ne.accountName;
+      }
+      const banks = await anchor.getBanks();
+      const matchedBank = banks.find((b) => b.code === bankCode);
+      if (!matchedBank?.id)
+        return res.status(400).json({ error: "Unknown bank — refresh the bank list" });
+
+      const cp = await anchor.createCounterparty({
+        accountNumber,
+        bankId: matchedBank.id,
+        accountName: resolvedName,
+      });
+      route = "nip";
+      await anchor.createTransfer({
+        fromAccountId: biz.anchorAccountId,
+        counterpartyId: cp.counterpartyId,
+        amount: Number(amount),
+        reason: narration || `Transfer from ${biz.name}`,
+        reference,
+      });
     }
 
-    // Anchor Counterparty needs the internal bank UUID, not the CBN code
-    const banks = await anchor.getBanks();
-    const matchedBank = banks.find((b) => b.code === bankCode);
-    if (!matchedBank?.id)
-      return res.status(400).json({ error: "Unknown bank — refresh the bank list" });
-
-    const cp = await anchor.createCounterparty({
-      accountNumber,
-      bankId: matchedBank.id,
-      accountName: resolvedName,
-    });
-
-    const reference = `kashbook_tf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    await anchor.createTransfer({
-      fromAccountId: biz.anchorAccountId,
-      counterpartyId: cp.counterpartyId,
-      amount: Number(amount),
-      reason: narration || `Transfer from ${biz.name}`,
-      reference,
-    });
-
-    const recipientLabel = bankName
-      ? `${resolvedName} · ${bankName} · ${accountNumber}`
+    const recipientLabel = resolvedBank
+      ? `${resolvedName} · ${resolvedBank} · ${accountNumber}`
       : `${resolvedName} · ${accountNumber}`;
     const description = narration
       ? `${narration} — to ${recipientLabel}`
@@ -142,7 +169,7 @@ router.post("/send", async (req, res) => {
       },
     });
 
-    res.json({ status: "success", reference });
+    res.json({ status: "success", reference, route });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });

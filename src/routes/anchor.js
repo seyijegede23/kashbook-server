@@ -464,6 +464,85 @@ router.post("/", async (req, res) => {
       return;
     }
 
+    // ── BookTransfer successful — credit the receiving business ────────────
+    // Source-side expense was already recorded synchronously in /transfers/send.
+    // We only need to insert the income row on the destination side and notify.
+    if (eventType === "book.transfer.successful") {
+      const destAccountId =
+        rels.destinationAccount?.data?.id ||
+        rels.destination?.data?.id ||
+        attrs.destinationAccountId;
+      const srcAccountId =
+        rels.account?.data?.id || rels.sourceAccount?.data?.id;
+      const amountRaw = Number(attrs.amount || 0);
+      const amount = amountRaw > 100000 ? amountRaw / 100 : amountRaw;
+      const reference = attrs.reference || event.data?.id || "";
+
+      if (!destAccountId || amount <= 0) return;
+
+      const destBiz = await prisma.business.findFirst({
+        where: { anchorAccountId: destAccountId },
+      });
+      if (!destBiz) {
+        console.warn(
+          `[Anchor webhook] book.transfer.successful — no business for dest account ${destAccountId}`,
+        );
+        return;
+      }
+
+      // Dedup: if we've already recorded this reference for this business, skip.
+      if (reference) {
+        const existing = await prisma.transaction.findFirst({
+          where: {
+            businessId: destBiz.id,
+            source: "anchor",
+            description: { contains: reference },
+          },
+        });
+        if (existing) return;
+      }
+
+      // Look up the sender (source DepositAccount) to give a friendly description
+      let senderName = "another KashBook user";
+      if (srcAccountId) {
+        const srcBiz = await prisma.business.findFirst({
+          where: { anchorAccountId: srcAccountId },
+          select: { name: true, virtualAccountName: true },
+        });
+        if (srcBiz) senderName = srcBiz.virtualAccountName || srcBiz.name;
+      }
+
+      const narration = attrs.reason || "";
+      let description = `Transfer received from ${senderName}`;
+      if (narration) description += ` · "${narration}"`;
+      if (reference) description += ` · Ref: ${reference}`;
+
+      await prisma.transaction.create({
+        data: {
+          businessId: destBiz.id,
+          userId: destBiz.userId,
+          type: "income",
+          amount,
+          description,
+          category: "transfer",
+          paymentMethod: "bank",
+          date: new Date(),
+          source: "anchor",
+        },
+      });
+
+      const notifBody = `₦${amount.toLocaleString("en-NG", {
+        minimumFractionDigits: 2,
+      })} received in ${destBiz.name}`;
+      await pushTo(destBiz.userId, "Payment Received 🎉", notifBody);
+      return;
+    }
+
+    if (eventType === "book.transfer.initiated") {
+      // informational — no DB action; source-side expense already recorded
+      return;
+    }
+
     // ── Outbound transfer outcomes ──────────────────────────────────────────
     if (
       eventType === "nip.transfer.successful" ||
