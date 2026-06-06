@@ -119,10 +119,12 @@ router.post("/", async (req, res) => {
       );
       for (const biz of pending) {
         try {
+          // BusinessCustomer only supports CURRENT — ignore the user's saved
+          // bankAccountType preference. (SAVINGS is for IndividualCustomer.)
           const acc = await anchor.createDepositAccount({
             customerId,
             customerType: "BusinessCustomer",
-            productName: biz.bankAccountType,
+            productName: "CURRENT",
           });
           // Only the deposit-account ID is reliable from the sync create.
           // The real virtual NUBAN + bank land via accountNumber.created.
