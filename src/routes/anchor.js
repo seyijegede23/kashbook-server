@@ -15,27 +15,7 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
-
-async function pushTo(userId, title, body) {
-  if (!userId) return;
-  await prisma.appNotification.create({ data: { userId, title, body } });
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { expoPushToken: true, notificationsEnabled: true },
-  });
-  if (user?.expoPushToken && user?.notificationsEnabled) {
-    fetch("https://exp.host/--/api/v2/push/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        to: user.expoPushToken,
-        title,
-        body,
-        sound: "default",
-      }),
-    }).catch(() => {});
-  }
-}
+const { pushTo } = require("../utils/pushNotification");
 
 router.post("/", async (req, res) => {
   const isBuffer = Buffer.isBuffer(req.body);
@@ -467,7 +447,7 @@ router.post("/", async (req, res) => {
 
       const notifBody = `₦${amount.toLocaleString("en-NG", {
         minimumFractionDigits: 2,
-      })} received in ${biz.name}`;
+      })} from ${senderName} → ${biz.name}`;
       await pushTo(biz.userId, "Payment Received 🎉", notifBody);
       return;
     }
@@ -541,7 +521,7 @@ router.post("/", async (req, res) => {
 
       const notifBody = `₦${amount.toLocaleString("en-NG", {
         minimumFractionDigits: 2,
-      })} received in ${destBiz.name}`;
+      })} from ${senderName} → ${destBiz.name}`;
       await pushTo(destBiz.userId, "Payment Received 🎉", notifBody);
       return;
     }
