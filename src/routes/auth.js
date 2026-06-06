@@ -182,6 +182,61 @@ router.post("/google", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// POST /auth/apple
+// body: { idToken, firstName?, lastName? }
+//   - idToken: the JWT returned by expo-apple-authentication / native Sign In with Apple
+//   - firstName/lastName: Apple only includes the user's name on FIRST sign-in.
+//     Client should pass them through if the SDK returned them.
+// ─────────────────────────────────────────────
+const appleSignin = require("apple-signin-auth");
+router.post("/apple", async (req, res) => {
+  const { idToken, firstName: clientFirstName, lastName: clientLastName } = req.body;
+  if (!idToken) return res.status(400).json({ error: "idToken required" });
+  try {
+    const claims = await appleSignin.verifyIdToken(idToken, {
+      // The "audience" must match the Bundle ID (iOS) or Service ID (web)
+      // registered with Apple. We accept both env vars to allow either.
+      audience: process.env.APPLE_CLIENT_ID || process.env.APPLE_BUNDLE_ID,
+      ignoreExpiration: false,
+    });
+    const appleId = claims.sub;
+    const email = claims.email || null;
+
+    let user = await prisma.user.findFirst({
+      where: {
+        OR: [{ appleId }, email ? { email } : { id: "__never__" }],
+      },
+    });
+    if (user) {
+      if (!user.appleId) {
+        user = await prisma.user.update({
+          where: { id: user.id },
+          data: { appleId },
+        });
+      }
+    } else {
+      const firstName = (clientFirstName || "").trim() || "Apple";
+      const lastName = (clientLastName || "").trim() || "User";
+      user = await prisma.user.create({
+        data: {
+          firstName,
+          lastName,
+          businessName: "My Business",
+          email,
+          appleId,
+        },
+      });
+    }
+    await ensurePrimaryBusiness(user.id, user.businessName || "My Business");
+    const token = signToken({ userId: user.id });
+    res.json(userResponse(user, token));
+  } catch (err) {
+    console.error("[apple sign-in]", err.message || err);
+    res.status(401).json({ error: "Apple token verification failed" });
+  }
+});
+
+// ─────────────────────────────────────────────
 // POST /auth/send-otp
 // ─────────────────────────────────────────────
 router.post("/send-otp", async (req, res) => {

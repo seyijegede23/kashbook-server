@@ -20,6 +20,7 @@ model User {
   employerId           String?
   profileImage         String?        @db.Text
   googleId             String?        @unique
+  appleId              String?        @unique
   avatarUrl            String?
   expoPushToken        String?
   language             String         @default("en")
