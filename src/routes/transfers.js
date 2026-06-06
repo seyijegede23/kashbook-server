@@ -19,16 +19,35 @@ router.get("/banks", async (_req, res) => {
 
 // POST /transfers/verify-account
 // body: { accountNumber, bankCode } — bankCode is the CBN bank code
+// Two-step lookup:
+//   1. Check our DB for an internal KashBook business with that NUBAN. Anchor's
+//      /payments/verify-account doesn't know about its own virtual NUBANs, so
+//      external-only enquiry returns "Account not found" for KashBook→KashBook.
+//   2. Fall back to Anchor's name enquiry for external banks.
 router.post("/verify-account", async (req, res) => {
   const { accountNumber, bankCode } = req.body;
   if (!accountNumber || !bankCode)
     return res.status(400).json({ error: "accountNumber and bankCode are required" });
 
   try {
+    const internal = await prisma.business.findFirst({
+      where: {
+        virtualAccountNumber: accountNumber,
+        anchorAccountId: { not: null },
+      },
+      select: { name: true, virtualAccountName: true },
+    });
+    if (internal) {
+      return res.json({
+        accountName: internal.virtualAccountName || internal.name,
+        internal: true,
+      });
+    }
+
     const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
     if (!ne.accountName)
       return res.status(400).json({ error: "Account not found" });
-    res.json({ accountName: ne.accountName });
+    res.json({ accountName: ne.accountName, internal: false });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
