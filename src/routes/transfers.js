@@ -2,6 +2,7 @@ const router = require("express").Router();
 const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
+const { verifyTransactionPin } = require("../utils/transactionPin");
 
 router.use(auth);
 
@@ -86,11 +87,19 @@ router.post("/send", async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Staff cannot initiate transfers" });
 
-  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName } = req.body;
+  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin } = req.body;
   if (!businessId || !accountNumber || !bankCode || !amount)
     return res.status(400).json({ error: "Missing required fields" });
   if (isNaN(amount) || Number(amount) <= 0)
     return res.status(400).json({ error: "Invalid amount" });
+
+  // Require a valid transaction PIN before processing.
+  const pinCheck = await verifyTransactionPin(req.user.id, pin);
+  if (!pinCheck.ok) {
+    return res
+      .status(pinCheck.status || 401)
+      .json({ error: pinCheck.error, code: pinCheck.code });
+  }
 
   try {
     const biz = await prisma.business.findFirst({

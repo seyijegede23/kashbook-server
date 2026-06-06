@@ -293,10 +293,21 @@ router.get("/me", authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) return res.status(404).json({ error: "User not found" });
-    const { password: _, ...safe } = user;
-    res.json({ user: { ...safe, accountType: safe.accountType.toLowerCase(),
-      settings: { language: safe.language, currency: safe.currency,
-        notificationsEnabled: safe.notificationsEnabled, biometricEnabled: safe.biometricEnabled } } });
+    // Strip raw secret-like fields before sending the user object.
+    const { password: _, transactionPin: _pin, transactionPinFailedCount: _c, transactionPinLockedUntil: _l, ...safe } = user;
+    res.json({
+      user: {
+        ...safe,
+        hasTransactionPin: !!user.transactionPin,
+        accountType: safe.accountType.toLowerCase(),
+        settings: {
+          language: safe.language,
+          currency: safe.currency,
+          notificationsEnabled: safe.notificationsEnabled,
+          biometricEnabled: safe.biometricEnabled,
+        },
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch user" });
   }
@@ -313,6 +324,42 @@ router.patch("/push-token", authMiddleware, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: "Failed to save push token" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// Transaction PIN (4-digit) — required before outbound transfers.
+// Locked for 15 min after 5 consecutive failures.
+// ─────────────────────────────────────────────
+const { PIN_REGEX } = require("../utils/transactionPin");
+
+// POST /auth/set-pin   body: { password, pin }
+// Used both for first-time setup AND to overwrite an existing PIN — password
+// is the source of truth for the user's identity so we always require it.
+router.post("/set-pin", authMiddleware, async (req, res) => {
+  const { password, pin } = req.body;
+  if (!password) return res.status(400).json({ error: "Password is required" });
+  if (!PIN_REGEX.test(String(pin || "")))
+    return res.status(400).json({ error: "PIN must be 4 digits" });
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.password)
+      return res.status(400).json({ error: "Set a password first to enable PIN" });
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ error: "Password is incorrect" });
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: {
+        transactionPin: await bcrypt.hash(String(pin), 10),
+        transactionPinFailedCount: 0,
+        transactionPinLockedUntil: null,
+      },
+    });
+    res.json({ message: "Transaction PIN set" });
+  } catch (err) {
+    console.error("[set-pin]", err);
+    res.status(500).json({ error: "Failed to set PIN" });
   }
 });
 

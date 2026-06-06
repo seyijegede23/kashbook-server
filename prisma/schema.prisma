@@ -26,6 +26,9 @@ model User {
   currency             String         @default("NGN")
   notificationsEnabled Boolean        @default(true)
   biometricEnabled     Boolean        @default(false)
+  transactionPin             String?
+  transactionPinFailedCount  Int       @default(0)
+  transactionPinLockedUntil  DateTime?
   failedLoginAttempts  Int            @default(0)
   lockedUntil          DateTime?
   dateOfBirth          DateTime?
