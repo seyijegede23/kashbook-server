@@ -28,15 +28,20 @@ async function authMiddleware(req, res, next) {
       effectivePlan = employer?.plan ?? "FREE";
     }
 
+    // PAYWALL DISABLED — every user is treated as PREMIUM regardless of their
+    // actual plan. Revert this block (use `user.plan ?? "FREE"` and the real
+    // `effectivePlan` above) to re-enable the paywall.
     req.user = {
       id:            user.id,
-      accountType:   user.accountType.toLowerCase(), // "owner" | "staff"
+      accountType:   user.accountType.toLowerCase(),
       employerId:    user.employerId ?? null,
       name:          `${user.firstName} ${user.lastName}`.trim(),
-      role:          user.role, // "USER" | "ADMIN"
-      plan:          user.plan ?? "FREE",
-      effectivePlan, // plan governing feature limits (employer's plan for staff)
+      role:          user.role,
+      plan:          "PREMIUM",
+      effectivePlan: "PREMIUM",
     };
+    // Silence unused-var warning while paywall is off.
+    void effectivePlan;
     next();
   } catch {
     return res.status(401).json({ error: "Invalid or expired token" });
