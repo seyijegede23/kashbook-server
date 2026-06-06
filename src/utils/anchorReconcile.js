@@ -23,11 +23,15 @@ async function fetchAnchorTransactions(accountId, size = 50) {
     { headers: { "x-anchor-key": KEY(), Accept: "application/json" } },
   );
   if (!res.ok) {
-    throw new Error(`Anchor transactions fetch failed (${res.status})`);
+    const err = new Error(`Anchor transactions fetch failed (${res.status})`);
+    err.status = res.status;
+    throw err;
   }
   const data = await res.json();
   return data.data || [];
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function normalizeAmount(raw) {
   // Anchor's transactions API returns amounts in kobo. Divide by 100.
@@ -96,19 +100,32 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
   return created;
 }
 
-async function reconcileAll({ onCreate, logger } = {}) {
+async function reconcileAll({ onCreate, logger, throttleMs = 1500 } = {}) {
   const bizs = await prisma.business.findMany({
     where: { anchorAccountId: { not: null } },
     select: { id: true, userId: true, name: true, anchorAccountId: true },
   });
   let total = 0;
-  for (const biz of bizs) {
+  let rateLimited = 0;
+  let backoff = throttleMs;
+  for (let i = 0; i < bizs.length; i++) {
+    const biz = bizs[i];
     try {
       const n = await reconcileBusiness(biz, { onCreate });
       total += n;
+      backoff = throttleMs;
     } catch (err) {
-      if (logger) logger(`[reconcile] ${biz.name}: ${err.message}`);
+      if (err.status === 429) {
+        rateLimited++;
+        backoff = Math.min(backoff * 2, 30_000);
+      } else if (logger) {
+        logger(`[reconcile] ${biz.name}: ${err.message}`);
+      }
     }
+    if (i < bizs.length - 1) await sleep(backoff);
+  }
+  if (rateLimited > 0 && logger) {
+    logger(`[reconcile] rate-limited on ${rateLimited}/${bizs.length} business(es) — will retry next cycle`);
   }
   return total;
 }

@@ -217,10 +217,12 @@ app.use((err, _req, res, _next) => {
 // ── Start server (Prisma connects lazily — no explicit connect needed) ────────
 app.listen(PORT, () => console.log(`KashBook API running on port ${PORT}`));
 
-// ── Background loop: reconcile Anchor inbound credits every 2 min ────────────
+// ── Background loop: reconcile Anchor inbound credits every 5 min ────────────
 // Belt-and-braces safety net so users still get credits + push notifications
 // even when Anchor's webhook delivery drops or the event isn't subscribed.
-require("./src/utils/anchorReconcile").startReconciliationLoop(2 * 60 * 1000);
+// Per-business calls are throttled inside the loop to stay under Anchor's
+// rate limit.
+require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 
 // ── Background cron: low stock push notifications (every hour) ───────────────
 cron.schedule("0 * * * *", async () => {
