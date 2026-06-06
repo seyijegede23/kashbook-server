@@ -335,11 +335,17 @@ router.post("/", async (req, res) => {
     if (
       eventType === "account.initiated" ||
       eventType === "customer.created" ||
-      eventType === "virtualNuban.opened"
+      eventType === "virtualNuban.opened" ||
+      eventType === "document.approved" ||
+      eventType === "document.submitted" ||
+      eventType === "document.rejected"
     ) {
       // account.initiated  — fires when a DepositAccount creation starts
       // customer.created   — fires after a customer is created (we already have the ID)
       // virtualNuban.opened — fires alongside accountNumber.created; same NUBAN info
+      // document.*         — per-document KYB review outcomes; the aggregate
+      //                      customer.identification.{approved,rejected} already
+      //                      handles the state transition we care about.
       return;
     }
 
