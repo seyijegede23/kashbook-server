@@ -236,12 +236,12 @@ router.get("/compliance/flags", async (req, res) => {
         const [user, business, transaction] = await Promise.all([
           prisma.user.findUnique({
             where: { id: f.userId },
-            select: { id: true, firstName: true, lastName: true, email: true, phone: true, accountStatus: true },
+            select: { id: true, firstName: true, lastName: true, email: true, phone: true, country: true, accountStatus: true },
           }),
           f.businessId
             ? prisma.business.findUnique({
                 where: { id: f.businessId },
-                select: { id: true, name: true, riskCategory: true, industry: true, virtualAccountNumber: true },
+                select: { id: true, name: true, country: true, riskCategory: true, industry: true, virtualAccountNumber: true },
               })
             : null,
           f.transactionId

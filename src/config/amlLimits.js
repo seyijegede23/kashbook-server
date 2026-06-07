@@ -1,51 +1,25 @@
-// Single source of truth for AML limits, risk classification, and step-up
-// thresholds. Tuning these is a code-review event by design — DB-driven
-// limits would let an admin loosen them without trail. If you need
-// emergency tuning without a redeploy, use the env-var overrides at the
-// bottom of this file.
+// AML thresholds and helpers — now sourced per-country from the country
+// config files. Risk classification (industry → high/elevated/standard)
+// stays global because Anchor's industry enum is universal.
+//
+// The exported names (TIER_LIMITS, STEP_UP_OTP_ABOVE, SINGLE_FLAG_ABOVE,
+// VELOCITY_RULES) remain for backwards compatibility — they expose the
+// Nigeria limits as the default. New code should call
+// `getThresholds(business)` or `resolveBusinessLimits(business)` to get
+// the country-correct values.
 
-const NAIRA = (n) => n; // self-doc: limits below are in naira
+const { getCountryConfig } = require("./countries");
 
-// ── Tiered limits by business KYB type ────────────────────────────────────
-const TIER_LIMITS = {
-  unverified: {
-    daily:     NAIRA(0),
-    weekly:    NAIRA(0),
-    monthly:   NAIRA(0),
-    singleMax: NAIRA(0),
-  },
-  sole_proprietor: {
-    daily:     NAIRA(500_000),
-    weekly:    NAIRA(2_500_000),
-    monthly:   NAIRA(5_000_000),
-    singleMax: NAIRA(2_000_000),
-  },
-  limited_company: {
-    daily:     NAIRA(5_000_000),
-    weekly:    NAIRA(25_000_000),
-    monthly:   NAIRA(50_000_000),
-    singleMax: NAIRA(2_000_000),
-  },
-};
-
-// Per-industry risk classification (matched against Business.industry verbatim
-// from Anchor's enum). Risk multiplier reduces the tier limits.
+// Per-industry risk classification (universal — Anchor's industry enum is
+// used across all countries today).
 const HIGH_RISK_INDUSTRIES = new Set([
-  "Betting",
-  "Lotteries",
-  "PredictionServices",
-  "Lending",
-  "Investments",
-  "AgriculturalInvestments",
-  "Remittances",
-  "MobileWallets",
-  "BillPayments",
+  "Betting", "Lotteries", "PredictionServices",
+  "Lending", "Investments", "AgriculturalInvestments",
+  "Remittances", "MobileWallets", "BillPayments",
 ]);
 
 const ELEVATED_RISK_INDUSTRIES = new Set([
-  "RealEstate",
-  "Construction",
-  "Automobiles",
+  "RealEstate", "Construction", "Automobiles",
 ]);
 
 const RISK_MULTIPLIER = {
@@ -54,41 +28,31 @@ const RISK_MULTIPLIER = {
   high:     0.5,
 };
 
-// ── Step-up and flagging thresholds ───────────────────────────────────────
-
-// Above this amount we require a one-time code sent to the user's email or
-// phone IN ADDITION to the transaction PIN. Bigger transfer = bigger proof.
-const STEP_UP_OTP_ABOVE = NAIRA(1_000_000);
-
 // OTP type tag used so transfer step-up OTPs can't be confused with the
 // signup / email-change / phone-change codes.
 const TRANSFER_OTP_TYPE = "TRANSFER_STEP_UP";
 
-// Any single transfer ≥ this amount auto-creates a CTR-style ComplianceFlag.
-// Mirrors NFIU's ₦5M individual cash threshold for awareness; ours is
-// digital so technically not CTR-subject, but it's a defensible signal.
-const SINGLE_FLAG_ABOVE = NAIRA(5_000_000);
-
-// ── Velocity / pattern rules thresholds ───────────────────────────────────
+// Backwards-compat exports (Nigeria values) — DO NOT use in new code.
+const NG = getCountryConfig("NG");
+const TIER_LIMITS = {
+  unverified:      { daily: 0,                            weekly: 0,                            monthly: 0,                             singleMax: 0 },
+  sole_proprietor: NG.amlLimits.soleProp,
+  limited_company: NG.amlLimits.limited,
+};
+const STEP_UP_OTP_ABOVE = NG.amlLimits.stepUpOtpAbove;
+const SINGLE_FLAG_ABOVE = NG.amlLimits.singleFlagAbove;
 const VELOCITY_RULES = {
-  // RAPID_FIRE: N transfers within window → medium flag
   rapidFireCount:    5,
   rapidFireWindowMs: 10 * 60 * 1000,
-
-  // VELOCITY_SPIKE: today's volume > N × 30-day rolling daily avg → high flag (hold)
   spikeMultiplier:   5,
-  spikeMinHistoryDays: 7, // don't flag spike if account is younger than this
-
-  // STRUCTURING: N transfers within window, each ≥ subThreshold and < SINGLE_FLAG_ABOVE
+  spikeMinHistoryDays: 7,
   structuringCount:        4,
-  structuringSubThreshold: NAIRA(4_500_000),
+  structuringSubThreshold: NG.amlLimits.structuringSubThreshold,
   structuringWindowMs:     24 * 60 * 60 * 1000,
-
-  // OFF_HOURS: transfer between these local hours + amount > minAmount → low flag
-  offHoursStartHour: 1,  // 01:00
-  offHoursEndHour:   5,  // 05:00 (exclusive)
-  offHoursMinAmount: NAIRA(500_000),
-  timezone:          "Africa/Lagos",
+  offHoursStartHour: 1,
+  offHoursEndHour:   5,
+  offHoursMinAmount: NG.amlLimits.offHoursMinAmount,
+  timezone:          NG.timezone,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -108,11 +72,46 @@ function resolveTierKey(business) {
   return "sole_proprietor";
 }
 
+// Country-aware thresholds object. Pull this from `business.country`.
+function getThresholds(business) {
+  const cfg = getCountryConfig(business?.country);
+  const aml = cfg.amlLimits;
+  return {
+    countryCode:             cfg.code,
+    currencyCode:            cfg.currency.code,
+    currencySymbol:          cfg.currency.symbol,
+    currencyLocale:          cfg.currency.locale,
+    timezone:                cfg.timezone,
+    stepUpOtpAbove:          aml.stepUpOtpAbove,
+    singleFlagAbove:         aml.singleFlagAbove,
+    structuringSubThreshold: aml.structuringSubThreshold,
+    offHoursMinAmount:       aml.offHoursMinAmount,
+    velocity: {
+      rapidFireCount:    5,
+      rapidFireWindowMs: 10 * 60 * 1000,
+      spikeMultiplier:   5,
+      spikeMinHistoryDays: 7,
+      structuringCount:        4,
+      structuringWindowMs:     24 * 60 * 60 * 1000,
+      offHoursStartHour: 1,
+      offHoursEndHour:   5,
+    },
+  };
+}
+
 function resolveBusinessLimits(business) {
-  const tier = TIER_LIMITS[resolveTierKey(business)] || TIER_LIMITS.unverified;
+  const cfg = getCountryConfig(business?.country);
+  const tierKey = resolveTierKey(business);
+  const tier =
+    tierKey === "limited_company"
+      ? cfg.amlLimits.limited
+      : tierKey === "sole_proprietor"
+      ? cfg.amlLimits.soleProp
+      : { daily: 0, weekly: 0, monthly: 0, singleMax: 0 };
   const mult = RISK_MULTIPLIER[business?.riskCategory || "standard"] || 1.0;
 
-  // Env overrides — for emergency tuning without redeploy.
+  // Env overrides — for emergency tuning without redeploy. Apply to NG only
+  // by default; non-NG override would need its own env var per market.
   const dailyOverride     = Number(process.env.AML_DAILY_LIMIT_OVERRIDE     || 0);
   const singleMaxOverride = Number(process.env.AML_SINGLE_MAX_OVERRIDE      || 0);
 
@@ -121,9 +120,23 @@ function resolveBusinessLimits(business) {
     weekly:    Math.floor(tier.weekly * mult),
     monthly:   Math.floor(tier.monthly * mult),
     singleMax: singleMaxOverride > 0 ? singleMaxOverride : Math.floor(tier.singleMax * mult),
-    tierKey:   resolveTierKey(business),
+    tierKey,
     riskCategory: business?.riskCategory || "standard",
+    countryCode: cfg.code,
+    currencyCode: cfg.currency.code,
+    currencySymbol: cfg.currency.symbol,
+    currencyLocale: cfg.currency.locale,
   };
+}
+
+// Format an amount using the business's country locale + currency.
+function formatAmountForBusiness(business, amount) {
+  const cfg = getCountryConfig(business?.country);
+  const { symbol, locale } = cfg.currency;
+  return `${symbol}${Number(amount || 0).toLocaleString(locale, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
 }
 
 module.exports = {
@@ -138,4 +151,6 @@ module.exports = {
   getRiskCategory,
   resolveTierKey,
   resolveBusinessLimits,
+  getThresholds,
+  formatAmountForBusiness,
 };

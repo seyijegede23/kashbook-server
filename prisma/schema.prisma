@@ -23,8 +23,9 @@ model User {
   appleId              String?        @unique
   avatarUrl            String?
   expoPushToken        String?
+  country              String         @default("NG")  // ISO 3166-1 alpha-2 — drives currency, language, calling code, KYC, AML
   language             String         @default("en")
-  currency             String         @default("NGN")
+  currency             String         @default("NGN")  // derived from country at write-time
   notificationsEnabled Boolean        @default(true)
   biometricEnabled     Boolean        @default(false)
   transactionPin             String?
@@ -86,6 +87,10 @@ model Business {
   usePaymentOverride Boolean       @default(false)
   riskCategory     String          @default("standard") // "standard" | "elevated" | "high"
   accountStatus    String          @default("active")   // "active" | "restricted" | "frozen" | "closed"
+  country          String          @default("NG")       // immutable after creation; drives currency + KYC + AML + banking
+  baseCurrency     String          @default("NGN")      // locked to country; dashboard / cash totals / AML thresholds read this
+  kycId            String?                              // generic primary KYC identifier (encrypted)
+  kycIdType        String          @default("BVN")      // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   invoiceCounter       Int             @default(0)
   virtualAccountRef    String?
   virtualAccountId     String?
@@ -141,7 +146,8 @@ model BusinessOfficer {
   firstName         String
   lastName          String
   middleName        String?
-  bvn               String   // encrypted via utils/crypto.js
+  bvn               String   // encrypted via utils/crypto.js — re-used as the ID value field; idType disambiguates
+  idType            String   @default("BVN") // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   dateOfBirth       DateTime
   gender            String   // "Male" | "Female"
   email             String?
@@ -327,6 +333,7 @@ model Transaction {
   userId               String?
   user                 User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   source               String?
+  currency             String    @default("NGN")   // base currency at time of record; per-business default
   flagSeverity         String?    // null | "low" | "medium" | "high"
   complianceStatus     String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
   createdAt            DateTime  @default(now())

@@ -9,9 +9,9 @@
 const prisma = require("./db");
 const {
   resolveBusinessLimits,
-  STEP_UP_OTP_ABOVE,
+  getThresholds,
+  formatAmountForBusiness,
   TRANSFER_OTP_TYPE,
-  SINGLE_FLAG_ABOVE,
 } = require("../config/amlLimits");
 const { runRules } = require("./amlRules");
 const { audit } = require("./audit");
@@ -111,7 +111,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
       ok: false,
       status: 400,
       code: "BLOCKED_SINGLE_CAP",
-      error: `Single transfer cap is ₦${limits.singleMax.toLocaleString("en-NG")}. Split into smaller transfers.`,
+      error: `Single transfer cap is ${formatAmountForBusiness(business, limits.singleMax)}. Split into smaller transfers.`,
     };
   }
 
@@ -157,7 +157,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
       ok: false,
       status: 400,
       code: "BLOCKED_LIMIT",
-      error: `This would bring today's transfers to ₦${(dailySoFar + amount).toLocaleString("en-NG")}. Your daily limit is ₦${limits.daily.toLocaleString("en-NG")}.`,
+      error: `This would bring today's transfers to ${formatAmountForBusiness(business, dailySoFar + amount)}. Your daily limit is ${formatAmountForBusiness(business, limits.daily)}.`,
     };
   }
   if (over(limits.weekly, weeklySoFar)) {
@@ -173,7 +173,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
       ok: false,
       status: 400,
       code: "BLOCKED_LIMIT",
-      error: `This would exceed your 7-day limit of ₦${limits.weekly.toLocaleString("en-NG")}.`,
+      error: `This would exceed your 7-day limit of ${formatAmountForBusiness(business, limits.weekly)}.`,
     };
   }
   if (over(limits.monthly, monthlySoFar)) {
@@ -189,12 +189,13 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
       ok: false,
       status: 400,
       code: "BLOCKED_LIMIT",
-      error: `This would exceed your 30-day limit of ₦${limits.monthly.toLocaleString("en-NG")}.`,
+      error: `This would exceed your 30-day limit of ${formatAmountForBusiness(business, limits.monthly)}.`,
     };
   }
 
   // 4. Step-up: one-time code on top of the PIN for large transfers ------
-  if (amount > STEP_UP_OTP_ABOVE) {
+  const thresholds = getThresholds(business);
+  if (amount > thresholds.stepUpOtpAbove) {
     const identifier = pickOtpIdentifier(user);
     if (!identifier) {
       await audit({
@@ -209,7 +210,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
         ok: false,
         status: 400,
         code: "STEP_UP_NO_IDENTIFIER",
-        error: "Add a verified email or phone number to send transfers above ₦1,000,000.",
+        error: `Add a verified email or phone number to send transfers above ${formatAmountForBusiness(business, thresholds.stepUpOtpAbove)}.`,
       };
     }
     if (!otp) {
@@ -219,7 +220,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
         resourceType: "business",
         resourceId: business.id,
         severity: "info",
-        metadata: { amount, threshold: STEP_UP_OTP_ABOVE, identifier },
+        metadata: { amount, threshold: thresholds.stepUpOtpAbove, identifier },
       });
       return {
         ok: false,
@@ -264,6 +265,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
     Math.floor((now - new Date(business.createdAt || now).getTime()) / (24 * 60 * 60 * 1000)),
   );
   const { maxSeverity, flags } = runRules({
+    business,
     amount,
     history24h,
     history30d: recent30,
@@ -296,17 +298,21 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
 
 // Called AFTER a transfer succeeds. Persists ComplianceFlag rows for any
 // flagged outcome and ensures CTR-style auto-flag if amount ≥ threshold.
-async function recordComplianceFlags({ userId, businessId, transactionId, amount, flags }) {
+// `business` is required so the CTR threshold and currency are correct
+// per-country.
+async function recordComplianceFlags({ userId, businessId, business, transactionId, amount, flags }) {
   const augmented = [...(flags || [])];
+  const thresholds = getThresholds(business || { country: "NG" });
+  const ctrThreshold = thresholds.singleFlagAbove;
 
   // Belt-and-braces CTR auto-flag — runRules already produces SINGLE_LARGE
   // for the same threshold; this guards against any rule-engine bypass.
-  if (amount >= SINGLE_FLAG_ABOVE && !augmented.some((f) => f.ruleCode === "SINGLE_LARGE")) {
+  if (amount >= ctrThreshold && !augmented.some((f) => f.ruleCode === "SINGLE_LARGE")) {
     augmented.push({
       ruleCode: "CTR_THRESHOLD",
       severity: "medium",
-      description: `Transfer of ₦${amount.toLocaleString("en-NG")} meets the CTR auto-flag threshold.`,
-      metadata: { amount, threshold: SINGLE_FLAG_ABOVE },
+      description: `Transfer of ${formatAmountForBusiness(business || { country: "NG" }, amount)} meets the CTR auto-flag threshold.`,
+      metadata: { amount, threshold: ctrThreshold },
     });
   }
 

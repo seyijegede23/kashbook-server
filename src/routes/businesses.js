@@ -257,6 +257,15 @@ router.post("/:id/virtual-account", async (req, res) => {
       });
     }
 
+    // Banking gate — bookkeeping-only countries can't open virtual accounts.
+    const { getProvider } = require("../providers");
+    if (!getProvider(biz).supportsBanking) {
+      return res.status(400).json({
+        error: "Banking isn't available in your country yet. You can still use KashBook for invoicing and bookkeeping. We'll let you know when banking arrives.",
+        code: "BANKING_NOT_AVAILABLE",
+      });
+    }
+
     const {
       bvn, dateOfBirth, gender,
       businessType,            // "sole_proprietorship" | "limited_company"

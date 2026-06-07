@@ -120,6 +120,17 @@ router.post("/send", async (req, res) => {
       where: { id: businessId, userId: req.user.id },
     });
     if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    // Banking gate — bookkeeping-only countries can't move money.
+    const { getProvider } = require("../providers");
+    const provider = getProvider(biz);
+    if (!provider.supportsBanking) {
+      return res.status(400).json({
+        error: "Banking isn't available in your country yet. You can still use KashBook for invoicing and bookkeeping.",
+        code: "BANKING_NOT_AVAILABLE",
+      });
+    }
+
     if (!biz.anchorAccountId)
       return res.status(400).json({
         error: "This business has no bank account. Set one up first.",
@@ -151,7 +162,7 @@ router.post("/send", async (req, res) => {
         const target = userFull.email || userFull.phone;
         if (target) {
           try {
-            await dispatchOtp(target, TRANSFER_OTP_TYPE);
+            await dispatchOtp(target, TRANSFER_OTP_TYPE, { country: biz.country });
           } catch (err) {
             console.error("[transfers] OTP dispatch failed:", err.message);
             return res.status(503).json({
@@ -253,6 +264,7 @@ router.post("/send", async (req, res) => {
         paymentMethod: "bank",
         date: new Date(),
         source: "anchor",
+        currency: biz.baseCurrency || "NGN",
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
       },
@@ -263,6 +275,7 @@ router.post("/send", async (req, res) => {
     await recordComplianceFlags({
       userId: req.user.id,
       businessId,
+      business: biz,
       transactionId: txn.id,
       amount: Number(amount),
       flags: amlCheck.flags,

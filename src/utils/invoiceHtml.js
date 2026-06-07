@@ -56,12 +56,25 @@ async function buildQrDataUrl(text) {
 const CURRENCY_SYMBOLS = {
   NGN: "₦", USD: "$", EUR: "€", GBP: "£", GHS: "₵", KES: "KSh",
   ZAR: "R", CAD: "C$", AUD: "A$", INR: "₹", JPY: "¥", CNY: "¥",
+  EGP: "ج.م", UGX: "USh", TZS: "TSh", RWF: "RF", XOF: "CFA", XAF: "FCFA", MAD: "DH",
 };
 
-function fmt(n, currency = "NGN") {
+// Per-currency locale fallback. Used when the caller doesn't pass a
+// locale explicitly — keeps formatting "correct enough" for any currency
+// even if we forget to thread the business locale through.
+const CURRENCY_LOCALES = {
+  NGN: "en-NG", GHS: "en-GH", KES: "en-KE", ZAR: "en-ZA",
+  EGP: "ar-EG", UGX: "en-UG", TZS: "en-TZ", RWF: "rw-RW",
+  XOF: "fr-CI", XAF: "fr-CM", MAD: "ar-MA",
+  USD: "en-US", EUR: "de-DE", GBP: "en-GB", CAD: "en-CA",
+  AUD: "en-AU", INR: "en-IN", JPY: "ja-JP", CNY: "zh-CN",
+};
+
+function fmt(n, currency = "NGN", locale) {
   const sym = CURRENCY_SYMBOLS[currency] || "";
+  const loc = locale || CURRENCY_LOCALES[currency] || "en-US";
   const num = Number(n || 0);
-  return `${sym}${num.toLocaleString("en-NG", {
+  return `${sym}${num.toLocaleString(loc, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;

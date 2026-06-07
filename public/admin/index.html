@@ -547,7 +547,7 @@
               <p class="text-sm font-medium text-gray-800 mb-1">${esc(f.description)}</p>
               <p class="text-xs text-gray-500">
                 ${userName}
-                ${f.business ? ` · ${esc(f.business.name)} (${esc(f.business.riskCategory || "standard")} risk)` : ""}
+                ${f.business ? ` · ${countryFlag(f.business.country)} ${esc(f.business.name)} (${esc(f.business.riskCategory || "standard")} risk)` : ""}
                 ${txAmount ? ` · ${txAmount}` : ""}
               </p>
             </div>
@@ -638,6 +638,14 @@
     return String(str || "")
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  // Convert a 2-char ISO country code into the flag emoji.
+  function countryFlag(cca2) {
+    if (!cca2 || cca2.length !== 2) return "";
+    return String.fromCodePoint(
+      ...[...cca2.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65),
+    );
   }
 
   // ── Auto-login if token exists ─────────────────────────────────────────

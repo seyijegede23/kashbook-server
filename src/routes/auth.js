@@ -39,10 +39,16 @@ function userResponse(user, token) {
   };
 }
 
-function normalizePhone(phone = "") {
+// Normalise a phone number to E.164. If the user picked a country at
+// registration / login, the client passes its calling code so 0-prefixed
+// local numbers route to the correct country. Falls back to +234 (Nigeria)
+// when no calling code is provided — preserves legacy single-country
+// behaviour for existing routes that don't yet pass it.
+function normalizePhone(phone = "", callingCode = "234") {
   const p = phone.replace(/\s+/g, "").trim();
   if (p.startsWith("+")) return p;
-  if (p.startsWith("0")) return "+234" + p.slice(1);
+  const cc = String(callingCode || "234").replace(/^\+/, "");
+  if (p.startsWith("0")) return `+${cc}${p.slice(1)}`;
   return p;
 }
 
@@ -51,11 +57,21 @@ function splitName(fullName = "") {
   return { firstName: parts[0] || "", lastName: parts.slice(1).join(" ") || parts[0] || "" };
 }
 
-async function ensurePrimaryBusiness(userId, businessName) {
+async function ensurePrimaryBusiness(userId, businessName, country) {
   const exists = await prisma.business.findFirst({ where: { userId } });
-  if (!exists) {
-    await prisma.business.create({ data: { userId, name: businessName, emoji: "🛍️", color: "#6C3FC5" } });
-  }
+  if (exists) return;
+  const { getCountryConfig } = require("../config/countries");
+  const cfg = getCountryConfig(country || "NG");
+  await prisma.business.create({
+    data: {
+      userId,
+      name: businessName,
+      emoji: "🛍️",
+      color: "#6C3FC5",
+      country: cfg.code,
+      baseCurrency: cfg.currency.code,
+    },
+  });
 }
 
 // ─────────────────────────────────────────────
@@ -65,13 +81,18 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const { firstName, lastName, name, businessName, email, password, phone, identifier, otpCode, currency } = req.body;
+  const { firstName, lastName, name, businessName, email, password, phone, identifier, otpCode, country, callingCode } = req.body;
   const fn  = firstName?.trim() || splitName(name).firstName;
   const ln  = lastName?.trim()  || splitName(name).lastName;
   const biz = businessName?.trim() || "My Business";
   const rawIdentifier = identifier || email || phone || "";
   const isEmail = rawIdentifier.includes("@");
-  const iden = isEmail ? rawIdentifier.trim().toLowerCase() : normalizePhone(rawIdentifier);
+  const iden = isEmail ? rawIdentifier.trim().toLowerCase() : normalizePhone(rawIdentifier, callingCode);
+  // Country is the source of truth for currency + language + KYC scheme.
+  // Default to NG if the client didn't send one (legacy registration flow).
+  const { getCountryConfig, isSupported } = require("../config/countries");
+  const countryCode = (country && isSupported(country)) ? String(country).toUpperCase() : "NG";
+  const countryCfg = getCountryConfig(countryCode);
 
   if (!fn)      return res.status(400).json({ error: "First name is required" });
   if (!iden)    return res.status(400).json({ error: "Email or phone number is required" });
@@ -89,14 +110,17 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
     const data = { firstName: fn, lastName: ln, businessName: biz, password: hashed,
       ...(isEmail ? { email: iden } : { phone: iden }) };
     if (email?.includes("@")) data.email = email.trim().toLowerCase();
-    if (phone) data.phone = normalizePhone(phone);
-    if (currency) data.currency = currency;
+    if (phone) data.phone = normalizePhone(phone, callingCode || countryCfg.callingCode);
+    // Currency is derived from country — country is the lock.
+    data.country  = countryCode;
+    data.currency = countryCfg.currency.code;
+    data.language = countryCfg.language;
 
     const user = exists
       ? await prisma.user.update({ where: { id: exists.id }, data })
       : await prisma.user.create({ data });
 
-    await ensurePrimaryBusiness(user.id, biz);
+    await ensurePrimaryBusiness(user.id, biz, countryCode);
     const token = signToken({ userId: user.id });
     res.status(201).json(userResponse(user, token));
   } catch (err) {
@@ -542,7 +566,13 @@ router.patch("/settings", authMiddleware, async (req, res) => {
   try {
     const data = {};
     if (language             !== undefined) data.language             = language;
-    if (currency             !== undefined) data.currency             = currency;
+    // Currency is locked to country — silently normalize any incoming value
+    // back to the country's currency so a stale client can't drift the row.
+    if (currency !== undefined) {
+      const { getBaseCurrency } = require("../config/countries");
+      const me = await prisma.user.findUnique({ where: { id: req.user.id }, select: { country: true } });
+      data.currency = getBaseCurrency(me?.country);
+    }
     if (notificationsEnabled !== undefined) data.notificationsEnabled = notificationsEnabled;
     if (biometricEnabled     !== undefined) data.biometricEnabled     = biometricEnabled;
     const user = await prisma.user.update({ where: { id: req.user.id }, data });

@@ -142,7 +142,11 @@ async function sendEmail(to, subject, html) {
 }
 
 // ── Dispatch OTP (Save + Send via Email or SMS) ─────────────────────────────
-async function dispatchOtp(identifier, type) {
+// `country` is an optional ISO 3166-1 alpha-2 code that routes the SMS to
+// the right provider (Termii for NG, Africa's Talking for KE/UG/RW, AWS SNS
+// for ZA/EG). Email always uses the existing SMTP transport regardless of
+// country.
+async function dispatchOtp(identifier, type, { country } = {}) {
   const code = await saveOtp(identifier, type);
   const isEmail = identifier.includes("@");
   const message = `Your KashBook verification code is: ${code}. Valid for 10 minutes.`;
@@ -178,7 +182,11 @@ async function dispatchOtp(identifier, type) {
       </body></html>`;
     await sendEmail(identifier, "Your KashBook Verification Code", html);
   } else {
-    await sendSms(identifier, message);
+    // Route via the country-aware SMS router; Termii adapter stays available
+    // as a direct export for backwards compatibility with anything that still
+    // imports sendSms() from this file.
+    const smsRouter = require("./sms");
+    await smsRouter.sendSms(identifier, message, { country });
   }
 
   return code;
