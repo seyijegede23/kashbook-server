@@ -37,6 +37,10 @@ model User {
   anchorCustomerId     String?
   paystackCustomerCode String?
   kycStatus            String         @default("unverified")
+  accountStatus        String         @default("active")  // "active" | "restricted" | "frozen" | "closed"
+  complianceFreezeReason String?
+  complianceFrozenAt   DateTime?
+  complianceFrozenBy   String?
   createdAt            DateTime       @default(now())
   updatedAt            DateTime       @updatedAt
 
@@ -80,6 +84,8 @@ model Business {
   bankAccountNumber String?
   bankAccountName  String?
   usePaymentOverride Boolean       @default(false)
+  riskCategory     String          @default("standard") // "standard" | "elevated" | "high"
+  accountStatus    String          @default("active")   // "active" | "restricted" | "frozen" | "closed"
   invoiceCounter       Int             @default(0)
   virtualAccountRef    String?
   virtualAccountId     String?
@@ -321,12 +327,15 @@ model Transaction {
   userId               String?
   user                 User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   source               String?
+  flagSeverity         String?    // null | "low" | "medium" | "high"
+  complianceStatus     String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
   @@index([businessId, date])
   @@index([userId])
   @@index([businessId, updatedAt])
+  @@index([complianceStatus, flagSeverity])
 }
 
 model InventoryItem {
@@ -510,4 +519,48 @@ enum InvoiceStatus {
   PAID
   OVERDUE
   VOID
+}
+
+// Append-only audit log — used for every state-changing or security-relevant
+// action. Reviewed by admins via the compliance dashboard.
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorType    String   // "user" | "admin" | "system"
+  actorId      String?
+  action       String
+  resourceType String?
+  resourceId   String?
+  ip           String?
+  userAgent    String?
+  metadata     Json?
+  severity     String   @default("info") // "info" | "warn" | "alert"
+  createdAt    DateTime @default(now())
+
+  @@index([actorId])
+  @@index([resourceType, resourceId])
+  @@index([severity, createdAt])
+  @@index([createdAt])
+  @@index([action, createdAt])
+}
+
+// Open-review queue for the compliance team. Rules engine writes here; admins
+// transition status to cleared/escalated/frozen.
+model ComplianceFlag {
+  id            String   @id @default(uuid())
+  userId        String
+  businessId    String?
+  transactionId String?
+  ruleCode      String
+  severity      String   // "low" | "medium" | "high"
+  description   String
+  metadata      Json
+  status        String   @default("open") // "open" | "cleared" | "escalated" | "frozen"
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  reviewerNote  String?
+  createdAt     DateTime @default(now())
+
+  @@index([status, severity, createdAt])
+  @@index([userId])
+  @@index([transactionId])
 }

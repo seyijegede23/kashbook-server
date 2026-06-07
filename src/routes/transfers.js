@@ -1,10 +1,14 @@
 const router = require("express").Router();
 const auth = require("../middleware/auth");
+const requireUnfrozen = require("../middleware/requireUnfrozen");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
 const { verifyTransactionPin } = require("../utils/transactionPin");
+const { runPreTransferChecks, recordComplianceFlags } = require("../utils/amlChecks");
+const { audit } = require("../utils/audit");
 
 router.use(auth);
+router.use(requireUnfrozen);
 
 // GET /transfers/banks
 router.get("/banks", async (_req, res) => {
@@ -96,6 +100,14 @@ router.post("/send", async (req, res) => {
   // Require a valid transaction PIN before processing.
   const pinCheck = await verifyTransactionPin(req.user.id, pin);
   if (!pinCheck.ok) {
+    await audit({
+      req,
+      action: "PIN_FAILED",
+      resourceType: "user",
+      resourceId: req.user.id,
+      severity: "warn",
+      metadata: { code: pinCheck.code },
+    });
     return res
       .status(pinCheck.status || 401)
       .json({ error: pinCheck.error, code: pinCheck.code });
@@ -110,6 +122,26 @@ router.post("/send", async (req, res) => {
       return res.status(400).json({
         error: "This business has no bank account. Set one up first.",
       });
+
+    // ── AML pre-transfer pipeline ─────────────────────────────────────
+    // Runs frozen + tier limit + single cap + step-up + rules engine in
+    // order. Writes audit rows for each gate and returns early on block.
+    const userFull = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { id: true, accountStatus: true, complianceFreezeReason: true },
+    });
+    const amlCheck = await runPreTransferChecks({
+      req,
+      user: userFull,
+      business: biz,
+      amount: Number(amount),
+      pinVerifiedAt: pinCheck.verifiedAt,
+    });
+    if (!amlCheck.ok) {
+      return res
+        .status(amlCheck.status || 400)
+        .json({ error: amlCheck.error, code: amlCheck.code });
+    }
 
     // Authoritative live balance from Anchor (user's own deposit account)
     const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
@@ -183,7 +215,7 @@ router.post("/send", async (req, res) => {
       ? `${narration} — to ${recipientLabel}`
       : `Transfer to ${recipientLabel}`;
 
-    await prisma.transaction.create({
+    const txn = await prisma.transaction.create({
       data: {
         businessId,
         userId: req.user.id,
@@ -194,6 +226,36 @@ router.post("/send", async (req, res) => {
         paymentMethod: "bank",
         date: new Date(),
         source: "anchor",
+        flagSeverity: amlCheck.maxSeverity || null,
+        complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
+      },
+    });
+
+    // Persist ComplianceFlag rows for any rules that triggered + the
+    // CTR auto-flag when the amount meets the threshold.
+    await recordComplianceFlags({
+      userId: req.user.id,
+      businessId,
+      transactionId: txn.id,
+      amount: Number(amount),
+      flags: amlCheck.flags,
+    });
+
+    await audit({
+      req,
+      action: "TRANSFER_SENT",
+      resourceType: "transaction",
+      resourceId: txn.id,
+      severity: amlCheck.maxSeverity === "high" ? "alert"
+              : amlCheck.maxSeverity === "medium" ? "warn"
+              : "info",
+      metadata: {
+        amount: Number(amount),
+        reference,
+        route,
+        accountNumber,
+        bankName: resolvedBank,
+        flags: (amlCheck.flags || []).map((f) => f.ruleCode),
       },
     });
 

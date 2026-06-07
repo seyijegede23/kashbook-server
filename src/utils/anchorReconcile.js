@@ -13,6 +13,7 @@
 const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const { recalcInvoiceStatus } = require("./invoiceStatus");
+const { SINGLE_FLAG_ABOVE } = require("../config/amlLimits");
 
 const BASE = () => process.env.ANCHOR_BASE_URL;
 const KEY = () => process.env.ANCHOR_API_KEY;
@@ -78,7 +79,21 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     if (narration) description += ` · "${narration}"`;
     description += ` · Ref: ${reference}`;
 
-    await prisma.transaction.create({
+    // Read the owner's compliance status — inbound credits to a frozen
+    // user or business still post (the money is already moved) but get
+    // held/flagged for review.
+    const owner = await prisma.user.findUnique({
+      where: { id: biz.userId },
+      select: { accountStatus: true },
+    });
+    const frozen =
+      (owner?.accountStatus && owner.accountStatus !== "active") ||
+      (biz.accountStatus && biz.accountStatus !== "active");
+    const flagCTR = amount >= SINGLE_FLAG_ABOVE;
+    const flagSeverity = frozen ? "high" : (flagCTR ? "medium" : null);
+    const complianceStatus = frozen ? "held" : (flagCTR ? "flagged" : "clean");
+
+    const txn = await prisma.transaction.create({
       data: {
         businessId: biz.id,
         userId: biz.userId,
@@ -89,8 +104,28 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
         paymentMethod: "bank",
         date: a.createdAt ? new Date(a.createdAt) : new Date(),
         source: "anchor",
+        flagSeverity,
+        complianceStatus,
       },
     });
+
+    // Persist ComplianceFlag rows for any inbound that warrants review.
+    if (frozen || flagCTR) {
+      await prisma.complianceFlag.create({
+        data: {
+          userId: biz.userId,
+          businessId: biz.id,
+          transactionId: txn.id,
+          ruleCode: frozen ? "INBOUND_TO_FROZEN" : "CTR_THRESHOLD",
+          severity: frozen ? "high" : "medium",
+          description: frozen
+            ? `Inbound credit of ₦${amount.toLocaleString("en-NG")} arrived on a frozen account.`
+            : `Inbound credit of ₦${amount.toLocaleString("en-NG")} meets the CTR auto-flag threshold.`,
+          metadata: { amount, senderName, senderBank: a.sourceBank || "" },
+        },
+      });
+    }
+
     const notifBody = `₦${amount.toLocaleString("en-NG", {
       minimumFractionDigits: 2,
     })} from ${senderName} → ${biz.name}`;
@@ -162,7 +197,10 @@ async function tryMatchInvoice(biz, amount, reference) {
 async function reconcileAll({ onCreate, logger, throttleMs = 1500 } = {}) {
   const bizs = await prisma.business.findMany({
     where: { anchorAccountId: { not: null } },
-    select: { id: true, userId: true, name: true, anchorAccountId: true },
+    select: {
+      id: true, userId: true, name: true, anchorAccountId: true,
+      accountStatus: true,
+    },
   });
   let total = 0;
   let rateLimited = 0;

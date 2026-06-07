@@ -8,6 +8,7 @@ const cloudinary     = require("../config/cloudinary");
 const { signToken }  = require("../utils/jwt");
 const { dispatchOtp, verifyOtp } = require("../utils/otp");
 const authMiddleware = require("../middleware/auth");
+const { audit } = require("../utils/audit");
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -135,6 +136,15 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
         where: { id: user.id },
         data: { failedLoginAttempts: attempts, ...(lockedUntil ? { lockedUntil } : {}) },
       });
+      await audit({
+        req,
+        action: "LOGIN_FAILED",
+        resourceType: "user",
+        resourceId: user.id,
+        severity: lockedUntil ? "alert" : "warn",
+        actorOverride: { type: "user", id: user.id },
+        metadata: { attempts, locked: !!lockedUntil },
+      });
       if (lockedUntil) return res.status(429).json({ error: "Too many failed attempts. Account locked for 15 minutes." });
       return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -143,6 +153,14 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
     await prisma.user.update({
       where: { id: user.id },
       data: { failedLoginAttempts: 0, lockedUntil: null },
+    });
+
+    await audit({
+      req,
+      action: "LOGIN_SUCCESS",
+      resourceType: "user",
+      resourceId: user.id,
+      actorOverride: { type: "user", id: user.id },
     });
 
     const token = signToken({ userId: user.id });
@@ -410,6 +428,13 @@ router.post("/set-pin", authMiddleware, async (req, res) => {
         transactionPinFailedCount: 0,
         transactionPinLockedUntil: null,
       },
+    });
+    await audit({
+      req,
+      action: "PIN_SET",
+      resourceType: "user",
+      resourceId: req.user.id,
+      severity: "warn",
     });
     res.json({ message: "Transaction PIN set" });
   } catch (err) {

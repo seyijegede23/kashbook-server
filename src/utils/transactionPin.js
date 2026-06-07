@@ -58,7 +58,9 @@ async function verifyTransactionPin(userId, pin) {
       data: { transactionPinFailedCount: 0, transactionPinLockedUntil: null },
     });
   }
-  return { ok: true };
+  // verifiedAt enables the AML pipeline to enforce a freshness window for
+  // step-up re-PIN on large transfers.
+  return { ok: true, verifiedAt: Date.now() };
 }
 
 module.exports = { verifyTransactionPin, PIN_REGEX };

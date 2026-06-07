@@ -13,7 +13,11 @@ async function authMiddleware(req, res, next) {
 
     const user = await prisma.user.findUnique({
       where: { id: payload.userId },
-      select: { id: true, accountType: true, employerId: true, firstName: true, lastName: true, role: true, plan: true },
+      select: {
+        id: true, accountType: true, employerId: true, firstName: true,
+        lastName: true, role: true, plan: true,
+        accountStatus: true, complianceFreezeReason: true,
+      },
     });
 
     if (!user) return res.status(401).json({ error: "User no longer exists" });
@@ -39,8 +43,11 @@ async function authMiddleware(req, res, next) {
       role:          user.role,
       plan:          "PREMIUM",
       effectivePlan: "PREMIUM",
+      accountStatus: user.accountStatus || "active",
+      complianceFreezeReason: user.complianceFreezeReason || null,
     };
-    // Silence unused-var warning while paywall is off.
+    // Surface frozen state so requireUnfrozen() can reject without another DB round-trip.
+    req.frozen = req.user.accountStatus !== "active";
     void effectivePlan;
     next();
   } catch {

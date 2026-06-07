@@ -2,6 +2,7 @@ const router = require("express").Router();
 const auth = require("../middleware/auth");
 const adminAuth = require("../middleware/adminAuth");
 const prisma = require("../utils/db");
+const { audit } = require("../utils/audit");
 
 router.use(auth, adminAuth);
 
@@ -115,6 +116,13 @@ router.patch("/users/:id/upgrade", async (req, res) => {
       where: { id: req.params.id },
       data: { plan: "PREMIUM" },
     });
+    await audit({
+      req,
+      action: "ADMIN_PLAN_UPGRADE",
+      resourceType: "user",
+      resourceId: req.params.id,
+      severity: "info",
+    });
     res.json({ ok: true });
   } catch (err) {
     console.error("PATCH /admin/users/upgrade error:", err.message);
@@ -128,6 +136,13 @@ router.patch("/users/:id/downgrade", async (req, res) => {
     await prisma.user.update({
       where: { id: req.params.id },
       data: { plan: "FREE" },
+    });
+    await audit({
+      req,
+      action: "ADMIN_PLAN_DOWNGRADE",
+      resourceType: "user",
+      resourceId: req.params.id,
+      severity: "info",
     });
     res.json({ ok: true });
   } catch (err) {
@@ -194,6 +209,197 @@ router.post("/notify", async (req, res) => {
   } catch (err) {
     console.error("POST /admin/notify error:", err.message);
     res.status(500).json({ error: "Failed to send notification" });
+  }
+});
+
+// ── Compliance: flag queue ────────────────────────────────────────────────
+// GET /admin-api/compliance/flags?status=open&severity=high&limit=50
+router.get("/compliance/flags", async (req, res) => {
+  try {
+    const { status = "open", severity, limit = "100" } = req.query;
+    const where = {};
+    if (status) where.status = status;
+    if (severity) where.severity = severity;
+    const flags = await prisma.complianceFlag.findMany({
+      where,
+      take: Math.min(Number(limit) || 100, 500),
+      orderBy: [
+        // High severity + most recent first
+        { severity: "desc" },
+        { createdAt: "desc" },
+      ],
+    });
+    // Join user + business + transaction summaries on the server so the
+    // admin SPA stays a simple fetch+render.
+    const enriched = await Promise.all(
+      flags.map(async (f) => {
+        const [user, business, transaction] = await Promise.all([
+          prisma.user.findUnique({
+            where: { id: f.userId },
+            select: { id: true, firstName: true, lastName: true, email: true, phone: true, accountStatus: true },
+          }),
+          f.businessId
+            ? prisma.business.findUnique({
+                where: { id: f.businessId },
+                select: { id: true, name: true, riskCategory: true, industry: true, virtualAccountNumber: true },
+              })
+            : null,
+          f.transactionId
+            ? prisma.transaction.findUnique({
+                where: { id: f.transactionId },
+                select: { id: true, amount: true, type: true, description: true, date: true, complianceStatus: true },
+              })
+            : null,
+        ]);
+        return { ...f, user, business, transaction };
+      }),
+    );
+    res.json(enriched);
+  } catch (err) {
+    console.error("[admin/compliance/flags]", err);
+    res.status(500).json({ error: "Failed to load flags" });
+  }
+});
+
+// PATCH /admin-api/compliance/flags/:id   body: { status, reviewerNote }
+router.patch("/compliance/flags/:id", async (req, res) => {
+  try {
+    const { status, reviewerNote } = req.body;
+    const allowed = ["cleared", "escalated", "frozen"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: `status must be one of ${allowed.join(", ")}` });
+    }
+    const flag = await prisma.complianceFlag.update({
+      where: { id: req.params.id },
+      data: {
+        status,
+        reviewedBy: req.user.id,
+        reviewedAt: new Date(),
+        reviewerNote: reviewerNote || null,
+      },
+    });
+    await audit({
+      req,
+      action: `FLAG_${status.toUpperCase()}`,
+      resourceType: "complianceFlag",
+      resourceId: flag.id,
+      severity: "info",
+      metadata: { reviewerNote },
+    });
+    res.json(flag);
+  } catch (err) {
+    console.error("[admin/compliance/flags PATCH]", err);
+    res.status(500).json({ error: "Failed to update flag" });
+  }
+});
+
+// ── Freeze workflow ───────────────────────────────────────────────────────
+// POST /admin-api/users/:id/freeze   body: { reason }
+router.post("/users/:id/freeze", async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ error: "A freeze reason is required for the audit trail." });
+    }
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: {
+        accountStatus: "frozen",
+        complianceFreezeReason: reason.trim(),
+        complianceFrozenAt: new Date(),
+        complianceFrozenBy: req.user.id,
+      },
+      select: { id: true, accountStatus: true, complianceFreezeReason: true },
+    });
+    await audit({
+      req,
+      action: "ADMIN_FREEZE",
+      resourceType: "user",
+      resourceId: user.id,
+      severity: "alert",
+      metadata: { reason: reason.trim() },
+    });
+    res.json(user);
+  } catch (err) {
+    console.error("[admin/freeze]", err);
+    res.status(500).json({ error: "Failed to freeze account" });
+  }
+});
+
+// POST /admin-api/users/:id/unfreeze   body: { note? }
+router.post("/users/:id/unfreeze", async (req, res) => {
+  try {
+    const { note } = req.body;
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: {
+        accountStatus: "active",
+        complianceFreezeReason: null,
+        complianceFrozenAt: null,
+        complianceFrozenBy: null,
+      },
+      select: { id: true, accountStatus: true },
+    });
+    await audit({
+      req,
+      action: "ADMIN_UNFREEZE",
+      resourceType: "user",
+      resourceId: user.id,
+      severity: "warn",
+      metadata: { note: note || null },
+    });
+    res.json(user);
+  } catch (err) {
+    console.error("[admin/unfreeze]", err);
+    res.status(500).json({ error: "Failed to unfreeze account" });
+  }
+});
+
+// ── Audit log lookup ──────────────────────────────────────────────────────
+// GET /admin-api/audit-log?actorId=...&action=...&from=YYYY-MM-DD&to=YYYY-MM-DD&limit=100
+router.get("/audit-log", async (req, res) => {
+  try {
+    const { actorId, action, severity, from, to, limit = "100" } = req.query;
+    const where = {};
+    if (actorId) where.actorId = actorId;
+    if (action) where.action = action;
+    if (severity) where.severity = severity;
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) where.createdAt.lte = new Date(to);
+    }
+    const logs = await prisma.auditLog.findMany({
+      where,
+      take: Math.min(Number(limit) || 100, 500),
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(logs);
+  } catch (err) {
+    console.error("[admin/audit-log]", err);
+    res.status(500).json({ error: "Failed to load audit log" });
+  }
+});
+
+// ── Transaction lookup ────────────────────────────────────────────────────
+// GET /admin-api/transactions/lookup?reference=...&userId=...&minAmount=...&limit=50
+router.get("/transactions/lookup", async (req, res) => {
+  try {
+    const { reference, userId, minAmount, complianceStatus, limit = "50" } = req.query;
+    const where = {};
+    if (userId) where.userId = userId;
+    if (reference) where.description = { contains: reference };
+    if (minAmount) where.amount = { gte: Number(minAmount) };
+    if (complianceStatus) where.complianceStatus = complianceStatus;
+    const txns = await prisma.transaction.findMany({
+      where,
+      take: Math.min(Number(limit) || 50, 200),
+      orderBy: { date: "desc" },
+    });
+    res.json(txns);
+  } catch (err) {
+    console.error("[admin/transactions/lookup]", err);
+    res.status(500).json({ error: "Failed to look up transactions" });
   }
 });
 

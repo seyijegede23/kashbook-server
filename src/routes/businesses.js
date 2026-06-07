@@ -1,11 +1,15 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
+const requireUnfrozen = require("../middleware/requireUnfrozen");
 const cloudinary = require("../config/cloudinary");
 const anchor = require("../utils/anchor");
 const { encrypt } = require("../utils/crypto");
+const { audit } = require("../utils/audit");
+const { getRiskCategory } = require("../config/amlLimits");
 
 router.use(auth);
+router.use(requireUnfrozen);
 
 // Helper to resolve the correct business owner ID
 const getTargetUserId = (req) =>
@@ -311,7 +315,10 @@ router.post("/:id/virtual-account", async (req, res) => {
     // Persist BVN encrypted; backfill DOB/gender on User if missing.
     // Persist new KYB fields on Business so the picker selections survive a retry.
     const bizPatch = { kycBvn: encrypt(bvn) };
-    if (industry) bizPatch.industry = industry;
+    if (industry) {
+      bizPatch.industry = industry;
+      bizPatch.riskCategory = getRiskCategory(industry);
+    }
     if (registrationType) bizPatch.registrationType = registrationType;
     if (dateOfRegistration) {
       bizPatch.dateOfRegistration = new Date(dateOfRegistration);
@@ -487,6 +494,20 @@ router.post("/:id/virtual-account", async (req, res) => {
           console.warn("[KYB trigger] failed:", e.message);
         }
       }
+      await audit({
+        req,
+        action: "KYB_SUBMIT",
+        resourceType: "business",
+        resourceId: biz.id,
+        severity: "info",
+        metadata: {
+          businessType,
+          registrationType,
+          industry,
+          ownersCount: Array.isArray(owners) ? owners.length : 0,
+          riskCategory: bizPatch.riskCategory || "standard",
+        },
+      });
       return res.status(202).json({
         status: "pending_kyc",
         message:
