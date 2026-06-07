@@ -89,18 +89,23 @@ function normalizePhoneForAnchor(phone) {
 async function createBusinessCustomer({
   // Business
   businessName,
-  businessBvn,            // BVN of the primary owner — sandbox reuses user BVN
+  businessBvn,            // BVN of the primary owner — sandbox reuses signing-user BVN
   dateOfRegistration,     // YYYY-MM-DD
   description,            // free-text business description
-  industry,               // e.g. "Retail-GeneralRetailers"
-  registrationType,       // "Private_Incorporated" | "Business_Name" | "Sole_Proprietor"…
+  industry,               // any Anchor industry enum value
+  registrationType,       // "Business_Name" | "Private_Incorporated"
   website,
   // Business address
   businessAddress,        // { state, addressLine_1, addressLine_2?, city, postalCode? }
-  // Director / Owner (the app user)
+  // The app user (always a DIRECTOR/CEO)
   user,                   // { firstName, lastName, email, phone, dateOfBirth, bvn }
-  // Optional separate director residential address (defaults to businessAddress)
+  // Optional director residential address (defaults to businessAddress)
   directorAddress,
+  // Optional owners array — used for LTD and multi-partner BN.
+  // If empty/missing → fall back to the sole-prop pattern (user is the 100% owner).
+  // Each: { firstName, lastName, bvn, dateOfBirth, gender?, percentageOwned,
+  //         email?, phoneNumber?, title?, address? }
+  owners,
 }) {
   const officerDob =
     user.dateOfBirth instanceof Date
@@ -141,6 +146,94 @@ async function createBusinessCustomer({
       }
     : bizAddr;
 
+  function ownerAddress(o) {
+    if (!o?.addressLine_1 && !o?.addressLine1) return bizAddr;
+    return {
+      country: "NG",
+      state: o.state || o.addressState || bizAddr.state,
+      addressLine_1: o.addressLine_1 || o.addressLine1,
+      addressLine_2: o.addressLine_2 || o.addressLine2 || "",
+      city: o.city || o.addressCity || bizAddr.city,
+      postalCode: o.postalCode || o.addressPostalCode || bizAddr.postalCode,
+    };
+  }
+
+  // Build officers array.
+  const officers = [
+    // Signing user is always the DIRECTOR (CEO, 0%).
+    {
+      role: "DIRECTOR",
+      fullName: {
+        firstName: user.firstName,
+        lastName: user.lastName || user.firstName,
+      },
+      nationality: "NG",
+      address: dirAddr,
+      dateOfBirth: officerDob,
+      email: user.email,
+      phoneNumber: phone,
+      bvn: user.bvn,
+      title: "CEO",
+      percentageOwned: 0,
+    },
+  ];
+
+  if (Array.isArray(owners) && owners.length > 0) {
+    // Validate sum + per-owner minimum before serializing.
+    const sum = owners.reduce((s, o) => s + Number(o.percentageOwned || 0), 0);
+    if (Math.abs(sum - 100) > 0.01) {
+      throw new Error(`Owner percentages must sum to 100 (got ${sum.toFixed(2)})`);
+    }
+    for (const o of owners) {
+      const pct = Number(o.percentageOwned || 0);
+      if (pct < 5) {
+        throw new Error(`Each owner must hold at least 5% (got ${pct})`);
+      }
+      if (!/^\d{11}$/.test(String(o.bvn || ""))) {
+        throw new Error(`Owner BVN must be 11 digits`);
+      }
+    }
+    for (const o of owners) {
+      const dob =
+        o.dateOfBirth instanceof Date
+          ? o.dateOfBirth.toISOString().slice(0, 10)
+          : o.dateOfBirth;
+      officers.push({
+        role: "OWNER",
+        fullName: {
+          firstName: o.firstName,
+          lastName: o.lastName || o.firstName,
+          ...(o.middleName ? { middleName: o.middleName } : {}),
+        },
+        nationality: "NG",
+        address: ownerAddress(o),
+        dateOfBirth: dob,
+        email: o.email || user.email,
+        phoneNumber: normalizePhoneForAnchor(o.phoneNumber || user.phone || "07000000000"),
+        bvn: o.bvn,
+        title: o.title || "President",
+        percentageOwned: Number(o.percentageOwned),
+      });
+    }
+  } else {
+    // Sole-prop fallback: signing user is the 100% owner. Preserves prior behaviour.
+    officers.push({
+      role: "OWNER",
+      fullName: {
+        firstName: user.firstName,
+        lastName: user.lastName || user.firstName,
+      },
+      nationality: "NG",
+      address: dirAddr,
+      dateOfBirth: officerDob,
+      email: user.email,
+      phoneNumber: phone,
+      bvn: user.bvn,
+      title: "President",
+      percentageOwned: 100,
+    });
+  }
+
   const body = {
     data: {
       type: "BusinessCustomer",
@@ -148,8 +241,6 @@ async function createBusinessCustomer({
         address: { country: "NG", state: bizAddr.state },
         basicDetail: {
           industry: industry || "Retail",
-          // Default to "Business_Name" — sandbox-friendly (single CAC BN cert)
-          // vs "Private_Incorporated" which needs TIN + Cert of Inc + RC + MEMART.
           registrationType: registrationType || "Business_Name",
           country: "NG",
           businessName,
@@ -170,41 +261,7 @@ async function createBusinessCustomer({
           },
           phoneNumber: phone,
         },
-        // Anchor requires BOTH a DIRECTOR (percentageOwned: 0) AND an OWNER
-        // (percentageOwned >= 5) entry. The sole proprietor pattern duplicates
-        // the same person as both. KYB rejects if total owner % is missing.
-        officers: [
-          {
-            role: "DIRECTOR", 
-            fullName: {
-              firstName: user.firstName,
-              lastName: user.lastName || user.firstName,
-            },
-            nationality: "NG",
-            address: dirAddr,
-            dateOfBirth: officerDob,
-            email: user.email,
-            phoneNumber: phone,
-            bvn: user.bvn,
-            title: "CEO",
-            percentageOwned: 0,
-          },
-          {
-            role: "OWNER",
-            fullName: {
-              firstName: user.firstName,
-              lastName: user.lastName || user.firstName,
-            },
-            nationality: "NG",
-            address: dirAddr,
-            dateOfBirth: officerDob,
-            email: user.email,
-            phoneNumber: phone,
-            bvn: user.bvn,
-            title: "President",
-            percentageOwned: 100,
-          },
-        ],
+        officers,
       },
     },
   };
@@ -214,6 +271,12 @@ async function createBusinessCustomer({
     customerId: res.data?.id,
     status: res.data?.attributes?.verification?.status || "pending",
   };
+}
+
+// Map our app-level businessType to Anchor's registrationType enum.
+function mapBusinessTypeToRegistration(businessType) {
+  if (businessType === "limited_company") return "Private_Incorporated";
+  return "Business_Name"; // sole_proprietorship + safe default
 }
 
 // Search for an existing customer by phone, email, or BVN.
@@ -587,6 +650,7 @@ async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, 
 
 module.exports = {
   createBusinessCustomer,
+  mapBusinessTypeToRegistration,
   searchCustomer,
   triggerKYB,
   createDepositAccount,

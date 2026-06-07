@@ -97,6 +97,7 @@ model Business {
   industry             String?
   registrationType     String?
   dateOfRegistration   DateTime?
+  dateOfIncorporation  DateTime?
   addressState         String?
   addressLine1         String?
   addressLine2         String?
@@ -120,9 +121,37 @@ model Business {
   payables          Payable[]
   invoices          Invoice[]
   recurringExpenses RecurringExpense[]
+  officers          BusinessOfficer[]
 
   @@index([userId])
   @@index([virtualAccountRef])
+}
+
+model BusinessOfficer {
+  id                String   @id @default(uuid())
+  businessId        String
+  business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  role              String   // "DIRECTOR" | "OWNER"
+  firstName         String
+  lastName          String
+  middleName        String?
+  bvn               String   // encrypted via utils/crypto.js
+  dateOfBirth       DateTime
+  gender            String   // "Male" | "Female"
+  email             String?
+  phoneNumber       String?
+  nationality       String   @default("NG")
+  title             String   @default("President")
+  percentageOwned   Float    @default(0)
+  addressLine1      String?
+  addressLine2      String?
+  addressCity       String?
+  addressState      String?
+  addressPostalCode String?
+  addressCountry    String   @default("NG")
+  createdAt         DateTime @default(now())
+
+  @@index([businessId])
 }
 
 model CustomCategory {

@@ -253,9 +253,47 @@ router.post("/:id/virtual-account", async (req, res) => {
       });
     }
 
-    const { bvn, dateOfBirth, gender } = req.body;
+    const {
+      bvn, dateOfBirth, gender,
+      businessType,            // "sole_proprietorship" | "limited_company"
+      industry,
+      dateOfRegistration,      // YYYY-MM-DD (CAC registration / incorporation)
+      businessAddress,         // { state, addressLine1, city, postalCode? }
+      owners,                  // [{ firstName, lastName, bvn, dateOfBirth, gender, percentageOwned, email?, phoneNumber?, addressLine1?, addressCity?, addressState? }]
+    } = req.body;
+
     if (!bvn || bvn.length !== 11) {
       return res.status(400).json({ error: "A valid 11-digit BVN is required." });
+    }
+
+    const isLtd = businessType === "limited_company";
+
+    // LTD requires the owners array + incorporation date.
+    if (isLtd) {
+      if (!Array.isArray(owners) || owners.length === 0) {
+        return res.status(400).json({ error: "Limited companies must list at least one owner." });
+      }
+      if (!dateOfRegistration) {
+        return res.status(400).json({ error: "Date of incorporation is required for limited companies." });
+      }
+      const sum = owners.reduce((s, o) => s + Number(o.percentageOwned || 0), 0);
+      if (Math.abs(sum - 100) > 0.01) {
+        return res.status(400).json({ error: `Owner percentages must add up to 100% (got ${sum.toFixed(2)}%).` });
+      }
+      for (const o of owners) {
+        if (!o.firstName || !o.lastName) {
+          return res.status(400).json({ error: "Each owner needs a first and last name." });
+        }
+        if (!/^\d{11}$/.test(String(o.bvn || ""))) {
+          return res.status(400).json({ error: "Each owner needs a valid 11-digit BVN." });
+        }
+        if (!o.dateOfBirth) {
+          return res.status(400).json({ error: "Each owner needs a date of birth." });
+        }
+        if (Number(o.percentageOwned) < 5) {
+          return res.status(400).json({ error: "Each owner must hold at least 5%." });
+        }
+      }
     }
 
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
@@ -268,16 +306,72 @@ router.post("/:id/virtual-account", async (req, res) => {
       return res.status(400).json({ error: "Gender is required for KYC verification." });
     }
 
-    // Persist BVN encrypted; backfill DOB/gender on User if missing
-    await prisma.business.update({
-      where: { id: biz.id },
-      data: { kycBvn: encrypt(bvn) },
-    });
+    const registrationType = anchor.mapBusinessTypeToRegistration(businessType);
+
+    // Persist BVN encrypted; backfill DOB/gender on User if missing.
+    // Persist new KYB fields on Business so the picker selections survive a retry.
+    const bizPatch = { kycBvn: encrypt(bvn) };
+    if (industry) bizPatch.industry = industry;
+    if (registrationType) bizPatch.registrationType = registrationType;
+    if (dateOfRegistration) {
+      bizPatch.dateOfRegistration = new Date(dateOfRegistration);
+      if (isLtd) bizPatch.dateOfIncorporation = new Date(dateOfRegistration);
+    }
+    if (businessAddress?.state) bizPatch.addressState = businessAddress.state;
+    if (businessAddress?.addressLine1) bizPatch.addressLine1 = businessAddress.addressLine1;
+    if (businessAddress?.city) bizPatch.addressCity = businessAddress.city;
+    if (businessAddress?.postalCode) bizPatch.addressPostalCode = businessAddress.postalCode;
+    if (isLtd) bizPatch.kycBusinessType = "limited_company";
+    else bizPatch.kycBusinessType = "sole_proprietor";
+
+    await prisma.business.update({ where: { id: biz.id }, data: bizPatch });
+
     const userPatch = {};
     if (!user.dateOfBirth) userPatch.dateOfBirth = new Date(dob);
     if (!user.gender) userPatch.gender = userGender;
     if (Object.keys(userPatch).length) {
       await prisma.user.update({ where: { id: req.user.id }, data: userPatch });
+    }
+
+    // Persist LTD officers (BVN encrypted) BEFORE the Anchor call so retries work.
+    if (isLtd) {
+      // Wipe any prior attempt's officer rows (re-submit case).
+      await prisma.businessOfficer.deleteMany({ where: { businessId: biz.id } });
+      await prisma.businessOfficer.createMany({
+        data: [
+          {
+            businessId: biz.id,
+            role: "DIRECTOR",
+            firstName: user.firstName,
+            lastName: user.lastName || user.firstName,
+            bvn: encrypt(bvn),
+            dateOfBirth: new Date(dob),
+            gender: userGender,
+            email: user.email,
+            phoneNumber: user.phone,
+            title: "CEO",
+            percentageOwned: 0,
+          },
+          ...owners.map((o) => ({
+            businessId: biz.id,
+            role: "OWNER",
+            firstName: o.firstName,
+            lastName: o.lastName,
+            middleName: o.middleName || null,
+            bvn: encrypt(o.bvn),
+            dateOfBirth: new Date(o.dateOfBirth),
+            gender: o.gender || "Male",
+            email: o.email || null,
+            phoneNumber: o.phoneNumber || null,
+            title: o.title || "President",
+            percentageOwned: Number(o.percentageOwned),
+            addressLine1: o.addressLine1 || null,
+            addressCity: o.addressCity || null,
+            addressState: o.addressState || null,
+            addressPostalCode: o.addressPostalCode || null,
+          })),
+        ],
+      });
     }
 
     // 1. Ensure-or-adopt the Anchor customer (Business preferred, Individual fallback)
@@ -289,6 +383,17 @@ router.post("/:id/virtual-account", async (req, res) => {
         const created = await anchor.createBusinessCustomer({
           businessName: biz.name,
           businessBvn: bvn,
+          registrationType,
+          industry,
+          dateOfRegistration,
+          businessAddress: businessAddress?.addressLine1
+            ? {
+                state: businessAddress.state,
+                addressLine_1: businessAddress.addressLine1,
+                city: businessAddress.city,
+                postalCode: businessAddress.postalCode,
+              }
+            : undefined,
           user: {
             firstName: user.firstName,
             lastName: user.lastName || user.firstName,
@@ -298,6 +403,21 @@ router.post("/:id/virtual-account", async (req, res) => {
             gender: userGender,
             bvn,
           },
+          owners: isLtd ? owners.map((o) => ({
+            firstName: o.firstName,
+            lastName: o.lastName,
+            middleName: o.middleName,
+            bvn: o.bvn,
+            dateOfBirth: o.dateOfBirth,
+            percentageOwned: Number(o.percentageOwned),
+            email: o.email,
+            phoneNumber: o.phoneNumber,
+            title: o.title,
+            addressLine1: o.addressLine1,
+            addressCity: o.addressCity,
+            addressState: o.addressState,
+            addressPostalCode: o.addressPostalCode,
+          })) : undefined,
         });
         customerId = created.customerId;
       } catch (e) {
