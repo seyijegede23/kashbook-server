@@ -12,6 +12,7 @@
 
 const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
+const { recalcInvoiceStatus } = require("./invoiceStatus");
 
 const BASE = () => process.env.ANCHOR_BASE_URL;
 const KEY = () => process.env.ANCHOR_API_KEY;
@@ -94,10 +95,68 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
       minimumFractionDigits: 2,
     })} from ${senderName} → ${biz.name}`;
     await pushTo(biz.userId, "Payment Received 🎉", notifBody);
+
+    // Auto-reconcile: if exactly one open invoice matches the credited amount
+    // within the last 90 days, record a payment and recalc status.
+    await tryMatchInvoice(biz, amount, reference).catch((err) =>
+      console.warn(`[reconcile] invoice match failed for ${biz.name}: ${err.message}`),
+    );
+
     created++;
     if (onCreate) onCreate({ biz, amount, reference });
   }
   return created;
+}
+
+async function tryMatchInvoice(biz, amount, reference) {
+  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10);
+
+  const candidates = await prisma.invoice.findMany({
+    where: {
+      businessId: biz.id,
+      status: { in: ["SENT", "PARTIAL", "OVERDUE"] },
+      issueDate: { gte: ninetyDaysAgo },
+    },
+    select: {
+      id: true, invoiceNumber: true, total: true, amountPaid: true, dueDate: true, status: true,
+    },
+  });
+
+  // Match candidates whose remaining balance equals the credited amount.
+  const matches = candidates.filter(
+    (c) => Math.abs((c.total - c.amountPaid) - amount) < 0.01,
+  );
+  if (matches.length !== 1) return; // 0 = no match; >1 = ambiguous, defer to user
+
+  const inv = matches[0];
+  await prisma.invoicePayment.create({
+    data: {
+      invoiceId: inv.id,
+      amount,
+      method: "bank",
+      note: `NUBAN transfer · ${reference}`,
+    },
+  });
+
+  const newAmountPaid = inv.amountPaid + amount;
+  const newStatus = recalcInvoiceStatus({
+    amountPaid: newAmountPaid,
+    total: inv.total,
+    dueDate: inv.dueDate,
+    status: inv.status,
+  });
+
+  await prisma.invoice.update({
+    where: { id: inv.id },
+    data: { amountPaid: newAmountPaid, status: newStatus },
+  });
+
+  await pushTo(
+    biz.userId,
+    "Invoice Paid ✅",
+    `${inv.invoiceNumber} marked ${newStatus.toLowerCase()} via NUBAN`,
+  );
 }
 
 async function reconcileAll({ onCreate, logger, throttleMs = 1500 } = {}) {

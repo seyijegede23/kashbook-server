@@ -197,6 +197,10 @@ app.use("/transfers", transferRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/sync", syncRoutes);
 
+// ── Public hosted invoice page (no auth) ──────────────────────────────────────
+// GET /i/:token — what merchants share with customers via WhatsApp / link.
+app.use("/", require("./src/routes/publicInvoice"));
+
 // ── Admin panel (serves SPA) ──────────────────────────────────────────────────
 app.get("/admin", (_req, res) =>
   res.sendFile(path.join(__dirname, "public", "admin", "index.html")),

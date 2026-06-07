@@ -347,6 +347,35 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
   }
 });
 
+// ── POST /invoices/:id/share-link ─────────────────────────────────────────────
+// Returns (and creates if missing) a public link customers can open without
+// auth. Idempotent — multiple calls return the same token.
+router.post("/:id/share-link", authMiddleware, async (req, res) => {
+  try {
+    const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: "Invoice not found" });
+    if (!(await ownsBusiness(req, existing.businessId)))
+      return res.status(403).json({ error: "Access denied" });
+
+    let link = await prisma.invoiceShareLink.findUnique({
+      where: { invoiceId: req.params.id },
+    });
+    if (!link) {
+      const token = require("crypto").randomBytes(16).toString("base64url");
+      link = await prisma.invoiceShareLink.create({
+        data: { invoiceId: req.params.id, token },
+      });
+    }
+
+    const base = process.env.PUBLIC_BASE_URL ||
+      `${req.protocol}://${req.get("host")}`;
+    res.json({ token: link.token, url: `${base}/i/${link.token}` });
+  } catch (err) {
+    console.error("share-link error:", err);
+    res.status(500).json({ error: "Failed to create share link" });
+  }
+});
+
 // ── DELETE /invoices/:id ──────────────────────────────────────────────────────
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {

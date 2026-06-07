@@ -119,7 +119,16 @@ router.patch("/:id/branding", async (req, res) => {
     return res.status(403).json({ error: "Staff cannot update businesses" });
   }
 
-  const { logoBase64, receiptFooter, color, invoiceTemplate, invoiceFooter, bankName, bankAccountNumber, bankAccountName } = req.body;
+  const {
+    logoBase64,
+    receiptFooter,
+    color,
+    invoiceTemplate,
+    bankName,
+    bankAccountNumber,
+    bankAccountName,
+    usePaymentOverride,
+  } = req.body;
   try {
     const biz = await prisma.business.findFirst({
       where: { id: req.params.id, userId: req.user.id },
@@ -146,10 +155,10 @@ router.patch("/:id/branding", async (req, res) => {
     if (receiptFooter !== undefined) data.receiptFooter = receiptFooter;
     if (color !== undefined) data.color = color;
     if (invoiceTemplate !== undefined) data.invoiceTemplate = invoiceTemplate;
-    if (invoiceFooter !== undefined) data.invoiceFooter = invoiceFooter;
     if (bankName !== undefined) data.bankName = bankName;
     if (bankAccountNumber !== undefined) data.bankAccountNumber = bankAccountNumber;
     if (bankAccountName !== undefined) data.bankAccountName = bankAccountName;
+    if (usePaymentOverride !== undefined) data.usePaymentOverride = !!usePaymentOverride;
 
     const updatedBiz = await prisma.business.update({
       where: { id: biz.id },

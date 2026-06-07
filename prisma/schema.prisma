@@ -76,10 +76,10 @@ model Business {
   logoUrl          String?
   receiptFooter    String?
   invoiceTemplate  String          @default("classic")
-  invoiceFooter    String?
   bankName         String?
   bankAccountNumber String?
   bankAccountName  String?
+  usePaymentOverride Boolean       @default(false)
   invoiceCounter       Int             @default(0)
   virtualAccountRef    String?
   virtualAccountId     String?
@@ -418,6 +418,7 @@ model Invoice {
   template       String           @default("classic")
   items          InvoiceItem[]
   payments       InvoicePayment[]
+  shareLink      InvoiceShareLink?
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
 
@@ -446,6 +447,16 @@ model InvoicePayment {
   note      String?
   date      DateTime @default(now())
   createdAt DateTime @default(now())
+}
+
+model InvoiceShareLink {
+  id        String   @id @default(cuid())
+  invoiceId String   @unique
+  token     String   @unique
+  createdAt DateTime @default(now())
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([token])
 }
 
 enum Plan {
