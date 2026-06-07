@@ -9,14 +9,39 @@
 const prisma = require("./db");
 const {
   resolveBusinessLimits,
-  STEP_UP_REPIN_ABOVE,
-  PIN_FRESHNESS_MS,
+  STEP_UP_OTP_ABOVE,
+  TRANSFER_OTP_TYPE,
   SINGLE_FLAG_ABOVE,
 } = require("../config/amlLimits");
 const { runRules } = require("./amlRules");
 const { audit } = require("./audit");
+const { verifyOtp } = require("./otp");
 
-async function runPreTransferChecks({ req, user, business, amount, pinVerifiedAt }) {
+// Pick the identifier we'll send the step-up OTP to. Email is preferred
+// (free, faster to deliver in this market); phone is the fallback when no
+// email is on file. Caller is responsible for actually dispatching.
+function pickOtpIdentifier(user) {
+  if (!user) return null;
+  if (user.email) return user.email;
+  if (user.phone) return user.phone;
+  return null;
+}
+
+// Return a partially-masked identifier so the client can render
+// "code sent to a••a@gmail.com" without exposing the full address in the
+// API response.
+function maskIdentifier(id) {
+  if (!id) return "";
+  if (id.includes("@")) {
+    const [local, domain] = id.split("@");
+    if (local.length <= 2) return `${local[0] || ""}*@${domain}`;
+    return `${local[0]}${"*".repeat(Math.max(1, local.length - 2))}${local.slice(-1)}@${domain}`;
+  }
+  // Phone — mask all but the last 4 digits.
+  return id.length <= 4 ? id : `${"*".repeat(id.length - 4)}${id.slice(-4)}`;
+}
+
+async function runPreTransferChecks({ req, user, business, amount, otp }) {
   // 1. Frozen check ------------------------------------------------------
   if (user?.accountStatus && user.accountStatus !== "active") {
     await audit({
@@ -168,28 +193,63 @@ async function runPreTransferChecks({ req, user, business, amount, pinVerifiedAt
     };
   }
 
-  // 4. Step-up: re-PIN within freshness window ---------------------------
-  if (amount > STEP_UP_REPIN_ABOVE) {
-    const fresh = pinVerifiedAt && now - pinVerifiedAt <= PIN_FRESHNESS_MS;
-    if (!fresh) {
+  // 4. Step-up: one-time code on top of the PIN for large transfers ------
+  if (amount > STEP_UP_OTP_ABOVE) {
+    const identifier = pickOtpIdentifier(user);
+    if (!identifier) {
       await audit({
         req,
-        action: "STEP_UP_REPIN_REQUIRED",
+        action: "STEP_UP_OTP_NO_IDENTIFIER",
+        resourceType: "user",
+        resourceId: user.id,
+        severity: "warn",
+        metadata: { amount },
+      });
+      return {
+        ok: false,
+        status: 400,
+        code: "STEP_UP_NO_IDENTIFIER",
+        error: "Add a verified email or phone number to send transfers above ₦1,000,000.",
+      };
+    }
+    if (!otp) {
+      await audit({
+        req,
+        action: "STEP_UP_OTP_REQUIRED",
         resourceType: "business",
         resourceId: business.id,
         severity: "info",
-        metadata: { amount, threshold: STEP_UP_REPIN_ABOVE },
+        metadata: { amount, threshold: STEP_UP_OTP_ABOVE, identifier },
       });
       return {
         ok: false,
         status: 401,
-        code: "REPIN_REQUIRED",
-        error: "Re-enter your PIN to confirm this large transfer.",
+        code: "OTP_REQUIRED",
+        error: "We've sent a 6-digit code to confirm this transfer.",
+        otpIdentifier: maskIdentifier(identifier),
+      };
+    }
+    const valid = await verifyOtp(identifier, String(otp).trim(), TRANSFER_OTP_TYPE);
+    if (!valid) {
+      await audit({
+        req,
+        action: "STEP_UP_OTP_INVALID",
+        resourceType: "business",
+        resourceId: business.id,
+        severity: "warn",
+        metadata: { amount, identifier },
+      });
+      return {
+        ok: false,
+        status: 401,
+        code: "OTP_INVALID",
+        error: "Wrong code. Check the email or SMS and try again.",
+        otpIdentifier: maskIdentifier(identifier),
       };
     }
     await audit({
       req,
-      action: "STEP_UP_REPIN_SATISFIED",
+      action: "STEP_UP_OTP_SATISFIED",
       resourceType: "business",
       resourceId: business.id,
       severity: "info",

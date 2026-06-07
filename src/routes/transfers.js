@@ -6,6 +6,8 @@ const anchor = require("../utils/anchor");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { runPreTransferChecks, recordComplianceFlags } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
+const { dispatchOtp } = require("../utils/otp");
+const { STEP_UP_OTP_ABOVE, TRANSFER_OTP_TYPE } = require("../config/amlLimits");
 
 router.use(auth);
 router.use(requireUnfrozen);
@@ -91,7 +93,7 @@ router.post("/send", async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Staff cannot initiate transfers" });
 
-  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin } = req.body;
+  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin, otp } = req.body;
   if (!businessId || !accountNumber || !bankCode || !amount)
     return res.status(400).json({ error: "Missing required fields" });
   if (isNaN(amount) || Number(amount) <= 0)
@@ -128,19 +130,44 @@ router.post("/send", async (req, res) => {
     // order. Writes audit rows for each gate and returns early on block.
     const userFull = await prisma.user.findUnique({
       where: { id: req.user.id },
-      select: { id: true, accountStatus: true, complianceFreezeReason: true },
+      select: {
+        id: true, accountStatus: true, complianceFreezeReason: true,
+        email: true, phone: true,
+      },
     });
     const amlCheck = await runPreTransferChecks({
       req,
       user: userFull,
       business: biz,
       amount: Number(amount),
-      pinVerifiedAt: pinCheck.verifiedAt,
+      otp,
     });
     if (!amlCheck.ok) {
+      // On the first attempt of a large transfer, the pipeline returns
+      // OTP_REQUIRED before any code has been issued. Dispatch one now so
+      // the user can collect it from email/SMS, then surface the request
+      // to the client with the masked identifier.
+      if (amlCheck.code === "OTP_REQUIRED") {
+        const target = userFull.email || userFull.phone;
+        if (target) {
+          try {
+            await dispatchOtp(target, TRANSFER_OTP_TYPE);
+          } catch (err) {
+            console.error("[transfers] OTP dispatch failed:", err.message);
+            return res.status(503).json({
+              error: "Could not send the verification code. Please try again.",
+              code: "OTP_DISPATCH_FAILED",
+            });
+          }
+        }
+      }
       return res
         .status(amlCheck.status || 400)
-        .json({ error: amlCheck.error, code: amlCheck.code });
+        .json({
+          error: amlCheck.error,
+          code: amlCheck.code,
+          ...(amlCheck.otpIdentifier ? { otpIdentifier: amlCheck.otpIdentifier } : {}),
+        });
     }
 
     // Authoritative live balance from Anchor (user's own deposit account)

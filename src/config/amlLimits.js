@@ -56,11 +56,13 @@ const RISK_MULTIPLIER = {
 
 // ── Step-up and flagging thresholds ───────────────────────────────────────
 
-// Above this amount we require a fresh PIN re-verification (≤ 60s old).
-const STEP_UP_REPIN_ABOVE = NAIRA(1_000_000);
+// Above this amount we require a one-time code sent to the user's email or
+// phone IN ADDITION to the transaction PIN. Bigger transfer = bigger proof.
+const STEP_UP_OTP_ABOVE = NAIRA(1_000_000);
 
-// PIN freshness window for re-PIN.
-const PIN_FRESHNESS_MS = 60_000;
+// OTP type tag used so transfer step-up OTPs can't be confused with the
+// signup / email-change / phone-change codes.
+const TRANSFER_OTP_TYPE = "TRANSFER_STEP_UP";
 
 // Any single transfer ≥ this amount auto-creates a CTR-style ComplianceFlag.
 // Mirrors NFIU's ₦5M individual cash threshold for awareness; ours is
@@ -129,8 +131,8 @@ module.exports = {
   HIGH_RISK_INDUSTRIES,
   ELEVATED_RISK_INDUSTRIES,
   RISK_MULTIPLIER,
-  STEP_UP_REPIN_ABOVE,
-  PIN_FRESHNESS_MS,
+  STEP_UP_OTP_ABOVE,
+  TRANSFER_OTP_TYPE,
   SINGLE_FLAG_ABOVE,
   VELOCITY_RULES,
   getRiskCategory,
