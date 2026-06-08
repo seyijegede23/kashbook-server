@@ -562,7 +562,7 @@ router.post("/upload-avatar", authMiddleware, async (req, res) => {
 // PATCH /auth/settings
 // ─────────────────────────────────────────────
 router.patch("/settings", authMiddleware, async (req, res) => {
-  const { language, currency, notificationsEnabled, biometricEnabled } = req.body;
+  const { language, currency, notificationsEnabled, biometricEnabled, autoDebitEnabled } = req.body;
   try {
     const data = {};
     if (language             !== undefined) data.language             = language;
@@ -575,6 +575,7 @@ router.patch("/settings", authMiddleware, async (req, res) => {
     }
     if (notificationsEnabled !== undefined) data.notificationsEnabled = notificationsEnabled;
     if (biometricEnabled     !== undefined) data.biometricEnabled     = biometricEnabled;
+    if (autoDebitEnabled     !== undefined) data.autoDebitEnabled     = !!autoDebitEnabled;
     const user = await prisma.user.update({ where: { id: req.user.id }, data });
     const { password: _, ...safe } = user;
     res.json({ user: safe });

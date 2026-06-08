@@ -41,7 +41,7 @@ function maskIdentifier(id) {
   return id.length <= 4 ? id : `${"*".repeat(id.length - 4)}${id.slice(-4)}`;
 }
 
-async function runPreTransferChecks({ req, user, business, amount, otp }) {
+async function runPreTransferChecks({ req, user, business, amount, otp, bypassOtp = false }) {
   // 1. Frozen check ------------------------------------------------------
   if (user?.accountStatus && user.accountStatus !== "active") {
     await audit({
@@ -194,8 +194,12 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
   }
 
   // 4. Step-up: one-time code on top of the PIN for large transfers ------
+  // `bypassOtp` is set ONLY by the recurring-expense cron after the user has
+  // already pre-authorised with a PIN at setup. Compensating control: the
+  // bypass is only honoured for amounts at or below the AML single-cap.
   const thresholds = getThresholds(business);
-  if (amount > thresholds.stepUpOtpAbove) {
+  const otpBypassAllowed = bypassOtp && amount <= limits.singleMax;
+  if (amount > thresholds.stepUpOtpAbove && !otpBypassAllowed) {
     const identifier = pickOtpIdentifier(user);
     if (!identifier) {
       await audit({
@@ -255,6 +259,16 @@ async function runPreTransferChecks({ req, user, business, amount, otp }) {
       resourceId: business.id,
       severity: "info",
       metadata: { amount },
+    });
+  } else if (amount > thresholds.stepUpOtpAbove && otpBypassAllowed) {
+    // Record the bypass for compliance review — auto-debit at scheduled time.
+    await audit({
+      req,
+      action: "STEP_UP_OTP_BYPASSED_RECURRING",
+      resourceType: "business",
+      resourceId: business.id,
+      severity: "info",
+      metadata: { amount, threshold: thresholds.stepUpOtpAbove, singleMax: limits.singleMax },
     });
   }
 

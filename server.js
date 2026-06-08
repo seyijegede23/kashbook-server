@@ -23,7 +23,6 @@ const anchorWebhookRoute = require("./src/routes/anchor");
 const transferRoutes = require("./src/routes/transfers");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
-const { computeNextDue } = require("./src/routes/recurringExpenses");
 
 const { sendSms } = require("./src/utils/otp");
 const cron = require("node-cron");
@@ -279,33 +278,14 @@ cron.schedule("0 * * * *", async () => {
   }
 });
 
-// ── Background cron: create due recurring expenses (daily at 00:05) ──────────
+// ── Background cron: process due recurring expenses (daily at 00:05) ─────────
+// For each due item: writes the bookkeeping Expense row + optionally fires the
+// auto-debit transfer if enabled. Full pipeline (AML / frozen / single-cap /
+// rules engine) runs on every auto-debit. See utils/recurringExpenseRunner.js.
+const { processRecurringExpenses } = require("./src/utils/recurringExpenseRunner");
 cron.schedule("5 0 * * *", async () => {
   try {
-    const now = new Date();
-    const due = await prisma.recurringExpense.findMany({
-      where: { active: true, nextDue: { lte: now } },
-    });
-    for (const rec of due) {
-      await prisma.expense.create({
-        data: {
-          userId: rec.userId,
-          businessId: rec.businessId,
-          category: rec.category,
-          amount: rec.amount,
-          paymentMethod: rec.paymentMethod,
-          notes: rec.notes,
-          date: now,
-        },
-      });
-      const nextDue = computeNextDue(rec.frequency, rec.nextDue);
-      await prisma.recurringExpense.update({
-        where: { id: rec.id },
-        data: { nextDue },
-      });
-    }
-    if (due.length > 0)
-      console.log(`[Cron] Created ${due.length} recurring expense(s)`);
+    await processRecurringExpenses();
   } catch (err) {
     console.error("[Cron] Recurring expenses error:", err);
   }

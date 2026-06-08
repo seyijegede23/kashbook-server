@@ -4,9 +4,10 @@ const requireUnfrozen = require("../middleware/requireUnfrozen");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
 const { verifyTransactionPin } = require("../utils/transactionPin");
-const { runPreTransferChecks, recordComplianceFlags } = require("../utils/amlChecks");
+const { runPreTransferChecks } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
 const { dispatchOtp } = require("../utils/otp");
+const { executeTransfer } = require("../utils/executeTransfer");
 const { STEP_UP_OTP_ABOVE, TRANSFER_OTP_TYPE } = require("../config/amlLimits");
 
 router.use(auth);
@@ -181,128 +182,29 @@ router.post("/send", async (req, res) => {
         });
     }
 
-    // Authoritative live balance from Anchor (user's own deposit account)
-    const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
-    if (balance < Number(amount)) {
-      return res.status(400).json({
-        error: `Insufficient balance. Available: ₦${balance.toLocaleString("en-NG", { minimumFractionDigits: 2 })}`,
-      });
-    }
-
-    const reference = `kashbook_tf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-
-    // Auto-detect internal vs external. If the destination NUBAN belongs to
-    // another KashBook business that has a DepositAccount on the same Anchor
-    // org, use BookTransfer (free + instant). Otherwise fall back to NIP.
-    const internalDest = await prisma.business.findFirst({
-      where: {
-        virtualAccountNumber: accountNumber,
-        anchorAccountId: { not: null },
-        NOT: { id: businessId }, // can't book-transfer to yourself
-      },
-      select: { id: true, name: true, anchorAccountId: true, virtualAccountName: true },
-    });
-
-    let resolvedName = accountName;
-    let resolvedBank = bankName;
-    let route;
-
-    if (internalDest) {
-      resolvedName = resolvedName || internalDest.virtualAccountName || internalDest.name;
-      resolvedBank = "KashBook (internal)";
-      route = "book";
-      await anchor.createBookTransfer({
-        fromAccountId: biz.anchorAccountId,
-        toAccountId: internalDest.anchorAccountId,
-        amount: Number(amount),
-        reason: narration || `Transfer from ${biz.name}`,
-        reference,
-      });
-    } else {
-      // External NIP path
-      if (!resolvedName) {
-        const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
-        if (!ne.accountName)
-          return res.status(400).json({ error: "Could not resolve recipient account" });
-        resolvedName = ne.accountName;
-      }
-      const banks = await anchor.getBanks();
-      const matchedBank = banks.find((b) => b.code === bankCode);
-      if (!matchedBank?.id)
-        return res.status(400).json({ error: "Unknown bank — refresh the bank list" });
-
-      const cp = await anchor.createCounterparty({
-        accountNumber,
-        bankId: matchedBank.id,
-        accountName: resolvedName,
-      });
-      route = "nip";
-      await anchor.createTransfer({
-        fromAccountId: biz.anchorAccountId,
-        counterpartyId: cp.counterpartyId,
-        amount: Number(amount),
-        reason: narration || `Transfer from ${biz.name}`,
-        reference,
-      });
-    }
-
-    const recipientLabel = resolvedBank
-      ? `${resolvedName} · ${resolvedBank} · ${accountNumber}`
-      : `${resolvedName} · ${accountNumber}`;
-    const description = narration
-      ? `${narration} — to ${recipientLabel}`
-      : `Transfer to ${recipientLabel}`;
-
-    const txn = await prisma.transaction.create({
-      data: {
-        businessId,
-        userId: req.user.id,
-        type: "expense",
-        amount: Number(amount),
-        description,
-        category: "transfer",
-        paymentMethod: "bank",
-        date: new Date(),
-        source: "anchor",
-        currency: biz.baseCurrency || "NGN",
-        flagSeverity: amlCheck.maxSeverity || null,
-        complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
-      },
-    });
-
-    // Persist ComplianceFlag rows for any rules that triggered + the
-    // CTR auto-flag when the amount meets the threshold.
-    await recordComplianceFlags({
-      userId: req.user.id,
-      businessId,
+    // Hand off to the shared executor — same code path the cron uses.
+    const { reference, route } = await executeTransfer({
       business: biz,
-      transactionId: txn.id,
+      userId: req.user.id,
       amount: Number(amount),
-      flags: amlCheck.flags,
-    });
-
-    await audit({
+      accountNumber,
+      bankCode,
+      accountName,
+      bankName,
+      narration,
+      amlCheck,
       req,
-      action: "TRANSFER_SENT",
-      resourceType: "transaction",
-      resourceId: txn.id,
-      severity: amlCheck.maxSeverity === "high" ? "alert"
-              : amlCheck.maxSeverity === "medium" ? "warn"
-              : "info",
-      metadata: {
-        amount: Number(amount),
-        reference,
-        route,
-        accountNumber,
-        bankName: resolvedBank,
-        flags: (amlCheck.flags || []).map((f) => f.ruleCode),
-      },
+      notify: false, // route doesn't push — client UI shows the success state itself
     });
 
     res.json({ status: "success", reference, route });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
+    if (err.code === "INSUFFICIENT_BALANCE")
+      return res.status(400).json({ error: err.message, code: err.code });
+    if (err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
+      return res.status(400).json({ error: err.message, code: err.code });
     console.error("Transfer error:", err);
     res.status(400).json({ error: err.message || "Transfer failed" });
   }

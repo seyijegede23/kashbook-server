@@ -28,6 +28,7 @@ model User {
   currency             String         @default("NGN")  // derived from country at write-time
   notificationsEnabled Boolean        @default(true)
   biometricEnabled     Boolean        @default(false)
+  autoDebitEnabled     Boolean        @default(true)   // global kill-switch for all recurring auto-debits
   transactionPin             String?
   transactionPinFailedCount  Int       @default(0)
   transactionPinLockedUntil  DateTime?
@@ -385,11 +386,23 @@ model RecurringExpense {
   frequency     String    @default("monthly")
   nextDue       DateTime
   active        Boolean   @default(true)
+  // ── Auto-debit (off by default; backwards-compatible) ──────────────────
+  autoSend             Boolean   @default(false)
+  authorizedAt         DateTime?
+  payeeAccountNumber   String?
+  payeeBankCode        String?
+  payeeBankName        String?
+  payeeAccountName     String?
+  lastAutoSendAt       DateTime?
+  lastAutoSendStatus   String?   // "ok" | "insufficient_balance" | "blocked_aml" | "anchor_error" | "above_cap" | "skipped_paused"
+  lastAutoSendRef      String?
+  consecutiveFailures  Int       @default(0)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
   @@index([userId, active])
   @@index([nextDue, active])
+  @@index([active, autoSend])
 }
 
 model OtpCode {
