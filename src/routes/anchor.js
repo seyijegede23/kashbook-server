@@ -16,6 +16,11 @@ const router = require("express").Router();
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
 const { pushTo } = require("../utils/pushNotification");
+const {
+  extractSender,
+  buildInboundNotification,
+  buildInboundDescription,
+} = require("../utils/inboundCreditNotification");
 
 router.post("/", async (req, res) => {
   const isBuffer = Buffer.isBuffer(req.body);
@@ -418,18 +423,10 @@ router.post("/", async (req, res) => {
         return;
       }
 
-      const senderName = attrs.senderName || attrs.sourceAccountName || "customer";
-      const senderBank = attrs.sourceBank || attrs.senderBank || "";
-      const senderAccount =
-        attrs.sourceAccountNumber || attrs.senderAccountNumber || "";
+      const sender = extractSender(attrs);
       const narration = attrs.narration || attrs.reason || "";
       const sessionId = attrs.sessionId || attrs.reference || "";
-
-      let description = `Transfer received from ${senderName}`;
-      if (senderBank) description += ` (${senderBank})`;
-      if (senderAccount) description += ` · Acct: ${senderAccount}`;
-      if (narration) description += ` · "${narration}"`;
-      if (sessionId) description += ` · Ref: ${sessionId}`;
+      const description = buildInboundDescription({ sender, narration, reference: sessionId });
 
       await prisma.transaction.create({
         data: {
@@ -445,10 +442,13 @@ router.post("/", async (req, res) => {
         },
       });
 
-      const notifBody = `₦${amount.toLocaleString("en-NG", {
-        minimumFractionDigits: 2,
-      })} from ${senderName} → ${biz.name}`;
-      await pushTo(biz.userId, "Payment Received 🎉", notifBody);
+      const { title, body } = buildInboundNotification({
+        business: biz,
+        amount,
+        sender,
+        narration,
+      });
+      await pushTo(biz.userId, title, body);
       return;
     }
 
@@ -490,8 +490,9 @@ router.post("/", async (req, res) => {
         if (existing) return;
       }
 
-      // Look up the sender (source DepositAccount) to give a friendly description
-      let senderName = "another KashBook user";
+      // Look up the sender (source DepositAccount) to give a friendly description.
+      // BookTransfer is KashBook→KashBook, so we have full sender details locally.
+      let senderName = "";
       if (srcAccountId) {
         const srcBiz = await prisma.business.findFirst({
           where: { anchorAccountId: srcAccountId },
@@ -499,11 +500,15 @@ router.post("/", async (req, res) => {
         });
         if (srcBiz) senderName = srcBiz.virtualAccountName || srcBiz.name;
       }
-
+      const sender = {
+        name: senderName,
+        bank: "KashBook",
+        accountNumber: "",
+        label: senderName || "another KashBook user",
+        hasName: !!senderName,
+      };
       const narration = attrs.reason || "";
-      let description = `Transfer received from ${senderName}`;
-      if (narration) description += ` · "${narration}"`;
-      if (reference) description += ` · Ref: ${reference}`;
+      const description = buildInboundDescription({ sender, narration, reference });
 
       await prisma.transaction.create({
         data: {
@@ -519,10 +524,13 @@ router.post("/", async (req, res) => {
         },
       });
 
-      const notifBody = `₦${amount.toLocaleString("en-NG", {
-        minimumFractionDigits: 2,
-      })} from ${senderName} → ${destBiz.name}`;
-      await pushTo(destBiz.userId, "Payment Received 🎉", notifBody);
+      const { title, body } = buildInboundNotification({
+        business: destBiz,
+        amount,
+        sender,
+        narration,
+      });
+      await pushTo(destBiz.userId, title, body);
       return;
     }
 

@@ -14,6 +14,11 @@ const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const { recalcInvoiceStatus } = require("./invoiceStatus");
 const { SINGLE_FLAG_ABOVE } = require("../config/amlLimits");
+const {
+  extractSender,
+  buildInboundNotification,
+  buildInboundDescription,
+} = require("./inboundCreditNotification");
 
 const BASE = () => process.env.ANCHOR_BASE_URL;
 const KEY = () => process.env.ANCHOR_API_KEY;
@@ -67,17 +72,9 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     });
     if (existing) continue;
 
-    const senderName =
-      a.senderName ||
-      a.sourceAccountName ||
-      a.fromAccountName ||
-      "another user";
-    const senderBank = a.sourceBank || a.senderBank || "";
+    const sender = extractSender(a);
     const narration = a.narration || a.reason || "";
-    let description = `Transfer received from ${senderName}`;
-    if (senderBank) description += ` (${senderBank})`;
-    if (narration) description += ` · "${narration}"`;
-    description += ` · Ref: ${reference}`;
+    const description = buildInboundDescription({ sender, narration, reference });
 
     // Read the owner's compliance status — inbound credits to a frozen
     // user or business still post (the money is already moved) but get
@@ -121,15 +118,18 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
           description: frozen
             ? `Inbound credit of ₦${amount.toLocaleString("en-NG")} arrived on a frozen account.`
             : `Inbound credit of ₦${amount.toLocaleString("en-NG")} meets the CTR auto-flag threshold.`,
-          metadata: { amount, senderName, senderBank: a.sourceBank || "" },
+          metadata: { amount, senderName: sender.name || sender.label, senderBank: sender.bank, senderAccountNumber: sender.accountNumber },
         },
       });
     }
 
-    const notifBody = `₦${amount.toLocaleString("en-NG", {
-      minimumFractionDigits: 2,
-    })} from ${senderName} → ${biz.name}`;
-    await pushTo(biz.userId, "Payment Received 🎉", notifBody);
+    const { title, body } = buildInboundNotification({
+      business: biz,
+      amount,
+      sender,
+      narration,
+    });
+    await pushTo(biz.userId, title, body);
 
     // Auto-reconcile: if exactly one open invoice matches the credited amount
     // within the last 90 days, record a payment and recalc status.
