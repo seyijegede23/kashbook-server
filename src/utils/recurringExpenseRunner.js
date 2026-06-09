@@ -1,12 +1,15 @@
 // Background processor for recurring expenses.
 //
 // Behaviour for every item:
-//   1. Create the bookkeeping Expense row (unchanged from before — this is
-//      the only thing the cron used to do).
-//   2. If `autoSend` is on AND the user hasn't paused globally AND the
-//      country has a real BaaS, run the auto-debit pipeline against the
-//      saved payee.
-//   3. Advance `nextDue` to the next occurrence.
+//   - Bookkeeping-only items (autoSend=false): create the Expense row, advance
+//     nextDue. Same as before.
+//   - Auto-debit items (autoSend=true): run the auto-debit transfer FIRST. If
+//     it succeeds, executeTransfer writes a Transaction row that IS the
+//     bookkeeping entry — we never create a separate Expense row. If the
+//     transfer fails (insufficient balance, AML block, Anchor error), NOTHING
+//     hits the books. The user's "Sent today" / outgoing totals only reflect
+//     money that actually moved.
+//   - nextDue advances either way (so we don't busy-loop).
 //
 // Per-item failures are caught, logged, and audited; the loop continues.
 // The 1.5s throttle between items matches anchorReconcile.js so we stay
@@ -35,26 +38,30 @@ async function processRecurringExpenses({ now = new Date() } = {}) {
 
   for (let i = 0; i < due.length; i++) {
     const rec = due[i];
+    const isAutoDebit = !!(rec.autoSend && rec.payeeAccountNumber && rec.business);
     try {
-      // 1. Bookkeeping row (always — same as before).
-      await prisma.expense.create({
-        data: {
-          userId: rec.userId,
-          businessId: rec.businessId,
-          category: rec.category,
-          amount: rec.amount,
-          paymentMethod: rec.paymentMethod,
-          notes: rec.notes,
-          date: now,
-        },
-      });
-      createdExpenses++;
-
-      // 2. Auto-debit pipeline (opt-in per row).
-      if (rec.autoSend && rec.payeeAccountNumber && rec.business) {
+      if (isAutoDebit) {
+        // Auto-debit branch: try the transfer first. The bookkeeping entry
+        // (a Transaction row) is only written by executeTransfer if Anchor
+        // accepts the transfer. A failed transfer leaves the books untouched
+        // so "Sent today" stays accurate.
         const result = await runAutoDebit(rec, now);
         if (result.ok) autoDebited++;
         else autoDebitErrors++;
+      } else {
+        // Bookkeeping-only branch: just record the Expense row as before.
+        await prisma.expense.create({
+          data: {
+            userId: rec.userId,
+            businessId: rec.businessId,
+            category: rec.category,
+            amount: rec.amount,
+            paymentMethod: rec.paymentMethod,
+            notes: rec.notes,
+            date: now,
+          },
+        });
+        createdExpenses++;
       }
     } catch (err) {
       console.error(`[recurring] ${rec.id} failed:`, err.message || err);
