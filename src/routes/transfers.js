@@ -8,7 +8,12 @@ const { runPreTransferChecks } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
-const { STEP_UP_OTP_ABOVE, TRANSFER_OTP_TYPE } = require("../config/amlLimits");
+const {
+  STEP_UP_OTP_ABOVE,
+  TRANSFER_OTP_TYPE,
+  resolveBusinessLimits,
+  getThresholds,
+} = require("../config/amlLimits");
 
 router.use(auth);
 router.use(requireUnfrozen);
@@ -85,6 +90,98 @@ router.get("/balance", async (req, res) => {
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED") return res.json({ balance: 0 });
     res.status(500).json({ error: err.message || "Failed to fetch balance" });
+  }
+});
+
+// GET /transfers/limits?businessId=
+//
+// Returns the resolved AML tier limits for the business plus how much has
+// already been sent today / this week / this month, so the client can show
+// the user where they stand. Includes:
+//
+//   singleMax            biggest individual transfer allowed today
+//   daily / weekly /     per-window caps from the country config
+//     monthly
+//   dailySoFar /         outbound transfers already counted against each
+//     weeklySoFar /        window (anchor expense transfers only)
+//     monthlySoFar
+//   dailyRemaining /     daily - dailySoFar (etc.), floored at 0 — what the
+//     weeklyRemaining /    user can still send before tripping a hard block
+//     monthlyRemaining
+//   stepUpOtpAbove       transfers above this require an OTP step-up
+//   tierKey, country,    metadata so the UI can show "Sole proprietor · NG"
+//     currencyCode
+//
+// Treats no-NUBAN businesses as the "unverified" tier (all zeros). The
+// client is also expected to gate access to this screen, but a hard-coded
+// zero here means even a bad client can't show stale limits.
+router.get("/limits", async (req, res) => {
+  try {
+    const { businessId } = req.query;
+    if (!businessId) return res.status(400).json({ error: "businessId required" });
+
+    const userId =
+      req.user.accountType === "staff" ? req.user.employerId : req.user.id;
+    const biz = await prisma.business.findFirst({ where: { id: businessId, userId } });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const limits = resolveBusinessLimits(biz);
+    const thresholds = getThresholds(biz);
+
+    // Mirror the windowing used by runPreTransferChecks so the numbers a user
+    // sees here match the gate they're about to hit on /send.
+    const now = Date.now();
+    const since24h = new Date(now - 24 * 60 * 60 * 1000);
+    const since7d  = new Date(now - 7  * 24 * 60 * 60 * 1000);
+    const since30d = new Date(now - 30 * 24 * 60 * 60 * 1000);
+    const recent30 = await prisma.transaction.findMany({
+      where: {
+        businessId: biz.id,
+        type: "expense",
+        category: "transfer",
+        source: "anchor",
+        date: { gte: since30d },
+      },
+      select: { amount: true, date: true },
+      orderBy: { date: "asc" },
+    });
+    const sumSince = (since) =>
+      recent30.filter((t) => t.date >= since).reduce((s, t) => s + t.amount, 0);
+
+    const dailySoFar   = sumSince(since24h);
+    const weeklySoFar  = sumSince(since7d);
+    const monthlySoFar = sumSince(since30d);
+    const remaining = (cap, used) => Math.max(0, cap - used);
+
+    res.json({
+      tierKey: limits.tierKey,
+      riskCategory: limits.riskCategory,
+      countryCode: limits.countryCode,
+      currencyCode: limits.currencyCode,
+      currencySymbol: limits.currencySymbol,
+      currencyLocale: limits.currencyLocale,
+
+      singleMax: limits.singleMax,
+      daily: limits.daily,
+      weekly: limits.weekly,
+      monthly: limits.monthly,
+
+      dailySoFar,
+      weeklySoFar,
+      monthlySoFar,
+
+      dailyRemaining:   remaining(limits.daily,   dailySoFar),
+      weeklyRemaining:  remaining(limits.weekly,  weeklySoFar),
+      monthlyRemaining: remaining(limits.monthly, monthlySoFar),
+
+      stepUpOtpAbove: thresholds.stepUpOtpAbove,
+      singleFlagAbove: thresholds.singleFlagAbove,
+
+      hasBankingAccount: !!biz.virtualAccountNumber,
+    });
+  } catch (err) {
+    console.error("[transfers/limits]", err);
+    res.status(500).json({ error: err.message || "Failed to fetch transfer limits" });
   }
 });
 
