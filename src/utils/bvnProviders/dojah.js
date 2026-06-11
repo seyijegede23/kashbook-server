@@ -15,8 +15,6 @@
 // name + DOB. Provider-specific shape stays here; rest of the system never
 // sees Dojah-specific field names.
 
-const { request } = require("undici");
-
 const TIMEOUT_MS = 4_000;
 
 function getBaseUrl() {
@@ -70,12 +68,10 @@ async function verifyBvn(bvn, { userId } = {}) {
 
   let res;
   try {
-    res = await request(url, {
+    res = await fetch(url, {
       method: "GET",
       headers,
-      // undici's bodyTimeout cancels if the body stream stalls after headers.
-      bodyTimeout: TIMEOUT_MS,
-      headersTimeout: TIMEOUT_MS,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (err) {
     return {
@@ -86,34 +82,36 @@ async function verifyBvn(bvn, { userId } = {}) {
   }
 
   let body;
-  try { body = await res.body.json(); }
+  try { body = await res.json(); }
   catch { body = null; }
 
-  if (res.statusCode >= 500 || res.statusCode === 408 || res.statusCode === 429) {
+  const status = res.status;
+
+  if (status >= 500 || status === 408 || status === 429) {
     return {
       ok: false,
       error: "PROVIDER_UNAVAILABLE",
-      httpStatus: res.statusCode,
-      message: body?.error || `Dojah ${res.statusCode}`,
+      httpStatus: status,
+      message: body?.error || `Dojah ${status}`,
     };
   }
 
-  if (res.statusCode === 400 || res.statusCode === 404) {
+  if (status === 400 || status === 404) {
     // Dojah uses 400 for "BVN not found" too — normalise to NOT_FOUND.
     return {
       ok: false,
       error: "NOT_FOUND",
-      httpStatus: res.statusCode,
+      httpStatus: status,
       message: body?.error || "BVN not found",
     };
   }
 
-  if (res.statusCode !== 200 || !body) {
+  if (status !== 200 || !body) {
     return {
       ok: false,
       error: "PROVIDER_ERROR",
-      httpStatus: res.statusCode,
-      message: body?.error || `Unexpected Dojah response (${res.statusCode})`,
+      httpStatus: status,
+      message: body?.error || `Unexpected Dojah response (${status})`,
     };
   }
 
@@ -135,7 +133,7 @@ async function verifyBvn(bvn, { userId } = {}) {
     return {
       ok: false,
       error: "PROVIDER_ERROR",
-      httpStatus: res.statusCode,
+      httpStatus: status,
       message: "Dojah returned no identity fields",
     };
   }
