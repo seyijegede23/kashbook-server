@@ -120,12 +120,6 @@ model Business {
   addressLine2         String?
   addressCity          String?
   addressPostalCode    String?
-  // Optional Phase D geocoding output. Populated when KYC_GEOCODING_ENABLED=true
-  // AND the address actually resolved. Missing geocode is NOT a hard gate;
-  // these are observational columns for future fraud/analytics work.
-  addressLat           Float?
-  addressLng           Float?
-  addressGeocodedAt    DateTime?
   directorAddressSame  Boolean  @default(true)
   directorAddressLine1 String?
   directorAddressState String?

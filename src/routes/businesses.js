@@ -10,7 +10,6 @@ const { getRiskCategory } = require("../config/amlLimits");
 const {
   runBvnCheck,
   runCacCheck,
-  runAddressCheck,
 } = require("../utils/kycCheck");
 const {
   isValidNigerianState,
@@ -468,24 +467,6 @@ router.post("/:id/virtual-account", async (req, res) => {
       }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase D · Address geocoding (opt-in, observational). Misses don't block.
-    // ─────────────────────────────────────────────────────────────────────
-    let geocoded = null;
-    if (businessAddress?.addressLine1 && businessAddress?.city) {
-      const r = await runAddressCheck({
-        address: {
-          line1:      businessAddress.addressLine1,
-          city:       businessAddress.city,
-          state:      businessAddress.state,
-          postalCode: businessAddress.postalCode,
-        },
-        userId: req.user.id,
-        req,
-      });
-      if (r.ok) geocoded = r.result;
-    }
-
     const registrationType = anchor.mapBusinessTypeToRegistration(businessType);
 
     // Persist BVN encrypted; backfill DOB/gender on User if missing.
@@ -497,11 +478,6 @@ router.post("/:id/virtual-account", async (req, res) => {
     if (cacNumber) {
       bizPatch.kycCacNumber = encrypt(normaliseCacNumber(cacNumber));
       bizPatch.kycCacHash   = cacHash;
-    }
-    if (geocoded) {
-      bizPatch.addressLat = geocoded.lat;
-      bizPatch.addressLng = geocoded.lng;
-      bizPatch.addressGeocodedAt = new Date();
     }
     if (industry) {
       bizPatch.industry = industry;

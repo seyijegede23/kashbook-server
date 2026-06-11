@@ -5,14 +5,12 @@
 //   • 2-tier cache (in-process LRU + KycCheckCache table)
 //   • Circuit-breaker per provider so a provider outage doesn't hammer them
 //   • Audit emission (KycCheckAttempt row + AuditLog row, every attempt)
-//   • Provider selection via registries in bvnProviders/, cacProviders/,
-//     addressProviders/.
+//   • Provider selection via registries in bvnProviders/, cacProviders/.
 //
 // Exports:
 //   runBvnCheck       — verify a BVN belongs to the typed name + DOB
 //   runCacCheck       — verify a CAC RC/BN exists and the user's business
 //                       name + at-least-one-director match
-//   runAddressCheck   — geocode an address (Phase D, opt-in via env)
 //   hashValue         — re-export of crypto.hmacValue for callers
 //   purgeStaleCache   — daily cron entry point
 //
@@ -27,14 +25,12 @@ const { hmacValue } = require("./crypto");
 const { audit } = require("./audit");
 const { getBvnProvider } = require("./bvnProviders");
 const { getCacProvider } = require("./cacProviders");
-const { getAddressProvider } = require("./addressProviders");
 const {
   fuzzyNameMatch,
   fuzzyBusinessNameMatch,
   isPlausibleBvn,
   isPlausibleCacNumber,
   normaliseCacNumber,
-  normaliseAddress,
 } = require("./kycMatch");
 
 // ── Tunables (env-overridable) ────────────────────────────────────────────────
@@ -496,63 +492,6 @@ async function runCacCheck({
   };
 }
 
-// ── Public: Address geocoding (observational, never blocks) ──────────────────
-
-async function runAddressCheck({ address, userId, req }) {
-  if (process.env.KYC_GEOCODING_ENABLED !== "true") {
-    return { ok: false, code: "DISABLED" };
-  }
-
-  const checkType = "address";
-  const valueHash = hmacValue(normaliseAddress(address));
-
-  const rl = await isRateLimited({ userId, checkType, valueHash });
-  if (rl.limited) {
-    // Address rate-limit doesn't block KYB; just log and skip.
-    return { ok: false, code: "RATE_LIMITED" };
-  }
-
-  let cached = await cacheGet({ checkType, valueHash });
-  const providerName = "google";
-
-  if (!cached) {
-    if (breakerIsOpen(checkType, providerName)) return { ok: false, code: "PROVIDER_UNAVAILABLE" };
-
-    const provider = getAddressProvider(providerName);
-    const r = await provider.geocodeAddress(address);
-
-    if (!r.ok && r.error === "PROVIDER_UNAVAILABLE") {
-      breakerRecord(checkType, providerName, false);
-      await recordAttempt({
-        userId, checkType, valueHash, result: "provider_unavailable",
-        provider: providerName, req,
-        errorMessage: r.message,
-      });
-      return { ok: false, code: "PROVIDER_UNAVAILABLE" };
-    }
-
-    if (!r.ok) {
-      await recordAttempt({
-        userId, checkType, valueHash, result: "geocode_failed",
-        provider: providerName, req,
-        errorMessage: r.message,
-      });
-      return { ok: false, code: "GEOCODE_FAILED" };
-    }
-
-    breakerRecord(checkType, providerName, true);
-    cached = r.details;
-    await cacheSet({ checkType, valueHash, provider: providerName, result: cached });
-  }
-
-  await recordAttempt({
-    userId, checkType, valueHash, result: "ok",
-    provider: providerName, cached: true, req,
-  });
-
-  return { ok: true, cached: true, result: cached, valueHash };
-}
-
 // ── Maintenance ───────────────────────────────────────────────────────────────
 
 // Daily cron entry point. Drops cache rows past TTL so we don't keep
@@ -584,7 +523,6 @@ function ymd(s) {
 module.exports = {
   runBvnCheck,
   runCacCheck,
-  runAddressCheck,
   purgeStaleCache,
   hashValue: hmacValue,
 };
