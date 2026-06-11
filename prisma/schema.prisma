@@ -103,6 +103,11 @@ model Business {
   bankAccountType      String          @default("SAVINGS")
   kycBvn               String?
   kycCacNumber         String?
+  // HMAC-SHA-256 fingerprints of the encrypted identifiers above. Searchable,
+  // irreversible — used for dedup ("has anyone else registered this BVN/CAC")
+  // and for the KycCheckCache lookup. See server/src/utils/crypto.js hmacValue().
+  kycBvnHash           String?  @db.VarChar(64)
+  kycCacHash           String?  @db.VarChar(64)
   kycBusinessType      String?  @default("sole_proprietor")
   cacCertificateUrl    String?
   description          String?
@@ -115,6 +120,12 @@ model Business {
   addressLine2         String?
   addressCity          String?
   addressPostalCode    String?
+  // Optional Phase D geocoding output. Populated when KYC_GEOCODING_ENABLED=true
+  // AND the address actually resolved. Missing geocode is NOT a hard gate;
+  // these are observational columns for future fraud/analytics work.
+  addressLat           Float?
+  addressLng           Float?
+  addressGeocodedAt    DateTime?
   directorAddressSame  Boolean  @default(true)
   directorAddressLine1 String?
   directorAddressState String?
@@ -137,6 +148,8 @@ model Business {
 
   @@index([userId])
   @@index([virtualAccountRef])
+  @@index([kycBvnHash])
+  @@index([kycCacHash])
 }
 
 model BusinessOfficer {
@@ -148,6 +161,10 @@ model BusinessOfficer {
   lastName          String
   middleName        String?
   bvn               String   // encrypted via utils/crypto.js — re-used as the ID value field; idType disambiguates
+  // HMAC-SHA-256 fingerprint of the encrypted bvn above. Searchable, irreversible.
+  // Used for officer-level BVN dedup ("this person is already a director of
+  // another KashBook business"). See server/src/utils/crypto.js hmacValue().
+  bvnHash           String?  @db.VarChar(64)
   idType            String   @default("BVN") // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   dateOfBirth       DateTime
   gender            String   // "Male" | "Female"
@@ -165,6 +182,49 @@ model BusinessOfficer {
   createdAt         DateTime @default(now())
 
   @@index([businessId])
+  @@index([bvnHash])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KYC pre-Anchor validation models. See server/src/utils/kycCheck.js.
+//
+// KycCheckAttempt   — append-only audit + rate-limit ledger. One row per
+//                     attempted check of any type (bvn / cac / address / …).
+// KycCheckCache     — successful Phase C / D responses, 24h TTL enforced in
+//                     code via a daily purge cron. No plaintext PII; the
+//                     result JSON is the provider's normalised response.
+// ─────────────────────────────────────────────────────────────────────────────
+model KycCheckAttempt {
+  id            String   @id @default(cuid())
+  userId        String
+  checkType     String   // "bvn" | "cac" | "address" | future: "nin" | …
+  // SHA-256/HMAC hash of the checked value. For "address" it's a hash of the
+  // normalised line1+city+state — lets us dedupe geocoding requests.
+  valueHash     String   @db.VarChar(64)
+  result        String   // see kycCheck.js for the full enum
+  provider      String?  // "dojah" | "google" | null for cheap-layer rejects
+  cached        Boolean  @default(false)
+  errorMessage  String?
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([checkType, valueHash, createdAt])
+}
+
+model KycCheckCache {
+  // Composite key: checkType + valueHash. Composite primary key so we don't
+  // accidentally collide hashes across check types.
+  checkType    String
+  valueHash    String   @db.VarChar(64)
+  provider     String
+  // Provider-specific normalised result. BVN: { firstName, lastName,
+  // dateOfBirth, gender, phone? }. CAC: { businessName, registrationNumber,
+  // status, directors[] }. Address: { lat, lng, formattedAddress, components }.
+  result       Json
+  cachedAt     DateTime @default(now())
+
+  @@id([checkType, valueHash])
+  @@index([cachedAt])
 }
 
 model CustomCategory {

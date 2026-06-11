@@ -152,6 +152,48 @@ router.patch("/users/:id/downgrade", async (req, res) => {
 });
 
 // GET /admin-api/revenue  (last 30 days, grouped by day)
+// POST /admin-api/users/:id/clear-kyc-attempts
+// Wipe the KycCheckAttempt rows that are blocking a user from re-submitting
+// their KYB. Used when a legitimate user got stuck on the rate-limit (e.g.
+// they typo'd their BVN three times). Append-only audit trail is preserved
+// because we also write a KYC_ATTEMPTS_CLEARED row with the count + admin
+// actor before deleting.
+router.post("/users/:id/clear-kyc-attempts", async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const u = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true },
+    });
+    if (!u) return res.status(404).json({ error: "User not found" });
+
+    // Only clear rate-limit-relevant rows (non-ok results). The "ok" rows
+    // stay so we keep the historical record of successful checks.
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const { count } = await prisma.kycCheckAttempt.deleteMany({
+      where: {
+        userId,
+        createdAt: { gt: since },
+        result: { notIn: ["ok"] },
+      },
+    });
+
+    await audit({
+      req,
+      action: "KYC_ATTEMPTS_CLEARED",
+      resourceType: "user",
+      resourceId: userId,
+      severity: "warn",
+      metadata: { cleared: count, userEmail: u.email },
+    });
+
+    res.json({ cleared: count });
+  } catch (err) {
+    console.error("[clear-kyc-attempts]", err);
+    res.status(500).json({ error: err.message || "Failed to clear KYC attempts" });
+  }
+});
+
 router.get("/revenue", async (req, res) => {
   try {
     const since = new Date();

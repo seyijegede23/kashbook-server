@@ -4,9 +4,21 @@ const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
 const cloudinary = require("../config/cloudinary");
 const anchor = require("../utils/anchor");
-const { encrypt } = require("../utils/crypto");
+const { encrypt, hmacValue } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
+const {
+  runBvnCheck,
+  runCacCheck,
+  runAddressCheck,
+} = require("../utils/kycCheck");
+const {
+  isValidNigerianState,
+  checkAdultDob,
+  checkRegistrationDate,
+  isPlausibleCacNumber,
+  normaliseCacNumber,
+} = require("../utils/kycMatch");
 
 router.use(auth);
 router.use(requireUnfrozen);
@@ -273,10 +285,11 @@ router.post("/:id/virtual-account", async (req, res) => {
       dateOfRegistration,      // YYYY-MM-DD (CAC registration / incorporation)
       businessAddress,         // { state, addressLine1, city, postalCode? }
       owners,                  // [{ firstName, lastName, bvn, dateOfBirth, gender, percentageOwned, email?, phoneNumber?, addressLine1?, addressCity?, addressState? }]
+      cacNumber,               // optional for sole prop; required for LTD
     } = req.body;
 
     if (!bvn || bvn.length !== 11) {
-      return res.status(400).json({ error: "A valid 11-digit BVN is required." });
+      return res.status(400).json({ error: "A valid 11-digit BVN is required.", code: "BVN_FORMAT_INVALID" });
     }
 
     const isLtd = businessType === "limited_company";
@@ -319,11 +332,177 @@ router.post("/:id/virtual-account", async (req, res) => {
       return res.status(400).json({ error: "Gender is required for KYC verification." });
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase A · Format & sanity (every field we collect, free, sync)
+    // ─────────────────────────────────────────────────────────────────────
+    const dobCheck = checkAdultDob(dob);
+    if (!dobCheck.ok) {
+      return res.status(400).json({
+        error: dobCheck.code === "DOB_TOO_YOUNG"
+          ? "You must be 18 or older to open a KashBook bank account."
+          : "The date of birth doesn't look valid. Please correct it.",
+        code: `BVN_${dobCheck.code}`,
+      });
+    }
+    if (dateOfRegistration) {
+      const regCheck = checkRegistrationDate(dateOfRegistration);
+      if (!regCheck.ok) {
+        return res.status(400).json({
+          error: regCheck.code === "REGDATE_FUTURE"
+            ? "The registration date can't be in the future."
+            : "The registration date doesn't look valid.",
+          code: regCheck.code,
+        });
+      }
+    }
+    if (businessAddress) {
+      if (businessAddress.state && !isValidNigerianState(businessAddress.state)) {
+        return res.status(400).json({
+          error: `"${businessAddress.state}" isn't a valid Nigerian state.`,
+          code: "ADDRESS_INVALID_STATE",
+        });
+      }
+      if (businessAddress.addressLine1 && businessAddress.addressLine1.trim().length < 5) {
+        return res.status(400).json({
+          error: "Address line 1 looks too short. Please enter a full street address.",
+          code: "ADDRESS_LINE1_TOO_SHORT",
+        });
+      }
+      if (businessAddress.city && businessAddress.city.trim().length < 2) {
+        return res.status(400).json({
+          error: "City is required.",
+          code: "ADDRESS_CITY_REQUIRED",
+        });
+      }
+      if (businessAddress.postalCode && !/^\d{6}$/.test(businessAddress.postalCode.trim())) {
+        return res.status(400).json({
+          error: "Postal code must be 6 digits (or leave it blank).",
+          code: "ADDRESS_POSTAL_INVALID",
+        });
+      }
+    }
+    // CAC number is required for LTD, optional for sole prop.
+    if (isLtd && !cacNumber) {
+      return res.status(400).json({
+        error: "A CAC RC number is required for limited companies.",
+        code: "CAC_REQUIRED",
+      });
+    }
+    if (cacNumber && !isPlausibleCacNumber(cacNumber)) {
+      return res.status(400).json({
+        error: "Enter a valid RC or BN number (4-8 digits, optional RC/BN prefix).",
+        code: "CAC_FORMAT_INVALID",
+      });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase B · Dedup. Reject if another business already verified this BVN
+    // or CAC. Same-user resubmissions are allowed (the business id check).
+    // ─────────────────────────────────────────────────────────────────────
+    const bvnHash = hmacValue(bvn);
+    const cacHash = cacNumber ? hmacValue(normaliseCacNumber(cacNumber)) : null;
+
+    if (bvnHash) {
+      const conflict = await prisma.business.findFirst({
+        where: { kycBvnHash: bvnHash, id: { not: biz.id } },
+        select: { id: true },
+      });
+      if (conflict) {
+        return res.status(400).json({
+          error: "This BVN is already linked to another KashBook account. If this is you, please log in to the original account.",
+          code: "BVN_ALREADY_VERIFIED",
+        });
+      }
+    }
+    if (cacHash) {
+      const conflict = await prisma.business.findFirst({
+        where: { kycCacHash: cacHash, id: { not: biz.id } },
+        select: { id: true },
+      });
+      if (conflict) {
+        return res.status(400).json({
+          error: "This RC/BN number is already registered to another KashBook business.",
+          code: "CAC_ALREADY_VERIFIED",
+        });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase C · Third-party identity match (Dojah). Soft on provider outage —
+    // we log a warn and let Anchor do the substantive verification.
+    // ─────────────────────────────────────────────────────────────────────
+    const directorFirstName = user.firstName;
+    const directorLastName  = user.lastName || user.firstName;
+
+    const bvnRes = await runBvnCheck({
+      bvn,
+      userId: req.user.id,
+      expectedFirstName: directorFirstName,
+      expectedLastName:  directorLastName,
+      expectedDateOfBirth: dob,
+      req,
+    });
+    if (!bvnRes.ok && bvnRes.code !== "PROVIDER_UNAVAILABLE" && bvnRes.code !== "PROVIDER_ERROR") {
+      return res.status(bvnRes.code === "BVN_RATE_LIMITED" ? 429 : 400).json({
+        error: bvnRes.message,
+        code: bvnRes.code,
+      });
+    }
+
+    if (cacNumber) {
+      const expectedDirectorNames = isLtd
+        ? [`${directorFirstName} ${directorLastName}`]
+        : []; // sole-prop CAC lookup confirms the business name, no director match
+      const cacRes = await runCacCheck({
+        cacNumber,
+        userId: req.user.id,
+        expectedBusinessName: biz.name,
+        expectedDirectorNames,
+        req,
+      });
+      if (!cacRes.ok && cacRes.code !== "PROVIDER_UNAVAILABLE" && cacRes.code !== "PROVIDER_ERROR") {
+        return res.status(cacRes.code === "CAC_RATE_LIMITED" ? 429 : 400).json({
+          error: cacRes.message,
+          code: cacRes.code,
+        });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase D · Address geocoding (opt-in, observational). Misses don't block.
+    // ─────────────────────────────────────────────────────────────────────
+    let geocoded = null;
+    if (businessAddress?.addressLine1 && businessAddress?.city) {
+      const r = await runAddressCheck({
+        address: {
+          line1:      businessAddress.addressLine1,
+          city:       businessAddress.city,
+          state:      businessAddress.state,
+          postalCode: businessAddress.postalCode,
+        },
+        userId: req.user.id,
+        req,
+      });
+      if (r.ok) geocoded = r.result;
+    }
+
     const registrationType = anchor.mapBusinessTypeToRegistration(businessType);
 
     // Persist BVN encrypted; backfill DOB/gender on User if missing.
     // Persist new KYB fields on Business so the picker selections survive a retry.
-    const bizPatch = { kycBvn: encrypt(bvn) };
+    const bizPatch = {
+      kycBvn: encrypt(bvn),
+      kycBvnHash: bvnHash,
+    };
+    if (cacNumber) {
+      bizPatch.kycCacNumber = encrypt(normaliseCacNumber(cacNumber));
+      bizPatch.kycCacHash   = cacHash;
+    }
+    if (geocoded) {
+      bizPatch.addressLat = geocoded.lat;
+      bizPatch.addressLng = geocoded.lng;
+      bizPatch.addressGeocodedAt = new Date();
+    }
     if (industry) {
       bizPatch.industry = industry;
       bizPatch.riskCategory = getRiskCategory(industry);
@@ -361,6 +540,7 @@ router.post("/:id/virtual-account", async (req, res) => {
             firstName: user.firstName,
             lastName: user.lastName || user.firstName,
             bvn: encrypt(bvn),
+            bvnHash: hmacValue(bvn),
             dateOfBirth: new Date(dob),
             gender: userGender,
             email: user.email,
@@ -375,6 +555,7 @@ router.post("/:id/virtual-account", async (req, res) => {
             lastName: o.lastName,
             middleName: o.middleName || null,
             bvn: encrypt(o.bvn),
+            bvnHash: hmacValue(o.bvn),
             dateOfBirth: new Date(o.dateOfBirth),
             gender: o.gender || "Male",
             email: o.email || null,

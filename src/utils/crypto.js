@@ -73,4 +73,21 @@ function mask(value) {
   return value[0] + "*".repeat(value.length - 2) + value[value.length - 1];
 }
 
-module.exports = { encrypt, decrypt, mask };
+// Deterministic HMAC-SHA-256 of a sensitive value, keyed by ENCRYPTION_KEY.
+// Used for searchable dedup indexes — e.g. Business.kycBvnHash — and as the
+// cache key for KYC check responses. Irreversible (one-way), so storing the
+// hash is safe even if our DB is exfiltrated.
+//
+// Returns a 64-character lowercase hex string. Pass the raw value (BVN, CAC
+// RC number, etc.) without any masking; whitespace is trimmed.
+function hmacValue(value) {
+  if (value == null || value === "") return null;
+  const normalised = String(value).trim();
+  if (!normalised) return null;
+  return crypto
+    .createHmac("sha256", getKey())
+    .update(normalised, "utf8")
+    .digest("hex");
+}
+
+module.exports = { encrypt, decrypt, mask, hmacValue };
