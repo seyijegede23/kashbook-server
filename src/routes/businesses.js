@@ -194,6 +194,10 @@ router.patch("/:id/branding", async (req, res) => {
 const balanceCache = new Map(); // businessId → { value, expires }
 const BALANCE_TTL_MS = 60 * 1000;
 router.get("/:id/balance", async (req, res) => {
+  // Staff record transactions but never see the money position.
+  if (req.user.accountType === "staff") {
+    return res.status(403).json({ error: "Balances are visible to the business owner only.", code: "STAFF_FORBIDDEN" });
+  }
   try {
     const biz = await prisma.business.findFirst({
       where: { id: req.params.id, userId: getTargetUserId(req) },

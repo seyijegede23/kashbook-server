@@ -429,13 +429,16 @@ router.post("/change-password", authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────
 router.patch("/profile", authMiddleware, async (req, res) => {
   const { firstName, lastName, businessName, phone, email, profileImage, dateOfBirth, gender } = req.body;
+  // Staff can update their own name/photo, but identity and business fields
+  // belong to the owner — strip them rather than failing the whole save.
+  const isStaff = req.user.accountType === "staff";
   try {
     const data = {};
     if (firstName)                 data.firstName    = firstName.trim();
     if (lastName)                  data.lastName     = lastName.trim();
-    if (businessName)              data.businessName = businessName.trim();
-    if (phone)                     data.phone        = phone.trim();
-    if (email)                     data.email        = email.trim().toLowerCase();
+    if (businessName && !isStaff)  data.businessName = businessName.trim();
+    if (phone && !isStaff)         data.phone        = phone.trim();
+    if (email && !isStaff)         data.email        = email.trim().toLowerCase();
     if (profileImage !== undefined) data.profileImage = profileImage;
     if (dateOfBirth !== undefined) {
       const dob = dateOfBirth ? new Date(dateOfBirth) : null;
@@ -544,6 +547,8 @@ router.post("/verify-password", authMiddleware, async (req, res) => {
 // Sends OTP to the new email address
 // ─────────────────────────────────────────────
 router.post("/request-email-change", authMiddleware, async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
   const { newEmail } = req.body;
   if (!newEmail?.includes("@")) return res.status(400).json({ error: "Valid email required" });
   const email = newEmail.trim().toLowerCase();
@@ -564,6 +569,8 @@ router.post("/request-email-change", authMiddleware, async (req, res) => {
 // Verifies OTP and updates the email
 // ─────────────────────────────────────────────
 router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
   const { newEmail, otpCode } = req.body;
   if (!newEmail?.includes("@") || !otpCode)
     return res.status(400).json({ error: "Email and verification code required" });
@@ -588,6 +595,8 @@ router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
 // Sends OTP SMS to the new phone number
 // ─────────────────────────────────────────────
 router.post("/request-phone-change", authMiddleware, async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
   const { newPhone } = req.body;
   if (!newPhone) return res.status(400).json({ error: "Phone number required" });
   const phone = newPhone.trim();
@@ -608,6 +617,8 @@ router.post("/request-phone-change", authMiddleware, async (req, res) => {
 // Verifies OTP and updates the phone number
 // ─────────────────────────────────────────────
 router.patch("/confirm-phone-change", authMiddleware, async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
   const { newPhone, otpCode } = req.body;
   if (!newPhone || !otpCode)
     return res.status(400).json({ error: "Phone and verification code required" });
