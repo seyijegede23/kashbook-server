@@ -340,6 +340,14 @@ router.patch("/push-token", authMiddleware, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: "token required" });
   try {
+    // A device token belongs to exactly ONE account — whoever logged in on
+    // the device last. Without this, every account ever used on a shared
+    // device keeps the token and a broadcast hits that device once per
+    // account (observed: one phone receiving 6 copies).
+    await prisma.user.updateMany({
+      where: { expoPushToken: token, NOT: { id: req.user.id } },
+      data: { expoPushToken: null },
+    });
     await prisma.user.update({ where: { id: req.user.id }, data: { expoPushToken: token } });
     res.json({ ok: true });
   } catch (err) {
