@@ -326,6 +326,7 @@
             ${safePlan}
           </span>
           ${u.role === 'ADMIN' ? '<span class="ml-1 px-2.5 py-0.5 rounded-full text-xs font-semibold badge-admin">ADMIN</span>' : ''}
+          ${u.accountStatus === 'frozen' ? '<span class="ml-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700">FROZEN</span>' : ''}
         </td>
         <td class="py-3 pr-4 text-gray-600">${Number(u.businessCount)}</td>
         <td class="py-3 pr-4 text-gray-500">${new Date(u.createdAt).toLocaleDateString()}</td>
@@ -343,6 +344,15 @@
             class="text-xs bg-indigo-100 hover:bg-indigo-200 text-indigo-700 font-semibold px-3 py-1.5 rounded-lg transition">
             Notify
           </button>
+          ${u.role !== 'ADMIN' ? (u.accountStatus === 'frozen'
+            ? `<button onclick="unfreezeUser('${safeId}', this)"
+                class="text-xs bg-emerald-100 hover:bg-emerald-200 text-emerald-700 font-semibold px-3 py-1.5 rounded-lg transition">
+                Unfreeze
+               </button>`
+            : `<button onclick="freezeUser('${safeId}', this)"
+                class="text-xs bg-red-100 hover:bg-red-200 text-red-700 font-semibold px-3 py-1.5 rounded-lg transition">
+                Freeze
+               </button>`) : ''}
         </td>
       `;
       tbody.appendChild(tr);
@@ -384,6 +394,48 @@
       btn.disabled = false;
       btn.textContent = "Downgrade";
       showError("Downgrade failed: " + err.message);
+    }
+  }
+
+  // Freeze blocks transfers and flags the account (AML §8). A reason is
+  // mandatory — it lands in complianceFreezeReason + the audit trail.
+  async function freezeUser(userId, btn) {
+    const reason = prompt("Freeze reason (required — goes to the audit trail):");
+    if (!reason || !reason.trim()) return;
+    btn.disabled = true;
+    btn.textContent = "…";
+    try {
+      await apiFetch(`/admin-api/users/${userId}/freeze`, {
+        method: "POST",
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+      const u = allUsers.find((x) => x.id === userId);
+      if (u) u.accountStatus = "frozen";
+      renderUsers(allUsers);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Freeze";
+      showError("Freeze failed: " + err.message);
+    }
+  }
+
+  async function unfreezeUser(userId, btn) {
+    const note = prompt("Unfreeze note (optional — for the audit trail):") || "";
+    if (!confirm("Restore this account to active? Transfers will be re-enabled immediately.")) return;
+    btn.disabled = true;
+    btn.textContent = "…";
+    try {
+      await apiFetch(`/admin-api/users/${userId}/unfreeze`, {
+        method: "POST",
+        body: JSON.stringify({ note: note.trim() }),
+      });
+      const u = allUsers.find((x) => x.id === userId);
+      if (u) u.accountStatus = "active";
+      renderUsers(allUsers);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "Unfreeze";
+      showError("Unfreeze failed: " + err.message);
     }
   }
 
