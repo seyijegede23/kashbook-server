@@ -364,6 +364,24 @@ router.post("/:id/virtual-account", async (req, res) => {
         code: "INDUSTRY_INVALID",
       });
     }
+    // Anchor requires the director's phone as exactly 11 local digits
+    // (0XXXXXXXXXX). A typo'd profile phone (registration only checks ≥6
+    // digits, and OTP may have gone to email) otherwise fails at Anchor with
+    // "phoneNumber size must be between 11 and 11".
+    if (user.phone && !anchor.isValidAnchorPhone(user.phone)) {
+      return res.status(400).json({
+        error: "Your profile phone number doesn't look like a valid Nigerian mobile number. Update it in Profile, then try again.",
+        code: "PHONE_INVALID",
+      });
+    }
+    for (const o of Array.isArray(owners) ? owners : []) {
+      if (o.phoneNumber && !anchor.isValidAnchorPhone(o.phoneNumber)) {
+        return res.status(400).json({
+          error: `${o.firstName || "A shareholder"}'s phone number doesn't look like a valid Nigerian mobile number.`,
+          code: "OWNER_PHONE_INVALID",
+        });
+      }
+    }
     if (businessAddress) {
       if (businessAddress.state && !isValidNigerianState(businessAddress.state)) {
         return res.status(400).json({

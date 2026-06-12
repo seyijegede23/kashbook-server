@@ -68,14 +68,24 @@ async function anchorFetch(path, { method = "GET", body } = {}) {
   return data;
 }
 
-// Anchor rejects phone numbers with "+" prefix — accept 234XXXXXXXXXX or
-// 0XXXXXXXXXX. Normalize to local 0XXXXXXXXXX.
+// Anchor wants exactly 11 numeric digits in local format (0XXXXXXXXXX) — it
+// rejects "+" prefixes and any other length with "phoneNumber size must be
+// between 11 and 11". Normalize the common shapes; anything else passes
+// through unchanged so the Phase A validator can reject it with a clear
+// error instead of Anchor's.
 function normalizePhoneForAnchor(phone) {
   if (!phone) return "";
   const digits = String(phone).replace(/\D/g, "");
   if (digits.startsWith("234") && digits.length === 13) return "0" + digits.slice(3);
+  // "+2340801…" — user kept the leading 0 after the country code.
+  if (digits.startsWith("2340") && digits.length === 14) return digits.slice(3);
   if (digits.length === 10) return "0" + digits;
   return digits;
+}
+
+// True when a phone normalizes to a valid NG mobile (11 digits, 0 + 10).
+function isValidAnchorPhone(phone) {
+  return /^0\d{10}$/.test(normalizePhoneForAnchor(phone));
 }
 
 // ─── Business Customer creation ──────────────────────────────────────────────
@@ -651,6 +661,7 @@ async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, 
 module.exports = {
   createBusinessCustomer,
   mapBusinessTypeToRegistration,
+  isValidAnchorPhone,
   searchCustomer,
   triggerKYB,
   createDepositAccount,
