@@ -389,6 +389,11 @@ model Transaction {
   currency             String    @default("NGN")   // base currency at time of record; per-business default
   flagSeverity         String?    // null | "low" | "medium" | "high"
   complianceStatus     String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
+  // Outbound-transfer fee charged to the user (₦51/₦101 pass-through + margin).
+  // `amount` stays the transfer amount so income/expense reports are truthful;
+  // the fee is its own field. Zero for everything that isn't an external transfer.
+  fee                  Float     @default(0)
+  feeBreakdown         Json?     // { nip, stampDuty, platform }
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 

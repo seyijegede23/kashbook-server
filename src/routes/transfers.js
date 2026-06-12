@@ -8,6 +8,7 @@ const { runPreTransferChecks } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
+const { computeTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
 const {
   STEP_UP_OTP_ABOVE,
   TRANSFER_OTP_TYPE,
@@ -178,10 +179,51 @@ router.get("/limits", async (req, res) => {
       singleFlagAbove: thresholds.singleFlagAbove,
 
       hasBankingAccount: !!biz.virtualAccountNumber,
+
+      // Fee schedule for the limits sheet. Per-transfer quotes come from
+      // GET /transfers/fee-quote; this is just display copy material.
+      feeSchedule: {
+        nip: NIP_FEE,
+        stampDuty: STAMP_DUTY,
+        stampDutyThreshold: STAMP_DUTY_THRESHOLD,
+        platform: PLATFORM_MARGIN,
+      },
     });
   } catch (err) {
     console.error("[transfers/limits]", err);
     res.status(500).json({ error: err.message || "Failed to fetch transfer limits" });
+  }
+});
+
+// GET /transfers/fee-quote?amount=<n>&accountNumber=<10-digit>
+// Returns the fee the user will pay for this transfer, detected the same way
+// executeTransfer routes it: a KashBook-internal destination is a free book
+// transfer; anything else is NIP (₦51 / ₦101 above ₦10,000). Server is
+// authoritative — the client never computes fees itself.
+router.get("/fee-quote", async (req, res) => {
+  try {
+    const amount = Number(req.query.amount);
+    const accountNumber = String(req.query.accountNumber || "").trim();
+    if (!amount || amount <= 0)
+      return res.status(400).json({ error: "amount required" });
+
+    let route = "nip";
+    if (/^\d{10}$/.test(accountNumber)) {
+      const internalDest = await prisma.business.findFirst({
+        where: {
+          virtualAccountNumber: accountNumber,
+          anchorAccountId: { not: null },
+        },
+        select: { id: true },
+      });
+      if (internalDest) route = "book";
+    }
+
+    const { total, breakdown } = computeTransferFee(amount, route);
+    res.json({ fee: total, breakdown, route, total: amount + total });
+  } catch (err) {
+    console.error("[transfers/fee-quote]", err);
+    res.status(500).json({ error: "Failed to quote fee" });
   }
 });
 
