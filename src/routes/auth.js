@@ -1,6 +1,5 @@
 const router  = require("express").Router();
 const bcrypt  = require("bcryptjs");
-const { OAuth2Client } = require("google-auth-library");
 const { body, validationResult } = require("express-validator");
 
 const prisma         = require("../utils/db");
@@ -9,8 +8,6 @@ const { signToken }  = require("../utils/jwt");
 const { dispatchOtp, verifyOtp } = require("../utils/otp");
 const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
-
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // ── Helper: safe user response ────────────────────────────────────────────────
 function userResponse(user, token) {
@@ -143,7 +140,16 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
       where: isEmailLike ? { email: identifier.trim().toLowerCase() } : { phone: normalizePhone(identifier) },
     });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
-    if (!user.password) return res.status(401).json({ error: "This account uses Google sign-in" });
+    if (!user.password) {
+      // Legacy users who signed up via Google/Apple before social sign-in
+      // was removed don't have a password. Steer them to the OTP-based
+      // password-set flow rather than locking them out.
+      return res.status(401).json({
+        code: "PASSWORD_NOT_SET",
+        error: "Reset your password to continue using this account",
+        identifier: isEmailLike ? user.email : user.phone,
+      });
+    }
 
     // ── Account lockout check ────────────────────────────────────────────
     if (user.lockedUntil && user.lockedUntil > new Date()) {
@@ -192,89 +198,6 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Login failed" });
-  }
-});
-
-// ─────────────────────────────────────────────
-// POST /auth/google
-// ─────────────────────────────────────────────
-router.post("/google", async (req, res) => {
-  const { idToken } = req.body;
-  if (!idToken) return res.status(400).json({ error: "idToken required" });
-  try {
-    const ticket = await googleClient.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
-    const { sub: googleId, email, name, picture } = ticket.getPayload();
-    const { firstName, lastName } = splitName(name);
-
-    let user = await prisma.user.findFirst({ where: { OR: [{ googleId }, { email }] } });
-    if (user) {
-      if (!user.googleId) user = await prisma.user.update({ where: { id: user.id }, data: { googleId } });
-    } else {
-      user = await prisma.user.create({
-        data: { firstName, lastName, businessName: "My Business", email, googleId, avatarUrl: picture },
-      });
-    }
-    await ensurePrimaryBusiness(user.id, user.businessName || "My Business");
-    const token = signToken({ userId: user.id });
-    res.json(userResponse(user, token));
-  } catch (err) {
-    console.error(err);
-    res.status(401).json({ error: "Google token verification failed" });
-  }
-});
-
-// ─────────────────────────────────────────────
-// POST /auth/apple
-// body: { idToken, firstName?, lastName? }
-//   - idToken: the JWT returned by expo-apple-authentication / native Sign In with Apple
-//   - firstName/lastName: Apple only includes the user's name on FIRST sign-in.
-//     Client should pass them through if the SDK returned them.
-// ─────────────────────────────────────────────
-const appleSignin = require("apple-signin-auth");
-router.post("/apple", async (req, res) => {
-  const { idToken, firstName: clientFirstName, lastName: clientLastName } = req.body;
-  if (!idToken) return res.status(400).json({ error: "idToken required" });
-  try {
-    const claims = await appleSignin.verifyIdToken(idToken, {
-      // The "audience" must match the Bundle ID (iOS) or Service ID (web)
-      // registered with Apple. We accept both env vars to allow either.
-      audience: process.env.APPLE_CLIENT_ID || process.env.APPLE_BUNDLE_ID,
-      ignoreExpiration: false,
-    });
-    const appleId = claims.sub;
-    const email = claims.email || null;
-
-    let user = await prisma.user.findFirst({
-      where: {
-        OR: [{ appleId }, email ? { email } : { id: "__never__" }],
-      },
-    });
-    if (user) {
-      if (!user.appleId) {
-        user = await prisma.user.update({
-          where: { id: user.id },
-          data: { appleId },
-        });
-      }
-    } else {
-      const firstName = (clientFirstName || "").trim() || "Apple";
-      const lastName = (clientLastName || "").trim() || "User";
-      user = await prisma.user.create({
-        data: {
-          firstName,
-          lastName,
-          businessName: "My Business",
-          email,
-          appleId,
-        },
-      });
-    }
-    await ensurePrimaryBusiness(user.id, user.businessName || "My Business");
-    const token = signToken({ userId: user.id });
-    res.json(userResponse(user, token));
-  } catch (err) {
-    console.error("[apple sign-in]", err.message || err);
-    res.status(401).json({ error: "Apple token verification failed" });
   }
 });
 
@@ -477,7 +400,12 @@ router.post("/change-password", authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (!user.password) return res.status(400).json({ error: "This account uses Google sign-in and has no password" });
+    if (!user.password) {
+      return res.status(400).json({
+        code: "PASSWORD_NOT_SET",
+        error: "No password is set on this account. Use the forgot-password flow to set one.",
+      });
+    }
     const match = await bcrypt.compare(currentPassword, user.password);
     if (!match) return res.status(401).json({ error: "Current password is incorrect" });
     await prisma.user.update({ where: { id: req.user.id }, data: { password: await bcrypt.hash(newPassword, 12) } });

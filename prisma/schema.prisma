@@ -19,8 +19,6 @@ model User {
   accountType          AccountType    @default(OWNER)
   employerId           String?
   profileImage         String?        @db.Text
-  googleId             String?        @unique
-  appleId              String?        @unique
   avatarUrl            String?
   expoPushToken        String?
   country              String         @default("NG")  // ISO 3166-1 alpha-2 — drives currency, language, calling code, KYC, AML
