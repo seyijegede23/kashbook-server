@@ -3,6 +3,7 @@ const auth = require("../middleware/auth");
 const adminAuth = require("../middleware/adminAuth");
 const prisma = require("../utils/db");
 const { audit } = require("../utils/audit");
+const { pushTo } = require("../utils/pushNotification");
 
 router.use(auth, adminAuth);
 
@@ -232,7 +233,10 @@ router.get("/revenue", async (req, res) => {
   }
 });
 
-// POST /admin-api/notify  — saves in-app notification for all users (or one user)
+// POST /admin-api/notify — in-app notification + device push for all users
+// (or one user). pushTo() writes the AppNotification row AND sends the Expo
+// push when the user has a registered token and notifications enabled —
+// users without a token still get the in-app entry.
 router.post("/notify", async (req, res) => {
   const { userId, title, body } = req.body;
   if (!title || !body) {
@@ -241,16 +245,19 @@ router.post("/notify", async (req, res) => {
 
   try {
     if (userId) {
-      // Single user
-      await prisma.appNotification.create({ data: { userId, title, body } });
+      await pushTo(userId, title, body);
       return res.json({ saved: 1 });
     }
 
-    // Broadcast: get all user IDs and create a notification for each
+    // Broadcast — chunked so a large user base doesn't fire thousands of
+    // concurrent Expo calls at once.
     const users = await prisma.user.findMany({ select: { id: true } });
-    await prisma.appNotification.createMany({
-      data: users.map((u) => ({ userId: u.id, title, body })),
-    });
+    const CHUNK = 20;
+    for (let i = 0; i < users.length; i += CHUNK) {
+      await Promise.allSettled(
+        users.slice(i, i + CHUNK).map((u) => pushTo(u.id, title, body)),
+      );
+    }
     res.json({ saved: users.length });
   } catch (err) {
     console.error("POST /admin/notify error:", err.message);
