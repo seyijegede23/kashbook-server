@@ -177,24 +177,53 @@ async function executeTransfer({
     ? `${narration} — to ${recipientLabel} · Ref: ${ref}`
     : `Transfer to ${recipientLabel} · Ref: ${ref}`;
 
-  const txn = await prisma.transaction.create({
-    data: {
-      businessId: business.id,
-      userId,
-      type: "expense",
-      amount: Number(amount),
-      description,
-      category: "transfer",
-      paymentMethod: "bank",
-      date: new Date(),
-      source: "anchor",
-      currency: business.baseCurrency || "NGN",
-      flagSeverity: amlCheck.maxSeverity || null,
-      complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
-      fee,
-      feeBreakdown: feeBreakdown || undefined,
-    },
-  });
+  // From here on the money has ALREADY MOVED at Anchor. A bookkeeping
+  // failure (DB outage, schema drift, …) must not bubble up as a transfer
+  // failure — the client would tell the user it failed and invite a retry,
+  // double-sending. Log at alert severity and return success instead; the
+  // missing row is reconciled manually from Anchor's ledger.
+  let txn;
+  try {
+    txn = await prisma.transaction.create({
+      data: {
+        businessId: business.id,
+        userId,
+        type: "expense",
+        amount: Number(amount),
+        description,
+        category: "transfer",
+        paymentMethod: "bank",
+        date: new Date(),
+        source: "anchor",
+        currency: business.baseCurrency || "NGN",
+        flagSeverity: amlCheck.maxSeverity || null,
+        complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
+        fee,
+        feeBreakdown: feeBreakdown || undefined,
+      },
+    });
+  } catch (bookErr) {
+    console.error(
+      `[executeTransfer] BOOKKEEPING FAILED after money moved (ref ${ref}, ₦${amount}):`,
+      bookErr.message,
+    );
+    await audit({
+      req,
+      action: "TRANSFER_BOOKKEEPING_FAILED",
+      resourceType: "business",
+      resourceId: business.id,
+      severity: "alert",
+      metadata: { reference: ref, amount: Number(amount), fee, route, accountNumber, error: bookErr.message },
+    }).catch(() => {});
+    if (notify) {
+      await pushTo(
+        userId,
+        "Transfer Sent ✅",
+        `${formatAmountForBusiness(business, amount)} → ${resolvedName} (Ref: ${ref.slice(-8)})`,
+      ).catch(() => {});
+    }
+    return { reference: ref, route, transactionId: null, transaction: null, fee, bookkeepingFailed: true };
+  }
 
   // 5. ComplianceFlag rows (CTR auto-flag + any rule hits).
   await recordComplianceFlags({

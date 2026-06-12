@@ -297,6 +297,20 @@ async function runPreTransferChecks({ req, user, business, amount, otp, bypassOt
       severity: "alert",
       metadata: { amount, flags: flags.map((f) => f.ruleCode) },
     });
+    // Persist the flags NOW — no Transaction row will ever exist for a held
+    // transfer (it stops before Anchor), but the compliance team must see it
+    // in the admin queue. transactionId stays null; status defaults "open".
+    await recordComplianceFlags({
+      userId: user.id,
+      businessId: business.id,
+      business,
+      transactionId: null,
+      amount,
+      flags: flags.map((f) => ({
+        ...f,
+        metadata: { ...(f.metadata || {}), heldTransfer: true, amount },
+      })),
+    }).catch((e) => console.error("[amlChecks] failed to persist held-transfer flags:", e.message));
     return {
       ok: false,
       status: 423,
