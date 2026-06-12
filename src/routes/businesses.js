@@ -18,6 +18,7 @@ const {
   isPlausibleCacNumber,
   normaliseCacNumber,
 } = require("../utils/kycMatch");
+const { isValidAnchorIndustry } = require("../data/anchorIndustries");
 
 router.use(auth);
 router.use(requireUnfrozen);
@@ -353,6 +354,15 @@ router.post("/:id/virtual-account", async (req, res) => {
           code: regCheck.code,
         });
       }
+    }
+    // Industry must be a known Anchor enum value. Anchor deserializes an
+    // unknown string to null and 400s with "industry must not be null",
+    // which costs a KYB attempt — catch it here instead.
+    if (industry && !isValidAnchorIndustry(industry)) {
+      return res.status(400).json({
+        error: "Pick an industry from the list — the one selected isn't recognised.",
+        code: "INDUSTRY_INVALID",
+      });
     }
     if (businessAddress) {
       if (businessAddress.state && !isValidNigerianState(businessAddress.state)) {

@@ -11,15 +11,25 @@
 const { getCountryConfig } = require("./countries");
 
 // Per-industry risk classification (universal — Anchor's industry enum is
-// used across all countries today).
+// used across all countries today). Canonical values carry Anchor's category
+// prefix ("Gaming_Betting"); the bare legacy spellings stay listed because
+// businesses onboarded before June 2026 stored them un-prefixed.
 const HIGH_RISK_INDUSTRIES = new Set([
+  "Gaming_Betting", "Gaming_Lotteries", "Gaming_PredictionServices",
+  "FinancialServices_Lending", "FinancialServices_Investments",
+  "FinancialServices_AgriculturalInvestments", "FinancialServices_Remittances",
+  "FinancialServices_MobileWallets", "FinancialServices_BillPayments",
+  // legacy un-prefixed values (pre-June-2026 rows)
   "Betting", "Lotteries", "PredictionServices",
   "Lending", "Investments", "AgriculturalInvestments",
   "Remittances", "MobileWallets", "BillPayments",
 ]);
 
 const ELEVATED_RISK_INDUSTRIES = new Set([
-  "RealEstate", "Construction", "Automobiles",
+  "RealEstate", "Commerce_RealEstate", "Construction",
+  "Commerce_Automobiles",
+  // legacy un-prefixed value (pre-June-2026 rows)
+  "Automobiles",
 ]);
 
 const RISK_MULTIPLIER = {
