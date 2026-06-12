@@ -502,7 +502,7 @@
           </div>
           <div class="text-right">
             <p class="text-sm font-semibold ${isIncome ? 'text-emerald-600' : 'text-red-500'}">
-              ${isIncome ? '+' : '-'}${formatMoney(t.amount)}
+              ${isIncome ? '+' : '-'}${formatMoney(t.amount, t.currency)}
             </p>
             <p class="text-xs text-gray-400">${new Date(t.date).toLocaleDateString()}</p>
           </div>
@@ -533,7 +533,7 @@
       flags.forEach((f) => {
         const c = sevColor[f.severity] || "gray";
         const userName = f.user ? esc(`${f.user.firstName || ""} ${f.user.lastName || ""}`.trim() || f.user.email) : "—";
-        const txAmount = f.transaction ? formatMoney(f.transaction.amount) : "";
+        const txAmount = f.transaction ? formatMoney(f.transaction.amount, f.transaction.currency) : "";
         const card = document.createElement("div");
         card.className = `border border-${c}-200 bg-${c}-50/40 rounded-xl p-4`;
         card.innerHTML = `
@@ -628,10 +628,18 @@
   document.getElementById("refreshAuditBtn")?.addEventListener("click", loadAudit);
 
   // ── Helpers ───────────────────────────────────────────────────────────
-  function formatMoney(n) {
-    if (n >= 1_000_000) return "$" + (n / 1_000_000).toFixed(1) + "M";
-    if (n >= 1_000)     return "$" + (n / 1_000).toFixed(1) + "K";
-    return "$" + Number(n || 0).toFixed(2);
+  // ISO 4217 → display symbol for the markets KashBook serves. Anything
+  // unmapped falls back to "CODE " (e.g. "XOF 5.0K") rather than a wrong
+  // symbol. Default NGN — the platform's home market.
+  const CURRENCY_SYMBOLS = {
+    NGN: "₦", USD: "$", KES: "KSh ", GHS: "GH₵", ZAR: "R",
+    EGP: "E£", GBP: "£", EUR: "€",
+  };
+  function formatMoney(n, currency = "NGN") {
+    const sym = CURRENCY_SYMBOLS[currency] ?? `${currency} `;
+    if (n >= 1_000_000) return sym + (n / 1_000_000).toFixed(1) + "M";
+    if (n >= 1_000)     return sym + (n / 1_000).toFixed(1) + "K";
+    return sym + Number(n || 0).toFixed(2);
   }
 
   function esc(str) {

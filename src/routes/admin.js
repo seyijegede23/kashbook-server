@@ -83,6 +83,7 @@ router.get("/activity", async (req, res) => {
         id: true,
         type: true,
         amount: true,
+        currency: true,
         description: true,
         date: true,
         business: { select: { name: true } },
@@ -95,6 +96,7 @@ router.get("/activity", async (req, res) => {
         id: t.id,
         type: t.type,
         amount: t.amount,
+        currency: t.currency,
         description: t.description,
         date: t.date,
         businessName: t.business?.name || "—",
@@ -289,7 +291,7 @@ router.get("/compliance/flags", async (req, res) => {
           f.transactionId
             ? prisma.transaction.findUnique({
                 where: { id: f.transactionId },
-                select: { id: true, amount: true, type: true, description: true, date: true, complianceStatus: true },
+                select: { id: true, amount: true, currency: true, type: true, description: true, date: true, complianceStatus: true },
               })
             : null,
         ]);
