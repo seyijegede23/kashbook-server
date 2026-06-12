@@ -137,11 +137,31 @@ model Business {
   invoices          Invoice[]
   recurringExpenses RecurringExpense[]
   officers          BusinessOfficer[]
+  beneficiaries     Beneficiary[]
 
   @@index([userId])
   @@index([virtualAccountRef])
   @@index([kycBvnHash])
   @@index([kycCacHash])
+}
+
+// Saved transfer recipients — powers the "Recents" chips on Send Money so a
+// repeat transfer starts from one tap instead of bank-search + 10 digits.
+// Upserted on every successful outbound transfer.
+model Beneficiary {
+  id            String   @id @default(uuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  accountNumber String
+  bankCode      String
+  bankName      String?
+  accountName   String?
+  timesUsed     Int      @default(1)
+  lastUsedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@unique([businessId, accountNumber, bankCode])
+  @@index([businessId, lastUsedAt])
 }
 
 model BusinessOfficer {

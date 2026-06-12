@@ -648,19 +648,47 @@ router.get("/staff", authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────
 router.post("/staff", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff") return res.status(403).json({ error: "Forbidden: Staff cannot create staff" });
-  if (req.user.plan !== "PREMIUM") return res.status(403).json({ error: "Staff accounts require a Pro plan. Upgrade to add team members." });
-  const { firstName, lastName, phone, password } = req.body;
-  if (!firstName || !phone || !password) return res.status(400).json({ error: "First Name, Phone, and Password required" });
-  const ph = normalizePhone(phone);
+  // PAYWALL DISABLED — the client treats every account as Pro while the
+  // paywall is off (AppContext isPro is forced true), so the server gate
+  // silently 403'd FREE-plan owners. Re-enable together with the paywall.
+  // if (req.user.plan !== "PREMIUM") return res.status(403).json({ error: "Staff accounts require a Pro plan. Upgrade to add team members." });
+
+  // Staff sign in with an identifier — phone OR email works for /auth/login,
+  // so either is enough here. The client form offers both.
+  const { firstName, lastName, phone, email, password } = req.body;
+  if (!firstName || !password || (!phone && !email)) {
+    return res.status(400).json({ error: "First name, password, and a phone number or email are required" });
+  }
+  const ph = phone ? normalizePhone(phone) : null;
+  const em = email ? String(email).trim().toLowerCase() : null;
+  if (em && !/\S+@\S+\.\S+/.test(em)) {
+    return res.status(400).json({ error: "Enter a valid email address" });
+  }
   try {
-    const exists = await prisma.user.findUnique({ where: { phone: ph } });
-    if (exists) return res.status(409).json({ error: "An account with this phone number already exists" });
+    if (ph) {
+      const exists = await prisma.user.findUnique({ where: { phone: ph } });
+      if (exists) return res.status(409).json({ error: "An account with this phone number already exists" });
+    }
+    if (em) {
+      const exists = await prisma.user.findUnique({ where: { email: em } });
+      if (exists) return res.status(409).json({ error: "An account with this email already exists" });
+    }
     const owner = await prisma.user.findUnique({ where: { id: req.user.id } });
     const newStaff = await prisma.user.create({
-      data: { firstName: firstName.trim(), lastName: lastName?.trim() || "", businessName: owner.businessName,
-        phone: ph, password: await bcrypt.hash(password, 12), accountType: "STAFF", employerId: req.user.id },
+      data: {
+        firstName: firstName.trim(),
+        lastName: lastName?.trim() || "",
+        businessName: owner.businessName,
+        phone: ph,
+        email: em,
+        password: await bcrypt.hash(password, 12),
+        accountType: "STAFF",
+        employerId: req.user.id,
+      },
     });
-    res.status(201).json(newStaff);
+    // Never return the password hash to the client.
+    const { password: _pw, ...safe } = newStaff;
+    res.status(201).json(safe);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to create staff account" });

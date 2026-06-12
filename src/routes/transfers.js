@@ -195,6 +195,33 @@ router.get("/limits", async (req, res) => {
   }
 });
 
+// GET /transfers/beneficiaries?businessId=<id>
+// Top recent transfer recipients for the Send Money "Recents" chips.
+router.get("/beneficiaries", async (req, res) => {
+  try {
+    const { businessId } = req.query;
+    if (!businessId) return res.status(400).json({ error: "businessId required" });
+    const userId =
+      req.user.accountType === "staff" ? req.user.employerId : req.user.id;
+    const biz = await prisma.business.findFirst({ where: { id: businessId, userId } });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const beneficiaries = await prisma.beneficiary.findMany({
+      where: { businessId },
+      orderBy: { lastUsedAt: "desc" },
+      take: 5,
+      select: {
+        id: true, accountNumber: true, bankCode: true,
+        bankName: true, accountName: true, timesUsed: true,
+      },
+    });
+    res.json(beneficiaries);
+  } catch (err) {
+    console.error("[transfers/beneficiaries]", err);
+    res.status(500).json({ error: "Failed to fetch beneficiaries" });
+  }
+});
+
 // GET /transfers/fee-quote?amount=<n>&accountNumber=<10-digit>
 // Returns the fee the user will pay for this transfer, detected the same way
 // executeTransfer routes it: a KashBook-internal destination is a free book
@@ -322,7 +349,7 @@ router.post("/send", async (req, res) => {
     }
 
     // Hand off to the shared executor — same code path the cron uses.
-    const { reference, route } = await executeTransfer({
+    const { reference, route, fee } = await executeTransfer({
       business: biz,
       userId: req.user.id,
       amount: Number(amount),
@@ -336,7 +363,34 @@ router.post("/send", async (req, res) => {
       notify: false, // route doesn't push — client UI shows the success state itself
     });
 
-    res.json({ status: "success", reference, route });
+    // Remember the recipient — powers the Send Money "Recents" chips.
+    // Best-effort: a failed upsert must never fail a successful transfer.
+    prisma.beneficiary
+      .upsert({
+        where: {
+          businessId_accountNumber_bankCode: {
+            businessId: biz.id,
+            accountNumber,
+            bankCode,
+          },
+        },
+        create: {
+          businessId: biz.id,
+          accountNumber,
+          bankCode,
+          bankName: bankName || null,
+          accountName: accountName || null,
+        },
+        update: {
+          lastUsedAt: new Date(),
+          timesUsed: { increment: 1 },
+          ...(accountName ? { accountName } : {}),
+          ...(bankName ? { bankName } : {}),
+        },
+      })
+      .catch((e) => console.warn("[transfers] beneficiary upsert failed:", e.message));
+
+    res.json({ status: "success", reference, route, fee });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
