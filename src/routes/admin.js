@@ -233,6 +233,26 @@ router.get("/revenue", async (req, res) => {
   }
 });
 
+// POST /admin-api/run-daily-report — manually trigger the 8pm daily business
+// report (testing / re-send after an outage). Same code path as the cron.
+router.post("/run-daily-report", async (req, res) => {
+  try {
+    const result = await require("../utils/dailyReport").sendDailyReports();
+    await audit({
+      req,
+      action: "ADMIN_DAILY_REPORT_TRIGGERED",
+      resourceType: "system",
+      resourceId: "daily-report",
+      severity: "info",
+      metadata: result,
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("[admin/run-daily-report]", err);
+    res.status(500).json({ error: "Failed to run daily report" });
+  }
+});
+
 // POST /admin-api/notify — in-app notification + device push for all users
 // (or one user). pushTo() writes the AppNotification row AND sends the Expo
 // push when the user has a registered token and notifications enabled —

@@ -227,6 +227,21 @@ app.listen(PORT, () => console.log(`KashBook API running on port ${PORT}`));
 // rate limit.
 require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 
+// ── Background cron: daily business report at 8pm Lagos time ─────────────────
+// Summary of today's money in/out per user, or a nudge if nothing was
+// recorded. node-cron handles the timezone; WAT has no DST.
+cron.schedule(
+  "0 20 * * *",
+  async () => {
+    try {
+      await require("./src/utils/dailyReport").sendDailyReports();
+    } catch (err) {
+      console.error("[cron dailyReport]", err.message);
+    }
+  },
+  { timezone: "Africa/Lagos" },
+);
+
 // ── Background cron: low stock push notifications (every hour) ───────────────
 cron.schedule("0 * * * *", async () => {
   try {
