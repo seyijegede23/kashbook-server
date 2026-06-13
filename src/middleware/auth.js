@@ -32,17 +32,16 @@ async function authMiddleware(req, res, next) {
       effectivePlan = employer?.plan ?? "FREE";
     }
 
-    // PAYWALL DISABLED — every user is treated as PREMIUM regardless of their
-    // actual plan. Revert this block (use `user.plan ?? "FREE"` and the real
-    // `effectivePlan` above) to re-enable the paywall.
+    // `plan` is this user's own plan; `effectivePlan` is what gates features
+    // (staff inherit their employer's plan, resolved above).
     req.user = {
       id:            user.id,
       accountType:   user.accountType.toLowerCase(),
       employerId:    user.employerId ?? null,
       name:          `${user.firstName} ${user.lastName}`.trim(),
       role:          user.role,
-      plan:          "PREMIUM",
-      effectivePlan: "PREMIUM",
+      plan:          user.plan ?? "FREE",
+      effectivePlan,
       accountStatus: user.accountStatus || "active",
       complianceFreezeReason: user.complianceFreezeReason || null,
     };

@@ -659,10 +659,7 @@ router.get("/staff", authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────
 router.post("/staff", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff") return res.status(403).json({ error: "Forbidden: Staff cannot create staff" });
-  // PAYWALL DISABLED — the client treats every account as Pro while the
-  // paywall is off (AppContext isPro is forced true), so the server gate
-  // silently 403'd FREE-plan owners. Re-enable together with the paywall.
-  // if (req.user.plan !== "PREMIUM") return res.status(403).json({ error: "Staff accounts require a Pro plan. Upgrade to add team members." });
+  if (req.user.plan !== "PREMIUM") return res.status(403).json({ error: "Staff accounts require a Pro plan. Upgrade to add team members.", code: "PRO_REQUIRED" });
 
   // Staff sign in with an identifier — phone OR email works for /auth/login,
   // so either is enough here. The client form offers both.
