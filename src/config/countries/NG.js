@@ -8,6 +8,7 @@ module.exports = {
 
   callingCode: "234",
   currency: { code: "NGN", symbol: "₦", locale: "en-NG", subunit: 100 },
+  vat: { rate: 7.5, label: "VAT" },
   language: "en",
   timezone: "Africa/Lagos",
 

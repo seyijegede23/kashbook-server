@@ -122,6 +122,12 @@ model Business {
   directorAddressLine1 String?
   directorAddressState String?
   directorAddressCity  String?
+  // VAT summary settings. Off by default (most micro-traders aren't VAT-
+  // registered). vatRate null → country default. vatInclusive: are recorded
+  // amounts treated as VAT-inclusive (true, NG default) or exclusive.
+  vatEnabled           Boolean         @default(false)
+  vatRate              Float?
+  vatInclusive         Boolean         @default(true)
   createdAt            DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 

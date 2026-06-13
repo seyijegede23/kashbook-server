@@ -21,6 +21,7 @@ const adminRoutes = require("./src/routes/admin");
 const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
 const transferRoutes = require("./src/routes/transfers");
+const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
 
@@ -179,6 +180,7 @@ app.use("/reminders", apiLimiter);
 app.use("/invoices", apiLimiter);
 app.use("/notifications", apiLimiter);
 app.use("/transfers", apiLimiter);
+app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
 app.use("/sync", apiLimiter);
 app.use("/admin-api", authLimiter);
@@ -196,6 +198,7 @@ app.use("/invoices", invoiceRoutes);
 app.use("/admin-api", adminRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/transfers", transferRoutes);
+app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/sync", syncRoutes);
 

@@ -36,6 +36,26 @@ function computeTransferFee(amount, route) {
   };
 }
 
+// ─── Bill-payment fees ──────────────────────────────────────────────────────
+// Airtime/data are sold at face value (₦0 user fee) — KashBook earns Anchor's
+// biller commission, and a zero markup is what keeps it competitive. A small
+// convenience fee on electricity/cable is OPT-IN (off by default): flip
+// BILL_CONVENIENCE_FEE > 0 to enable. Same { total, breakdown } shape, and
+// still gated on ANCHOR_FEE_ACCOUNT_ID so nothing is collected without a
+// revenue account configured.
+const BILL_CONVENIENCE_FEE = 0; // ₦ added to electricity/cable; 0 = no user fee
+const BILL_CONVENIENCE_CATEGORIES = new Set(["electricity", "cabletv"]);
+
+function computeBillFee(_amount, category) {
+  if (!feesEnabled() || BILL_CONVENIENCE_FEE <= 0) {
+    return { total: 0, breakdown: null };
+  }
+  if (!BILL_CONVENIENCE_CATEGORIES.has(String(category).toLowerCase())) {
+    return { total: 0, breakdown: null };
+  }
+  return { total: BILL_CONVENIENCE_FEE, breakdown: { convenience: BILL_CONVENIENCE_FEE } };
+}
+
 module.exports = {
   NIP_FEE,
   STAMP_DUTY,
@@ -43,4 +63,5 @@ module.exports = {
   PLATFORM_MARGIN,
   feesEnabled,
   computeTransferFee,
+  computeBillFee,
 };

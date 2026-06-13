@@ -564,6 +564,38 @@ router.post("/", async (req, res) => {
       return;
     }
 
+    // ── Bill payment outcomes ───────────────────────────────────────────────
+    // The expense Transaction was written optimistically when /bills/pay ran.
+    // On success: nothing to do. On failure: flag the row + tell the user the
+    // money wasn't taken (Anchor reverses the debit on a failed bill).
+    if (
+      eventType === "bills.successful" ||
+      eventType === "bills.failed" ||
+      eventType === "bills.initiated"
+    ) {
+      if (eventType === "bills.failed") {
+        const ref = attrs.reference || attrs.transactionReference;
+        const accountId = rels.account?.data?.id;
+        const biz = accountId
+          ? await prisma.business.findFirst({ where: { anchorAccountId: accountId } })
+          : null;
+        if (ref) {
+          await prisma.transaction.updateMany({
+            where: { description: { contains: ref }, category: "bill" },
+            data: { complianceStatus: "flagged", flagSeverity: "low" },
+          }).catch(() => {});
+        }
+        if (biz) {
+          await pushTo(
+            biz.userId,
+            "Bill payment failed",
+            attrs.reason || "Your bill payment didn't go through — you weren't charged.",
+          );
+        }
+      }
+      return;
+    }
+
     console.log(`[Anchor webhook] unhandled event type: ${eventType}`);
   } catch (err) {
     console.error("[Anchor webhook] processing error:", err);

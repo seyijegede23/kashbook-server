@@ -658,6 +658,47 @@ async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, 
   return data;
 }
 
+// ─── Bill payments (airtime / data / electricity / cable TV) ────────────────
+// Funded from the customer's DepositAccount balance. Docs:
+// https://docs.getanchor.co/docs/data-bill-purchase
+//   GET  /bills/billers?category=<category>
+//   GET  /bills/billers/{billerId}/products
+//   POST /bills
+// Categories Anchor accepts: "airtime" | "data" | "electricity" | "cabletv".
+async function listBillers(category) {
+  const res = await anchorFetch(`/bills/billers?category=${encodeURIComponent(category)}`);
+  return res.data || [];
+}
+
+async function getBillerProducts(billerId) {
+  const res = await anchorFetch(`/bills/billers/${encodeURIComponent(billerId)}/products`);
+  return res.data || [];
+}
+
+// Pay a bill. `billType` is Anchor's transaction category ("Airtime", "Data",
+// "Electricity", "CableTv"); `customerId` is the phone/meter/smartcard number.
+// Wrapped in Anchor's JSON:API envelope (same convention as /transfers) — verify
+// the exact attribute names against the bills reference on first sandbox run.
+async function payBill({ accountId, billType, customerId, amount, productSlug, reference }) {
+  const body = {
+    data: {
+      type: "Bill",
+      attributes: {
+        type: billType,
+        phoneNumber: customerId,
+        amount: Math.round(Number(amount) * 100), // kobo
+        ...(productSlug ? { productSlug } : {}),
+        reference,
+      },
+      relationships: {
+        account: { data: { type: "DepositAccount", id: accountId } },
+      },
+    },
+  };
+  const res = await anchorFetch("/bills", { method: "POST", body });
+  return { billId: res.data?.id, status: res.data?.attributes?.status, raw: res.data };
+}
+
 module.exports = {
   createBusinessCustomer,
   mapBusinessTypeToRegistration,
@@ -676,4 +717,7 @@ module.exports = {
   verifyWebhook,
   listCustomerDocuments,
   uploadDocument,
+  listBillers,
+  getBillerProducts,
+  payBill,
 };

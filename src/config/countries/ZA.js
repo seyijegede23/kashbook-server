@@ -7,6 +7,7 @@ module.exports = {
 
   callingCode: "27",
   currency: { code: "ZAR", symbol: "R", locale: "en-ZA", subunit: 100 },
+  vat: { rate: 15, label: "VAT" },
   language: "en",
   timezone: "Africa/Johannesburg",
 

@@ -7,6 +7,7 @@ module.exports = {
 
   callingCode: "20",
   currency: { code: "EGP", symbol: "ج.م", locale: "ar-EG", subunit: 100 },
+  vat: { rate: 14, label: "VAT" },
   language: "ar",
   timezone: "Africa/Cairo",
 

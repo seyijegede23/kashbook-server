@@ -7,6 +7,7 @@ module.exports = {
 
   callingCode: "256",
   currency: { code: "UGX", symbol: "USh", locale: "en-UG", subunit: 100 },
+  vat: { rate: 18, label: "VAT" },
   language: "en",
   timezone: "Africa/Kampala",
 

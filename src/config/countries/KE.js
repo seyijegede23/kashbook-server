@@ -7,6 +7,7 @@ module.exports = {
 
   callingCode: "254",
   currency: { code: "KES", symbol: "KSh", locale: "en-KE", subunit: 100 },
+  vat: { rate: 16, label: "VAT" },
   language: "sw",
   timezone: "Africa/Nairobi",
 

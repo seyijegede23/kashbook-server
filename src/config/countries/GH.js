@@ -8,6 +8,7 @@ module.exports = {
 
   callingCode: "233",
   currency: { code: "GHS", symbol: "₵", locale: "en-GH", subunit: 100 },
+  vat: { rate: 15, label: "VAT" },
   language: "en",
   timezone: "Africa/Accra",
 

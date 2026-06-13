@@ -91,7 +91,7 @@ router.patch("/:id", async (req, res) => {
     return res.status(403).json({ error: "Staff cannot update businesses" });
   }
 
-  const { name, emoji, color, customCategories } = req.body;
+  const { name, emoji, color, customCategories, vatEnabled, vatRate, vatInclusive } = req.body;
   try {
     // Verify ownership
     const existing = await prisma.business.findFirst({
@@ -103,6 +103,13 @@ router.patch("/:id", async (req, res) => {
     if (name !== undefined) data.name = name;
     if (emoji !== undefined) data.emoji = emoji;
     if (color !== undefined) data.color = color;
+    if (vatEnabled !== undefined) data.vatEnabled = !!vatEnabled;
+    if (vatInclusive !== undefined) data.vatInclusive = !!vatInclusive;
+    if (vatRate !== undefined) {
+      // null clears the override (falls back to the country rate); otherwise
+      // clamp to a sane 0–100%.
+      data.vatRate = vatRate === null ? null : Math.min(100, Math.max(0, Number(vatRate) || 0));
+    }
 
     // Replace customCategories if provided
     if (customCategories !== undefined) {
