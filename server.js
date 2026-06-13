@@ -120,6 +120,9 @@ app.use(
 );
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+// RevenueCat webhook — header-token auth (no body signature), so it's fine
+// after express.json. Keeps User.plan in sync with subscriptions.
+app.use("/webhooks/revenuecat", require("./src/routes/revenuecat"));
 app.use((_req, res, next) => {
   res.setHeader("ngrok-skip-browser-warning", "1");
   next();
