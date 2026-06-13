@@ -42,6 +42,20 @@ router.get("/billers/:id/products", async (req, res) => {
   }
 });
 
+// GET /bills/validate?provider=<slug>&customerId=<meter|smartcard>
+// Resolve the customer name for electricity / cable before paying.
+router.get("/validate", async (req, res) => {
+  const { provider, customerId } = req.query;
+  if (!provider || !customerId)
+    return res.status(400).json({ error: "provider and customerId required" });
+  try {
+    res.json(await anchor.validateBillCustomer(provider, customerId));
+  } catch (err) {
+    console.error("[bills/validate]", err.message);
+    res.status(502).json({ error: "Could not validate this number." });
+  }
+});
+
 // GET /bills/fee-quote?amount=&category=
 router.get("/fee-quote", async (req, res) => {
   const amount = Number(req.query.amount);
@@ -57,13 +71,18 @@ router.post("/pay", async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Staff cannot pay bills" });
 
-  const { businessId, category, customerId, amount, productSlug, billerName, pin, otp } = req.body;
+  const { businessId, category, customerId, amount, provider, phoneNumber, productSlug, billerName, pin, otp } = req.body;
   if (!businessId || !category || !customerId || !amount)
     return res.status(400).json({ error: "Missing required fields" });
-  if (!VALID_CATEGORIES.has(String(category).toLowerCase()))
+  const cat = String(category).toLowerCase();
+  if (!VALID_CATEGORIES.has(cat))
     return res.status(400).json({ error: "Unknown bill category" });
   if (isNaN(amount) || Number(amount) <= 0)
     return res.status(400).json({ error: "Invalid amount" });
+  if (cat === "airtime" && !provider)
+    return res.status(400).json({ error: "Network provider required for airtime" });
+  if (cat !== "airtime" && !productSlug)
+    return res.status(400).json({ error: "Select a plan/product first" });
 
   const pinCheck = await verifyTransactionPin(req.user.id, pin);
   if (!pinCheck.ok) {
@@ -117,9 +136,11 @@ router.post("/pay", async (req, res) => {
     const { reference, fee, token, transactionId } = await executeBillPayment({
       business: biz,
       userId: req.user.id,
-      category: String(category).toLowerCase(),
+      category: cat,
       customerId,
       amount: Number(amount),
+      provider,
+      phoneNumber,
       productSlug,
       billerName,
       amlCheck,

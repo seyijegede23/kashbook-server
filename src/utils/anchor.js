@@ -659,44 +659,89 @@ async function uploadDocument({ customerId, documentId, fileBuffer, fileBase64, 
 }
 
 // ─── Bill payments (airtime / data / electricity / cable TV) ────────────────
-// Funded from the customer's DepositAccount balance. Docs:
-// https://docs.getanchor.co/docs/data-bill-purchase
-//   GET  /bills/billers?category=<category>
+// Funded from the customer's DepositAccount balance. Verified against the
+// Anchor sandbox + docs.getanchor.co/docs/{airtime,data-bill,electricity,
+// cable-tv}-purchase. Amounts are in KOBO (₦100 = 10000).
+//   GET  /bills/billers?category=<airtime|data|electricity|cabletv>
 //   GET  /bills/billers/{billerId}/products
-//   POST /bills
-// Categories Anchor accepts: "airtime" | "data" | "electricity" | "cabletv".
+//   GET  /bills/customer-validation/{providerSlug}/{customerNumber}
+//   POST /bills   data.type = Airtime | Data | Electricity | Television
+
+// Our lowercase UI category → Anchor's data.type. Note "cabletv" → "Television".
+const BILL_TYPE = { airtime: "Airtime", data: "Data", electricity: "Electricity", cabletv: "Television" };
+
+// Anchor returns JSON:API: { id, attributes: { name, slug, category, price } }.
+// Flatten to plain objects so the client doesn't deal with the envelope.
+function flattenBiller(b) {
+  return { id: b.id, name: b.attributes?.name, slug: b.attributes?.slug, category: b.attributes?.category };
+}
+function flattenProduct(p) {
+  const a = p.attributes || {};
+  const min = a.price?.minimumAmount ?? null; // kobo
+  const max = a.price?.maximumAmount ?? null;
+  return {
+    id: p.id,
+    name: a.name,
+    slug: a.slug,
+    amount: min != null ? min / 100 : null,   // naira; null/range → user enters
+    amountMin: min != null ? min / 100 : null,
+    amountMax: max != null ? max / 100 : null,
+    fixed: min != null && min === max,
+  };
+}
+
 async function listBillers(category) {
   const res = await anchorFetch(`/bills/billers?category=${encodeURIComponent(category)}`);
-  return res.data || [];
+  return (res.data || []).map(flattenBiller);
 }
 
 async function getBillerProducts(billerId) {
   const res = await anchorFetch(`/bills/billers/${encodeURIComponent(billerId)}/products`);
-  return res.data || [];
+  return (res.data || []).map(flattenProduct);
 }
 
-// Pay a bill. `billType` is Anchor's transaction category ("Airtime", "Data",
-// "Electricity", "CableTv"); `customerId` is the phone/meter/smartcard number.
-// Wrapped in Anchor's JSON:API envelope (same convention as /transfers) — verify
-// the exact attribute names against the bills reference on first sandbox run.
-async function payBill({ accountId, billType, customerId, amount, productSlug, reference }) {
+// Validate a meter / smartcard before paying (electricity + cable). Returns the
+// resolved customer name so the user can confirm before money moves.
+async function validateBillCustomer(providerSlug, customerNumber) {
+  const res = await anchorFetch(
+    `/bills/customer-validation/${encodeURIComponent(providerSlug)}/${encodeURIComponent(customerNumber)}`,
+  );
+  const a = res.data?.attributes || {};
+  return { name: a.name || a.customerName || null, raw: res.data };
+}
+
+// Pay a bill. The attribute shape differs per category (Anchor's spec):
+//   airtime     → { provider, phoneNumber, amount, reference }
+//   data        → { phoneNumber, amount, productSlug, reference }
+//   electricity → { meterAccountNumber, phoneNumber, amount, productSlug, reference }
+//   television  → { smartCardNumber, phoneNumber, amount, productSlug, reference }
+async function payBill({ accountId, category, provider, customerId, phoneNumber, amount, productSlug, reference }) {
+  const type = BILL_TYPE[category];
+  if (!type) throw new Error(`Unknown bill category: ${category}`);
+  const kobo = Math.round(Number(amount) * 100);
+  const contact = phoneNumber || customerId;
+
+  let attributes;
+  if (category === "airtime") {
+    attributes = { provider, phoneNumber: customerId, amount: kobo, reference };
+  } else if (category === "data") {
+    attributes = { phoneNumber: customerId, amount: kobo, productSlug, reference };
+  } else if (category === "electricity") {
+    attributes = { meterAccountNumber: customerId, phoneNumber: contact, amount: kobo, productSlug, reference };
+  } else {
+    attributes = { smartCardNumber: customerId, phoneNumber: contact, amount: kobo, productSlug, reference };
+  }
+
   const body = {
     data: {
-      type: "Bill",
-      attributes: {
-        type: billType,
-        phoneNumber: customerId,
-        amount: Math.round(Number(amount) * 100), // kobo
-        ...(productSlug ? { productSlug } : {}),
-        reference,
-      },
-      relationships: {
-        account: { data: { type: "DepositAccount", id: accountId } },
-      },
+      type,
+      attributes,
+      relationships: { account: { data: { type: "DepositAccount", id: accountId } } },
     },
   };
   const res = await anchorFetch("/bills", { method: "POST", body });
-  return { billId: res.data?.id, status: res.data?.attributes?.status, raw: res.data };
+  const a = res.data?.attributes || {};
+  return { billId: res.data?.id, status: a.status, token: a.detail?.token || a.token || null, raw: res.data };
 }
 
 module.exports = {
@@ -719,5 +764,6 @@ module.exports = {
   uploadDocument,
   listBillers,
   getBillerProducts,
+  validateBillCustomer,
   payBill,
 };

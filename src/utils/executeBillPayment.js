@@ -30,7 +30,9 @@ async function executeBillPayment({
   category,        // "airtime" | "data" | "electricity" | "cabletv"
   customerId,      // phone / meter / smartcard number
   amount,
-  productSlug,     // data plan / cable bouquet / electricity product (optional for airtime)
+  provider,        // biller slug — required for airtime (e.g. "mtn")
+  phoneNumber,     // contact for electricity/cable (defaults to customerId)
+  productSlug,     // data plan / cable bouquet / electricity product (not airtime)
   billerName,      // for the description, e.g. "MTN", "Ikeja Electric"
   reference,
   amlCheck = {},
@@ -71,16 +73,17 @@ async function executeBillPayment({
   }
 
   // 3. Anchor bill purchase.
-  const billType = CATEGORY_LABEL[category] || category;
   const result = await anchor.payBill({
     accountId: business.anchorAccountId,
-    billType,
+    category,
+    provider,
     customerId,
+    phoneNumber,
     amount: Number(amount),
     productSlug,
     reference: ref,
   });
-  const token = result.raw?.attributes?.token || null; // electricity prepaid token
+  const token = result.token || null; // electricity prepaid token (if returned)
 
   // 4. Collect convenience fee (free book transfer), if any. A failed
   // collection must NOT fail the bill — the bill already went through.
