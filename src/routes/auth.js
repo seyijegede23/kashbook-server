@@ -55,19 +55,24 @@ function splitName(fullName = "") {
 }
 
 async function ensurePrimaryBusiness(userId, businessName, country) {
-  const exists = await prisma.business.findFirst({ where: { userId } });
-  if (exists) return;
-  const { getCountryConfig } = require("../config/countries");
-  const cfg = getCountryConfig(country || "NG");
-  await prisma.business.create({
-    data: {
-      userId,
-      name: businessName,
-      emoji: "🛍️",
-      color: "#6C3FC5",
-      country: cfg.code,
-      baseCurrency: cfg.currency.code,
-    },
+  // Serialize per user + re-check inside the lock so two concurrent callers
+  // (e.g. register and a racing OTP-verify) can't both pass the existence check
+  // and create duplicate primary businesses.
+  return prisma.withBusinessLock(userId, async () => {
+    const exists = await prisma.business.findFirst({ where: { userId } });
+    if (exists) return;
+    const { getCountryConfig } = require("../config/countries");
+    const cfg = getCountryConfig(country || "NG");
+    await prisma.business.create({
+      data: {
+        userId,
+        name: businessName,
+        emoji: "🛍️",
+        color: "#6C3FC5",
+        country: cfg.code,
+        baseCurrency: cfg.currency.code,
+      },
+    });
   });
 }
 
@@ -451,6 +456,30 @@ router.patch("/profile", authMiddleware, async (req, res) => {
         return res.status(400).json({ error: "gender must be 'Male' or 'Female'" });
       data.gender = gender;
     }
+
+    // Lock the business name once a bank account (NUBAN) has been issued — the
+    // name is bound to the verified KYB identity at Anchor, so changing it here
+    // would desync the account from its registered owner.
+    if (data.businessName !== undefined) {
+      const me = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { businessName: true },
+      });
+      if (me && data.businessName !== me.businessName) {
+        const linked = await prisma.business.findFirst({
+          where: { userId: req.user.id, virtualAccountNumber: { not: null } },
+          select: { id: true },
+        });
+        if (linked) {
+          return res.status(403).json({
+            error:
+              "Your business name is locked because a bank account has already been issued for it. Contact support if it must change.",
+            code: "BUSINESS_NAME_LOCKED",
+          });
+        }
+      }
+    }
+
     const user = await prisma.user.update({ where: { id: req.user.id }, data });
     const { password: _, ...safe } = user;
     res.json({ user: safe });

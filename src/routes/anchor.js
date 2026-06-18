@@ -51,6 +51,28 @@ router.post("/", async (req, res) => {
   console.log(`[Anchor webhook] event=${eventType}`);
 
   try {
+    // ── Idempotency: process each delivered event at most once ───────────────
+    // Anchor delivers at-least-once, so a re-delivered credit would otherwise be
+    // recorded twice (the inbound path below has no per-row dedup). Claim the
+    // event by inserting its id; a duplicate hits the @unique and we skip. Keyed
+    // on (eventType + resource id) so distinct event types on the same resource
+    // (e.g. account.opened then accountNumber.created) are NOT collapsed.
+    const dedupId = event.data?.id || attrs.reference || attrs.sessionId || "";
+    if (dedupId) {
+      try {
+        await prisma.processedWebhook.create({
+          data: { eventId: `${eventType}:${dedupId}`, type: eventType },
+        });
+      } catch (dupErr) {
+        if (dupErr.code === "P2002") {
+          console.log(`[Anchor webhook] duplicate ${eventType}:${dedupId} — skipping`);
+          return;
+        }
+        // A dedup-ledger error must never drop a real event — log and continue.
+        console.error("[Anchor webhook] dedup insert error:", dupErr.message);
+      }
+    }
+
     // ── Customer KYC / KYB approved ──────────────────────────────────────────
     // Anchor emits `customer.identification.approved` for IndividualCustomer
     // and may emit `customer.verification.approved` / `business.verification.approved`

@@ -112,42 +112,52 @@ router.post("/pay", async (req, res) => {
       where: { id: req.user.id },
       select: { id: true, accountStatus: true, complianceFreezeReason: true, email: true, phone: true },
     });
-    const amlCheck = await runPreTransferChecks({
-      req, user: userFull, business: biz, amount: Number(amount), otp,
-    });
-    if (!amlCheck.ok) {
-      if (amlCheck.code === "OTP_REQUIRED") {
-        const target = userFull.email || userFull.phone;
-        if (target) {
-          try {
-            await dispatchOtp(target, TRANSFER_OTP_TYPE, { country: biz.country });
-          } catch (err) {
-            console.error("[bills] OTP dispatch failed:", err.message);
-            return res.status(503).json({ error: "Could not send the verification code. Please try again.", code: "OTP_DISPATCH_FAILED" });
+    // Serialize money-out per business (same as transfers) so concurrent bills
+    // can't both pass the cumulative AML limit / balance gate and overshoot.
+    const outcome = await prisma.withBusinessLock(biz.id, async () => {
+      const amlCheck = await runPreTransferChecks({
+        req, user: userFull, business: biz, amount: Number(amount), otp,
+      });
+      if (!amlCheck.ok) {
+        if (amlCheck.code === "OTP_REQUIRED") {
+          const target = userFull.email || userFull.phone;
+          if (target) {
+            try {
+              await dispatchOtp(target, TRANSFER_OTP_TYPE, { country: biz.country });
+            } catch (err) {
+              console.error("[bills] OTP dispatch failed:", err.message);
+              return { status: 503, body: { error: "Could not send the verification code. Please try again.", code: "OTP_DISPATCH_FAILED" } };
+            }
           }
         }
+        return {
+          status: amlCheck.status || 400,
+          body: {
+            error: amlCheck.error, code: amlCheck.code,
+            ...(amlCheck.otpIdentifier ? { otpIdentifier: amlCheck.otpIdentifier } : {}),
+          },
+        };
       }
-      return res.status(amlCheck.status || 400).json({
-        error: amlCheck.error, code: amlCheck.code,
-        ...(amlCheck.otpIdentifier ? { otpIdentifier: amlCheck.otpIdentifier } : {}),
-      });
-    }
 
-    const { reference, fee, token, transactionId } = await executeBillPayment({
-      business: biz,
-      userId: req.user.id,
-      category: cat,
-      customerId,
-      amount: Number(amount),
-      provider,
-      phoneNumber,
-      productSlug,
-      billerName,
-      amlCheck,
-      req,
-      notify: false, // client shows its own success state
+      const exec = await executeBillPayment({
+        business: biz,
+        userId: req.user.id,
+        category: cat,
+        customerId,
+        amount: Number(amount),
+        provider,
+        phoneNumber,
+        productSlug,
+        billerName,
+        amlCheck,
+        req,
+        notify: false, // client shows its own success state
+      });
+      return { exec };
     });
 
+    if (outcome.status) return res.status(outcome.status).json(outcome.body);
+    const { reference, fee, token, transactionId } = outcome.exec;
     res.json({ status: "success", reference, fee, token, transactionId });
   } catch (err) {
     if (err.code === "INSUFFICIENT_BALANCE")

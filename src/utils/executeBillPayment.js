@@ -125,6 +125,7 @@ async function executeBillPayment({
         paymentMethod: "bank",
         date: new Date(),
         source: "anchor",
+        reference: ref, // idempotency key (unique per [businessId, reference])
         currency: business.baseCurrency || "NGN",
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",

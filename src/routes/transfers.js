@@ -313,55 +313,63 @@ router.post("/send", async (req, res) => {
         email: true, phone: true,
       },
     });
-    const amlCheck = await runPreTransferChecks({
-      req,
-      user: userFull,
-      business: biz,
-      amount: Number(amount),
-      otp,
-    });
-    if (!amlCheck.ok) {
-      // On the first attempt of a large transfer, the pipeline returns
-      // OTP_REQUIRED before any code has been issued. Dispatch one now so
-      // the user can collect it from email/SMS, then surface the request
-      // to the client with the masked identifier.
-      if (amlCheck.code === "OTP_REQUIRED") {
-        const target = userFull.email || userFull.phone;
-        if (target) {
-          try {
-            await dispatchOtp(target, TRANSFER_OTP_TYPE, { country: biz.country });
-          } catch (err) {
-            console.error("[transfers] OTP dispatch failed:", err.message);
-            return res.status(503).json({
-              error: "Could not send the verification code. Please try again.",
-              code: "OTP_DISPATCH_FAILED",
-            });
+    // Serialize money-out per business: the AML cumulative-limit read and the
+    // execution must be atomic, or two concurrent transfers could both pass the
+    // limit/balance gate and overshoot. Different businesses still run in
+    // parallel. Early-returns become outcome values handled after the lock.
+    const outcome = await prisma.withBusinessLock(biz.id, async () => {
+      const amlCheck = await runPreTransferChecks({
+        req,
+        user: userFull,
+        business: biz,
+        amount: Number(amount),
+        otp,
+      });
+      if (!amlCheck.ok) {
+        // On the first attempt of a large transfer, the pipeline returns
+        // OTP_REQUIRED before any code has been issued. Dispatch one now so
+        // the user can collect it from email/SMS, then surface the request
+        // to the client with the masked identifier.
+        if (amlCheck.code === "OTP_REQUIRED") {
+          const target = userFull.email || userFull.phone;
+          if (target) {
+            try {
+              await dispatchOtp(target, TRANSFER_OTP_TYPE, { country: biz.country });
+            } catch (err) {
+              console.error("[transfers] OTP dispatch failed:", err.message);
+              return { status: 503, body: { error: "Could not send the verification code. Please try again.", code: "OTP_DISPATCH_FAILED" } };
+            }
           }
         }
+        return {
+          status: amlCheck.status || 400,
+          body: {
+            error: amlCheck.error,
+            code: amlCheck.code,
+            ...(amlCheck.otpIdentifier ? { otpIdentifier: amlCheck.otpIdentifier } : {}),
+          },
+        };
       }
-      return res
-        .status(amlCheck.status || 400)
-        .json({
-          error: amlCheck.error,
-          code: amlCheck.code,
-          ...(amlCheck.otpIdentifier ? { otpIdentifier: amlCheck.otpIdentifier } : {}),
-        });
-    }
 
-    // Hand off to the shared executor — same code path the cron uses.
-    const { reference, route, fee } = await executeTransfer({
-      business: biz,
-      userId: req.user.id,
-      amount: Number(amount),
-      accountNumber,
-      bankCode,
-      accountName,
-      bankName,
-      narration,
-      amlCheck,
-      req,
-      notify: false, // route doesn't push — client UI shows the success state itself
+      // Hand off to the shared executor — same code path the cron uses.
+      const exec = await executeTransfer({
+        business: biz,
+        userId: req.user.id,
+        amount: Number(amount),
+        accountNumber,
+        bankCode,
+        accountName,
+        bankName,
+        narration,
+        amlCheck,
+        req,
+        notify: false, // route doesn't push — client UI shows the success state itself
+      });
+      return { exec };
     });
+
+    if (outcome.status) return res.status(outcome.status).json(outcome.body);
+    const { reference, route, fee } = outcome.exec;
 
     // Remember the recipient — powers the Send Money "Recents" chips.
     // Best-effort: a failed upsert must never fail a successful transfer.

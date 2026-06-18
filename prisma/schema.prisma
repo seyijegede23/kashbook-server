@@ -34,7 +34,7 @@ model User {
   lockedUntil          DateTime?
   dateOfBirth          DateTime?
   gender               String?
-  anchorCustomerId     String?
+  anchorCustomerId     String?        @unique
   paystackCustomerCode String?
   kycStatus            String         @default("unverified")
   accountStatus        String         @default("active")  // "active" | "restricted" | "frozen" | "closed"
@@ -412,6 +412,11 @@ model Transaction {
   userId               String?
   user                 User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   source               String?
+  // Deterministic idempotency key for Anchor-sourced money movement (transfers,
+  // bills, inbound credits). The @@unique below makes "record this once" atomic:
+  // a duplicate insert fails with P2002 instead of double-spending/double-crediting.
+  // Null for manual/offline transactions (Postgres allows many nulls).
+  reference            String?
   currency             String    @default("NGN")   // base currency at time of record; per-business default
   flagSeverity         String?    // null | "low" | "medium" | "high"
   complianceStatus     String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
@@ -423,10 +428,21 @@ model Transaction {
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
 
+  @@unique([businessId, reference])
   @@index([businessId, date])
   @@index([userId])
   @@index([businessId, updatedAt])
   @@index([complianceStatus, flagSeverity])
+}
+
+// Idempotency ledger for inbound Anchor webhooks. We insert the provider event
+// id BEFORE acting on it; a duplicate delivery hits the @unique and is skipped,
+// so a credit/debit is processed exactly once regardless of re-delivery.
+model ProcessedWebhook {
+  id         String   @id @default(uuid())
+  eventId    String   @unique
+  type       String?
+  receivedAt DateTime @default(now())
 }
 
 model InventoryItem {

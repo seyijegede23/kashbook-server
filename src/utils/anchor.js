@@ -36,15 +36,20 @@ function ensureConfigured() {
   }
 }
 
-async function anchorFetch(path, { method = "GET", body } = {}) {
+async function anchorFetch(path, { method = "GET", body, idempotencyKey } = {}) {
   ensureConfigured();
+  const headers = {
+    "x-anchor-key": API_KEY(),
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  // Anchor de-dupes Transfers / VirtualNubans for 24h when this key is present,
+  // so a retried/concurrent POST with the same key returns the original result
+  // instead of moving money twice. (Bills do NOT support it — see payBill.)
+  if (idempotencyKey) headers["x-anchor-idempotent-key"] = idempotencyKey;
   const res = await fetch(`${BASE()}${path}`, {
     method,
-    headers: {
-      "x-anchor-key": API_KEY(),
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -451,7 +456,7 @@ async function createBookTransfer({
       },
     },
   };
-  const res = await anchorFetch("/transfers", { method: "POST", body });
+  const res = await anchorFetch("/transfers", { method: "POST", body, idempotencyKey: reference || undefined });
   return { transferId: res.data?.id, raw: res.data };
 }
 
@@ -478,7 +483,7 @@ async function createTransfer({
       },
     },
   };
-  const res = await anchorFetch("/transfers", { method: "POST", body });
+  const res = await anchorFetch("/transfers", { method: "POST", body, idempotencyKey: reference || undefined });
   return { transferId: res.data?.id, raw: res.data };
 }
 

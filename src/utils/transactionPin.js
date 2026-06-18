@@ -33,23 +33,33 @@ async function verifyTransactionPin(userId, pin) {
   }
   const match = await bcrypt.compare(String(pin), user.transactionPin);
   if (!match) {
-    const failed = (user.transactionPinFailedCount || 0) + 1;
-    const lockedUntil =
-      failed >= PIN_MAX_ATTEMPTS ? new Date(Date.now() + PIN_LOCK_MS) : null;
-    await prisma.user.update({
+    // Atomic increment — concurrent wrong guesses can't all read the same count
+    // and write back 1, which would let an attacker evade the lock-out.
+    const { transactionPinFailedCount: failed } = await prisma.user.update({
       where: { id: userId },
-      data: {
-        transactionPinFailedCount: lockedUntil ? 0 : failed,
-        transactionPinLockedUntil: lockedUntil,
-      },
+      data: { transactionPinFailedCount: { increment: 1 } },
+      select: { transactionPinFailedCount: true },
     });
+    if (failed >= PIN_MAX_ATTEMPTS) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: {
+          transactionPinFailedCount: 0,
+          transactionPinLockedUntil: new Date(Date.now() + PIN_LOCK_MS),
+        },
+      });
+      return {
+        ok: false,
+        error: "Too many wrong PINs. Locked for 15 minutes.",
+        status: 423,
+        code: "PIN_LOCKED",
+      };
+    }
     return {
       ok: false,
-      error: lockedUntil
-        ? "Too many wrong PINs. Locked for 15 minutes."
-        : `Wrong PIN. ${PIN_MAX_ATTEMPTS - failed} attempt(s) left.`,
+      error: `Wrong PIN. ${PIN_MAX_ATTEMPTS - failed} attempt(s) left.`,
       status: 401,
-      code: lockedUntil ? "PIN_LOCKED" : "PIN_WRONG",
+      code: "PIN_WRONG",
     };
   }
   if (user.transactionPinFailedCount || user.transactionPinLockedUntil) {

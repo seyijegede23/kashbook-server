@@ -99,6 +99,18 @@ router.patch("/:id", async (req, res) => {
     });
     if (!existing) return res.status(404).json({ error: "Business not found" });
 
+    // Once a bank account (NUBAN) has been issued, the business name is locked:
+    // it was verified against the business's CAC/KYB records at Anchor, so a
+    // change here would desync the account from its registered owner. Other
+    // fields (emoji, colour, VAT, categories) stay editable.
+    if (name !== undefined && name !== existing.name && existing.virtualAccountNumber) {
+      return res.status(403).json({
+        error:
+          "Your business name is locked because a bank account has already been issued for it. Contact support if it must change.",
+        code: "BUSINESS_NAME_LOCKED",
+      });
+    }
+
     const data = {};
     if (name !== undefined) data.name = name;
     if (emoji !== undefined) data.emoji = emoji;
@@ -586,11 +598,21 @@ router.post("/:id/virtual-account", async (req, res) => {
       });
     }
 
-    // 1. Ensure-or-adopt the Anchor customer (Business preferred, Individual fallback)
+    // 1. Ensure-or-adopt the Anchor customer (Business preferred, Individual
+    // fallback) — serialized per business so two concurrent virtual-account
+    // requests can't create duplicate Anchor customers (also backstopped by
+    // User.anchorCustomerId @unique).
     let customerId = user.anchorCustomerId;
     let customerType = "BusinessCustomer";
     let adoptedAlreadyApproved = false;
-    if (!customerId) {
+    await prisma.withBusinessLock(req.params.id, async () => {
+      // Re-read inside the lock: a racing request may have just set it.
+      const fresh = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: { anchorCustomerId: true },
+      });
+      customerId = fresh?.anchorCustomerId || null;
+      if (customerId) return; // already created/adopted by a concurrent request
       try {
         const created = await anchor.createBusinessCustomer({
           businessName: biz.name,
@@ -684,7 +706,7 @@ router.post("/:id/virtual-account", async (req, res) => {
         where: { id: user.id },
         data: { anchorCustomerId: customerId },
       });
-    }
+    });
 
     // 2. Trigger KYB only for newly-created BusinessCustomers that aren't verified
     if (

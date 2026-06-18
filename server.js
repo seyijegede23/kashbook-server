@@ -240,7 +240,7 @@ cron.schedule(
   "0 20 * * *",
   async () => {
     try {
-      await require("./src/utils/dailyReport").sendDailyReports();
+      await prisma.withCronLock(4001, () => require("./src/utils/dailyReport").sendDailyReports());
     } catch (err) {
       console.error("[cron dailyReport]", err.message);
     }
@@ -251,6 +251,7 @@ cron.schedule(
 // ── Background cron: low stock push notifications (every hour) ───────────────
 cron.schedule("0 * * * *", async () => {
   try {
+    await prisma.withCronLock(4002, async () => {
     // Filter at the DB level so we only pull genuinely low rows (instead of
     // loading the entire inventory table into memory each hour).
     const actualLow = await prisma.$queryRaw`
@@ -294,6 +295,7 @@ cron.schedule("0 * * * *", async () => {
     }
     if (actualLow.length > 0)
       console.log(`[Cron] Low stock alerts sent for ${actualLow.length} item(s)`);
+    });
   } catch (err) {
     console.error("[Cron] Low stock check error:", err);
   }
@@ -306,7 +308,7 @@ cron.schedule("0 * * * *", async () => {
 const { processRecurringExpenses } = require("./src/utils/recurringExpenseRunner");
 cron.schedule("5 0 * * *", async () => {
   try {
-    await processRecurringExpenses();
+    await prisma.withCronLock(4003, () => processRecurringExpenses());
   } catch (err) {
     console.error("[Cron] Recurring expenses error:", err);
   }

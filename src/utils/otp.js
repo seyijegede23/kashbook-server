@@ -24,8 +24,12 @@ async function saveOtp(identifier, type) {
 }
 
 // ── Verify OTP ──────────────────────────────────────────────────────────────
+// Atomic single-use: a conditional UPDATE claims the code in one statement, so
+// two concurrent verifications of the same code can't both succeed (the second
+// finds used=false no longer true → count 0). The code is single-use precisely
+// because exactly one caller can flip used:false → used:true.
 async function verifyOtp(identifier, code, type) {
-  const record = await prisma.otpCode.findFirst({
+  const { count } = await prisma.otpCode.updateMany({
     where: {
       identifier,
       code,
@@ -33,15 +37,9 @@ async function verifyOtp(identifier, code, type) {
       used: false,
       expiresAt: { gt: new Date() },
     },
-  });
-
-  if (!record) return false;
-
-  await prisma.otpCode.update({
-    where: { id: record.id },
     data: { used: true },
   });
-  return true;
+  return count === 1;
 }
 
 // Termii expects phone numbers in 234XXXXXXXXXX format (no plus, no leading 0)
