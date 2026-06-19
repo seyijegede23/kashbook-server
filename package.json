@@ -12,6 +12,7 @@
     "@node-rs/bcrypt": "^1.10.7",
     "@prisma/adapter-pg": "^7.4.1",
     "@prisma/client": "^7.4.1",
+    "@sentry/node": "^10.59.0",
     "cloudinary": "^2.9.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

@@ -39,13 +39,12 @@ async function collectHealth() {
   const since1h = new Date(now - 60 * 60 * 1000);
   const since24h = new Date(now - 24 * 60 * 60 * 1000);
 
-  const [db, heartbeats, warn1h, alert1h, openErrors, openFlags, heldTx, failed24h] =
+  const [db, heartbeats, warn1h, alert1h, openFlags, heldTx, failed24h] =
     await Promise.all([
       pingDb(),
       prisma.cronHeartbeat.findMany(),
       prisma.auditLog.count({ where: { severity: "warn", createdAt: { gte: since1h } } }),
       prisma.auditLog.count({ where: { severity: "alert", createdAt: { gte: since1h } } }),
-      prisma.errorGroup.count({ where: { status: "open" } }),
       prisma.complianceFlag.groupBy({ by: ["severity"], where: { status: "open" }, _count: true }),
       prisma.transaction.count({ where: { complianceStatus: "held" } }),
       prisma.auditLog.count({ where: { action: { contains: "FAILED" }, createdAt: { gte: since24h } } }),
@@ -72,7 +71,8 @@ async function collectHealth() {
     db,
     deps: depsConfigured(),
     crons,
-    errors: { open: openErrors, warn1h, alert1h, failed24h },
+    // Audit/compliance signals (exception tracking itself now lives in Sentry).
+    errors: { warn1h, alert1h, failed24h },
     compliance: Object.fromEntries(openFlags.map((f) => [f.severity, f._count])),
     heldTransactions: heldTx,
   };

@@ -72,12 +72,11 @@ async function takeAnalyticsSnapshot() {
   return data;
 }
 
-// Keep ~90 days of snapshots and ~60 days of error events.
+// Keep ~90 days of metric snapshots. (Exception history now lives in Sentry,
+// which manages its own retention.)
 async function purgeRetention() {
   const snapCutoff = new Date(Date.now() - 90 * 86400000);
-  const evtCutoff = new Date(Date.now() - 60 * 86400000);
   await prisma.metricSnapshot.deleteMany({ where: { takenAt: { lt: snapCutoff } } });
-  await prisma.errorEvent.deleteMany({ where: { createdAt: { lt: evtCutoff } } });
 }
 
 module.exports = { recordHeartbeat, takeHealthSnapshot, takeAnalyticsSnapshot, collectAnalytics, purgeRetention };

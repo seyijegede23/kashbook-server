@@ -1,4 +1,8 @@
 require("dotenv").config();
+// Sentry must initialize before express/route modules so it can auto-instrument
+// HTTP + Express. No-op when SENTRY_DSN is unset. Also registers its own
+// unhandledRejection / uncaughtException handlers (captures + flushes + exits).
+const Sentry = require("./src/instrument");
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -6,18 +10,7 @@ const prisma = require("./src/utils/db");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const morgan = require("morgan");
-const { captureError } = require("./src/utils/errorTracker");
 const { metricsMiddleware } = require("./src/utils/metrics");
-
-// Last-resort capture so crashes are recorded before the process restarts.
-process.on("unhandledRejection", (reason) => {
-  captureError(reason, { level: "fatal", context: { kind: "unhandledRejection" } });
-});
-process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
-  captureError(err, { level: "fatal", context: { kind: "uncaughtException" } });
-  setTimeout(() => process.exit(1), 500); // let the capture flush, then restart cleanly
-});
 
 const authRoutes = require("./src/routes/auth");
 const businessRoutes = require("./src/routes/businesses");
@@ -239,10 +232,13 @@ app.get("/health", async (_req, res) => {
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
-// ── Global error handler ──────────────────────────────────────────────────────
+// ── Error handling ────────────────────────────────────────────────────────────
+// Sentry's error handler must come before any other error middleware — it
+// captures the exception (no-op without a DSN) then passes it on to ours.
+Sentry.setupExpressErrorHandler(app);
+
 app.use((err, req, res, _next) => {
   console.error(err);
-  captureError(err, { req, context: { statusCode: 500 } });
   res.status(500).json({ error: "Internal server error" });
 });
 
