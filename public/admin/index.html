@@ -102,6 +102,38 @@
       <canvas id="revenueChart" height="90"></canvas>
     </section>
 
+    <!-- System Health -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-800">🩺 System Health</h2>
+        <button id="refreshHealthBtn" class="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">Refresh</button>
+      </div>
+      <div id="healthCards" class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm"></div>
+      <div id="healthCrons" class="mt-4 text-xs text-gray-600"></div>
+    </section>
+
+    <!-- Error Tracking -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-800">🐞 Errors</h2>
+        <select id="errorStatusFilter" class="px-3 py-1.5 rounded-lg border border-gray-200 bg-white text-sm">
+          <option value="open">Open</option>
+          <option value="">All</option>
+          <option value="resolved">Resolved</option>
+          <option value="ignored">Ignored</option>
+        </select>
+      </div>
+      <div id="errorsList" class="space-y-2"></div>
+      <div id="noErrors" class="hidden text-center text-gray-400 py-8">No errors 🎉</div>
+    </section>
+
+    <!-- Analytics -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+      <h2 class="text-lg font-semibold text-gray-800 mb-4">📈 Analytics</h2>
+      <div id="analyticsCards" class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm mb-4"></div>
+      <canvas id="analyticsChart" height="90"></canvas>
+    </section>
+
     <!-- Push Notification Broadcast -->
     <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
       <h2 class="text-lg font-semibold text-gray-800 mb-4">📣 Broadcast Notification</h2>
@@ -276,7 +308,7 @@
   async function showDashboard() {
     document.getElementById("loginScreen").classList.add("hidden");
     document.getElementById("dashboard").classList.remove("hidden");
-    await Promise.all([loadStats(), loadUsers(), loadRevenue(), loadActivity(), loadFlags(), loadAudit()]);
+    await Promise.all([loadStats(), loadUsers(), loadRevenue(), loadActivity(), loadFlags(), loadAudit(), loadHealth(), loadErrors(), loadAnalytics()]);
   }
 
   async function loadStats() {
@@ -291,6 +323,106 @@
       showError("Failed to load stats: " + err.message);
     }
   }
+
+  // ── Observability: health, errors, analytics ──────────────────────────────
+  function fmtDur(s) {
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  }
+
+  async function loadHealth() {
+    try {
+      const [h, m] = await Promise.all([apiFetch("/admin-api/health"), apiFetch("/admin-api/metrics")]);
+      const card = (label, value, tone = "text-gray-900") =>
+        `<div class="rounded-xl border border-gray-100 p-3"><p class="text-xs text-gray-500">${label}</p><p class="text-lg font-bold ${tone}">${value}</p></div>`;
+      const poolBusy = h.pool.total - h.pool.idle;
+      document.getElementById("healthCards").innerHTML = [
+        card("Uptime", fmtDur(h.uptimeSec)),
+        card("Memory", h.memory.rssMB + " MB"),
+        card("Event-loop lag", h.eventLoopLagMs + " ms", h.eventLoopLagMs > 100 ? "text-red-600" : "text-gray-900"),
+        card("DB", h.db.ok ? h.db.latencyMs + " ms" : "DOWN", h.db.ok ? "text-gray-900" : "text-red-600"),
+        card("Pool", `${poolBusy}/${h.pool.max} busy${h.pool.waiting ? ` · ${h.pool.waiting} waiting` : ""}`, h.pool.waiting ? "text-red-600" : "text-gray-900"),
+        card("Requests", (m.totalRequests || 0).toLocaleString()),
+        card("5xx rate", (m.errorRate5xx || 0) + "%", m.errorRate5xx >= 5 ? "text-red-600" : "text-gray-900"),
+        card("Open errors", h.errors.open, h.errors.open > 0 ? "text-amber-600" : "text-gray-900"),
+      ].join("");
+      const crons = (h.crons || [])
+        .map((c) => `<span class="inline-block mr-3 ${c.stale ? "text-red-600 font-semibold" : ""}">${esc(c.name)}: ${c.ageMin}m ago${c.stale ? " ⚠ stale" : ""}</span>`)
+        .join("");
+      document.getElementById("healthCrons").innerHTML = crons ? "Crons — " + crons : "Crons — none have reported yet";
+    } catch (err) {
+      showError("Failed to load health: " + err.message);
+    }
+  }
+
+  async function loadErrors() {
+    try {
+      const status = document.getElementById("errorStatusFilter").value;
+      const groups = await apiFetch("/admin-api/errors" + (status ? `?status=${status}` : ""));
+      const box = document.getElementById("errorsList");
+      document.getElementById("noErrors").classList.toggle("hidden", groups.length > 0);
+      box.innerHTML = groups
+        .map((g) => {
+          const lvl = g.level === "fatal" ? "bg-red-100 text-red-700" : g.level === "warn" ? "bg-amber-100 text-amber-700" : "bg-rose-100 text-rose-700";
+          return `<div class="border border-gray-100 rounded-xl p-3">
+            <div class="flex items-center justify-between gap-2">
+              <div class="min-w-0">
+                <p class="font-medium text-gray-800 truncate">${esc(g.name)}: ${esc(g.message)}</p>
+                <p class="text-xs text-gray-500 truncate">${esc(g.where || "")} · ×${g.count} · last ${new Date(g.lastSeen).toLocaleString()}</p>
+              </div>
+              <div class="flex items-center gap-1 shrink-0">
+                <span class="px-2 py-0.5 text-xs font-semibold rounded ${lvl}">${esc(g.level)}</span>
+                <button data-err-id="${g.id}" data-action="resolved" class="err-action px-2 py-1 text-xs rounded bg-emerald-100 text-emerald-700">Resolve</button>
+                <button data-err-id="${g.id}" data-action="ignored" class="err-action px-2 py-1 text-xs rounded bg-gray-100 text-gray-600">Ignore</button>
+              </div>
+            </div>
+          </div>`;
+        })
+        .join("");
+      box.querySelectorAll(".err-action").forEach((btn) =>
+        btn.addEventListener("click", async () => {
+          try {
+            await apiFetch(`/admin-api/errors/${btn.dataset.errId}`, { method: "PATCH", body: JSON.stringify({ status: btn.dataset.action }) });
+            loadErrors();
+          } catch (e) {
+            showError("Failed to update error: " + e.message);
+          }
+        }),
+      );
+    } catch (err) {
+      showError("Failed to load errors: " + err.message);
+    }
+  }
+
+  let analyticsChart;
+  async function loadAnalytics() {
+    try {
+      const [{ history }, s] = await Promise.all([apiFetch("/admin-api/analytics?days=30"), apiFetch("/admin-api/stats")]);
+      const latest = history.length ? history[history.length - 1].data : {};
+      const card = (l, v) => `<div class="rounded-xl border border-gray-100 p-3"><p class="text-xs text-gray-500">${l}</p><p class="text-lg font-bold text-gray-900">${v}</p></div>`;
+      document.getElementById("analyticsCards").innerHTML = [
+        card("Total users", (s.totalUsers || 0).toLocaleString()),
+        card("Premium", (s.premiumUsers || 0).toLocaleString()),
+        card("Active businesses", latest.activeBusinesses ?? "—"),
+        card("Conversion", (latest.conversionPct ?? 0) + "%"),
+      ].join("");
+      const ctx = document.getElementById("analyticsChart").getContext("2d");
+      const labels = history.map((h) => new Date(h.takenAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }));
+      if (analyticsChart) analyticsChart.destroy();
+      analyticsChart = new Chart(ctx, {
+        type: "line",
+        data: { labels, datasets: [{ label: "Total users", data: history.map((h) => h.data.totalUsers || 0), borderColor: "#4f46e5", backgroundColor: "rgba(79,70,229,0.1)", tension: 0.3, fill: true }] },
+        options: { responsive: true, plugins: { legend: { display: true } } },
+      });
+    } catch (err) {
+      showError("Failed to load analytics: " + err.message);
+    }
+  }
+
+  document.getElementById("refreshHealthBtn")?.addEventListener("click", loadHealth);
+  document.getElementById("errorStatusFilter")?.addEventListener("change", loadErrors);
 
   async function loadUsers() {
     try {

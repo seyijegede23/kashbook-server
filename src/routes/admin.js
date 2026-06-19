@@ -4,6 +4,8 @@ const adminAuth = require("../middleware/adminAuth");
 const prisma = require("../utils/db");
 const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
+const { collectHealth } = require("../utils/healthCheck");
+const { getMetrics } = require("../utils/metrics");
 
 router.use(auth, adminAuth);
 
@@ -473,6 +475,84 @@ router.get("/transactions/lookup", async (req, res) => {
   } catch (err) {
     console.error("[admin/transactions/lookup]", err);
     res.status(500).json({ error: "Failed to look up transactions" });
+  }
+});
+
+// ── Observability: error tracking ─────────────────────────────────────────────
+// GET /admin-api/errors?status=open&level=error&sort=lastSeen|count
+router.get("/errors", async (req, res) => {
+  try {
+    const { status, level, sort } = req.query;
+    const where = status ? { status } : { status: { not: "ignored" } };
+    if (level) where.level = level;
+    const orderBy = sort === "count" ? { count: "desc" } : { lastSeen: "desc" };
+    res.json(await prisma.errorGroup.findMany({ where, orderBy, take: 100 }));
+  } catch (err) {
+    console.error("GET /admin/errors error:", err.message);
+    res.status(500).json({ error: "Failed to fetch errors" });
+  }
+});
+
+// GET /admin-api/errors/:id — group + its most recent events (stack + context)
+router.get("/errors/:id", async (req, res) => {
+  try {
+    const group = await prisma.errorGroup.findUnique({ where: { id: req.params.id } });
+    if (!group) return res.status(404).json({ error: "Not found" });
+    const events = await prisma.errorEvent.findMany({
+      where: { groupId: group.id },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    });
+    res.json({ group, events });
+  } catch (err) {
+    console.error("GET /admin/errors/:id error:", err.message);
+    res.status(500).json({ error: "Failed to fetch error" });
+  }
+});
+
+// PATCH /admin-api/errors/:id  { status: "open" | "resolved" | "ignored" }
+router.patch("/errors/:id", async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["open", "resolved", "ignored"].includes(status))
+      return res.status(400).json({ error: "status must be open|resolved|ignored" });
+    const group = await prisma.errorGroup.update({ where: { id: req.params.id }, data: { status } });
+    await audit({
+      req, action: `ERROR_${status.toUpperCase()}`, resourceType: "errorGroup",
+      resourceId: group.id, severity: "info", metadata: { fingerprint: group.fingerprint },
+    });
+    res.json(group);
+  } catch (err) {
+    console.error("PATCH /admin/errors/:id error:", err.message);
+    res.status(500).json({ error: "Failed to update error" });
+  }
+});
+
+// ── Observability: health + live request metrics ──────────────────────────────
+router.get("/health", async (_req, res) => {
+  try { res.json(await collectHealth()); }
+  catch (err) { console.error("GET /admin/health error:", err.message); res.status(500).json({ error: "Failed to collect health" }); }
+});
+
+router.get("/metrics", (_req, res) => {
+  try { res.json(getMetrics()); }
+  catch (err) { res.status(500).json({ error: "Failed to read metrics" }); }
+});
+
+// ── Observability: analytics history (charts read this; current KPIs via /stats) ──
+// GET /admin-api/analytics?days=30
+router.get("/analytics", async (req, res) => {
+  try {
+    const days = Math.min(180, Math.max(1, Number(req.query.days) || 30));
+    const since = new Date(Date.now() - days * 86400000);
+    const history = await prisma.metricSnapshot.findMany({
+      where: { kind: "analytics", takenAt: { gte: since } },
+      orderBy: { takenAt: "asc" },
+    });
+    res.json({ days, history });
+  } catch (err) {
+    console.error("GET /admin/analytics error:", err.message);
+    res.status(500).json({ error: "Failed to fetch analytics" });
   }
 });
 

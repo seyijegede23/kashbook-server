@@ -1,5 +1,5 @@
 const router  = require("express").Router();
-const bcrypt  = require("bcryptjs");
+const bcrypt  = require("@node-rs/bcrypt"); // native (off-thread) — hash()/verify(); $2a$/$2b$/$2y$ cross-compatible
 const { body, validationResult } = require("express-validator");
 
 const prisma         = require("../utils/db");
@@ -162,7 +162,7 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
       return res.status(429).json({ error: `Account locked. Try again in ${secsLeft} seconds.` });
     }
 
-    const valid = await bcrypt.compare(password, user.password);
+    const valid = await bcrypt.verify(password, user.password);
     if (!valid) {
       const attempts = user.failedLoginAttempts + 1;
       // Lock for 15 min after 10 failed attempts
@@ -379,7 +379,7 @@ router.post("/set-pin", authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
     if (!user.password)
       return res.status(400).json({ error: "Set a password first to enable PIN" });
-    const valid = await bcrypt.compare(password, user.password);
+    const valid = await bcrypt.verify(password, user.password);
     if (!valid) return res.status(401).json({ error: "Password is incorrect" });
     await prisma.user.update({
       where: { id: req.user.id },
@@ -419,7 +419,7 @@ router.post("/change-password", authMiddleware, async (req, res) => {
         error: "No password is set on this account. Use the forgot-password flow to set one.",
       });
     }
-    const match = await bcrypt.compare(currentPassword, user.password);
+    const match = await bcrypt.verify(currentPassword, user.password);
     if (!match) return res.status(401).json({ error: "Current password is incorrect" });
     await prisma.user.update({ where: { id: req.user.id }, data: { password: await bcrypt.hash(newPassword, 12) } });
     res.json({ message: "Password updated successfully" });
@@ -563,7 +563,7 @@ router.post("/verify-password", authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user?.password) return res.status(400).json({ error: "No password set on this account" });
-    const match = await bcrypt.compare(password, user.password);
+    const match = await bcrypt.verify(password, user.password);
     if (!match) return res.status(401).json({ error: "Incorrect password" });
     res.json({ verified: true });
   } catch (err) {

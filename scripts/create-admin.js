@@ -1,5 +1,5 @@
 require("dotenv").config({ path: require("path").join(__dirname, "../.env") });
-const bcrypt = require("bcryptjs");
+const bcrypt = require("@node-rs/bcrypt");
 const prisma = require("../src/utils/db");
 
 async function main() {

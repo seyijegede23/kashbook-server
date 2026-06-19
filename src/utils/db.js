@@ -59,4 +59,12 @@ async function withCronLock(lockKey, fn) {
 }
 prisma.withCronLock = withCronLock;
 
+// Live connection-pool stats — the tightest scaling signal (max defaults to 10).
+prisma.poolStats = () => ({
+  total: pool.totalCount,
+  idle: pool.idleCount,
+  waiting: pool.waitingCount,
+  max: pool.options?.max || 10,
+});
+
 module.exports = prisma;

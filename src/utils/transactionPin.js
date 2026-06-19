@@ -1,4 +1,4 @@
-const bcrypt = require("bcryptjs");
+const bcrypt = require("@node-rs/bcrypt"); // native (off-thread) — verify() replaces compare()
 const prisma = require("./db");
 
 const PIN_REGEX = /^\d{4}$/;
@@ -31,7 +31,7 @@ async function verifyTransactionPin(userId, pin) {
       code: "PIN_LOCKED",
     };
   }
-  const match = await bcrypt.compare(String(pin), user.transactionPin);
+  const match = await bcrypt.verify(String(pin), user.transactionPin);
   if (!match) {
     // Atomic increment — concurrent wrong guesses can't all read the same count
     // and write back 1, which would let an attacker evade the lock-out.

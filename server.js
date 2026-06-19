@@ -6,6 +6,18 @@ const prisma = require("./src/utils/db");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const morgan = require("morgan");
+const { captureError } = require("./src/utils/errorTracker");
+const { metricsMiddleware } = require("./src/utils/metrics");
+
+// Last-resort capture so crashes are recorded before the process restarts.
+process.on("unhandledRejection", (reason) => {
+  captureError(reason, { level: "fatal", context: { kind: "unhandledRejection" } });
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+  captureError(err, { level: "fatal", context: { kind: "uncaughtException" } });
+  setTimeout(() => process.exit(1), 500); // let the capture flush, then restart cleanly
+});
 
 const authRoutes = require("./src/routes/auth");
 const businessRoutes = require("./src/routes/businesses");
@@ -40,6 +52,9 @@ app.use(
     stream: { write: (msg) => process.stdout.write(msg) },
   }),
 );
+
+// Per-request latency + status metrics (in-memory; read via /admin-api/metrics).
+app.use(metricsMiddleware);
 
 // ── Rate limiters ─────────────────────────────────────────────────────────────
 
@@ -212,14 +227,22 @@ app.get("/admin", (_req, res) =>
 );
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/health", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: "ok", uptime: Math.round(process.uptime()) });
+  } catch {
+    res.status(503).json({ status: "degraded" });
+  }
+});
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
 // ── Global error handler ──────────────────────────────────────────────────────
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   console.error(err);
+  captureError(err, { req, context: { statusCode: 500 } });
   res.status(500).json({ error: "Internal server error" });
 });
 
@@ -240,7 +263,10 @@ cron.schedule(
   "0 20 * * *",
   async () => {
     try {
-      await prisma.withCronLock(4001, () => require("./src/utils/dailyReport").sendDailyReports());
+      await prisma.withCronLock(4001, async () => {
+        await require("./src/utils/snapshots").recordHeartbeat("dailyReport");
+        await require("./src/utils/dailyReport").sendDailyReports();
+      });
     } catch (err) {
       console.error("[cron dailyReport]", err.message);
     }
@@ -252,6 +278,7 @@ cron.schedule(
 cron.schedule("0 * * * *", async () => {
   try {
     await prisma.withCronLock(4002, async () => {
+    await require("./src/utils/snapshots").recordHeartbeat("lowStock");
     // Filter at the DB level so we only pull genuinely low rows (instead of
     // loading the entire inventory table into memory each hour).
     const actualLow = await prisma.$queryRaw`
@@ -308,9 +335,37 @@ cron.schedule("0 * * * *", async () => {
 const { processRecurringExpenses } = require("./src/utils/recurringExpenseRunner");
 cron.schedule("5 0 * * *", async () => {
   try {
-    await prisma.withCronLock(4003, () => processRecurringExpenses());
+    await prisma.withCronLock(4003, async () => {
+      await require("./src/utils/snapshots").recordHeartbeat("recurringExpenses");
+      await processRecurringExpenses();
+    });
   } catch (err) {
     console.error("[Cron] Recurring expenses error:", err);
+  }
+});
+
+// ── Observability: health snapshot + alerts every 10 min; analytics hourly ───
+cron.schedule("*/10 * * * *", async () => {
+  try {
+    await prisma.withCronLock(4005, async () => {
+      const snaps = require("./src/utils/snapshots");
+      const { checkAlerts } = require("./src/utils/alerts");
+      await snaps.recordHeartbeat("snapshot");
+      const health = await snaps.takeHealthSnapshot();
+      await checkAlerts(health);
+      if (new Date().getMinutes() < 10) await snaps.takeAnalyticsSnapshot(); // ~hourly at :00
+    });
+  } catch (err) {
+    console.error("[Cron] observability snapshot error:", err);
+  }
+});
+
+// ── Observability: retention purge (daily 01:10) ─────────────────────────────
+cron.schedule("10 1 * * *", async () => {
+  try {
+    await prisma.withCronLock(4006, () => require("./src/utils/snapshots").purgeRetention());
+  } catch (err) {
+    console.error("[Cron] retention purge error:", err);
   }
 });
 
@@ -319,6 +374,7 @@ cron.schedule("5 0 * * *", async () => {
 // the minute. 5min cadence cuts cron-driven DB queries by 80%.
 cron.schedule("*/5 * * * *", async () => {
   try {
+    await require("./src/utils/snapshots").recordHeartbeat("reminders");
     const now = new Date();
     const pendingReminders = await prisma.reminder.findMany({
       where: { status: "pending", scheduledFor: { lte: now } },

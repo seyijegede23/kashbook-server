@@ -685,3 +685,63 @@ model ComplianceFlag {
   @@index([userId])
   @@index([transactionId])
 }
+
+// ── Observability ─────────────────────────────────────────────────────────────
+// In-house error tracking, health/analytics history snapshots, cron heartbeats
+// and alert-cooldown state. See server/src/utils/{errorTracker,metrics,alerts}.js.
+
+model ErrorGroup {
+  id          String       @id @default(uuid())
+  fingerprint String       @unique           // hash(name + normalized message + top frame)
+  name        String                          // error class / name
+  message     String                          // representative message
+  where       String?                         // top in-app stack frame or route
+  level       String       @default("error")  // "error" | "fatal" | "warn"
+  status      String       @default("open")   // "open" | "resolved" | "ignored"
+  count       Int          @default(0)
+  firstSeen   DateTime     @default(now())
+  lastSeen    DateTime     @default(now())
+  events      ErrorEvent[]
+
+  @@index([status, lastSeen])
+}
+
+model ErrorEvent {
+  id         String     @id @default(uuid())
+  groupId    String
+  group      ErrorGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  message    String
+  stack      String?    @db.Text
+  route      String?
+  method     String?
+  statusCode Int?
+  userId     String?
+  ip         String?
+  userAgent  String?
+  context    Json?      // redacted request context (no secrets/PII)
+  createdAt  DateTime   @default(now())
+
+  @@index([groupId, createdAt])
+}
+
+model MetricSnapshot {
+  id      String   @id @default(uuid())
+  kind    String                            // "health" | "analytics"
+  takenAt DateTime @default(now())
+  data    Json
+
+  @@index([kind, takenAt])
+}
+
+model CronHeartbeat {
+  name       String   @id                    // cron identifier
+  lastRunAt  DateTime
+  lastStatus String   @default("ok")          // "ok" | "error"
+  lastError  String?
+}
+
+model AlertState {
+  key         String   @id                    // alert rule key
+  lastFiredAt DateTime
+  lastValue   String?
+}

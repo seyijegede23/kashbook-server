@@ -244,14 +244,17 @@ function startReconciliationLoop(intervalMs = 2 * 60 * 1000) {
     try {
       // Leader-elect across instances so only one reconciles per tick (the
       // in-process `running` guard above only covers reentrancy on one instance).
-      const total = (await prisma.withCronLock(4004, () => reconcileAll({
-        onCreate: ({ biz, amount, reference }) => {
-          console.log(
-            `[reconcile] +${biz.name} ←₦${amount.toLocaleString("en-NG")} ref=${reference}`,
-          );
-        },
-        logger: (msg) => console.warn(msg),
-      }))) || 0;
+      const total = (await prisma.withCronLock(4004, async () => {
+        await require("./snapshots").recordHeartbeat("reconcile");
+        return reconcileAll({
+          onCreate: ({ biz, amount, reference }) => {
+            console.log(
+              `[reconcile] +${biz.name} ←₦${amount.toLocaleString("en-NG")} ref=${reference}`,
+            );
+          },
+          logger: (msg) => console.warn(msg),
+        });
+      })) || 0;
       if (total > 0) console.log(`[reconcile] inserted ${total} credit(s)`);
     } catch (err) {
       console.error("[reconcile] loop error:", err.message);
