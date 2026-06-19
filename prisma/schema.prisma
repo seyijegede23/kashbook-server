@@ -91,6 +91,7 @@ model Business {
   kycId            String?                              // generic primary KYC identifier (encrypted)
   kycIdType        String          @default("BVN")      // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   invoiceCounter       Int             @default(0)
+  taxId                String?                              // display-only Tax ID / RC number for documents (P&L, invoices)
   virtualAccountRef    String?
   virtualAccountId     String?
   virtualAccountNumber String?
@@ -558,6 +559,7 @@ model Invoice {
   customer       Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
   userId         String
   invoiceNumber  String
+  type           String           @default("invoice") // "invoice" | "quote" (quotes convert to invoices)
   status         InvoiceStatus    @default(DRAFT)
   issueDate      String
   dueDate        String?

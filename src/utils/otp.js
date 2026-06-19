@@ -180,11 +180,25 @@ async function dispatchOtp(identifier, type, { country } = {}) {
       </body></html>`;
     await sendEmail(identifier, "Your KashBook Verification Code", html);
   } else {
-    // Route via the country-aware SMS router; Termii adapter stays available
-    // as a direct export for backwards compatibility with anything that still
-    // imports sendSms() from this file.
-    const smsRouter = require("./sms");
-    await smsRouter.sendSms(identifier, message, { country });
+    // Phone identifier: prefer WhatsApp (Meta Cloud API) when it's configured,
+    // and fall back to SMS on any failure or when WhatsApp isn't set up. We
+    // generated `code` above, so verification (verifyOtp) is identical
+    // regardless of which channel delivered it.
+    const { sendWhatsAppOtp, isConfigured } = require("./whatsapp");
+    let delivered = false;
+    if (isConfigured()) {
+      const wa = await sendWhatsAppOtp(identifier, code);
+      delivered = wa.ok;
+      if (!wa.ok) {
+        console.warn(`[OTP] WhatsApp delivery failed (${wa.error}) — falling back to SMS`);
+      }
+    }
+    if (!delivered) {
+      // Country-aware SMS router; Termii adapter stays available as a direct
+      // export for anything that still imports sendSms() from this file.
+      const smsRouter = require("./sms");
+      await smsRouter.sendSms(identifier, message, { country });
+    }
   }
 
   return code;

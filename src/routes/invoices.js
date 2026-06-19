@@ -46,7 +46,7 @@ const INCLUDE = {
 // ── GET /invoices ─────────────────────────────────────────────────────────────
 router.get("/", authMiddleware, async (req, res) => {
   try {
-    const { businessId, status, dateFrom, dateTo, since } = req.query;
+    const { businessId, status, type, dateFrom, dateTo, since } = req.query;
     if (!businessId) return res.status(400).json({ error: "businessId required" });
     if (!(await ownsBusiness(req, businessId)))
       return res.status(403).json({ error: "Access denied" });
@@ -56,6 +56,7 @@ router.get("/", authMiddleware, async (req, res) => {
       where.updatedAt = { gt: new Date(since) };
     } else {
       if (status) where.status = status.toUpperCase();
+      if (type) where.type = type; // "invoice" | "quote"
       if (dateFrom || dateTo) {
         where.issueDate = {};
         if (dateFrom) where.issueDate.gte = dateFrom;
@@ -107,6 +108,7 @@ router.post("/", authMiddleware, async (req, res) => {
       terms,
       template = "classic",
       status = "DRAFT",
+      type = "invoice",
     } = req.body;
 
     if (!businessId) return res.status(400).json({ error: "businessId required" });
@@ -117,11 +119,12 @@ router.post("/", authMiddleware, async (req, res) => {
     if (!biz) return res.status(403).json({ error: "Access denied" });
 
     // Auto-increment invoice counter
+    const isQuote = type === "quote";
     const updatedBiz = await prisma.business.update({
       where: { id: businessId },
       data: { invoiceCounter: { increment: 1 } },
     });
-    const invoiceNumber = `INV-${String(updatedBiz.invoiceCounter).padStart(3, "0")}`;
+    const invoiceNumber = `${isQuote ? "QTE" : "INV"}-${String(updatedBiz.invoiceCounter).padStart(3, "0")}`;
 
     // Calculate totals
     const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
@@ -140,6 +143,7 @@ router.post("/", authMiddleware, async (req, res) => {
         customerId: customerId || null,
         userId,
         invoiceNumber,
+        type: isQuote ? "quote" : "invoice",
         status: status.toUpperCase(),
         issueDate,
         dueDate: dueDate || null,
@@ -301,6 +305,8 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId)))
       return res.status(403).json({ error: "Access denied" });
+    if (existing.type === "quote")
+      return res.status(403).json({ error: "Quotes can't take payments — convert it to an invoice first.", code: "QUOTE_NO_PAYMENT" });
     if (existing.status === "VOID")
       return res.status(400).json({ error: "Cannot record payment on a VOID invoice" });
 
@@ -373,6 +379,36 @@ router.post("/:id/share-link", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("share-link error:", err);
     res.status(500).json({ error: "Failed to create share link" });
+  }
+});
+
+// ── POST /invoices/:id/convert-to-invoice ─────────────────────────────────────
+// Turn an accepted quote into a real invoice: flip type, assign a fresh INV-
+// number off the business counter, reset to DRAFT so it can be sent + paid.
+router.post("/:id/convert-to-invoice", authMiddleware, async (req, res) => {
+  try {
+    const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: "Invoice not found" });
+    if (!(await ownsBusiness(req, existing.businessId)))
+      return res.status(403).json({ error: "Access denied" });
+    if (existing.type !== "quote")
+      return res.status(400).json({ error: "Only a quote can be converted." });
+
+    const updatedBiz = await prisma.business.update({
+      where: { id: existing.businessId },
+      data: { invoiceCounter: { increment: 1 } },
+    });
+    const invoiceNumber = `INV-${String(updatedBiz.invoiceCounter).padStart(3, "0")}`;
+
+    const invoice = await prisma.invoice.update({
+      where: { id: req.params.id },
+      data: { type: "invoice", invoiceNumber, status: "DRAFT" },
+      include: INCLUDE,
+    });
+    res.json(formatInvoice(invoice));
+  } catch (err) {
+    console.error("convert error:", err);
+    res.status(500).json({ error: "Failed to convert quote" });
   }
 });
 
