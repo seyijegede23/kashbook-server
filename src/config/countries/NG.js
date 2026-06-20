@@ -43,5 +43,5 @@ module.exports = {
   regulators: ["CBN", "NFIU"],
   primaryAct: "Money Laundering (Prevention and Prohibition) Act, 2022",
 
-  smsProvider: "termii",
+  smsProvider: "africas_talking",
 };

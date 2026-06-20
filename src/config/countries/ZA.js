@@ -42,5 +42,5 @@ module.exports = {
   regulators: ["SARB", "FIC"],
   primaryAct: "Financial Intelligence Centre Act, 2001 (FICA)",
 
-  smsProvider: "aws_sns",
+  smsProvider: "africas_talking",
 };

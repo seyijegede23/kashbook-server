@@ -23,11 +23,17 @@ async function sendSms(phone, message) {
 
   // E.164 normalisation — Africa's Talking expects + prefix.
   const to = String(phone).startsWith("+") ? phone : `+${String(phone).replace(/\D/g, "")}`;
-  const senderId = process.env.AFRICAS_TALKING_SENDER || "AT";
 
   try {
-    const body = new URLSearchParams({ username, to, message, from: senderId });
-    const res = await fetch("https://api.africastalking.com/version1/messaging", {
+    const params = { username, to, message };
+    // Only set a sender ID if one is REGISTERED with Africa's Talking. An
+    // unregistered alphanumeric sender is rejected on live in many countries;
+    // omitting `from` lets AT use its default/pooled sender so delivery still works.
+    if (process.env.AFRICAS_TALKING_SENDER) params.from = process.env.AFRICAS_TALKING_SENDER;
+
+    const base = process.env.AFRICAS_TALKING_BASE || "https://api.africastalking.com/version1/messaging";
+    const body = new URLSearchParams(params);
+    const res = await fetch(base, {
       method: "POST",
       headers: {
         "apiKey": apiKey,

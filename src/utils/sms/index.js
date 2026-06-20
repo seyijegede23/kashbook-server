@@ -1,6 +1,6 @@
 // SMS provider router. Picks the right adapter based on the user's country
-// (or an explicit override). Falls back to Termii if the country is
-// unknown so legacy code paths still work.
+// (or an explicit override). Falls back to Africa's Talking for unknown
+// countries (the platform-wide default SMS provider).
 const { getCountryConfig } = require("../../config/countries");
 const termii = require("./termii");
 const africasTalking = require("./africas_talking");
@@ -14,8 +14,8 @@ const ADAPTERS = {
 
 function pickAdapter(country) {
   const cfg = getCountryConfig(country);
-  const key = cfg.smsProvider || "termii";
-  return ADAPTERS[key] || termii;
+  const key = cfg.smsProvider || "africas_talking";
+  return ADAPTERS[key] || africasTalking;
 }
 
 async function sendSms(phone, message, { country } = {}) {

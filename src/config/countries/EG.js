@@ -42,5 +42,5 @@ module.exports = {
   regulators: ["CBE", "EMLCU"],
   primaryAct: "Anti-Money Laundering Law No. 80 of 2002 (as amended)",
 
-  smsProvider: "aws_sns",
+  smsProvider: "africas_talking",
 };
