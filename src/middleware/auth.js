@@ -16,11 +16,18 @@ async function authMiddleware(req, res, next) {
       select: {
         id: true, accountType: true, employerId: true, firstName: true,
         lastName: true, role: true, plan: true,
-        accountStatus: true, complianceFreezeReason: true,
+        accountStatus: true, complianceFreezeReason: true, tokenVersion: true,
       },
     });
 
     if (!user) return res.status(401).json({ error: "User no longer exists" });
+
+    // Session revocation: a token minted before a password change / logout-all
+    // carries an older tokenVersion and is rejected here. (Legacy tokens with no
+    // tokenVersion claim default to 0, matching a fresh account — no mass logout.)
+    if ((payload.tokenVersion ?? 0) !== (user.tokenVersion ?? 0)) {
+      return res.status(401).json({ error: "Session expired, please log in again" });
+    }
 
     // For staff, feature limits are governed by the employer's plan
     let effectivePlan = user.plan ?? "FREE";

@@ -25,7 +25,8 @@ if (dsn) {
     // We are a fintech app — never let Sentry collect bodies/PII by default.
     sendDefaultPii: false,
     // Belt-and-braces scrub: drop request body, cookies, and auth headers from
-    // every event before it leaves the process (covers PINs, tokens, BVN, etc.).
+    // every event before it leaves the process (covers PINs, tokens, BVN, etc.),
+    // and strip sensitive query params from the URL.
     beforeSend(event) {
       if (event.request) {
         delete event.request.data;
@@ -34,6 +35,12 @@ if (dsn) {
           delete event.request.headers.authorization;
           delete event.request.headers.Authorization;
           delete event.request.headers.cookie;
+        }
+        if (event.request.url) {
+          event.request.url = String(event.request.url).replace(
+            /([?&](?:amount|accountNumber|bvn|nin|pin|otp|token|cvv|card|password)=)[^&#]*/gi,
+            "$1<redacted>",
+          );
         }
       }
       return event;

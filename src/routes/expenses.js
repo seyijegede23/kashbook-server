@@ -25,7 +25,7 @@ router.get("/", async (req, res) => {
     const expenses = await prisma.expense.findMany({
       where,
       orderBy: since ? { updatedAt: "asc" } : { date: "desc" },
-      take: since ? undefined : Number(limit),
+      take: since ? undefined : Math.min(1000, Math.max(1, Number(limit) || 200)),
     });
     res.json(expenses);
   } catch (err) {

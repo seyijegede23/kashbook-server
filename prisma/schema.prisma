@@ -32,6 +32,9 @@ model User {
   transactionPinLockedUntil  DateTime?
   failedLoginAttempts  Int            @default(0)
   lockedUntil          DateTime?
+  // Bumped on password change / logout-all; JWTs carry this value and are
+  // rejected by authMiddleware once it no longer matches (session revocation).
+  tokenVersion         Int            @default(0)
   dateOfBirth          DateTime?
   gender               String?
   anchorCustomerId     String?        @unique

@@ -17,6 +17,7 @@
  * Event reference: https://www.revenuecat.com/docs/webhooks/event-types-and-fields
  */
 const router = require("express").Router();
+const crypto = require("crypto");
 const prisma = require("../utils/db");
 const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
@@ -41,7 +42,9 @@ router.post("/", async (req, res) => {
     console.warn("[RevenueCat webhook] REVENUECAT_WEBHOOK_AUTH not set — rejecting");
     return res.sendStatus(401);
   }
-  if (req.headers.authorization !== expected) {
+  const provided = Buffer.from(req.headers.authorization || "");
+  const expectedBuf = Buffer.from(expected);
+  if (provided.length !== expectedBuf.length || !crypto.timingSafeEqual(provided, expectedBuf)) {
     console.warn("[RevenueCat webhook] auth mismatch — rejecting");
     return res.sendStatus(401);
   }

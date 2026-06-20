@@ -12,6 +12,7 @@ const CRON_INTERVAL_MIN = {
   reminders: 5,
   reconcile: 5,
   snapshot: 10,
+  kycPurge: 24 * 60,
 };
 
 async function pingDb() {

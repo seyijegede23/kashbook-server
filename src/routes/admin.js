@@ -7,7 +7,27 @@ const { pushTo } = require("../utils/pushNotification");
 const { collectHealth } = require("../utils/healthCheck");
 const { getMetrics } = require("../utils/metrics");
 
-router.use(auth, adminAuth);
+// CSRF defense-in-depth. Admin auth is Bearer-token (already CSRF-resistant since
+// a cross-site page can't set the Authorization header), but we additionally
+// reject cross-origin state-changing requests. Requests with no Origin header
+// (non-browser tools) still pass — they remain gated by the Bearer token.
+function adminCsrfGuard(req, res, next) {
+  if (["POST", "PATCH", "PUT", "DELETE"].includes(req.method)) {
+    const origin = req.headers.origin;
+    if (origin) {
+      const allowed = (process.env.ALLOWED_ORIGIN || "")
+        .split(",").map((s) => s.trim()).filter(Boolean);
+      let sameHost = false;
+      try { sameHost = new URL(origin).host === req.headers.host; } catch {}
+      if (!sameHost && !allowed.includes(origin)) {
+        return res.status(403).json({ error: "Cross-origin request blocked" });
+      }
+    }
+  }
+  next();
+}
+
+router.use(auth, adminAuth, adminCsrfGuard);
 
 // GET /admin-api/stats
 router.get("/stats", async (req, res) => {
@@ -197,7 +217,7 @@ router.post("/users/:id/clear-kyc-attempts", async (req, res) => {
     res.json({ cleared: count });
   } catch (err) {
     console.error("[clear-kyc-attempts]", err);
-    res.status(500).json({ error: err.message || "Failed to clear KYC attempts" });
+    res.status(500).json({ error: "Failed to clear KYC attempts" });
   }
 });
 

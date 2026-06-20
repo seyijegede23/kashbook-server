@@ -123,7 +123,7 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
       : await prisma.user.create({ data });
 
     await ensurePrimaryBusiness(user.id, biz, countryCode);
-    const token = signToken({ userId: user.id });
+    const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion ?? 0 });
     res.status(201).json(userResponse(user, token));
   } catch (err) {
     console.error(err);
@@ -198,7 +198,7 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
       actorOverride: { type: "user", id: user.id },
     });
 
-    const token = signToken({ userId: user.id });
+    const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion ?? 0 });
     res.json(userResponse(user, token));
   } catch (err) {
     console.error(err);
@@ -218,8 +218,9 @@ router.post("/send-otp", async (req, res) => {
     await dispatchOtp(iden, type);
     res.json({ message: "OTP sent" });
   } catch (err) {
+    if (err.status === 429) return res.status(429).json({ error: err.message });
     console.error("send-otp error:", err.message ?? err);
-    res.status(500).json({ error: `Failed to send OTP: ${err.message ?? "unknown error"}` });
+    res.status(500).json({ error: "Failed to send verification code. Please try again." });
   }
 });
 
@@ -259,7 +260,7 @@ router.post("/verify-otp", async (req, res) => {
       });
     }
     await ensurePrimaryBusiness(user.id, user.businessName || "My Business");
-    const token = signToken({ userId: user.id });
+    const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion ?? 0 });
     res.json(userResponse(user, token));
   } catch (err) {
     console.error(err);
@@ -278,12 +279,18 @@ router.post("/forgot-password", async (req, res) => {
   const iden = isEmail ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
   try {
     const user = await prisma.user.findFirst({ where: isEmail ? { email: iden } : { phone: iden } });
-    if (!user) return res.json({ message: "If that account exists, a reset code was sent." });
-    await dispatchOtp(iden, "phone_reset");
+    // Respond identically and immediately whether or not the account exists, then
+    // dispatch the code AFTER responding — so neither the message nor the response
+    // time (SMS/email latency) reveals which identifiers are registered.
     res.json({ message: "If that account exists, a reset code was sent." });
+    if (user) {
+      dispatchOtp(iden, "phone_reset").catch((e) =>
+        console.error("[forgot-password] dispatch failed:", e.message),
+      );
+    }
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to process request" });
+    if (!res.headersSent) res.status(500).json({ error: "Failed to process request" });
   }
 });
 
@@ -302,7 +309,8 @@ router.post("/reset-password", async (req, res) => {
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
     await prisma.user.updateMany({
       where: isEmail ? { email: iden } : { phone: iden },
-      data: { password: await bcrypt.hash(newPassword, 12) },
+      // Bump tokenVersion so any tokens issued before the reset stop working.
+      data: { password: await bcrypt.hash(newPassword, 12), tokenVersion: { increment: 1 } },
     });
     res.json({ message: "Password updated successfully" });
   } catch (err) {
@@ -344,6 +352,11 @@ router.get("/me", authMiddleware, async (req, res) => {
 router.patch("/push-token", authMiddleware, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: "token required" });
+  // Must be a real Expo push token — we POST it to exp.host, so an arbitrary
+  // string/URL here would be an SSRF / data-exfil vector.
+  if (!/^ExponentPushToken\[[A-Za-z0-9_-]+\]$/.test(token)) {
+    return res.status(400).json({ error: "invalid push token" });
+  }
   try {
     // A device token belongs to exactly ONE account — whoever logged in on
     // the device last. Without this, every account ever used on a shared
@@ -421,11 +434,33 @@ router.post("/change-password", authMiddleware, async (req, res) => {
     }
     const match = await bcrypt.verify(currentPassword, user.password);
     if (!match) return res.status(401).json({ error: "Current password is incorrect" });
-    await prisma.user.update({ where: { id: req.user.id }, data: { password: await bcrypt.hash(newPassword, 12) } });
+    await prisma.user.update({
+      where: { id: req.user.id },
+      // Invalidate every existing token (incl. other devices) on password change.
+      data: { password: await bcrypt.hash(newPassword, 12), tokenVersion: { increment: 1 } },
+    });
     res.json({ message: "Password updated successfully" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to change password" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /auth/logout — sign out of ALL devices (bumps tokenVersion so every
+// previously-issued JWT is rejected by authMiddleware on its next use).
+// ─────────────────────────────────────────────
+router.post("/logout", authMiddleware, async (req, res) => {
+  try {
+    await prisma.user.update({
+      where: { id: req.user.id },
+      data: { tokenVersion: { increment: 1 } },
+    });
+    await audit({ req, action: "LOGOUT_ALL", resourceType: "user", resourceId: req.user.id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to log out" });
   }
 });
 

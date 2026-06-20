@@ -1,0 +1,7 @@
+[Sentry] disabled (no SENTRY_DSN set)
+[validateEnv] configuration problems:
+  - REVENUECAT_WEBHOOK_AUTH is not set (RevenueCat subscription webhooks will be rejected)
+  - Dojah sandbox key (test_sk_*) is set against the LIVE base URL — fix the key/URL pair
+[validateEnv] (warnings only outside production)
+[reconcile] started, interval=300000ms
+KashBook API running on port 3999

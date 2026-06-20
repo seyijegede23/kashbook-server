@@ -11,10 +11,14 @@ function normalizePhoneForTermii(phone) {
 }
 
 async function sendSms(phone, message) {
-  console.log(`\n============================`);
-  console.log(`📱 OTP SMS (Termii) → ${phone}`);
-  console.log(`   ${message}`);
-  console.log(`============================\n`);
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`\n============================`);
+    console.log(`📱 OTP SMS (Termii) → ${phone}`);
+    console.log(`   ${message}`);
+    console.log(`============================\n`);
+  } else {
+    console.log(`📱 OTP SMS (Termii) → ${String(phone).replace(/\d(?=\d{4})/g, "*")}`);
+  }
 
   const apiKey = process.env.TERMII_API_KEY;
   if (!apiKey) {

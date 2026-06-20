@@ -494,6 +494,15 @@ async function createTransfer({
 //
 // We compute THREE plausible recipes and accept whichever matches — useful for
 // diagnosing format mismatches between Anchor's actual implementation and docs.
+// Constant-time compare so a signature can't be brute-forced byte-by-byte via
+// response-timing. Length mismatch short-circuits (lengths aren't secret).
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a || ""), "utf8");
+  const bb = Buffer.from(String(b || ""), "utf8");
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
 function verifyWebhook(rawBody, headers) {
   // Emergency bypass — set ANCHOR_VERIFY_WEBHOOK=false in env to skip
   // signature verification entirely. Use sparingly; only safe in sandbox
@@ -503,7 +512,16 @@ function verifyWebhook(rawBody, headers) {
     return true;
   }
   const secret = WEBHOOK_SECRET();
-  if (!secret) return true; // not configured — fail-open (dev only)
+  if (!secret) {
+    // Fail CLOSED in production — an unsigned webhook could fake inbound credits.
+    // In dev/staging, allow + warn so local testing without a secret still works.
+    if (process.env.NODE_ENV === "production") {
+      console.error("[Anchor verifyWebhook] ANCHOR_WEBHOOK_SECRET not set — rejecting");
+      return false;
+    }
+    console.warn("[Anchor verifyWebhook] no secret configured (dev) — skipping verification");
+    return true;
+  }
   const provided =
     headers["x-anchor-signature"] || headers["anchor-signature"] || "";
   if (!provided) return false;
@@ -532,27 +550,20 @@ function verifyWebhook(rawBody, headers) {
     } catch {}
   }
 
-  if (
-    provided === recipeA ||
-    provided === recipeB ||
-    provided === recipeC ||
-    provided === recipeD ||
-    (recipeE && provided === recipeE)
-  ) {
+  // Constant-time compare against each candidate recipe.
+  const candidates = [recipeA, recipeB, recipeC, recipeD, recipeE].filter(Boolean);
+  if (candidates.some((c) => safeEqual(provided, c))) {
     return true;
   }
 
-  console.warn(
-    `[Anchor verifyWebhook] mismatch.\n` +
-      `  provided=${provided}\n` +
-      `  recipeA(b64-of-hex)    =${recipeA}\n` +
-      `  recipeB(b64-of-bytes)  =${recipeB}\n` +
-      `  recipeC(hex)           =${recipeC}\n` +
-      `  recipeD(b64-of-HEX)    =${recipeD}\n` +
-      `  recipeE(secret-as-hex) =${recipeE}\n` +
-      `  bodyLen=${body.length} secretLen=${secret.length} secretFirst3=${secret.slice(0, 3)} secretLast3=${secret.slice(-3)}\n` +
-      `  body=${body.toString("utf8").slice(0, 500)}`,
-  );
+  // Never log the secret or the request body. Recipe values are HMAC outputs
+  // (not the secret) and only printed in non-production for diagnosis.
+  console.warn(`[Anchor verifyWebhook] signature mismatch (bodyLen=${body.length})`);
+  if (process.env.NODE_ENV !== "production") {
+    console.warn(
+      `  provided=${provided}\n  A=${recipeA}\n  B=${recipeB}\n  C=${recipeC}\n  D=${recipeD}\n  E=${recipeE}`,
+    );
+  }
   return false;
 }
 

@@ -3,10 +3,14 @@
 // are set. Console-prints the message in dev so the OTP is still visible.
 
 async function sendSms(phone, message) {
-  console.log(`\n============================`);
-  console.log(`📱 OTP SMS (Africa's Talking) → ${phone}`);
-  console.log(`   ${message}`);
-  console.log(`============================\n`);
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`\n============================`);
+    console.log(`📱 OTP SMS (Africa's Talking) → ${phone}`);
+    console.log(`   ${message}`);
+    console.log(`============================\n`);
+  } else {
+    console.log(`📱 OTP SMS (Africa's Talking) → ${String(phone).replace(/\d(?=\d{4})/g, "*")}`);
+  }
 
   const apiKey   = process.env.AFRICAS_TALKING_KEY;
   const username = process.env.AFRICAS_TALKING_USER;

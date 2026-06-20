@@ -13,8 +13,10 @@
  */
 
 const router = require("express").Router();
+const crypto = require("crypto");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
+const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
 const {
   extractSender,
@@ -57,20 +59,32 @@ router.post("/", async (req, res) => {
     // event by inserting its id; a duplicate hits the @unique and we skip. Keyed
     // on (eventType + resource id) so distinct event types on the same resource
     // (e.g. account.opened then accountNumber.created) are NOT collapsed.
-    const dedupId = event.data?.id || attrs.reference || attrs.sessionId || "";
-    if (dedupId) {
-      try {
-        await prisma.processedWebhook.create({
-          data: { eventId: `${eventType}:${dedupId}`, type: eventType },
+    // Body-hash fallback so an id-less (or replayed id-less) event still dedups
+    // instead of falling through unprotected.
+    const dedupId =
+      event.data?.id ||
+      attrs.reference ||
+      attrs.sessionId ||
+      crypto.createHash("sha256").update(rawBody).digest("hex");
+    try {
+      await prisma.processedWebhook.create({
+        data: { eventId: `${eventType}:${dedupId}`, type: eventType },
+      });
+    } catch (dupErr) {
+      if (dupErr.code === "P2002") {
+        // Duplicate delivery (or replay) — record it so spikes are detectable.
+        console.warn(`[Anchor webhook] duplicate ${eventType}:${dedupId} — skipping`);
+        await audit({
+          action: "ANCHOR_WEBHOOK_DUPLICATE",
+          resourceType: "webhook",
+          resourceId: String(dedupId).slice(0, 120),
+          severity: "info",
+          metadata: { eventType },
         });
-      } catch (dupErr) {
-        if (dupErr.code === "P2002") {
-          console.log(`[Anchor webhook] duplicate ${eventType}:${dedupId} — skipping`);
-          return;
-        }
-        // A dedup-ledger error must never drop a real event — log and continue.
-        console.error("[Anchor webhook] dedup insert error:", dupErr.message);
+        return;
       }
+      // A dedup-ledger error must never drop a real event — log and continue.
+      console.error("[Anchor webhook] dedup insert error:", dupErr.message);
     }
 
     // ── Customer KYC / KYB approved ──────────────────────────────────────────
@@ -471,6 +485,21 @@ router.post("/", async (req, res) => {
         narration,
       });
       await pushTo(biz.userId, title, body);
+
+      // Detailed credit alert (fire-and-forget).
+      if (biz.user?.email) {
+        require("../utils/transactionEmail").sendTransactionEmail({
+          to: biz.user.email,
+          direction: "credit",
+          amount,
+          currency: biz.currency || "NGN",
+          counterparty: sender?.label || sender?.name || "a bank transfer",
+          narration,
+          reference: sessionId,
+          businessName: biz.name,
+          dateLabel: new Date().toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" }),
+        });
+      }
       return;
     }
 
@@ -492,6 +521,7 @@ router.post("/", async (req, res) => {
 
       const destBiz = await prisma.business.findFirst({
         where: { anchorAccountId: destAccountId },
+        include: { user: true },
       });
       if (!destBiz) {
         console.warn(
@@ -553,6 +583,21 @@ router.post("/", async (req, res) => {
         narration,
       });
       await pushTo(destBiz.userId, title, body);
+
+      // Detailed credit alert (fire-and-forget).
+      if (destBiz.user?.email) {
+        require("../utils/transactionEmail").sendTransactionEmail({
+          to: destBiz.user.email,
+          direction: "credit",
+          amount,
+          currency: destBiz.currency || "NGN",
+          counterparty: sender?.label || sender?.name || "another KashBook user",
+          narration,
+          reference,
+          businessName: destBiz.name,
+          dateLabel: new Date().toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" }),
+        });
+      }
       return;
     }
 

@@ -6,8 +6,34 @@ function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+// Per-identifier throttle (independent of the per-IP limiter) so one phone/email
+// can't be spammed with codes and so a NAT/proxy can't enumerate accounts by
+// blasting many identifiers from one IP.
+const OTP_MIN_INTERVAL_MS = 30 * 1000; // min gap between codes for an identifier
+const OTP_MAX_PER_HOUR = 5;
+
+async function assertOtpQuota(identifier) {
+  const now = Date.now();
+  const recent = await prisma.otpCode.findMany({
+    where: { identifier, createdAt: { gte: new Date(now - 60 * 60 * 1000) } },
+    select: { createdAt: true },
+    orderBy: { createdAt: "desc" },
+  });
+  if (recent.length && now - new Date(recent[0].createdAt).getTime() < OTP_MIN_INTERVAL_MS) {
+    const err = new Error("Please wait a moment before requesting another code.");
+    err.status = 429;
+    throw err;
+  }
+  if (recent.length >= OTP_MAX_PER_HOUR) {
+    const err = new Error("Too many code requests. Please try again later.");
+    err.status = 429;
+    throw err;
+  }
+}
+
 // ── Save OTP to DB (invalidates previous ones of same type) ────────────────
 async function saveOtp(identifier, type) {
+  await assertOtpQuota(identifier);
   const code = generateCode();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
@@ -54,11 +80,16 @@ function normalizePhoneForTermii(phone) {
 
 // ── Send SMS via Termii ─────────────────────────────────────────────────────
 async function sendSms(phone, message) {
-  // Always print the message so it's visible in the server console during dev
-  console.log(`\n============================`);
-  console.log(`📱 OTP SMS → ${phone}`);
-  console.log(`   ${message}`);
-  console.log(`============================\n`);
+  // In dev, print the message so the OTP is visible in the console. In
+  // production never log the message (contains the code) or the full phone (PII).
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`\n============================`);
+    console.log(`📱 OTP SMS → ${phone}`);
+    console.log(`   ${message}`);
+    console.log(`============================\n`);
+  } else {
+    console.log(`📱 OTP SMS → ${String(phone).replace(/\d(?=\d{4})/g, "*")}`);
+  }
 
   const apiKey = process.env.TERMII_API_KEY;
   if (!apiKey) {

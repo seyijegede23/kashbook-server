@@ -27,7 +27,8 @@ router.get("/banks", async (_req, res) => {
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
-    res.status(500).json({ error: err.message || "Failed to fetch banks" });
+    console.error("[transfers/banks]", err.message);
+    res.status(500).json({ error: "Failed to fetch banks" });
   }
 });
 
@@ -65,9 +66,10 @@ router.post("/verify-account", async (req, res) => {
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
+    console.error("[transfers/verify-account]", err.message);
     res
       .status(400)
-      .json({ error: err.message || "Could not verify account. Check the number and bank." });
+      .json({ error: "Could not verify account. Check the number and bank." });
   }
 });
 
@@ -90,7 +92,8 @@ router.get("/balance", async (req, res) => {
     res.json({ balance });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED") return res.json({ balance: 0 });
-    res.status(500).json({ error: err.message || "Failed to fetch balance" });
+    console.error("[transfers/balance]", err.message);
+    res.status(500).json({ error: "Failed to fetch balance" });
   }
 });
 
@@ -191,7 +194,7 @@ router.get("/limits", async (req, res) => {
     });
   } catch (err) {
     console.error("[transfers/limits]", err);
-    res.status(500).json({ error: err.message || "Failed to fetch transfer limits" });
+    res.status(500).json({ error: "Failed to fetch transfer limits" });
   }
 });
 
@@ -399,6 +402,24 @@ router.post("/send", async (req, res) => {
       .catch((e) => console.warn("[transfers] beneficiary upsert failed:", e.message));
 
     res.json({ status: "success", reference, route, fee });
+
+    // Detailed debit alert — fire-and-forget, never affects the transfer result.
+    if (userFull.email) {
+      const counterparty =
+        [accountName, bankName].filter(Boolean).join(" · ") || String(accountNumber);
+      require("../utils/transactionEmail").sendTransactionEmail({
+        to: userFull.email,
+        direction: "debit",
+        amount: Number(amount),
+        currency: biz.currency || "NGN",
+        counterparty,
+        narration,
+        fee,
+        reference,
+        businessName: biz.name,
+        dateLabel: new Date().toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" }),
+      });
+    }
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
@@ -407,7 +428,7 @@ router.post("/send", async (req, res) => {
     if (err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
       return res.status(400).json({ error: err.message, code: err.code });
     console.error("Transfer error:", err);
-    res.status(400).json({ error: err.message || "Transfer failed" });
+    res.status(400).json({ error: "Transfer failed" });
   }
 });
 

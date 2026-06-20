@@ -3,6 +3,8 @@ require("dotenv").config();
 // HTTP + Express. No-op when SENTRY_DSN is unset. Also registers its own
 // unhandledRejection / uncaughtException handlers (captures + flushes + exits).
 const Sentry = require("./src/instrument");
+// Fail fast on insecure/missing config before anything starts listening.
+require("./src/utils/validateEnv").validateEnv();
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -82,6 +84,24 @@ const apiLimiter = rateLimit({
   message: { error: "Too many requests. Please slow down." },
 });
 
+// Webhooks: per-IP flood guard. Legitimate providers (Anchor/RevenueCat) come
+// from a small set of IPs well under this; an attacker flooding from one IP is cut off.
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests." },
+});
+
+// Admin SPA HTML serve — static file, just stop hammering.
+const adminSpaLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ── Security headers ──────────────────────────────────────────────────────────
 // Strips X-Powered-By, sets XSS-Protection, HSTS, Content-Type-Options, etc.
 app.use(
@@ -89,15 +109,18 @@ app.use(
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
+        // No 'unsafe-inline' — the admin SPA's JS lives in /admin/app.js (served
+        // from 'self') and has no inline <script> or inline event handlers.
         scriptSrc: [
           "'self'",
-          "'unsafe-inline'",
           "cdn.tailwindcss.com",
           "cdn.jsdelivr.net",
         ],
+        // styleSrc keeps 'unsafe-inline' because the Tailwind Play CDN injects
+        // generated styles at runtime (style injection, not script execution).
         styleSrc: ["'self'", "'unsafe-inline'", "cdn.tailwindcss.com"],
         imgSrc: ["'self'", "data:"],
-        scriptSrcAttr: ["'unsafe-inline'"],
+        scriptSrcAttr: ["'none'"],
         connectSrc: ["'self'", "cdn.tailwindcss.com", "cdn.jsdelivr.net"],
         fontSrc: ["'self'"],
         objectSrc: ["'none'"],
@@ -111,19 +134,29 @@ app.use(
 // CORS: in production restrict to your actual domain via ALLOWED_ORIGIN env var
 // e.g. ALLOWED_ORIGIN=https://api.kashbook.com
 // In dev (no env var set) allow all origins so ngrok/local testing still works
-const corsOptions = process.env.ALLOWED_ORIGIN
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+// In production an explicit allowlist is REQUIRED — never fall back to reflecting
+// any origin (that would let any site make credentialed cross-origin calls).
+if (process.env.NODE_ENV === "production" && ALLOWED_ORIGINS.length === 0) {
+  throw new Error("ALLOWED_ORIGIN must be set in production (comma-separated list of origins)");
+}
+const corsOptions = ALLOWED_ORIGINS.length
   ? {
-      origin: process.env.ALLOWED_ORIGIN,
+      origin: ALLOWED_ORIGINS,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
       credentials: true,
     }
-  : {};
+  : {}; // dev only — reflect any origin so ngrok/local testing works
 app.use(cors(corsOptions));
 // Paystack webhook needs the raw body for HMAC-SHA512 verification — mount with
 // express.raw BEFORE express.json so the JSON parser doesn't consume the stream.
 app.use(
   "/webhooks/anchor",
+  webhookLimiter,
   express.raw({ type: "application/json", limit: "1mb" }),
   anchorWebhookRoute,
 );
@@ -131,7 +164,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // RevenueCat webhook — header-token auth (no body signature), so it's fine
 // after express.json. Keeps User.plan in sync with subscriptions.
-app.use("/webhooks/revenuecat", require("./src/routes/revenuecat"));
+app.use("/webhooks/revenuecat", webhookLimiter, require("./src/routes/revenuecat"));
 app.use((_req, res, next) => {
   res.setHeader("ngrok-skip-browser-warning", "1");
   next();
@@ -215,7 +248,7 @@ app.use("/sync", syncRoutes);
 app.use("/", require("./src/routes/publicInvoice"));
 
 // ── Admin panel (serves SPA) ──────────────────────────────────────────────────
-app.get("/admin", (_req, res) =>
+app.get("/admin", adminSpaLimiter, (_req, res) =>
   res.sendFile(path.join(__dirname, "public", "admin", "index.html")),
 );
 
@@ -364,6 +397,23 @@ cron.schedule("10 1 * * *", async () => {
     console.error("[Cron] retention purge error:", err);
   }
 });
+
+// ── KYC cache retention: drop normalized KYC/identity data past TTL (daily 02:00 Lagos) ──
+// NDPA data-minimization — the purge entry point existed but was never scheduled.
+cron.schedule(
+  "0 2 * * *",
+  async () => {
+    try {
+      await prisma.withCronLock(4007, async () => {
+        await require("./src/utils/snapshots").recordHeartbeat("kycPurge");
+        await require("./src/utils/kycCheck").purgeStaleCache();
+      });
+    } catch (err) {
+      console.error("[Cron] KYC cache purge error:", err.message);
+    }
+  },
+  { timezone: "Africa/Lagos" },
+);
 
 // ── Background cron: send pending reminders every 5 minutes ──────────────────
 // Reminders are scheduled at user-chosen times and rarely time-critical to

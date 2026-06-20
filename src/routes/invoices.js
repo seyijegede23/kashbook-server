@@ -51,16 +51,27 @@ router.get("/", authMiddleware, async (req, res) => {
     if (!(await ownsBusiness(req, businessId)))
       return res.status(403).json({ error: "Access denied" });
 
+    // Coerce + validate any date input before it reaches Prisma.
+    const toDate = (v, label) => {
+      const d = new Date(v);
+      if (isNaN(d.getTime())) {
+        const e = new Error(`Invalid ${label}`);
+        e.status = 400;
+        throw e;
+      }
+      return d;
+    };
+
     const where = { businessId };
     if (since) {
-      where.updatedAt = { gt: new Date(since) };
+      where.updatedAt = { gt: toDate(since, "since") };
     } else {
       if (status) where.status = status.toUpperCase();
       if (type) where.type = type; // "invoice" | "quote"
       if (dateFrom || dateTo) {
         where.issueDate = {};
-        if (dateFrom) where.issueDate.gte = dateFrom;
-        if (dateTo) where.issueDate.lte = dateTo;
+        if (dateFrom) where.issueDate.gte = toDate(dateFrom, "dateFrom");
+        if (dateTo) where.issueDate.lte = toDate(dateTo, "dateTo");
       }
     }
 
@@ -86,6 +97,7 @@ router.get("/", authMiddleware, async (req, res) => {
 
     res.json(result);
   } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: "Failed to fetch invoices" });
   }
@@ -310,44 +322,54 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
     if (existing.status === "VOID")
       return res.status(400).json({ error: "Cannot record payment on a VOID invoice" });
 
-    const outstanding = Math.max(0, existing.total - existing.amountPaid);
-    if (outstanding <= 0)
-      return res.status(400).json({ error: "This invoice is already paid in full." });
-    if (Number(amount) > outstanding)
-      return res.status(400).json({
-        error: `Payment exceeds outstanding balance of ${outstanding.toFixed(2)}.`,
+    // Serialize payments per business so two concurrent posts can't both read a
+    // stale amountPaid and overpay / lose an update. Re-read inside the lock.
+    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+      const inv = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+      const outstanding = Math.max(0, inv.total - inv.amountPaid);
+      if (outstanding <= 0) {
+        const e = new Error("This invoice is already paid in full.");
+        e.status = 400;
+        throw e;
+      }
+      if (Number(amount) > outstanding) {
+        const e = new Error(`Payment exceeds outstanding balance of ${outstanding.toFixed(2)}.`);
+        e.status = 400;
+        throw e;
+      }
+
+      const paymentDate = date ? new Date(date) : new Date();
+      await prisma.invoicePayment.create({
+        data: {
+          invoiceId: req.params.id,
+          amount: Number(amount),
+          method,
+          note: note || null,
+          date: paymentDate,
+        },
       });
 
-    const paymentDate = date ? new Date(date) : new Date();
-    await prisma.invoicePayment.create({
-      data: {
-        invoiceId: req.params.id,
-        amount: Number(amount),
-        method,
-        note: note || null,
-        date: paymentDate,
-      },
-    });
+      const newAmountPaid = inv.amountPaid + Number(amount);
+      const today = new Date().toISOString().slice(0, 10);
+      let newStatus;
+      if (newAmountPaid >= inv.total) {
+        newStatus = "PAID";
+      } else if (inv.dueDate && inv.dueDate < today) {
+        newStatus = "OVERDUE";
+      } else {
+        newStatus = "PARTIAL";
+      }
 
-    const newAmountPaid = existing.amountPaid + Number(amount);
-    const now = new Date().toISOString().slice(0, 10);
-    let newStatus;
-    if (newAmountPaid >= existing.total) {
-      newStatus = "PAID";
-    } else if (existing.dueDate && existing.dueDate < now) {
-      newStatus = "OVERDUE";
-    } else {
-      newStatus = "PARTIAL";
-    }
-
-    const invoice = await prisma.invoice.update({
-      where: { id: req.params.id },
-      data: { amountPaid: newAmountPaid, status: newStatus },
-      include: INCLUDE,
+      return prisma.invoice.update({
+        where: { id: req.params.id },
+        data: { amountPaid: newAmountPaid, status: newStatus },
+        include: INCLUDE,
+      });
     });
 
     res.status(201).json(formatInvoice(invoice));
   } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: "Failed to record payment" });
   }

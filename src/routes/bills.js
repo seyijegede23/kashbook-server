@@ -159,13 +159,35 @@ router.post("/pay", async (req, res) => {
     if (outcome.status) return res.status(outcome.status).json(outcome.body);
     const { reference, fee, token, transactionId } = outcome.exec;
     res.json({ status: "success", reference, fee, token, transactionId });
+
+    // Detailed debit alert for the bill payment — fire-and-forget.
+    if (userFull.email) {
+      const counterparty = [billerName, provider].filter(Boolean).join(" · ") || cat;
+      const narration = [
+        cat,
+        customerId || phoneNumber ? `for ${customerId || phoneNumber}` : "",
+        token ? `· token ${token}` : "",
+      ].filter(Boolean).join(" ");
+      require("../utils/transactionEmail").sendTransactionEmail({
+        to: userFull.email,
+        direction: "debit",
+        amount: Number(amount),
+        currency: biz.currency || "NGN",
+        counterparty,
+        narration,
+        fee,
+        reference,
+        businessName: biz.name,
+        dateLabel: new Date().toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" }),
+      });
+    }
   } catch (err) {
     if (err.code === "INSUFFICIENT_BALANCE")
       return res.status(400).json({ error: err.message, code: err.code });
     if (err.code === "NO_BANKING")
       return res.status(400).json({ error: err.message, code: err.code });
     console.error("Bill payment error:", err);
-    res.status(400).json({ error: err.message || "Bill payment failed" });
+    res.status(400).json({ error: "Bill payment failed" });
   }
 });
 

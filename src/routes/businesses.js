@@ -262,7 +262,7 @@ router.get("/:id/balance", async (req, res) => {
     }
   } catch (err) {
     console.error("Balance lookup failed:", err);
-    res.status(500).json({ error: err.message || "Failed to fetch balance" });
+    res.status(500).json({ error: "Failed to fetch balance" });
   }
 });
 
@@ -783,7 +783,7 @@ router.post("/:id/virtual-account", async (req, res) => {
     console.error("Virtual account error:", err);
     res
       .status(400)
-      .json({ error: err.message || "Failed to create virtual account" });
+      .json({ error: "Failed to create virtual account" });
   }
 });
 
@@ -831,7 +831,7 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Anchor not configured." });
     console.error("[sync-anchor-account] failed:", err);
-    res.status(500).json({ error: err.message || "Failed to sync from Anchor" });
+    res.status(500).json({ error: "Failed to sync from Anchor" });
   }
 });
 
@@ -854,7 +854,7 @@ router.get("/:id/required-documents", async (req, res) => {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Anchor not configured." });
     console.error("[required-documents] failed:", err.message);
-    res.status(500).json({ error: err.message || "Failed to fetch documents" });
+    res.status(500).json({ error: "Failed to fetch documents" });
   }
 });
 
@@ -895,7 +895,7 @@ router.post("/:id/upload-kyb-document", async (req, res) => {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
       return res.status(503).json({ error: "Anchor not configured." });
     console.error("[upload-kyb-document] failed:", err.message);
-    res.status(400).json({ error: err.message || "Failed to upload document" });
+    res.status(400).json({ error: "Failed to upload document" });
   }
 });
 
@@ -934,7 +934,7 @@ router.post("/:id/upload-cac", async (req, res) => {
     res.json({ url: upload.secure_url });
   } catch (err) {
     console.error("CAC upload failed:", err);
-    res.status(500).json({ error: err.message || "Failed to upload CAC certificate" });
+    res.status(500).json({ error: "Failed to upload CAC certificate" });
   }
 });
 
