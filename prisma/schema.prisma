@@ -132,6 +132,16 @@ model Business {
   vatEnabled           Boolean         @default(false)
   vatRate              Float?
   vatInclusive         Boolean         @default(true)
+  // ── Online storefront ("get a website") ──────────────────────────────────
+  storeEnabled         Boolean         @default(false)   // is the public store live
+  storeSlug            String?         @unique           // public URL: /store/:slug
+  storeDescription     String?
+  storeBannerUrl       String?
+  storeContactPhone    String?
+  storeTemplate        String          @default("classic") // preset theme
+  storeConfig          Json?                              // customization (sections + visibility, accent, layout, socials, etc.)
+  storePreviewToken    String?         @unique           // preview before going live
+  orderCounter         Int             @default(0)        // ORD-001 numbering
   createdAt            DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
@@ -148,6 +158,7 @@ model Business {
   recurringExpenses RecurringExpense[]
   officers          BusinessOfficer[]
   beneficiaries     Beneficiary[]
+  orders            Order[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -466,11 +477,14 @@ model InventoryItem {
   sku            String?
   barcode        String?
   image          String?
+  showInStore    Boolean   @default(false)   // visible on the public storefront
   lastRestocked  DateTime?
   createdBy      String?
   createdByName  String?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
+
+  orderItems     OrderItem[]
 
   @@index([userId, businessId])
   @@index([businessId, updatedAt])
@@ -619,6 +633,56 @@ model InvoiceShareLink {
   invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
   @@index([token])
+}
+
+// ── Online storefront orders ────────────────────────────────────────────────
+// A customer order placed on a business's public store. Becomes PAID when an
+// inbound NUBAN credit is matched (anchorReconcile). Stock decrements on PAID.
+model Order {
+  id               String      @id @default(uuid())
+  businessId       String
+  business         Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId           String      // merchant (denormalized for scoping)
+  orderNumber      String      // e.g. ORD-001 (per-business via Business.orderCounter)
+  status           OrderStatus @default(PENDING)
+  customerName     String
+  customerPhone    String
+  customerEmail    String?
+  deliveryAddress  String?
+  note             String?
+  currency         String      @default("NGN")
+  subtotal         Float       @default(0)
+  total            Float       @default(0)
+  paymentReference String      @unique   // shown to customer; matched in narration
+  publicToken      String      @unique   // order-status page /store/order/:token
+  paidAt           DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  items            OrderItem[]
+
+  @@index([businessId, status])
+  @@index([businessId, createdAt])
+}
+
+model OrderItem {
+  id              String         @id @default(uuid())
+  orderId         String
+  order           Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  inventoryItemId String?        // for stock decrement on PAID
+  inventoryItem   InventoryItem? @relation(fields: [inventoryItemId], references: [id], onDelete: SetNull)
+  name            String
+  price           Float
+  quantity        Int
+  amount          Float
+
+  @@index([orderId])
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FULFILLED
+  CANCELLED
 }
 
 enum Plan {

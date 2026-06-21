@@ -207,6 +207,73 @@ router.patch("/:id/branding", async (req, res) => {
   }
 });
 
+// ── PATCH /businesses/:id/store — online storefront settings + customization ──
+const STORE_SLUG_RE = /^[a-z0-9-]{3,40}$/;
+function hexOk(c) { return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c); }
+function sanitizeStoreConfig(c) {
+  if (!c || typeof c !== "object") return {};
+  const s = {};
+  if (hexOk(c.accentColor)) s.accentColor = c.accentColor;
+  if (["grid", "list"].includes(c.layout)) s.layout = c.layout;
+  if (["light", "dark"].includes(c.theme)) s.theme = c.theme;
+  if (["recent", "bestselling", "price_asc"].includes(c.productSort)) s.productSort = c.productSort;
+  const section = (obj, textFields = []) => {
+    if (!obj || typeof obj !== "object") return undefined;
+    const o = { visible: !!obj.visible };
+    for (const f of textFields) if (obj[f] != null) o[f] = String(obj[f]).slice(0, 600);
+    return o;
+  };
+  if (c.banner) s.banner = section(c.banner, ["imageUrl", "title", "description"]);
+  if (c.announcement) s.announcement = section(c.announcement, ["text"]);
+  if (c.about) s.about = section(c.about, ["text"]);
+  if (c.contact) s.contact = section(c.contact, ["phone", "address"]);
+  if (c.socials) s.socials = section(c.socials, ["instagram", "whatsapp", "x", "tiktok"]);
+  if (c.whatsappChat) s.whatsappChat = section(c.whatsappChat, ["number"]);
+  if (c.returnPolicy) s.returnPolicy = section(c.returnPolicy, ["text"]);
+  return s;
+}
+
+router.patch("/:id/store", async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the owner can manage the store" });
+  try {
+    const biz = await prisma.business.findFirst({ where: { id: req.params.id, userId: req.user.id } });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const { storeEnabled, storeSlug, storeDescription, storeBannerUrl, storeContactPhone, storeTemplate, storeConfig } = req.body;
+    const data = {};
+
+    if (storeSlug !== undefined) {
+      const slug = String(storeSlug || "").toLowerCase().trim();
+      if (!STORE_SLUG_RE.test(slug))
+        return res.status(400).json({ error: "Store link must be 3–40 characters: lowercase letters, numbers and hyphens only." });
+      const taken = await prisma.business.findFirst({ where: { storeSlug: slug, NOT: { id: biz.id } }, select: { id: true } });
+      if (taken) return res.status(409).json({ error: "That store link is already taken — try another." });
+      data.storeSlug = slug;
+    }
+    if (storeEnabled !== undefined) {
+      if (storeEnabled && !(data.storeSlug || biz.storeSlug))
+        return res.status(400).json({ error: "Set a store link before going live." });
+      data.storeEnabled = !!storeEnabled;
+    }
+    if (storeDescription !== undefined) data.storeDescription = storeDescription ? String(storeDescription).slice(0, 300) : null;
+    if (storeBannerUrl !== undefined) data.storeBannerUrl = storeBannerUrl || null;
+    if (storeContactPhone !== undefined) data.storeContactPhone = storeContactPhone ? String(storeContactPhone).slice(0, 40) : null;
+    if (storeTemplate !== undefined) data.storeTemplate = ["classic", "modern", "minimal"].includes(storeTemplate) ? storeTemplate : "classic";
+    if (storeConfig !== undefined) data.storeConfig = sanitizeStoreConfig(storeConfig);
+
+    // Mint a preview token once so the app can preview before going live.
+    if (!biz.storePreviewToken) data.storePreviewToken = require("crypto").randomBytes(12).toString("base64url");
+
+    const updated = await prisma.business.update({ where: { id: biz.id }, data });
+    await audit({ req, action: "STORE_UPDATED", resourceType: "business", resourceId: biz.id, metadata: { storeEnabled: updated.storeEnabled, hasSlug: !!updated.storeSlug } });
+    res.json(updated);
+  } catch (err) {
+    console.error("[store update]", err.message);
+    res.status(500).json({ error: "Failed to update store" });
+  }
+});
+
 // GET /businesses/:id/balance
 // Anchor exposes a per-deposit-account balance — we hit `/accounts/balance/:id`
 // and cache 60s. Falls back to local math if the call fails so the UI doesn't blank.

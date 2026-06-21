@@ -31,6 +31,7 @@ const transferRoutes = require("./src/routes/transfers");
 const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
+const orderRoutes = require("./src/routes/orders");
 
 const { sendSms } = require("./src/utils/otp");
 const cron = require("node-cron");
@@ -224,6 +225,7 @@ app.use("/transfers", apiLimiter);
 app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
 app.use("/sync", apiLimiter);
+app.use("/orders", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
@@ -242,10 +244,16 @@ app.use("/transfers", transferRoutes);
 app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/sync", syncRoutes);
+app.use("/orders", orderRoutes);
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
 app.use("/", require("./src/routes/publicInvoice"));
+
+// ── Public merchant storefront (no auth) ──────────────────────────────────────
+// GET /store/:slug shop page, /store/order/:token status, POST /store/:slug/orders.
+// (/store/store.js is served by express.static above.)
+app.use("/", require("./src/routes/storefront"));
 
 // ── Admin panel (serves SPA) ──────────────────────────────────────────────────
 app.get("/admin", adminSpaLimiter, (_req, res) =>
