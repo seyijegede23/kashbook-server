@@ -44,7 +44,6 @@ router.post("/", validateInventoryItem, async (req, res) => {
     category,
     sku,
     barcode,
-    showInStore,
   } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
 
@@ -79,7 +78,6 @@ router.post("/", validateInventoryItem, async (req, res) => {
         category: category || null,
         sku: sku || null,
         barcode: barcode || null,
-        showInStore: !!showInStore,
         createdBy: req.user.id,
         createdByName: req.user.name,
       },
@@ -108,7 +106,6 @@ router.patch("/:id", async (req, res) => {
     category,
     sku,
     barcode,
-    showInStore,
   } = req.body;
   try {
     const item = await prisma.inventoryItem.findUnique({
@@ -134,7 +131,6 @@ router.patch("/:id", async (req, res) => {
     if (category !== undefined) data.category = category;
     if (sku !== undefined) data.sku = sku;
     if (barcode !== undefined) data.barcode = barcode;
-    if (showInStore !== undefined) data.showInStore = !!showInStore;
 
     const updated = await prisma.inventoryItem.update({
       where: { id: req.params.id },

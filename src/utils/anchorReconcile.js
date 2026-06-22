@@ -13,7 +13,6 @@
 const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const { recalcInvoiceStatus } = require("./invoiceStatus");
-const { tryMatchOrder } = require("./orderReconcile");
 const { SINGLE_FLAG_ABOVE } = require("../config/amlLimits");
 const {
   extractSender,
@@ -136,11 +135,6 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     // within the last 90 days, record a payment and recalc status.
     await tryMatchInvoice(biz, amount, reference).catch((err) =>
       console.warn(`[reconcile] invoice match failed for ${biz.name}: ${err.message}`),
-    );
-
-    // Auto-reconcile storefront orders too (reference-in-narration or exact total).
-    await tryMatchOrder({ business: biz, amount, narration, reference }).catch((err) =>
-      console.warn(`[reconcile] order match failed for ${biz.name}: ${err.message}`),
     );
 
     created++;

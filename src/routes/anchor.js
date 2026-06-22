@@ -501,10 +501,6 @@ router.post("/", async (req, res) => {
         });
       }
 
-      // Auto-mark a matching storefront order PAID (+ decrement stock + notify).
-      await require("../utils/orderReconcile")
-        .tryMatchOrder({ business: biz, amount, narration, reference: sessionId })
-        .catch((e) => console.error("[order match]", e.message));
       return;
     }
 
@@ -604,10 +600,6 @@ router.post("/", async (req, res) => {
         });
       }
 
-      // Auto-mark a matching storefront order PAID (+ decrement stock + notify).
-      await require("../utils/orderReconcile")
-        .tryMatchOrder({ business: destBiz, amount, narration, reference })
-        .catch((e) => console.error("[order match]", e.message));
       return;
     }
 

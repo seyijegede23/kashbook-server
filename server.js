@@ -31,7 +31,6 @@ const transferRoutes = require("./src/routes/transfers");
 const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
-const orderRoutes = require("./src/routes/orders");
 
 const { sendSms } = require("./src/utils/otp");
 const cron = require("node-cron");
@@ -196,14 +195,8 @@ function sanitizeObject(obj) {
 }
 
 app.use((req, _res, next) => {
-  // The storefront editor saves merchant-authored HTML/CSS (GrapesJS), which has
-  // its own dedicated sanitizer (sanitizeStoreHtml). The blanket tag-stripper
-  // here would destroy the design, so skip it for that one endpoint.
-  const isStoreConfigSave = req.method === "PUT" && /^\/businesses\/[^/]+\/store\/config$/.test(req.path);
-  if (!isStoreConfigSave) {
-    if (req.body) sanitizeObject(req.body);
-    if (req.query) sanitizeObject(req.query);
-  }
+  if (req.body) sanitizeObject(req.body);
+  if (req.query) sanitizeObject(req.query);
   next();
 });
 
@@ -231,7 +224,6 @@ app.use("/transfers", apiLimiter);
 app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
 app.use("/sync", apiLimiter);
-app.use("/orders", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
@@ -250,21 +242,10 @@ app.use("/transfers", transferRoutes);
 app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/sync", syncRoutes);
-app.use("/orders", orderRoutes);
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
 app.use("/", require("./src/routes/publicInvoice"));
-
-// ── Public merchant storefront (no auth) ──────────────────────────────────────
-// GET /store/:slug shop page, /store/order/:token status, POST /store/:slug/orders.
-// (/store/store.js is served by express.static above.)
-app.use("/", require("./src/routes/storefront"));
-
-// ── JSON storefront API for the Next.js storefront app (no auth, read-only) ────
-// Public store SSR fetches /api/storefront/:slug etc. server-to-server. Checkout
-// still POSTs to /store/:slug/orders (above), which owns order creation.
-app.use("/api/storefront", apiLimiter, require("./src/routes/storefrontApi"));
 
 // ── Admin panel (serves SPA) ──────────────────────────────────────────────────
 app.get("/admin", adminSpaLimiter, (_req, res) =>
