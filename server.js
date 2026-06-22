@@ -255,6 +255,11 @@ app.use("/", require("./src/routes/publicInvoice"));
 // (/store/store.js is served by express.static above.)
 app.use("/", require("./src/routes/storefront"));
 
+// ── JSON storefront API for the Next.js storefront app (no auth, read-only) ────
+// Public store SSR fetches /api/storefront/:slug etc. server-to-server. Checkout
+// still POSTs to /store/:slug/orders (above), which owns order creation.
+app.use("/api/storefront", apiLimiter, require("./src/routes/storefrontApi"));
+
 // ── Admin panel (serves SPA) ──────────────────────────────────────────────────
 app.get("/admin", adminSpaLimiter, (_req, res) =>
   res.sendFile(path.join(__dirname, "public", "admin", "index.html")),
