@@ -196,8 +196,14 @@ function sanitizeObject(obj) {
 }
 
 app.use((req, _res, next) => {
-  if (req.body) sanitizeObject(req.body);
-  if (req.query) sanitizeObject(req.query);
+  // The storefront editor saves merchant-authored HTML/CSS (GrapesJS), which has
+  // its own dedicated sanitizer (sanitizeStoreHtml). The blanket tag-stripper
+  // here would destroy the design, so skip it for that one endpoint.
+  const isStoreConfigSave = req.method === "PUT" && /^\/businesses\/[^/]+\/store\/config$/.test(req.path);
+  if (!isStoreConfigSave) {
+    if (req.body) sanitizeObject(req.body);
+    if (req.query) sanitizeObject(req.query);
+  }
   next();
 });
 

@@ -203,6 +203,7 @@ function sanitizeStoreDoc(rawDoc, { isPro = true, existingTypes = [] } = {}) {
       accentColor: hexOk(theme.accentColor) ? theme.accentColor : "#2563EB",
       density: DENSITIES.includes(theme.density) ? theme.density : "comfortable",
     },
+    layoutMode: raw.layoutMode === "free" ? "free" : "flow",
     blocks: [],
   };
   const existing = new Set(existingTypes);
@@ -234,6 +235,10 @@ function mkBlock(type, props, opts = {}) {
 }
 
 function upgradeStoreConfig(rawConfig, business = {}) {
+  // GrapesJS design → pass through untouched (rendered as sanitized html/css).
+  if (rawConfig && typeof rawConfig === "object" && rawConfig.engine === "grapesjs") {
+    return rawConfig;
+  }
   // Already v2 → return as-is (callers may still want sanitize separately).
   if (rawConfig && typeof rawConfig === "object" && Number(rawConfig.version) >= 2 && Array.isArray(rawConfig.blocks)) {
     return rawConfig;
@@ -300,6 +305,7 @@ function upgradeStoreConfig(rawConfig, business = {}) {
       accentColor: hexOk(c.accentColor) ? c.accentColor : (business.color || "#2563EB"),
       density: "comfortable",
     },
+    layoutMode: "flow",
     blocks,
     // Carry the legacy floating-WhatsApp setting as chrome config (renderer reads it).
     chrome: { whatsappChat: asObj(c.whatsappChat) },

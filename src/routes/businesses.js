@@ -20,6 +20,7 @@ const {
 } = require("../utils/kycMatch");
 const { isValidAnchorIndustry } = require("../data/anchorIndustries");
 const { upgradeStoreConfig, sanitizeStoreDoc, TEMPLATES, PREMIUM_BLOCK_TYPES } = require("../utils/storeConfig");
+const { sanitizeStoreHtmlString, sanitizeStoreCssString } = require("../utils/sanitizeStoreHtml");
 
 router.use(auth);
 router.use(requireUnfrozen);
@@ -285,6 +286,28 @@ function editorProduct(p) {
   return { id: p.id, name: p.name, price: Number(p.price) || 0, image: p.image || null, quantity: Number(p.quantity) || 0, category: p.category || null, showInStore: !!p.showInStore, description: p.description || "" };
 }
 
+// Sanitise a GrapesJS design (engine="grapesjs") before storing. The public store
+// renders html/css, so those are XSS-scrubbed; projectData only re-hydrates the
+// owner's editor (never rendered publicly) so it's stored as-is, size-capped.
+function sanitizeDesign(d) {
+  const t = (d && typeof d === "object" && d.theme) || {};
+  let projectData = null;
+  if (d && d.projectData && typeof d.projectData === "object") {
+    try { if (JSON.stringify(d.projectData).length <= 1500000) projectData = d.projectData; } catch { /* ignore */ }
+  }
+  return {
+    engine: "grapesjs",
+    theme: {
+      template: TEMPLATES.includes(t.template) ? t.template : "aurora",
+      accentColor: hexOk(t.accentColor) ? t.accentColor : "#2563EB",
+      mode: t.mode === "dark" ? "dark" : "light",
+    },
+    html: sanitizeStoreHtmlString(d && d.html),
+    css: sanitizeStoreCssString(d && d.css),
+    projectData,
+  };
+}
+
 // GET /businesses/:id/store/editor-bootstrap — everything the editor needs in one call.
 router.get("/:id/store/editor-bootstrap", async (req, res) => {
   if (req.user.accountType === "staff")
@@ -327,24 +350,28 @@ router.put("/:id/store/config", async (req, res) => {
     const biz = await prisma.business.findFirst({ where: { id: req.params.id, userId: req.user.id } });
     if (!biz) return res.status(404).json({ error: "Business not found" });
 
+    const body = req.body || {};
+    const wantPublish = !!body.publish;
     const isPro = req.user.effectivePlan === "PREMIUM";
-    const published = upgradeStoreConfig(biz.storeConfig, biz);
-    const existingTypes = (published.blocks || []).map((b) => b.type);
-    const sanitize = (d) => sanitizeStoreDoc(d, { isPro, existingTypes });
-
     const data = {};
-    let nextDoc = null;
-    if (req.body && req.body.doc !== undefined) {
-      nextDoc = sanitize(req.body.doc);
+
+    if (body.design && body.design.engine === "grapesjs") {
+      // GrapesJS design (html/css/projectData) — the new editor.
+      const design = sanitizeDesign(body.design);
+      data.storeConfigDraft = design;
+      if (wantPublish) data.storeConfig = design;
+    } else if (body.doc !== undefined) {
+      // Legacy block-document path (kept for backward compatibility).
+      const published = upgradeStoreConfig(biz.storeConfig, biz);
+      const existingTypes = (published.blocks || []).map((b) => b.type);
+      const nextDoc = sanitizeStoreDoc(body.doc, { isPro, existingTypes });
       data.storeConfigDraft = nextDoc;
+      if (wantPublish) data.storeConfig = nextDoc;
+    } else if (wantPublish && biz.storeConfigDraft) {
+      // Publish whatever is already in the draft (any format).
+      data.storeConfig = biz.storeConfigDraft;
     }
-    const wantPublish = !!(req.body && req.body.publish);
-    if (wantPublish) {
-      const toPublish = nextDoc
-        || (biz.storeConfigDraft ? sanitize(biz.storeConfigDraft) : published);
-      data.storeConfig = toPublish;
-      data.storeConfigDraft = toPublish; // keep draft aligned with what's live
-    }
+
     if (!biz.storePreviewToken) data.storePreviewToken = require("crypto").randomBytes(12).toString("base64url");
     if (Object.keys(data).length === 0) return res.status(400).json({ error: "Nothing to save" });
 
