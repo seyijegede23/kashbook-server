@@ -19,6 +19,7 @@ const {
   normaliseCacNumber,
 } = require("../utils/kycMatch");
 const { isValidAnchorIndustry } = require("../data/anchorIndustries");
+const { upgradeStoreConfig, sanitizeStoreDoc, TEMPLATES, PREMIUM_BLOCK_TYPES } = require("../utils/storeConfig");
 
 router.use(auth);
 router.use(requireUnfrozen);
@@ -271,6 +272,93 @@ router.patch("/:id/store", async (req, res) => {
   } catch (err) {
     console.error("[store update]", err.message);
     res.status(500).json({ error: "Failed to update store" });
+  }
+});
+
+// ── Visual editor (storeConfig v2 block document) ─────────────────────────────
+const STORE_CLOUDINARY = {
+  cloudName: process.env.CLOUDINARY_CLOUD_NAME || "dkbvxdbao",
+  uploadPreset: process.env.CLOUDINARY_STORE_PRESET || "Kashbook",
+  folder: "kashbook/store",
+};
+function editorProduct(p) {
+  return { id: p.id, name: p.name, price: Number(p.price) || 0, image: p.image || null, quantity: Number(p.quantity) || 0, category: p.category || null, showInStore: !!p.showInStore, description: p.description || "" };
+}
+
+// GET /businesses/:id/store/editor-bootstrap — everything the editor needs in one call.
+router.get("/:id/store/editor-bootstrap", async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the owner can edit the store" });
+  try {
+    const biz = await prisma.business.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+      include: { inventoryItems: { orderBy: { createdAt: "desc" } } },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    // Start editing from the draft if present, else the published (upgraded) doc.
+    const config = upgradeStoreConfig(biz.storeConfigDraft || biz.storeConfig, biz);
+    const isPro = req.user.effectivePlan === "PREMIUM";
+    res.json({
+      business: {
+        id: biz.id, name: biz.name, emoji: biz.emoji, color: biz.color, logoUrl: biz.logoUrl,
+        currency: biz.baseCurrency || "NGN", storeEnabled: !!biz.storeEnabled, storeSlug: biz.storeSlug,
+        storePreviewToken: biz.storePreviewToken, contactPhone: biz.storeContactPhone, hasBank: !!biz.virtualAccountNumber,
+      },
+      config,
+      products: biz.inventoryItems.map(editorProduct),
+      limits: { isPro, premiumBlockTypes: PREMIUM_BLOCK_TYPES, maxBlocks: 80 },
+      cloudinary: STORE_CLOUDINARY,
+      templates: TEMPLATES,
+    });
+  } catch (err) {
+    console.error("[editor-bootstrap]", err.message);
+    res.status(500).json({ error: "Failed to load editor" });
+  }
+});
+
+// PUT /businesses/:id/store/config — save the block document (draft) and/or publish.
+//   body { doc }            → sanitize + save as draft
+//   body { publish: true }  → publish (doc if provided, else current draft) → live store
+router.put("/:id/store/config", async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the owner can edit the store" });
+  try {
+    const biz = await prisma.business.findFirst({ where: { id: req.params.id, userId: req.user.id } });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const isPro = req.user.effectivePlan === "PREMIUM";
+    const published = upgradeStoreConfig(biz.storeConfig, biz);
+    const existingTypes = (published.blocks || []).map((b) => b.type);
+    const sanitize = (d) => sanitizeStoreDoc(d, { isPro, existingTypes });
+
+    const data = {};
+    let nextDoc = null;
+    if (req.body && req.body.doc !== undefined) {
+      nextDoc = sanitize(req.body.doc);
+      data.storeConfigDraft = nextDoc;
+    }
+    const wantPublish = !!(req.body && req.body.publish);
+    if (wantPublish) {
+      const toPublish = nextDoc
+        || (biz.storeConfigDraft ? sanitize(biz.storeConfigDraft) : published);
+      data.storeConfig = toPublish;
+      data.storeConfigDraft = toPublish; // keep draft aligned with what's live
+    }
+    if (!biz.storePreviewToken) data.storePreviewToken = require("crypto").randomBytes(12).toString("base64url");
+    if (Object.keys(data).length === 0) return res.status(400).json({ error: "Nothing to save" });
+
+    const updated = await prisma.business.update({
+      where: { id: biz.id }, data,
+      select: { storeConfig: true, storeConfigDraft: true, storePreviewToken: true },
+    });
+    if (wantPublish) {
+      await audit({ req, action: "STORE_PUBLISHED", resourceType: "business", resourceId: biz.id });
+    }
+    res.json({ ok: true, published: wantPublish, config: updated.storeConfigDraft, previewToken: updated.storePreviewToken });
+  } catch (err) {
+    console.error("[store config save]", err.message);
+    res.status(500).json({ error: "Failed to save store" });
   }
 });
 

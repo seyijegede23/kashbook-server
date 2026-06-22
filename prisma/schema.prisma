@@ -139,7 +139,8 @@ model Business {
   storeBannerUrl       String?
   storeContactPhone    String?
   storeTemplate        String          @default("classic") // preset theme
-  storeConfig          Json?                              // customization (sections + visibility, accent, layout, socials, etc.)
+  storeConfig          Json?                              // PUBLISHED storefront block document (v2) — what the public store renders
+  storeConfigDraft     Json?                              // editor working draft; Publish copies draft → storeConfig
   storePreviewToken    String?         @unique           // preview before going live
   orderCounter         Int             @default(0)        // ORD-001 numbering
   createdAt            DateTime        @default(now())

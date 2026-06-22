@@ -93,6 +93,24 @@ router.get("/:slug/product/:productKey", async (req, res) => {
   }
 });
 
+// ── GET /api/storefront/preview/:token — DRAFT preview (unpublished) ───────────
+router.get("/preview/:token", async (req, res) => {
+  try {
+    const business = await prisma.business.findUnique({ where: { storePreviewToken: req.params.token }, include: STORE_INCLUDE });
+    if (!business) return res.status(404).json({ error: "not_found" });
+    const config = upgradeStoreConfig(business.storeConfigDraft || business.storeConfig, business);
+    res.json({
+      business: mapBusiness(business),
+      config,
+      products: business.inventoryItems.map(mapProduct),
+      preview: true,
+    });
+  } catch (e) {
+    console.error("[storefrontApi preview]", e.message);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 // ── GET /api/storefront/order/:token — order status JSON ───────────────────────
 router.get("/order/:token", async (req, res) => {
   try {
