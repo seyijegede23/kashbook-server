@@ -486,6 +486,9 @@ router.post("/", async (req, res) => {
       });
       await pushTo(biz.userId, title, body);
 
+      // Reflect the inbound credit in cash-at-bank immediately (display cache).
+      try { require("../utils/balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
+
       // Detailed credit alert (fire-and-forget).
       if (biz.user?.email) {
         require("../utils/transactionEmail").sendTransactionEmail({
@@ -584,6 +587,9 @@ router.post("/", async (req, res) => {
         narration,
       });
       await pushTo(destBiz.userId, title, body);
+
+      // Reflect the inbound credit in cash-at-bank immediately (display cache).
+      try { require("../utils/balanceCache").adjustBalance(destBiz.id, Number(amount) || 0); } catch { /* noop */ }
 
       // Detailed credit alert (fire-and-forget).
       if (destBiz.user?.email) {
