@@ -20,6 +20,20 @@ pool.on("error", (err) => {
   console.error("[db] idle pool client error (handled, non-fatal):", err.message);
 });
 
+// The pool's 'error' above only covers IDLE clients. When a connection dies on a
+// client that is currently CHECKED OUT (mid-query, e.g. Prisma using it), pg does
+// `client.emit('error', …)` — and Node THROWS if that client has no 'error'
+// listener, surfacing as an uncaughtException (pg client.js:180 "Connection
+// terminated unexpectedly") that crashes the process. Attaching a listener to
+// every client the moment it connects protects it for its whole life (idle AND
+// in-use), so a dropped socket is logged instead of crashing. Pending queries
+// still reject normally and propagate to the caller — this only stops the throw.
+pool.on("connect", (client) => {
+  client.on("error", (err) => {
+    console.error("[db] pg client error (handled, non-fatal):", err.message);
+  });
+});
+
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
