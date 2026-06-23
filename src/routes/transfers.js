@@ -374,6 +374,14 @@ router.post("/send", async (req, res) => {
     if (outcome.status) return res.status(outcome.status).json(outcome.body);
     const { reference, route, fee } = outcome.exec;
 
+    // Optimistically reflect the debit (amount + fee) in the cached "cash at
+    // bank" so the dashboard shows the new balance immediately on its next
+    // refetch, instead of the up-to-60s-stale value. Reconciles with Anchor when
+    // the cache entry expires. Never let a display-cache tweak affect the result.
+    try {
+      require("../utils/balanceCache").adjustBalance(biz.id, -(Number(amount) + Number(fee || 0)));
+    } catch { /* noop */ }
+
     // Remember the recipient — powers the Send Money "Recents" chips.
     // Best-effort: a failed upsert must never fail a successful transfer.
     prisma.beneficiary

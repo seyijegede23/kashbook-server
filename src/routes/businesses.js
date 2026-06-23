@@ -209,9 +209,9 @@ router.patch("/:id/branding", async (req, res) => {
 
 // GET /businesses/:id/balance
 // Anchor exposes a per-deposit-account balance — we hit `/accounts/balance/:id`
-// and cache 60s. Falls back to local math if the call fails so the UI doesn't blank.
-const balanceCache = new Map(); // businessId → { value, expires }
-const BALANCE_TTL_MS = 60 * 1000;
+// and cache 60s (shared cache so a transfer can optimistically adjust it).
+// Falls back to local math if the call fails so the UI doesn't blank.
+const balanceCache = require("../utils/balanceCache");
 router.get("/:id/balance", async (req, res) => {
   // Staff record transactions but never see the money position.
   if (req.user.accountType === "staff") {
@@ -225,17 +225,14 @@ router.get("/:id/balance", async (req, res) => {
     if (!biz.anchorAccountId)
       return res.json({ balance: 0, hasAccount: false });
 
-    const cached = balanceCache.get(biz.id);
-    if (cached && cached.expires > Date.now()) {
-      return res.json({ balance: cached.value, hasAccount: true, cached: true });
+    const cachedVal = balanceCache.getBalance(biz.id);
+    if (cachedVal !== undefined) {
+      return res.json({ balance: cachedVal, hasAccount: true, cached: true });
     }
 
     try {
       const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
-      balanceCache.set(biz.id, {
-        value: balance,
-        expires: Date.now() + BALANCE_TTL_MS,
-      });
+      balanceCache.setBalance(biz.id, balance);
       return res.json({ balance, hasAccount: true });
     } catch (anchorErr) {
       console.warn("[Anchor balance] falling back to local math:", anchorErr.message);
