@@ -2,7 +2,24 @@ const { PrismaClient } = require("@prisma/client");
 const { PrismaPg } = require("@prisma/adapter-pg");
 const { Pool } = require("pg");
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  keepAlive: true,                // TCP keepalive — stop NAT/idle drops on Render
+  idleTimeoutMillis: 30000,       // recycle idle clients before the DB/network kills the socket
+  connectionTimeoutMillis: 10000, // fail fast instead of hanging on a bad connect
+  max: 10,
+});
+
+// CRITICAL: node-postgres emits an 'error' on the POOL when an *idle* client's
+// connection is dropped (Render Postgres / the network closes idle sockets).
+// With no listener, Node rethrows it as an uncaughtException and the whole API
+// crashes — which is the "Connection terminated unexpectedly" → restart loop
+// seen in the Render logs. Handling it here keeps a dead idle socket from taking
+// the process down; the pool simply discards that client and opens a fresh one.
+pool.on("error", (err) => {
+  console.error("[db] idle pool client error (handled, non-fatal):", err.message);
+});
+
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
