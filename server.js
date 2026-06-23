@@ -5,6 +5,31 @@ require("dotenv").config();
 const Sentry = require("./src/instrument");
 // Fail fast on insecure/missing config before anything starts listening.
 require("./src/utils/validateEnv").validateEnv();
+
+// Last-resort safety net. A dropped Postgres socket can surface as an
+// uncaughtException ("Connection terminated unexpectedly") from deep inside pg's
+// event emitters (e.g. during the reconcile cron's DB writes). Swallow ONLY that
+// benign, self-healing case so the API stays up — the pool reconnects on the next
+// query. Anything else is reported to Sentry and the process exits so Render
+// restarts cleanly. (Paired with the per-client error listener in utils/db.js.)
+process.on("uncaughtException", (err) => {
+  if (/Connection terminated/i.test((err && err.message) || "")) {
+    console.error("[uncaught] pg connection dropped (handled, non-fatal):", err.message);
+    return;
+  }
+  console.error("[uncaught] fatal:", err);
+  try { Sentry.captureException(err); } catch { /* noop */ }
+  Sentry.flush(2000).catch(() => {}).finally(() => process.exit(1));
+});
+process.on("unhandledRejection", (reason) => {
+  const msg = (reason && (reason.message || String(reason))) || "";
+  if (/Connection terminated/i.test(msg)) {
+    console.error("[unhandledRejection] pg connection dropped (handled, non-fatal):", msg);
+    return;
+  }
+  console.error("[unhandledRejection]", reason);
+});
+
 const express = require("express");
 const cors = require("cors");
 const path = require("path");

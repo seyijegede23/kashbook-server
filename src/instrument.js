@@ -20,6 +20,12 @@ if (dsn) {
     dsn,
     environment: process.env.SENTRY_ENV || process.env.NODE_ENV || "development",
     release: process.env.SENTRY_RELEASE || process.env.RENDER_GIT_COMMIT || undefined,
+    // A dropped Postgres socket ("Connection terminated unexpectedly") is benign
+    // and self-healing (the pool reconnects). Don't page on it, and don't let
+    // Sentry's uncaughtException integration force-exit the process when our own
+    // handler (server.js) has decided to keep it alive.
+    ignoreErrors: [/Connection terminated/i],
+    integrations: [Sentry.onUncaughtExceptionIntegration({ exitEvenIfOtherHandlersAreRegistered: false })],
     // Performance tracing — sample a slice of requests. Set to 0 to disable.
     tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? 0.1),
     // We are a fintech app — never let Sentry collect bodies/PII by default.
