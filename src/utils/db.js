@@ -2,8 +2,25 @@ const { PrismaClient } = require("@prisma/client");
 const { PrismaPg } = require("@prisma/adapter-pg");
 const { Pool } = require("pg");
 
+// Render's INTERNAL Postgres serves a SELF-SIGNED cert over its private network,
+// which `sslmode=verify-full` rejects ("self-signed certificate"). Drop any
+// sslmode from the URL and connect with SSL but WITHOUT CA verification — safe
+// because the internal link is Render's private network (and the external/local
+// connection tolerates it too). The traffic is still encrypted.
+function dbConnectionString() {
+  const raw = process.env.DATABASE_URL || "";
+  try {
+    const u = new URL(raw);
+    u.searchParams.delete("sslmode");
+    return u.toString();
+  } catch {
+    return raw;
+  }
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: dbConnectionString(),
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
   keepAlive: true,                // TCP keepalive — stop NAT/idle drops on Render
   idleTimeoutMillis: 30000,       // recycle idle clients before the DB/network kills the socket
   connectionTimeoutMillis: 10000, // fail fast instead of hanging on a bad connect
