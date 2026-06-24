@@ -13,6 +13,13 @@ const { formatAmountForBusiness } = require("../config/amlLimits");
 // the user always knows roughly who paid them, even if Anchor didn't send a
 // usable name.
 function extractSender(attrs = {}) {
+  // Anchor nests the sender on inbound credits as a counterParty / source-account
+  // object (capital P), while some partner payloads use flat fields. Check the
+  // nested object first, then every flat variant we've seen.
+  const cp =
+    attrs.counterParty || attrs.counterparty || attrs.sourceAccount ||
+    attrs.payer || attrs.originator || attrs.debitAccount || attrs.sender || {};
+
   const name =
     cleanName(attrs.senderName) ||
     cleanName(attrs.sourceAccountName) ||
@@ -20,23 +27,35 @@ function extractSender(attrs = {}) {
     cleanName(attrs.payerName) ||
     cleanName(attrs.originatorName) ||
     cleanName(attrs.counterpartyName) ||
+    cleanName(cp.accountName) ||
+    cleanName(cp.name) ||
     cleanName(attrs.nameEnquiry?.accountName) ||
-    cleanName(attrs.sender?.accountName) ||
-    cleanName(attrs.sender?.name) ||
     "";
 
-  const bank =
-    attrs.sourceBank ||
-    attrs.senderBank ||
-    attrs.sourceBankName ||
-    attrs.fromBank ||
+  const bankRaw =
+    cp.bank?.name || cp.bankName || cp.bank ||
+    attrs.sourceBank || attrs.senderBank || attrs.sourceBankName || attrs.fromBank ||
     "";
+  const bank = typeof bankRaw === "string" ? bankRaw : (bankRaw?.name || "");
 
   const accountNumber =
+    cp.accountNumber ||
     attrs.sourceAccountNumber ||
     attrs.senderAccountNumber ||
     attrs.fromAccountNumber ||
     "";
+
+  // If we STILL couldn't find a name, log the raw sender-ish payload so we can map
+  // whatever shape this partner/event used (then add it above). Only logs on miss.
+  if (!name) {
+    try {
+      console.warn("[inbound] sender name not found — raw:", JSON.stringify({
+        keys: Object.keys(attrs).slice(0, 40),
+        counterParty: attrs.counterParty, counterparty: attrs.counterparty,
+        sourceAccount: attrs.sourceAccount, payer: attrs.payer, debitAccount: attrs.debitAccount,
+      }).slice(0, 1500));
+    } catch { /* noop */ }
+  }
 
   // Build a display label. Prefer the real name; otherwise "GTB ****4321";
   // last-resort plain "Anonymous sender".
