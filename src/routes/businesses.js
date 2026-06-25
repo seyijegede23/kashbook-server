@@ -4,6 +4,7 @@ const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
 const cloudinary = require("../config/cloudinary");
 const anchor = require("../utils/anchor");
+const { openIndividualBankAccount } = require("../utils/anchorBank");
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
@@ -611,13 +612,19 @@ router.post("/:id/virtual-account", async (req, res) => {
       customerId = fresh?.anchorCustomerId || null;
       if (customerId) return; // already created/adopted by a concurrent request
       try {
-        const created = await anchor.createBusinessCustomer({
-          businessName: biz.name,
-          businessBvn: bvn,
-          registrationType,
-          industry,
-          dateOfRegistration,
-          businessAddress: businessAddress?.addressLine1
+        // Individual-KYC path: onboard the OWNER as an Anchor IndividualCustomer
+        // (Tier-2 BVN KYC ≈ ₦50, vs ₦1,000 business KYB). The BUSINESS NAME is
+        // not on the Anchor customer — it goes on the virtual NUBAN we mint after
+        // approval (openIndividualBankAccount). Customers pay that business-named
+        // NUBAN; money settles into this individual's SAVINGS deposit account.
+        const created = await anchor.createIndividualCustomer({
+          user: {
+            firstName: user.firstName,
+            lastName: user.lastName || user.firstName,
+            email: user.email || `${user.id}@kashbook.app`,
+            phone: user.phone || "+2348000000000",
+          },
+          address: businessAddress?.addressLine1
             ? {
                 state: businessAddress.state,
                 addressLine_1: businessAddress.addressLine1,
@@ -625,30 +632,6 @@ router.post("/:id/virtual-account", async (req, res) => {
                 postalCode: businessAddress.postalCode,
               }
             : undefined,
-          user: {
-            firstName: user.firstName,
-            lastName: user.lastName || user.firstName,
-            email: user.email || `${user.id}@kashbook.app`,
-            phone: user.phone || "+2348000000000",
-            dateOfBirth: new Date(dob),
-            gender: userGender,
-            bvn,
-          },
-          owners: isLtd ? owners.map((o) => ({
-            firstName: o.firstName,
-            lastName: o.lastName,
-            middleName: o.middleName,
-            bvn: o.bvn,
-            dateOfBirth: o.dateOfBirth,
-            percentageOwned: Number(o.percentageOwned),
-            email: o.email,
-            phoneNumber: o.phoneNumber,
-            title: o.title,
-            addressLine1: o.addressLine1,
-            addressCity: o.addressCity,
-            addressState: o.addressState,
-            addressPostalCode: o.addressPostalCode,
-          })) : undefined,
         });
         customerId = created.customerId;
       } catch (e) {
@@ -705,17 +688,29 @@ router.post("/:id/virtual-account", async (req, res) => {
       });
     });
 
-    // 2. Trigger KYB only for newly-created BusinessCustomers that aren't verified
-    if (
-      !adoptedAlreadyApproved &&
-      customerType === "BusinessCustomer" &&
-      user.kycStatus !== "verified"
-    ) {
+    // The Anchor ID suffix is the source of truth for customer type
+    // (-anc_ind_cst = individual, -anc_bus_cst = legacy business). A user who
+    // adopted a pre-existing customer, or is adding a 2nd business, must follow
+    // the type Anchor actually has — not the path we attempted above.
+    customerType = /-anc_ind_cst$/.test(customerId || "")
+      ? "IndividualCustomer"
+      : "BusinessCustomer";
+
+    // 2. Trigger KYC/KYB for newly-created customers that aren't verified yet.
+    if (!adoptedAlreadyApproved && user.kycStatus !== "verified") {
       try {
-        await anchor.triggerKYB(customerId);
+        if (customerType === "IndividualCustomer") {
+          await anchor.triggerIndividualKyc(customerId, {
+            bvn,
+            dateOfBirth: dob,
+            gender: userGender,
+          });
+        } else {
+          await anchor.triggerKYB(customerId);
+        }
       } catch (e) {
         if (e.httpStatus !== 409) {
-          console.warn("[KYB trigger] failed:", e.message);
+          console.warn("[KYC trigger] failed:", e.message);
         }
       }
       await audit({
@@ -735,7 +730,7 @@ router.post("/:id/virtual-account", async (req, res) => {
       return res.status(202).json({
         status: "pending_kyc",
         message:
-          "We're verifying your business. You'll get a notification when your account is ready.",
+          "We're verifying your identity. You'll get a notification when your account is ready.",
       });
     }
 
@@ -748,12 +743,25 @@ router.post("/:id/virtual-account", async (req, res) => {
       });
     }
 
-    // 3. KYC/KYB verified — open deposit account synchronously.
-    // NOTE: the response carries the DepositAccount's masked underlying details
-    // (e.g. CORESTEP MFB shell), NOT the virtual NUBAN that customers send to.
-    // The virtual NUBAN arrives via the `accountNumber.created` webhook later
-    // — that handler writes virtualAccountNumber/Bank/Name. We only persist
-    // the deposit account ID here so the webhook can match the business.
+    // 3. KYC verified — open the bank account synchronously.
+    if (customerType === "IndividualCustomer") {
+      // Individual path (e.g. adding a 2nd business after the 1st verified the
+      // user): open the SAVINGS settlement account + business-named virtual
+      // NUBAN right now — the raw BVN is in this request. Returns a ready,
+      // payable account immediately.
+      const r = await openIndividualBankAccount({ biz, customerId, bvn });
+      return res.status(200).json({
+        status: "ready",
+        accountNumber: r.accountNumber,
+        bankName: r.bankName,
+        accountName: r.accountName,
+      });
+    }
+
+    // Legacy business path: open a CURRENT account. The response's accountNumber
+    // is the masked DepositAccount shell — not payable — so we wait for the
+    // accountNumber.created webhook (usually <1s) to write the real NUBAN. We
+    // persist the deposit account id here so the webhook can match the business.
     const acc = await anchor.createDepositAccount({ customerId, customerType });
     await prisma.business.update({
       where: { id: biz.id },
@@ -763,10 +771,6 @@ router.post("/:id/virtual-account", async (req, res) => {
         virtualAccountRef: acc.accountId,
       },
     });
-
-    // The synchronous response's accountNumber is the masked DepositAccount
-    // number — not useful for receiving payments. Always wait for the
-    // accountNumber.created webhook (usually <1s) to write the real NUBAN.
     return res.status(202).json({
       status: "pending_account",
       message: "Your account is being provisioned. You'll get a notification shortly.",

@@ -322,6 +322,119 @@ async function triggerKYB(customerId) {
   });
 }
 
+// ─── Individual customer (cheap KYC path) ────────────────────────────────────
+// For the "individual KYC + business-named virtual account" flow: onboard the
+// owner as an IndividualCustomer (Tier-2 BVN KYC ≈ ₦50, vs ₦1,000 business KYB),
+// open a SAVINGS settlement account, then mint a VirtualNuban LABELLED with the
+// business name (see createVirtualNuban). Customers pay the business-named NUBAN;
+// money settles into the owner's individual deposit account.
+//
+// Tier 0 creation only needs name/email/phone/address; the BVN goes in the
+// separate verification call (triggerIndividualKyc).
+async function createIndividualCustomer({ user, address }) {
+  const phone = normalizePhoneForAnchor(user.phone || "07000000000");
+  const a = address || {};
+  const addr = {
+    country: "NG",
+    state: a.state || "Lagos",
+    addressLine_1: a.addressLine_1 || a.addressLine1 || "1 Marina Street",
+    addressLine_2: a.addressLine_2 || a.addressLine2 || "",
+    city: a.city || "Lagos Island",
+    postalCode: a.postalCode || "100001",
+  };
+  const body = {
+    data: {
+      type: "IndividualCustomer",
+      attributes: {
+        fullName: {
+          firstName: user.firstName,
+          lastName: user.lastName || user.firstName,
+        },
+        email: user.email,
+        phoneNumber: phone,
+        address: addr,
+      },
+    },
+  };
+  const res = await anchorFetch("/customers", { method: "POST", body });
+  return {
+    customerId: res.data?.id,
+    status: res.data?.attributes?.verification?.status || "pending",
+  };
+}
+
+// Anchor's gender enum is Title-case ("Male"/"Female").
+function normalizeGenderForAnchor(g) {
+  return String(g || "").trim().toLowerCase().startsWith("f") ? "Female" : "Male";
+}
+
+// Trigger Tier-2 (BVN) KYC on an IndividualCustomer. Async → webhook
+// customer.identification.approved/.rejected follows (sandbox approves in
+// seconds). The "level: TIER_2 + level2.bvn" shape is what Anchor accepts.
+async function triggerIndividualKyc(customerId, { bvn, dateOfBirth, gender }) {
+  const dob =
+    dateOfBirth instanceof Date ? dateOfBirth.toISOString().slice(0, 10) : dateOfBirth;
+  return anchorFetch(`/customers/${customerId}/verification/individual`, {
+    method: "POST",
+    body: {
+      data: {
+        type: "Verification",
+        attributes: {
+          level: "TIER_2",
+          level2: { bvn, dateOfBirth: dob, gender: normalizeGenderForAnchor(gender) },
+        },
+      },
+    },
+  });
+}
+
+// Read a customer's current verification status — used to poll for approval in
+// the synchronous onboarding fast-path (KYC is usually instant for a BVN match).
+async function getCustomerStatus(customerId) {
+  const res = await anchorFetch(`/customers/${encodeURIComponent(customerId)}`);
+  const a = res.data?.attributes || {};
+  return {
+    status: a.verification?.status || a.status || "unknown",
+    type: res.data?.type,
+    raw: res.data,
+  };
+}
+
+// ─── Virtual NUBAN (business-named collection account) ───────────────────────
+// Creates a Providus virtual account whose displayed name is ARBITRARY (proven:
+// it honoured a custom name), settling into the given DepositAccount. NIBSS
+// requires a BVN on the account — pass the owner's. `permanent: true` = a fixed
+// account the merchant can reuse. The returned accountNumber/accountName/bank is
+// what customers pay into and see.
+async function createVirtualNuban({ settlementAccountId, name, bvn, reference, permanent = true, provider = "providus" }) {
+  const body = {
+    data: {
+      type: "VirtualNuban",
+      attributes: {
+        provider,
+        virtualAccountDetail: {
+          name,
+          reference: reference || "kb-" + Date.now(),
+          permanent,
+          ...(bvn ? { bvn } : {}),
+        },
+      },
+      relationships: {
+        settlementAccount: { data: { type: "DepositAccount", id: settlementAccountId } },
+      },
+    },
+  };
+  const res = await anchorFetch("/virtual-nubans", { method: "POST", body, idempotencyKey: reference || undefined });
+  const a = res.data?.attributes || {};
+  return {
+    virtualNubanId: res.data?.id,
+    accountNumber: a.accountNumber,
+    accountName: a.accountName || a.virtualAccountDetail?.name || name,
+    bankName: a.bank?.name || "Providus Bank",
+    raw: res.data,
+  };
+}
+
 // ─── Deposit account ─────────────────────────────────────────────────────────
 // Must be called AFTER customer.identification.approved fires.
 // productName: "SAVINGS" (IndividualCustomer only) or "CURRENT" (both types).
@@ -766,6 +879,10 @@ module.exports = {
   isValidAnchorPhone,
   searchCustomer,
   triggerKYB,
+  createIndividualCustomer,
+  triggerIndividualKyc,
+  getCustomerStatus,
+  createVirtualNuban,
   createDepositAccount,
   getAccountBalance,
   getAccount,

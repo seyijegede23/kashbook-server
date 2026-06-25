@@ -16,6 +16,7 @@ const router = require("express").Router();
 const crypto = require("crypto");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
+const { openIndividualBankAccount } = require("../utils/anchorBank");
 const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
 const {
@@ -135,34 +136,54 @@ router.post("/", async (req, res) => {
           virtualAccountNumber: null,
         },
       });
+      // Customer type is encoded in the Anchor ID suffix:
+      //   -anc_ind_cst → individual (cheap KYC + business-named virtual NUBAN)
+      //   -anc_bus_cst → legacy business (CURRENT account; NUBAN via webhook)
+      const isIndividual = /-anc_ind_cst$/.test(customerId);
       console.log(
-        `[Anchor webhook] approved ${customerId} → opening ${pending.length} deposit account(s)`,
+        `[Anchor webhook] approved ${customerId} (${isIndividual ? "individual" : "business"}) → opening ${pending.length} account(s)`,
       );
       for (const biz of pending) {
         try {
-          // BusinessCustomer only supports CURRENT — ignore the user's saved
-          // bankAccountType preference. (SAVINGS is for IndividualCustomer.)
-          const acc = await anchor.createDepositAccount({
-            customerId,
-            customerType: "BusinessCustomer",
-            productName: "CURRENT",
-          });
-          // Only the deposit-account ID is reliable from the sync create.
-          // The real virtual NUBAN + bank land via accountNumber.created.
-          await prisma.business.update({
-            where: { id: biz.id },
-            data: {
-              anchorAccountId: acc.accountId,
-              virtualAccountId: acc.accountId,
-              virtualAccountRef: acc.accountId,
-            },
-          });
-          console.log(
-            `[Anchor webhook] DepositAccount ${acc.accountId} opened for ${biz.name}`,
-          );
+          if (isIndividual) {
+            // Individual-KYC path: open a SAVINGS settlement account + a
+            // business-named virtual NUBAN (BVN decrypted from Business.kycBvn).
+            // openIndividualBankAccount persists the NUBAN, so the account is
+            // immediately payable — no accountNumber.created wait needed.
+            const r = await openIndividualBankAccount({ biz, customerId });
+            if (!r.skipped) {
+              await pushTo(
+                biz.userId,
+                "Bank account ready 🎉",
+                `${biz.name}'s bank account is active.`,
+              );
+            }
+            console.log(
+              `[Anchor webhook] virtual NUBAN ${r.accountNumber} opened for ${biz.name}`,
+            );
+          } else {
+            // Legacy BusinessCustomer only supports CURRENT — the real virtual
+            // NUBAN + bank land via accountNumber.created.
+            const acc = await anchor.createDepositAccount({
+              customerId,
+              customerType: "BusinessCustomer",
+              productName: "CURRENT",
+            });
+            await prisma.business.update({
+              where: { id: biz.id },
+              data: {
+                anchorAccountId: acc.accountId,
+                virtualAccountId: acc.accountId,
+                virtualAccountRef: acc.accountId,
+              },
+            });
+            console.log(
+              `[Anchor webhook] DepositAccount ${acc.accountId} opened for ${biz.name}`,
+            );
+          }
         } catch (err) {
           console.error(
-            `[Anchor webhook] createDepositAccount failed for biz ${biz.id} (${biz.name}):`,
+            `[Anchor webhook] open account failed for biz ${biz.id} (${biz.name}):`,
             err.message,
             err.anchorErrors ? JSON.stringify(err.anchorErrors) : "",
           );
@@ -306,6 +327,17 @@ router.post("/", async (req, res) => {
         return;
       }
 
+      // The individual-KYC flow writes a BUSINESS-named virtual NUBAN explicitly
+      // (openIndividualBankAccount). The SAVINGS settlement account's OWN
+      // accountNumber.created — named after the PERSON — must not clobber it.
+      // Once a NUBAN is set, only an identical redelivery is allowed through.
+      if (biz.virtualAccountNumber && biz.virtualAccountNumber !== accountNumber) {
+        console.log(
+          `[Anchor webhook] accountNumber.created ignored — ${biz.name} already has NUBAN ${biz.virtualAccountNumber} (incoming ${accountNumber})`,
+        );
+        return;
+      }
+
       // Dedup the "Bank account ready" push: only fire if the NUBAN was
       // previously unset on the business row. Anchor often re-delivers this
       // event and we don't want to spam the user with notifications.
@@ -383,6 +415,10 @@ router.post("/", async (req, res) => {
         where: { anchorAccountId: linkedAccountId },
       });
       if (!biz) return;
+      // Don't clobber an already-set (business-named) NUBAN with a different one.
+      if (biz.virtualAccountNumber && biz.virtualAccountNumber !== virtualNuban) {
+        return;
+      }
       const wasReady = !!biz.virtualAccountNumber;
 
       await prisma.business.update({
