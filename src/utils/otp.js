@@ -1,5 +1,6 @@
 const prisma = require("./db");
 const nodemailer = require("nodemailer");
+const { renderOtpEmail } = require("./emailLayout");
 
 // ── Generate a 6-digit OTP ──────────────────────────────────────────────────
 function generateCode() {
@@ -181,34 +182,7 @@ async function dispatchOtp(identifier, type, { country } = {}) {
   const message = `Your KashBook verification code is: ${code}. Valid for 10 minutes.`;
 
   if (isEmail) {
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head><meta charset="utf-8"><title>KashBook Verification</title></head>
-      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f4f4f5; margin:0; padding:20px 0;">
-        <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;">
-          <tr><td align="center" style="padding:20px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#fff;border-radius:12px;overflow:hidden;">
-              <tr><td style="background:#6C3FC5;padding:32px 40px;text-align:center;">
-                <h1 style="color:#fff;margin:0;font-size:28px;font-weight:700;">KashBook</h1>
-              </td></tr>
-              <tr><td style="padding:40px;color:#3f3f46;line-height:1.6;">
-                <p style="margin:0 0 20px;font-size:16px;">Hello,</p>
-                <p style="margin:0 0 20px;font-size:16px;">Please use the verification code below to access your KashBook account.</p>
-                <table width="100%" cellpadding="0" cellspacing="0" style="margin:32px 0;">
-                  <tr><td align="center" style="background:#f3e8ff;border:1px solid #d8b4fe;border-radius:8px;padding:24px;">
-                    <span style="font-size:36px;font-weight:800;color:#6C3FC5;letter-spacing:8px;">${code}</span>
-                  </td></tr>
-                </table>
-                <p style="margin:0;font-size:16px;">This code expires in <strong>10 minutes</strong>.</p>
-              </td></tr>
-              <tr><td style="background:#fafafa;padding:24px 40px;text-align:center;border-top:1px solid #e4e4e7;">
-                <p style="margin:0;color:#71717a;font-size:14px;">&copy; ${new Date().getFullYear()} KashBook. All rights reserved.</p>
-              </td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </body></html>`;
+    const html = renderOtpEmail(code);
     await sendEmail(identifier, "Your KashBook Verification Code", html);
   } else {
     // Phone identifier: prefer WhatsApp (Meta Cloud API) when it's configured,
