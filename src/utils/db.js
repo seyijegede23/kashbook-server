@@ -24,7 +24,10 @@ const pool = new Pool({
   keepAlive: true,                // TCP keepalive — stop NAT/idle drops on Render
   idleTimeoutMillis: 30000,       // recycle idle clients before the DB/network kills the socket
   connectionTimeoutMillis: 10000, // fail fast instead of hanging on a bad connect
-  max: 10,
+  // Pool size PER INSTANCE. Render Postgres allows 103 connections, so keep
+  // (instances × max) comfortably under that — e.g. 4 instances × 25 = 100.
+  // Tunable via env (no code change) for load testing / scaling.
+  max: Number(process.env.DB_POOL_MAX) || 25,
 });
 
 // CRITICAL: node-postgres emits an 'error' on the POOL when an *idle* client's
