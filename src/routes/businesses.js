@@ -5,6 +5,7 @@ const requireUnfrozen = require("../middleware/requireUnfrozen");
 const cloudinary = require("../config/cloudinary");
 const anchor = require("../utils/anchor");
 const { openIndividualBankAccount } = require("../utils/anchorBank");
+const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require("../utils/businessName");
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
@@ -54,7 +55,14 @@ router.post("/", async (req, res) => {
     color = "#6C3FC5",
     customCategories = [],
   } = req.body;
-  if (!name) return res.status(400).json({ error: "Business name required" });
+  const cleanName = cleanBusinessName(name);
+  if (!cleanName) return res.status(400).json({ error: "Business name required" });
+  if (isProtectedName(cleanName)) {
+    return res.status(400).json({
+      error: "That name isn't allowed — it matches a bank, regulator, or well-known brand. Please use your own business name.",
+      code: "BUSINESS_NAME_PROTECTED",
+    });
+  }
 
   try {
     if (req.user.plan !== "PREMIUM") {
@@ -64,10 +72,24 @@ router.post("/", async (req, res) => {
       }
     }
 
+    // One account can't hold two businesses with the same name
+    // (case- and whitespace-insensitive) — avoids duplicate NUBANs/receipts.
+    const mine = await prisma.business.findMany({
+      where: { userId: req.user.id },
+      select: { name: true },
+    });
+    const normalized = normalizeBusinessName(cleanName);
+    if (mine.some((b) => normalizeBusinessName(b.name) === normalized)) {
+      return res.status(409).json({
+        error: "You already have a business with this name. Pick a different name.",
+        code: "BUSINESS_NAME_DUPLICATE",
+      });
+    }
+
     const biz = await prisma.business.create({
       data: {
         userId: req.user.id,
-        name,
+        name: cleanName,
         emoji,
         color,
         customCategories: {
@@ -82,6 +104,13 @@ router.post("/", async (req, res) => {
     });
     res.status(201).json(biz);
   } catch (err) {
+    // DB unique-index backstop (race across devices/requests) → friendly dup error.
+    if (err?.code === "P2002") {
+      return res.status(409).json({
+        error: "You already have a business with this name. Pick a different name.",
+        code: "BUSINESS_NAME_DUPLICATE",
+      });
+    }
     res.status(500).json({ error: "Failed to create business" });
   }
 });
@@ -100,11 +129,17 @@ router.patch("/:id", async (req, res) => {
     });
     if (!existing) return res.status(404).json({ error: "Business not found" });
 
+    // Normalize the requested name; a whitespace/case-only edit is not a change.
+    const cleanName = name !== undefined ? cleanBusinessName(name) : undefined;
+    if (cleanName !== undefined && !cleanName) {
+      return res.status(400).json({ error: "Business name required" });
+    }
+    const nameChanged = cleanName !== undefined && cleanName !== existing.name;
+
     // Once a bank account (NUBAN) has been issued, the business name is locked:
-    // it was verified against the business's CAC/KYB records at Anchor, so a
-    // change here would desync the account from its registered owner. Other
-    // fields (emoji, colour, VAT, categories) stay editable.
-    if (name !== undefined && name !== existing.name && existing.virtualAccountNumber) {
+    // it backs the virtual-account label and must stay aligned with what Anchor
+    // verified. Other fields (emoji, colour, VAT, categories) stay editable.
+    if (nameChanged && existing.virtualAccountNumber) {
       return res.status(403).json({
         error:
           "Your business name is locked because a bank account has already been issued for it. Contact support if it must change.",
@@ -112,8 +147,29 @@ router.patch("/:id", async (req, res) => {
       });
     }
 
+    // Block impersonation + per-account duplicate names on rename too.
+    if (nameChanged) {
+      if (isProtectedName(cleanName)) {
+        return res.status(400).json({
+          error: "That name isn't allowed — it matches a bank, regulator, or well-known brand. Please use your own business name.",
+          code: "BUSINESS_NAME_PROTECTED",
+        });
+      }
+      const others = await prisma.business.findMany({
+        where: { userId: req.user.id, id: { not: req.params.id } },
+        select: { name: true },
+      });
+      const normalized = normalizeBusinessName(cleanName);
+      if (others.some((b) => normalizeBusinessName(b.name) === normalized)) {
+        return res.status(409).json({
+          error: "You already have a business with this name. Pick a different name.",
+          code: "BUSINESS_NAME_DUPLICATE",
+        });
+      }
+    }
+
     const data = {};
-    if (name !== undefined) data.name = name;
+    if (cleanName !== undefined) data.name = cleanName;
     if (emoji !== undefined) data.emoji = emoji;
     if (color !== undefined) data.color = color;
     if (vatEnabled !== undefined) data.vatEnabled = !!vatEnabled;
@@ -145,6 +201,12 @@ router.patch("/:id", async (req, res) => {
     });
     res.json(biz);
   } catch (err) {
+    if (err?.code === "P2002") {
+      return res.status(409).json({
+        error: "You already have a business with this name. Pick a different name.",
+        code: "BUSINESS_NAME_DUPLICATE",
+      });
+    }
     res.status(500).json({ error: "Failed to update business" });
   }
 });
