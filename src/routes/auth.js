@@ -492,28 +492,8 @@ router.patch("/profile", authMiddleware, async (req, res) => {
       data.gender = gender;
     }
 
-    // Lock the business name once a bank account (NUBAN) has been issued — the
-    // name is bound to the verified KYB identity at Anchor, so changing it here
-    // would desync the account from its registered owner.
-    if (data.businessName !== undefined) {
-      const me = await prisma.user.findUnique({
-        where: { id: req.user.id },
-        select: { businessName: true },
-      });
-      if (me && data.businessName !== me.businessName) {
-        const linked = await prisma.business.findFirst({
-          where: { userId: req.user.id, virtualAccountNumber: { not: null } },
-          select: { id: true },
-        });
-        if (linked) {
-          return res.status(403).json({
-            error:
-              "Your business name is locked because a bank account has already been issued for it. Contact support if it must change.",
-            code: "BUSINESS_NAME_LOCKED",
-          });
-        }
-      }
-    }
+    // Business name is editable normally (individual KYC — the name is just the
+    // virtual-account display label, not bound to a verified KYB identity).
 
     const user = await prisma.user.update({ where: { id: req.user.id }, data });
     const { password: _, ...safe } = user;

@@ -136,17 +136,10 @@ router.patch("/:id", async (req, res) => {
     }
     const nameChanged = cleanName !== undefined && cleanName !== existing.name;
 
-    // Once a bank account (NUBAN) has been issued, the business name is locked:
-    // it backs the virtual-account label and must stay aligned with what Anchor
-    // verified. Other fields (emoji, colour, VAT, categories) stay editable.
-    if (nameChanged && existing.virtualAccountNumber) {
-      return res.status(403).json({
-        error:
-          "Your business name is locked because a bank account has already been issued for it. Contact support if it must change.",
-        code: "BUSINESS_NAME_LOCKED",
-      });
-    }
-
+    // The business name is NOT locked after a NUBAN is issued — with individual
+    // KYC the name is just the virtual-account display label, so renames are
+    // allowed normally (still subject to the impersonation + uniqueness checks
+    // below). Note: the virtual NUBAN keeps its original display name at Anchor.
     // Block impersonation + per-account duplicate names on rename too.
     if (nameChanged) {
       if (isProtectedName(cleanName)) {
