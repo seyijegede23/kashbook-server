@@ -2,6 +2,7 @@ const router = require("express").Router();
 const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { validateSale, validateIdParam } = require("../middleware/validate");
+const { normalizeChannel } = require("../utils/salesChannel");
 
 router.use(auth);
 
@@ -34,6 +35,38 @@ router.get("/", async (req, res) => {
   }
 });
 
+// GET /sales/by-channel?businessId=&from=&to=
+// Sales totals grouped by channel — powers the "Sales by channel" breakdown.
+router.get("/by-channel", async (req, res) => {
+  try {
+    const { businessId, from, to } = req.query;
+    const where = { userId: getTargetUserId(req) };
+    if (businessId) where.businessId = businessId;
+    if (from || to) {
+      where.date = {};
+      if (from) where.date.gte = new Date(from);
+      if (to) where.date.lte = new Date(to);
+    }
+    const rows = await prisma.sales.groupBy({
+      by: ["channel"],
+      where,
+      _sum: { amount: true },
+      _count: { _all: true },
+    });
+    const result = rows
+      .map((r) => ({
+        channel: r.channel || "unspecified",
+        total: r._sum.amount || 0,
+        count: r._count._all,
+      }))
+      .sort((a, b) => b.total - a.total);
+    res.json(result);
+  } catch (err) {
+    console.error("[sales/by-channel]", err);
+    res.status(500).json({ error: "Failed to aggregate sales by channel" });
+  }
+});
+
 // POST /sales
 router.post("/", validateSale, async (req, res) => {
   const {
@@ -44,6 +77,7 @@ router.post("/", validateSale, async (req, res) => {
     notes,
     date,
     businessId,
+    channel,
   } = req.body;
   if (!amount) return res.status(400).json({ error: "amount required" });
 
@@ -64,6 +98,7 @@ router.post("/", validateSale, async (req, res) => {
         paymentMethod,
         isCredit,
         notes: notes || null,
+        channel: normalizeChannel(channel),
         date: date ? new Date(date) : new Date(),
         recordedBy: req.user.id,
         recordedByName: req.user.name,
@@ -84,7 +119,7 @@ router.patch("/:id", validateIdParam, async (req, res) => {
     const sale = await prisma.sales.findUnique({ where: { id: req.params.id } });
     if (!sale) return res.status(404).json({ error: "Sale not found" });
     if (sale.userId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
-    const { amount, notes, paymentMethod, date } = req.body;
+    const { amount, notes, paymentMethod, date, channel } = req.body;
     const updated = await prisma.sales.update({
       where: { id: req.params.id },
       data: {
@@ -92,6 +127,7 @@ router.patch("/:id", validateIdParam, async (req, res) => {
         ...(notes !== undefined && { notes }),
         ...(paymentMethod !== undefined && { paymentMethod }),
         ...(date !== undefined && { date: new Date(date) }),
+        ...(channel !== undefined && { channel: normalizeChannel(channel) }),
       },
     });
     res.json(updated);

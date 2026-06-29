@@ -366,6 +366,7 @@ model Sales {
   paymentMethod        String    @default("cash")
   isCredit             Boolean   @default(false)
   notes                String?
+  channel              String?   // sales channel: instagram | whatsapp | walk-in | online | other
   matchedTransactionId String?
   recordedBy           String?
   recordedByName       String?
@@ -376,6 +377,7 @@ model Sales {
   @@index([userId, businessId])
   @@index([businessId, date])
   @@index([businessId, updatedAt])
+  @@index([businessId, channel])
 }
 
 model Expense {
@@ -416,6 +418,7 @@ model Transaction {
   userId               String?
   user                 User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
   source               String?
+  channel              String?   // sales channel: instagram | whatsapp | walk-in | online | other
   // Deterministic idempotency key for Anchor-sourced money movement (transfers,
   // bills, inbound credits). The @@unique below makes "record this once" atomic:
   // a duplicate insert fails with P2002 instead of double-spending/double-crediting.
@@ -437,6 +440,7 @@ model Transaction {
   @@index([userId])
   @@index([businessId, updatedAt])
   @@index([complianceStatus, flagSeverity])
+  @@index([businessId, channel])
 }
 
 // Idempotency ledger for inbound Anchor webhooks. We insert the provider event

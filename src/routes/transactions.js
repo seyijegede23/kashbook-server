@@ -1,6 +1,7 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
+const { normalizeChannel } = require("../utils/salesChannel");
 
 router.use(auth);
 
@@ -58,7 +59,7 @@ router.get("/", async (req, res) => {
 
 // POST /transactions
 router.post("/", async (req, res) => {
-  const { businessId, type, amount, description, category, customerId, date, paymentMethod } =
+  const { businessId, type, amount, description, category, customerId, date, paymentMethod, channel } =
     req.body;
   if (!businessId || !type || !amount || !date) {
     return res
@@ -82,6 +83,7 @@ router.post("/", async (req, res) => {
         category: category || null,
         customerId: customerId || null,
         paymentMethod: paymentMethod || "cash",
+        channel: normalizeChannel(channel),
         date: new Date(date),
         recordedBy: req.user.id,
         recordedByName: req.user.name,
