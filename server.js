@@ -52,6 +52,8 @@ const invoiceRoutes = require("./src/routes/invoices");
 const adminRoutes = require("./src/routes/admin");
 const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
+const instagramRoutes = require("./src/routes/instagram");
+const instagramWebhookRoute = require("./src/routes/instagramWebhook");
 const transferRoutes = require("./src/routes/transfers");
 const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
@@ -185,6 +187,15 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   anchorWebhookRoute,
 );
+// Instagram messaging webhook — same raw-body-before-json requirement so the
+// X-Hub-Signature-256 HMAC verifies against the exact bytes Meta sent. The GET
+// handshake carries no body, so express.raw is a no-op for it.
+app.use(
+  "/webhooks/instagram",
+  webhookLimiter,
+  express.raw({ type: "application/json", limit: "1mb" }),
+  instagramWebhookRoute,
+);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // RevenueCat webhook — header-token auth (no body signature), so it's fine
@@ -249,6 +260,7 @@ app.use("/transfers", apiLimiter);
 app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
 app.use("/sync", apiLimiter);
+app.use("/instagram", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
@@ -267,6 +279,7 @@ app.use("/transfers", transferRoutes);
 app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/sync", syncRoutes);
+app.use("/instagram", instagramRoutes);
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
@@ -435,6 +448,27 @@ cron.schedule(
       });
     } catch (err) {
       console.error("[Cron] KYC cache purge error:", err.message);
+    }
+  },
+  { timezone: "Africa/Lagos" },
+);
+
+// ── Background cron: refresh Instagram long-lived tokens (daily 03:30 Lagos) ──
+// IG User tokens last 60 days; refresh any within ~10 days of expiry while still
+// valid. Already-expired ones are flagged for re-OAuth. See instagramJobs.js.
+cron.schedule(
+  "30 3 * * *",
+  async () => {
+    try {
+      await prisma.withCronLock(4008, async () => {
+        await require("./src/utils/snapshots").recordHeartbeat("instagramTokenRefresh");
+        const r = await require("./src/utils/instagramJobs").refreshExpiringTokens();
+        if (r.refreshed || r.expired || r.failed) {
+          console.log(`[Cron] IG tokens — refreshed ${r.refreshed}, expired ${r.expired}, failed ${r.failed}`);
+        }
+      });
+    } catch (err) {
+      console.error("[Cron] IG token refresh error:", err.message);
     }
   },
   { timezone: "Africa/Lagos" },

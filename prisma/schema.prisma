@@ -126,6 +126,24 @@ model Business {
   directorAddressLine1 String?
   directorAddressState String?
   directorAddressCity  String?
+  // ── Instagram (per-business OAuth connection — Path A: Instagram Login) ───
+  // The merchant connects their IG Professional account (Instagram Login, no
+  // Facebook Page) so they can read/reply to DMs and send their NUBAN payment
+  // details from inside KashBook. The token is a long-lived (~60d) IG User
+  // token, refreshed by a cron, stored ENCRYPTED at rest (enc:v1:… via
+  // utils/crypto.encrypt). The id/username are plaintext. Tokens are
+  // per-Business (one user may own several businesses / IG accounts).
+  // See docs/INSTAGRAM_API_SPEC.md for the verified Meta contracts.
+  instagramAccessToken       String?   // encrypt()-ed long-lived token — never returned to the client
+  // @unique: one IG account ↔ one business. Webhook routing is by this id, so a
+  // duplicate would make routing ambiguous. Nullable-unique → Postgres allows
+  // many NULLs (un-connected businesses) but rejects a second claim of the same
+  // id, closing the connect-callback TOCTOU race (caught as P2002).
+  instagramBusinessAccountId String?   @unique // the merchant's IG account id (IGID)
+  instagramUsername          String?   // @handle, for display
+  igTokenExpiresAt           DateTime?
+  igConnectionStatus         String?   @default("disconnected") // "disconnected" | "connected" | "expired" | "error"
+  igWebhookSubscribed        Boolean   @default(false) // did me/subscribed_apps succeed? if false, inbound DMs won't arrive
   // VAT summary settings. Off by default (most micro-traders aren't VAT-
   // registered). vatRate null → country default. vatInclusive: are recorded
   // amounts treated as VAT-inclusive (true, NG default) or exclusive.
@@ -148,6 +166,7 @@ model Business {
   recurringExpenses RecurringExpense[]
   officers          BusinessOfficer[]
   beneficiaries     Beneficiary[]
+  igConversations   IgConversation[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -451,6 +470,45 @@ model ProcessedWebhook {
   eventId    String   @unique
   type       String?
   receivedAt DateTime @default(now())
+}
+
+// ── Instagram DM cache ───────────────────────────────────────────────────────
+// Meta stays the source of truth for messages; we keep a thin local cache so the
+// in-app inbox renders fast and unread state survives a relaunch. Populated by
+// the webhook (inbound) and by our own send calls (outbound). One conversation
+// per (business, IG-scoped customer id) — webhook message events give us the
+// participant IGSID but not always a thread id, so the IGSID is the stable key
+// and igThreadId is filled lazily from the Conversations API.
+model IgConversation {
+  id                  String      @id @default(uuid())
+  businessId          String
+  business            Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  participantIgId     String      // the customer's IG-scoped user id (IGSID) — stable key
+  igThreadId          String?     // Meta conversation id, when known
+  participantUsername String?
+  lastMessageAt       DateTime    @default(now())
+  // Last time the CUSTOMER messaged us — gates the 24h standard / 7d HUMAN_AGENT
+  // send window (Meta blocks replies outside it). Distinct from lastMessageAt,
+  // which also moves on our own outbound replies. See docs/INSTAGRAM_API_SPEC.md §4.
+  lastInboundAt       DateTime?
+  unread              Boolean     @default(false)
+  createdAt           DateTime    @default(now())
+  messages            IgMessage[]
+
+  @@unique([businessId, participantIgId])
+  @@index([businessId, lastMessageAt])
+}
+
+model IgMessage {
+  id             String         @id @default(uuid())
+  conversationId String
+  conversation   IgConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  igMessageId    String         @unique // Meta message id (mid) — dedups redelivered webhooks
+  direction      String         // "in" (from customer) | "out" (from merchant)
+  text           String?
+  sentAt         DateTime       @default(now())
+
+  @@index([conversationId, sentAt])
 }
 
 model InventoryItem {
