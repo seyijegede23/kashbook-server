@@ -279,11 +279,21 @@ async function sendMessage(token, igId, recipientIgsid, text, { humanAgent = fal
   return { messageId: data?.message_id || null, recipientId: data?.recipient_id || null };
 }
 
-// Compose the merchant's bank-transfer payment message from their NUBAN.
-function buildPaymentText(business, { note } = {}) {
+// Format a money amount for a DM. NGN → "₦5,000"; else "5,000 USD".
+function formatAmount(amount, currency) {
+  const n = Number(amount) || 0;
+  const cur = currency || "NGN";
+  const num = n.toLocaleString("en-NG", { maximumFractionDigits: 2 });
+  return cur === "NGN" ? `₦${num}` : `${num} ${cur}`;
+}
+
+// Compose the merchant's bank-transfer payment message from their NUBAN. When an
+// `amount` is given it becomes a "Please pay ₦X" request (used by auto-confirm).
+function buildPaymentText(business, { amount, note } = {}) {
   if (!business?.virtualAccountNumber) return null;
+  const amt = amount > 0 ? formatAmount(amount, business.baseCurrency) : null;
   const lines = [
-    "Here are our payment details 👇",
+    amt ? `Please pay ${amt} to the account below 👇` : "Here are our payment details 👇",
     "",
     `Bank: ${business.virtualAccountBank || ""}`.trim(),
     `Account Number: ${business.virtualAccountNumber}`,
@@ -339,6 +349,7 @@ module.exports = {
   getMessage,
   sendMessage,
   buildPaymentText,
+  formatAmount,
   // webhooks
   verifyHandshake,
   verifyWebhookSignature,

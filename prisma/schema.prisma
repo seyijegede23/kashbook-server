@@ -491,6 +491,14 @@ model IgConversation {
   // send window (Meta blocks replies outside it). Distinct from lastMessageAt,
   // which also moves on our own outbound replies. See docs/INSTAGRAM_API_SPEC.md §4.
   lastInboundAt       DateTime?
+  // Auto payment confirmation: when the merchant sends a "Request ₦X" in this
+  // thread we store the expected amount + time. An inbound NUBAN credit that
+  // matches it (within 48h, exactly one candidate) auto-replies "payment
+  // received", clears these, and stamps lastPaymentConfirmedAt. See
+  // server/src/utils/igPaymentMatch.js.
+  expectedAmount         Float?
+  expectedSince          DateTime?
+  lastPaymentConfirmedAt DateTime?
   unread              Boolean     @default(false)
   createdAt           DateTime    @default(now())
   messages            IgMessage[]

@@ -265,6 +265,8 @@ router.get("/conversations", async (req, res) => {
         lastMessageAt: c.lastMessageAt,
         lastInboundAt: c.lastInboundAt,
         unread: c.unread,
+        expectedAmount: c.expectedAmount,
+        lastPaymentConfirmedAt: c.lastPaymentConfirmedAt,
         preview: c.messages[0]?.text?.slice(0, 120) || "",
       })),
     });
@@ -336,6 +338,8 @@ router.get("/conversations/:id/messages", async (req, res) => {
         id: convo.id,
         participantUsername: convo.participantUsername,
         lastInboundAt: convo.lastInboundAt,
+        expectedAmount: convo.expectedAmount,
+        lastPaymentConfirmedAt: convo.lastPaymentConfirmedAt,
       },
       messages: messages.map((m) => ({
         id: m.id, direction: m.direction, text: m.text, sentAt: m.sentAt,
@@ -398,12 +402,13 @@ router.post("/conversations/:id/reply", async (req, res) => {
 // POST /instagram/conversations/:id/send-payment → DM the merchant's NUBAN
 router.post("/conversations/:id/send-payment", async (req, res) => {
   try {
+    const amount = Number(req.body.amount) || 0;
     const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });
     if (!convo) return res.status(404).json({ error: "Conversation not found." });
     const business = await resolveBusiness(req, convo.businessId);
     if (!business) return res.status(404).json({ error: "Conversation not found." });
 
-    const text = ig.buildPaymentText(business, { note: req.body.note });
+    const text = ig.buildPaymentText(business, { amount, note: req.body.note });
     if (!text) {
       return res.status(400).json({ error: "Add a bank account (NUBAN) to this business first." });
     }
@@ -417,8 +422,16 @@ router.post("/conversations/:id/send-payment", async (req, res) => {
       });
       if (recent) return;
       await sendInConversation({ business, convo, text });
+      // Arm auto-confirmation: remember the requested amount so a matching inbound
+      // NUBAN credit can auto-reply "payment received". Only when an amount is set.
+      if (amount > 0) {
+        await prisma.igConversation.update({
+          where: { id: convo.id },
+          data: { expectedAmount: amount, expectedSince: new Date() },
+        });
+      }
     });
-    return res.json({ ok: true });
+    return res.json({ ok: true, armed: amount > 0 });
   } catch (err) {
     console.error("[instagram/send-payment]", err.message);
     return fail(res, err, "Couldn't send your payment details.");

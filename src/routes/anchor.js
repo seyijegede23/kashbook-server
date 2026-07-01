@@ -522,6 +522,9 @@ router.post("/", async (req, res) => {
       });
       await pushTo(biz.userId, title, body);
 
+      // Auto-confirm a matching Instagram payment request (fire-and-forget).
+      require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
+
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
 
@@ -623,6 +626,9 @@ router.post("/", async (req, res) => {
         narration,
       });
       await pushTo(destBiz.userId, title, body);
+
+      // Auto-confirm a matching Instagram payment request (fire-and-forget).
+      require("../utils/igPaymentMatch").tryMatchIgPayment(destBiz, amount).catch(() => {});
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(destBiz.id, Number(amount) || 0); } catch { /* noop */ }

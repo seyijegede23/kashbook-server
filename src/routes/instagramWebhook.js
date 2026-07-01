@@ -14,6 +14,7 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const ig = require("../utils/instagram");
+const { pushTo } = require("../utils/pushNotification");
 
 // ── GET: verification handshake ──────────────────────────────────────────────
 router.get("/", (req, res) => {
@@ -48,7 +49,7 @@ router.post("/", async (req, res) => {
       // Route to the business that connected this IG account.
       const business = await prisma.business.findFirst({
         where: { instagramBusinessAccountId: merchantIgId },
-        select: { id: true },
+        select: { id: true, userId: true },
       });
       if (!business) {
         console.warn(`[IG webhook] no business for IG id ${merchantIgId} — skipping`);
@@ -81,8 +82,9 @@ router.post("/", async (req, res) => {
 
         // Serialize per-business so concurrent events for the same conversation
         // don't race the upsert.
+        let convo;
         await prisma.withBusinessLock(business.id, async () => {
-          const convo = await prisma.igConversation.upsert({
+          convo = await prisma.igConversation.upsert({
             where: { businessId_participantIgId: { businessId: business.id, participantIgId: senderIgsid } },
             create: {
               businessId: business.id,
@@ -99,6 +101,13 @@ router.post("/", async (req, res) => {
             if (e.code !== "P2002") throw e; // unique mid backstop — ignore re-delivery
           });
         });
+
+        // Notify the business owner (in-app row + Expo push, respecting their
+        // notification toggle). Only new messages reach here — duplicates were
+        // dropped by the ProcessedWebhook dedup above, so no double-pings.
+        const who = convo?.participantUsername ? `@${convo.participantUsername}` : "an Instagram customer";
+        const preview = (text || "sent you a message").slice(0, 140);
+        await pushTo(business.userId, "📩 New Instagram message", `${who}: ${preview}`).catch(() => {});
       }
     }
   } catch (err) {
