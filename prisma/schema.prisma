@@ -167,6 +167,8 @@ model Business {
   officers          BusinessOfficer[]
   beneficiaries     Beneficiary[]
   igConversations   IgConversation[]
+  quickReplies      QuickReply[]
+  igAutoReplies     IgAutoReply[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -294,6 +296,7 @@ model Customer {
   sales           Sales[]
   transactions    Transaction[]
   invoices        Invoice[]
+  igConversations IgConversation[]
 
   @@unique([userId, phone])
   @@index([userId, businessId])
@@ -486,6 +489,10 @@ model IgConversation {
   participantIgId     String      // the customer's IG-scoped user id (IGSID) — stable key
   igThreadId          String?     // Meta conversation id, when known
   participantUsername String?
+  // Stable link to the bookkeeping Customer (set on first record-sale / invoice).
+  // Used instead of matching by display name, which can collide.
+  customerId          String?
+  customer            Customer?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
   lastMessageAt       DateTime    @default(now())
   // Last time the CUSTOMER messaged us — gates the 24h standard / 7d HUMAN_AGENT
   // send window (Meta blocks replies outside it). Distinct from lastMessageAt,
@@ -505,6 +512,37 @@ model IgConversation {
 
   @@unique([businessId, participantIgId])
   @@index([businessId, lastMessageAt])
+  // Supports the auto-payment matcher's per-business "armed conversations" query
+  // (WHERE businessId=? AND expectedAmount IS NOT NULL …), run on every credit.
+  @@index([businessId, expectedAmount])
+}
+
+// Automated IG DM replies. "greeting" fires once on a conversation's first
+// inbound message; "keyword" fires when an inbound message contains the keyword.
+model IgAutoReply {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  kind       String   // "greeting" | "keyword" | "comment" | "away"
+  keyword    String?  // for kind="keyword"/"comment" (matched case-insensitively; null comment = any)
+  text       String   @db.VarChar(900)
+  fromHour   Int?     // for kind="away": window start hour 0-23 (Africa/Lagos)
+  toHour     Int?     // for kind="away": window end hour 0-23
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@index([businessId])
+}
+
+// Saved canned replies a merchant can insert into an IG DM with one tap.
+model QuickReply {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  text       String   @db.VarChar(900) // DB-enforced cap (route also validates ≤900)
+  createdAt  DateTime @default(now())
+
+  @@index([businessId])
 }
 
 model IgMessage {
@@ -514,6 +552,7 @@ model IgMessage {
   igMessageId    String         @unique // Meta message id (mid) — dedups redelivered webhooks
   direction      String         // "in" (from customer) | "out" (from merchant)
   text           String?
+  attachmentUrl  String?        // inbound image/media URL (temporary, signed by Meta)
   sentAt         DateTime       @default(now())
 
   @@index([conversationId, sentAt])

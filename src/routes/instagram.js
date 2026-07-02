@@ -27,6 +27,34 @@ async function resolveBusiness(req, businessId) {
   return prisma.business.findFirst({ where: { id: businessId, userId: ownerId(req) } });
 }
 
+// Resolve the bookkeeping Customer linked to an IG conversation. Prefers the
+// STORED link (convo.customerId) so we never mis-match on a shared display name;
+// falls back to a deterministic name match; creates + links only on write flows.
+async function resolveIgCustomer(business, convo, ownerUserId, { create = false } = {}) {
+  if (convo.customerId) {
+    const c = await prisma.customer.findFirst({ where: { id: convo.customerId, businessId: business.id } });
+    if (c) return c;
+  }
+  const igName = convo.participantUsername ? `@${convo.participantUsername}` : "Instagram customer";
+  let customer = await prisma.customer.findFirst({
+    where: { businessId: business.id, name: igName }, orderBy: { createdAt: "asc" },
+  });
+  if (!customer && create && ownerUserId) {
+    customer = await prisma.customer.create({ data: { userId: ownerUserId, businessId: business.id, name: igName } });
+  }
+  if (customer && create && convo.customerId !== customer.id) {
+    await prisma.igConversation.update({ where: { id: convo.id }, data: { customerId: customer.id } }).catch(() => {});
+  }
+  return customer;
+}
+
+// Reject non-finite / absurd amounts (Infinity passes `> 0`). Returns a clean
+// number or null.
+function parseAmount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 && n <= 1e12 ? n : null;
+}
+
 // Decrypt the live token, or throw a 409 "reconnect" error if missing/expired.
 function liveToken(business) {
   if (!business?.instagramAccessToken) {
@@ -291,24 +319,18 @@ router.post("/sync", async (req, res) => {
       // The "other" participant is the customer (skip our own account).
       const customer = (c.participants || []).find((p) => p.id && p.id !== myId);
       if (!customer) continue;
-      const seededAt = parseMetaTime(c.updatedTime) || new Date();
-      await prisma.igConversation.upsert({
-        where: { businessId_participantIgId: { businessId: business.id, participantIgId: customer.id } },
-        create: {
-          businessId: business.id,
-          participantIgId: customer.id,
-          participantUsername: customer.username || null,
-          igThreadId: c.id || null,
-          lastMessageAt: seededAt,
-        },
-        // Only enrich username/threadId — never clobber webhook-owned
-        // lastMessageAt / lastInboundAt / unread.
-        update: {
+      // Update-only: enrich username/threadId on conversations the WEBHOOK already
+      // created. We deliberately do NOT create here — a sync-seeded (message-less)
+      // conversation would make the next inbound look like a repeat contact and
+      // suppress the greeting auto-reply. Never clobber webhook-owned timestamps.
+      const updated = await prisma.igConversation.updateMany({
+        where: { businessId: business.id, participantIgId: customer.id },
+        data: {
           participantUsername: customer.username || undefined,
           igThreadId: c.id || undefined,
         },
       });
-      synced++;
+      if (updated.count > 0) synced++;
     }
     return res.json({ ok: true, synced });
   } catch (err) {
@@ -342,7 +364,7 @@ router.get("/conversations/:id/messages", async (req, res) => {
         lastPaymentConfirmedAt: convo.lastPaymentConfirmedAt,
       },
       messages: messages.map((m) => ({
-        id: m.id, direction: m.direction, text: m.text, sentAt: m.sentAt,
+        id: m.id, direction: m.direction, text: m.text, attachmentUrl: m.attachmentUrl, sentAt: m.sentAt,
       })),
     });
   } catch (err) { return fail(res, err); }
@@ -402,7 +424,7 @@ router.post("/conversations/:id/reply", async (req, res) => {
 // POST /instagram/conversations/:id/send-payment → DM the merchant's NUBAN
 router.post("/conversations/:id/send-payment", async (req, res) => {
   try {
-    const amount = Number(req.body.amount) || 0;
+    const amount = parseAmount(req.body.amount) || 0;
     const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });
     if (!convo) return res.status(404).json({ error: "Conversation not found." });
     const business = await resolveBusiness(req, convo.businessId);
@@ -435,6 +457,301 @@ router.post("/conversations/:id/send-payment", async (req, res) => {
   } catch (err) {
     console.error("[instagram/send-payment]", err.message);
     return fail(res, err, "Couldn't send your payment details.");
+  }
+});
+
+// ── Quick replies (saved canned messages) ────────────────────────────────────
+// GET /instagram/quick-replies?businessId=
+router.get("/quick-replies", async (req, res) => {
+  try {
+    const business = await resolveBusiness(req, req.query.businessId);
+    if (!business) return res.status(404).json({ error: "Business not found." });
+    const rows = await prisma.quickReply.findMany({
+      where: { businessId: business.id }, orderBy: { createdAt: "asc" }, take: 50,
+    });
+    return res.json({ quickReplies: rows.map((r) => ({ id: r.id, text: r.text })) });
+  } catch (err) { return fail(res, err); }
+});
+
+// POST /instagram/quick-replies { businessId, text }
+router.post("/quick-replies", async (req, res) => {
+  try {
+    const text = String(req.body.text || "").trim();
+    if (!text) return res.status(400).json({ error: "Message can't be empty." });
+    if (text.length > 900) return res.status(400).json({ error: "Too long (max 900 characters)." });
+    const business = await resolveBusiness(req, req.body.businessId);
+    if (!business) return res.status(404).json({ error: "Business not found." });
+    const row = await prisma.quickReply.create({ data: { businessId: business.id, text } });
+    return res.json({ id: row.id, text: row.text });
+  } catch (err) { return fail(res, err); }
+});
+
+// DELETE /instagram/quick-replies/:id
+router.delete("/quick-replies/:id", async (req, res) => {
+  try {
+    const row = await prisma.quickReply.findUnique({ where: { id: req.params.id } });
+    if (!row) return res.json({ ok: true }); // already gone
+    const business = await resolveBusiness(req, row.businessId);
+    if (!business) return res.status(404).json({ error: "Not found." });
+    await prisma.quickReply.delete({ where: { id: row.id } });
+    return res.json({ ok: true });
+  } catch (err) { return fail(res, err); }
+});
+
+// ── Record a sale straight from a DM ──────────────────────────────────────────
+// POST /instagram/conversations/:id/record-sale { amount, notes }
+// Finds-or-creates a Customer for the IG handle and books a channel=instagram
+// sale — turning a chat into recorded revenue (feeds the by-channel analytics).
+router.post("/conversations/:id/record-sale", async (req, res) => {
+  try {
+    const amount = parseAmount(req.body.amount);
+    if (!amount) return res.status(400).json({ error: "Enter a valid amount." });
+    const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });
+    if (!convo) return res.status(404).json({ error: "Conversation not found." });
+    const business = await resolveBusiness(req, convo.businessId);
+    if (!business) return res.status(404).json({ error: "Conversation not found." });
+
+    const ownerUserId = ownerId(req);
+    // Serialize per-business so a double-tap / concurrent request can't create two
+    // customers (withBusinessLock queues same-business calls via a pg advisory lock).
+    const result = await prisma.withBusinessLock(business.id, async () => {
+      const customer = await resolveIgCustomer(business, convo, ownerUserId, { create: true });
+      const sale = await prisma.sales.create({
+        data: {
+          userId: ownerUserId,
+          businessId: business.id,
+          customerId: customer.id,
+          amount,
+          paymentMethod: "transfer",
+          channel: "instagram",
+          notes: String(req.body.notes || "").trim() || null,
+          recordedBy: req.user.id,
+          recordedByName: req.user.name,
+        },
+      });
+      return { saleId: sale.id, customerId: customer.id };
+    });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[instagram/record-sale]", err.message);
+    return fail(res, err, "Couldn't record the sale.");
+  }
+});
+
+// ── Auto-replies (greeting + keyword) ────────────────────────────────────────
+// GET /instagram/auto-replies?businessId=
+router.get("/auto-replies", async (req, res) => {
+  try {
+    const business = await resolveBusiness(req, req.query.businessId);
+    if (!business) return res.status(404).json({ error: "Business not found." });
+    const rows = await prisma.igAutoReply.findMany({
+      where: { businessId: business.id }, orderBy: { createdAt: "asc" }, take: 100,
+    });
+    return res.json({
+      rules: rows.map((r) => ({ id: r.id, kind: r.kind, keyword: r.keyword, text: r.text, enabled: r.enabled, fromHour: r.fromHour, toHour: r.toHour })),
+    });
+  } catch (err) { return fail(res, err); }
+});
+
+// POST /instagram/auto-replies { businessId, kind, keyword?, text, fromHour?, toHour? }
+// kinds: greeting | keyword | comment | away. One greeting + one away per business.
+const AUTO_REPLY_KINDS = new Set(["greeting", "keyword", "comment", "away"]);
+function mapRule(r) {
+  return { id: r.id, kind: r.kind, keyword: r.keyword, text: r.text, enabled: r.enabled, fromHour: r.fromHour, toHour: r.toHour };
+}
+router.post("/auto-replies", async (req, res) => {
+  try {
+    const kind = AUTO_REPLY_KINDS.has(req.body.kind) ? req.body.kind : "keyword";
+    const text = String(req.body.text || "").trim();
+    const keyword = String(req.body.keyword || "").trim();
+    if (!text) return res.status(400).json({ error: "Reply text can't be empty." });
+    if (text.length > 900) return res.status(400).json({ error: "Too long (max 900 characters)." });
+    if (kind === "keyword" && !keyword) return res.status(400).json({ error: "Enter a keyword to match." });
+    const business = await resolveBusiness(req, req.body.businessId);
+    if (!business) return res.status(404).json({ error: "Business not found." });
+
+    let fromHour = null, toHour = null;
+    if (kind === "away") {
+      const parseHour = (v) => (v == null || v === "" ? null : parseInt(v, 10));
+      fromHour = parseHour(req.body.fromHour);
+      toHour = parseHour(req.body.toHour);
+      const okHour = (h) => h == null || (Number.isInteger(h) && h >= 0 && h <= 23);
+      if (!okHour(fromHour) || !okHour(toHour)) return res.status(400).json({ error: "Hours must be between 0 and 23." });
+    }
+
+    // One greeting / one away per business — update in place if it exists.
+    if (kind === "greeting" || kind === "away") {
+      const existing = await prisma.igAutoReply.findFirst({ where: { businessId: business.id, kind } });
+      if (existing) {
+        const row = await prisma.igAutoReply.update({
+          where: { id: existing.id }, data: { text, enabled: true, fromHour, toHour },
+        });
+        return res.json(mapRule(row));
+      }
+    }
+    const row = await prisma.igAutoReply.create({
+      data: {
+        businessId: business.id, kind, text, fromHour, toHour,
+        keyword: (kind === "keyword" || kind === "comment") ? (keyword || null) : null,
+      },
+    });
+    return res.json(mapRule(row));
+  } catch (err) { return fail(res, err); }
+});
+
+// PATCH /instagram/auto-replies/:id { enabled }
+router.patch("/auto-replies/:id", async (req, res) => {
+  try {
+    const row = await prisma.igAutoReply.findUnique({ where: { id: req.params.id } });
+    if (!row) return res.status(404).json({ error: "Rule not found." });
+    const business = await resolveBusiness(req, row.businessId);
+    if (!business) return res.status(404).json({ error: "Rule not found." });
+    const updated = await prisma.igAutoReply.update({ where: { id: row.id }, data: { enabled: !!req.body.enabled } });
+    return res.json({ id: updated.id, enabled: updated.enabled });
+  } catch (err) { return fail(res, err); }
+});
+
+// DELETE /instagram/auto-replies/:id
+router.delete("/auto-replies/:id", async (req, res) => {
+  try {
+    const row = await prisma.igAutoReply.findUnique({ where: { id: req.params.id } });
+    if (!row) return res.json({ ok: true });
+    const business = await resolveBusiness(req, row.businessId);
+    if (!business) return res.status(404).json({ error: "Not found." });
+    await prisma.igAutoReply.delete({ where: { id: row.id } });
+    return res.json({ ok: true });
+  } catch (err) { return fail(res, err); }
+});
+
+// POST /instagram/conversations/:id/send-product { itemId } — DM a product's details
+router.post("/conversations/:id/send-product", async (req, res) => {
+  try {
+    const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });
+    if (!convo) return res.status(404).json({ error: "Conversation not found." });
+    const business = await resolveBusiness(req, convo.businessId);
+    if (!business) return res.status(404).json({ error: "Conversation not found." });
+    const item = await prisma.inventoryItem.findFirst({
+      where: { id: String(req.body.itemId || ""), businessId: business.id },
+    });
+    if (!item) return res.status(404).json({ error: "Product not found." });
+
+    const price = ig.formatAmount(item.price, business.baseCurrency);
+    const lines = [`🛍️ ${item.name} — ${price}`];
+    if (item.description) lines.push(item.description);
+    if (item.quantity > 0) lines.push(`In stock: ${item.quantity} ${item.unit || "pcs"}`);
+    lines.push("", "Reply to order 👍");
+    const text = lines.join("\n");
+
+    await prisma.withBusinessLock(business.id, () => sendInConversation({ business, convo, text }));
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[instagram/send-product]", err.message);
+    return fail(res, err, "Couldn't send the product.");
+  }
+});
+
+// GET /instagram/unread-count?businessId= → unread conversation count (badge)
+router.get("/unread-count", async (req, res) => {
+  try {
+    const business = await resolveBusiness(req, req.query.businessId);
+    if (!business) return res.json({ count: 0 });
+    const count = await prisma.igConversation.count({ where: { businessId: business.id, unread: true } });
+    return res.json({ count });
+  } catch { return res.json({ count: 0 }); }
+});
+
+// GET /instagram/analytics?businessId= → inbox + DM→sale conversion stats
+router.get("/analytics", async (req, res) => {
+  try {
+    const business = await resolveBusiness(req, req.query.businessId);
+    if (!business) return res.status(404).json({ error: "Business not found." });
+    const [conversations, unread, inbound, outbound, sales] = await Promise.all([
+      prisma.igConversation.count({ where: { businessId: business.id } }),
+      prisma.igConversation.count({ where: { businessId: business.id, unread: true } }),
+      prisma.igMessage.count({ where: { conversation: { businessId: business.id }, direction: "in" } }),
+      prisma.igMessage.count({ where: { conversation: { businessId: business.id }, direction: "out" } }),
+      prisma.sales.aggregate({ where: { businessId: business.id, channel: "instagram" }, _count: true, _sum: { amount: true } }),
+    ]);
+    return res.json({
+      conversations, unread, inbound, outbound,
+      salesCount: sales._count || 0,
+      salesTotal: sales._sum?.amount || 0,
+    });
+  } catch (err) { return fail(res, err); }
+});
+
+// GET /instagram/conversations/:id/customer-summary → the linked customer's bookkeeping snapshot
+router.get("/conversations/:id/customer-summary", async (req, res) => {
+  try {
+    const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });
+    if (!convo) return res.status(404).json({ error: "Conversation not found." });
+    const business = await resolveBusiness(req, convo.businessId);
+    if (!business) return res.status(404).json({ error: "Conversation not found." });
+
+    const customer = await resolveIgCustomer(business, convo, null, { create: false });
+    if (!customer) return res.json({ linked: false });
+
+    const agg = await prisma.sales.aggregate({
+      where: { businessId: business.id, customerId: customer.id },
+      _count: true, _sum: { amount: true },
+    });
+    return res.json({
+      linked: true,
+      customerId: customer.id,
+      name: customer.name,
+      totalOwed: customer.totalOwed || 0,
+      salesCount: agg._count || 0,
+      salesTotal: agg._sum?.amount || 0,
+    });
+  } catch (err) { return fail(res, err); }
+});
+
+// POST /instagram/conversations/:id/create-invoice { amount, description }
+// Creates a SENT invoice (find-or-create customer) + share link and DMs the link.
+router.post("/conversations/:id/create-invoice", async (req, res) => {
+  try {
+    const amount = parseAmount(req.body.amount);
+    if (!amount) return res.status(400).json({ error: "Enter a valid amount." });
+    const description = String(req.body.description || "").trim() || "Order";
+    const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });
+    if (!convo) return res.status(404).json({ error: "Conversation not found." });
+    const business = await resolveBusiness(req, convo.businessId);
+    if (!business) return res.status(404).json({ error: "Conversation not found." });
+
+    const ownerUserId = ownerId(req);
+    const result = await prisma.withBusinessLock(business.id, async () => {
+      const customer = await resolveIgCustomer(business, convo, ownerUserId, { create: true });
+      const biz = await prisma.business.update({ where: { id: business.id }, data: { invoiceCounter: { increment: 1 } } });
+      const invoiceNumber = `INV-${String(biz.invoiceCounter).padStart(3, "0")}`;
+      const invoice = await prisma.invoice.create({
+        data: {
+          businessId: business.id, customerId: customer.id, userId: ownerUserId,
+          invoiceNumber, type: "invoice", status: "SENT",
+          issueDate: new Date().toISOString().slice(0, 10),
+          currency: business.baseCurrency || "NGN",
+          subtotal: amount, total: amount,
+          items: { create: [{ name: description, quantity: 1, rate: amount, amount }] },
+        },
+      });
+      const token = require("crypto").randomBytes(32).toString("base64url");
+      await prisma.invoiceShareLink.create({ data: { invoiceId: invoice.id, token } });
+      return { invoiceId: invoice.id, invoiceNumber, token };
+    });
+
+    const base = process.env.PUBLIC_BASE_URL || "";
+    const url = base ? `${base.replace(/\/$/, "")}/i/${result.token}` : "";
+    const amtLabel = ig.formatAmount(amount, business.baseCurrency);
+    const text = `Here's your invoice ${result.invoiceNumber} for ${amtLabel} 🧾${url ? `\n${url}` : ""}\n\nTap the link to view and pay. Thank you!`;
+    try {
+      await prisma.withBusinessLock(business.id, () => sendInConversation({ business, convo, text }));
+    } catch (e) {
+      // Invoice was created; DM failed (e.g. outside the 24h window). Still a success.
+      console.warn("[instagram/create-invoice] DM failed:", e.message);
+    }
+    return res.json({ ok: true, invoiceId: result.invoiceId, invoiceNumber: result.invoiceNumber });
+  } catch (err) {
+    console.error("[instagram/create-invoice]", err.message);
+    return fail(res, err, "Couldn't create the invoice.");
   }
 });
 

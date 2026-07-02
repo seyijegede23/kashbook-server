@@ -29,7 +29,7 @@ const AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize";
 const SHORT_TOKEN_URL = "https://api.instagram.com/oauth/access_token";
 const GRAPH = "https://graph.instagram.com";
 const DEFAULT_VERSION = "v25.0";
-const DEFAULT_SCOPES = "instagram_business_basic,instagram_business_manage_messages";
+const DEFAULT_SCOPES = "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments";
 
 // Long-lived token lifetime per Meta (60 days). Used as a fallback when a token
 // response omits expires_in.
@@ -202,7 +202,7 @@ async function getAccountInfo(token) {
 // without this, OAuth succeeds but no inbound DMs ever arrive (#1 silent bug).
 async function subscribeWebhooks(token) {
   const url = `${graphBase()}/me/subscribed_apps?${new URLSearchParams({
-    subscribed_fields: "messages",
+    subscribed_fields: "messages,comments",
     access_token: token,
   })}`;
   const data = await httpJson(url, { method: "POST" });
@@ -279,6 +279,18 @@ async function sendMessage(token, igId, recipientIgsid, text, { humanAgent = fal
   return { messageId: data?.message_id || null, recipientId: data?.recipient_id || null };
 }
 
+// Private reply: DM the author of a comment. recipient.comment_id opens a DM to
+// the commenter (requires instagram_business_manage_comments). Returns { messageId }.
+async function sendPrivateReply(token, igId, commentId, text) {
+  const url = `${graphBase()}/${encodeURIComponent(igId)}/messages`;
+  const data = await httpJson(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: { recipient: { comment_id: String(commentId) }, message: { text: String(text).slice(0, MAX_TEXT) } },
+  });
+  return { messageId: data?.message_id || null, recipientId: data?.recipient_id || null };
+}
+
 // Format a money amount for a DM. NGN → "₦5,000"; else "5,000 USD".
 function formatAmount(amount, currency) {
   const n = Number(amount) || 0;
@@ -348,6 +360,7 @@ module.exports = {
   listMessageIds,
   getMessage,
   sendMessage,
+  sendPrivateReply,
   buildPaymentText,
   formatAmount,
   // webhooks

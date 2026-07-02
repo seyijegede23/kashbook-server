@@ -8,9 +8,13 @@
  * within the last 48h, we auto-reply "payment received" in the DM, clear the
  * flag, stamp lastPaymentConfirmedAt, and notify the merchant.
  *
- * Mirrors tryMatchInvoice() in anchorReconcile.js. Safe to call more than once
- * per credit — the first match consumes the flag, so a repeat call finds nothing.
+ * CONCURRENCY: the webhook AND the 5-min reconcile can both fire for the same
+ * credit. We CLAIM (read + null the flag) atomically inside withBusinessLock so a
+ * second caller finds nothing — no duplicate DMs. The slow Graph send happens
+ * OUTSIDE the lock so we never hold a business's money-out lock across an
+ * external HTTP call. Mirrors tryMatchInvoice() in anchorReconcile.js.
  */
+const crypto = require("crypto");
 const prisma = require("./db");
 const ig = require("./instagram");
 const { decrypt } = require("./crypto");
@@ -18,23 +22,38 @@ const { pushTo } = require("./pushNotification");
 
 const WINDOW_MS = 48 * 60 * 60 * 1000; // how long an armed "Request ₦X" stays matchable
 
+// Exact-to-the-kobo comparison — robust against IEEE-754 float representation
+// (e.g. 500001 kobo / 100 = 5000.01, where `Math.abs(x - 5000) < 0.01` fails).
+function sameMoney(a, b) {
+  return Math.round((Number(a) || 0) * 100) === Math.round((Number(b) || 0) * 100);
+}
+
 async function tryMatchIgPayment(biz, amount) {
   if (!biz?.id || !ig.isConfigured()) return;
   const amt = Number(amount);
   if (!(amt > 0)) return;
-
   const since = new Date(Date.now() - WINDOW_MS);
-  const candidates = await prisma.igConversation.findMany({
-    where: { businessId: biz.id, expectedAmount: { not: null }, expectedSince: { gte: since } },
-    select: {
-      id: true, participantIgId: true, participantUsername: true,
-      expectedAmount: true, lastInboundAt: true,
-    },
-  });
-  const matches = candidates.filter((c) => Math.abs((c.expectedAmount || 0) - amt) < 0.01);
-  if (matches.length !== 1) return; // 0 = no match; >1 = ambiguous → let the merchant confirm
-  const convo = matches[0];
 
+  // ── Atomically CLAIM one armed conversation (inside the per-business lock) ──
+  // Consuming the flag here is what makes double-firing safe: a concurrent caller
+  // acquires the lock afterwards, re-queries, and finds nothing to match.
+  const convo = await prisma.withBusinessLock(biz.id, async () => {
+    const candidates = await prisma.igConversation.findMany({
+      where: { businessId: biz.id, expectedAmount: { not: null }, expectedSince: { gte: since } },
+      select: { id: true, participantIgId: true, participantUsername: true, expectedAmount: true, lastInboundAt: true },
+    });
+    const matches = candidates.filter((c) => sameMoney(c.expectedAmount, amt));
+    if (matches.length !== 1) return null; // 0 = no match; >1 = ambiguous → merchant confirms
+    const m = matches[0];
+    await prisma.igConversation.update({
+      where: { id: m.id },
+      data: { expectedAmount: null, expectedSince: null, lastPaymentConfirmedAt: new Date() },
+    });
+    return m;
+  });
+  if (!convo) return;
+
+  // ── Slow work, OUTSIDE the lock ────────────────────────────────────────────
   const business = await prisma.business.findUnique({
     where: { id: biz.id },
     select: {
@@ -43,12 +62,14 @@ async function tryMatchIgPayment(biz, amount) {
       igConnectionStatus: true, igTokenExpiresAt: true,
     },
   });
+  if (!business) return; // business vanished (deleted) — the flag is already consumed
+
   const tokenLive =
-    business?.instagramAccessToken &&
+    business.instagramAccessToken &&
     business.igConnectionStatus === "connected" &&
     (!business.igTokenExpiresAt || new Date(business.igTokenExpiresAt) > new Date());
 
-  const amtLabel = ig.formatAmount(amt, business?.baseCurrency);
+  const amtLabel = ig.formatAmount(amt, business.baseCurrency);
   const who = convo.participantUsername ? `@${convo.participantUsername}` : "your Instagram customer";
 
   // Best-effort auto-reply, inside Meta's 24h / 7d messaging window.
@@ -68,10 +89,13 @@ async function tryMatchIgPayment(biz, amount) {
         await prisma.igMessage.create({
           data: {
             conversationId: convo.id,
-            igMessageId: res.messageId || `out_pay_${Date.now()}_${convo.id}`,
+            igMessageId: res.messageId || `out_pay_${crypto.randomUUID()}`,
             direction: "out",
             text,
           },
+        }).catch(() => {});
+        await prisma.igConversation.update({
+          where: { id: convo.id }, data: { lastMessageAt: new Date() },
         }).catch(() => {});
         dmSent = true;
       } catch (e) {
@@ -79,17 +103,6 @@ async function tryMatchIgPayment(biz, amount) {
       }
     }
   }
-
-  // Consume the armed flag regardless (the payment DID arrive) and stamp it.
-  await prisma.igConversation.update({
-    where: { id: convo.id },
-    data: {
-      expectedAmount: null,
-      expectedSince: null,
-      lastPaymentConfirmedAt: new Date(),
-      ...(dmSent ? { lastMessageAt: new Date() } : {}),
-    },
-  });
 
   await pushTo(
     business.userId,
