@@ -144,6 +144,16 @@ model Business {
   igTokenExpiresAt           DateTime?
   igConnectionStatus         String?   @default("disconnected") // "disconnected" | "connected" | "expired" | "error"
   igWebhookSubscribed        Boolean   @default(false) // did me/subscribed_apps succeed? if false, inbound DMs won't arrive
+  // ── WhatsApp Business (Cloud API — Embedded Signup) ───────────────────────
+  // Per-merchant WABA connection mirroring the Instagram block above. The token
+  // is a business-scoped token (NO expiry — no refresh cron), stored encrypted.
+  // waPhoneNumberId is the webhook routing key. See docs/WHATSAPP_API_SPEC.md.
+  waAccessToken       String?  // encrypt()-ed business token — never returned to clients
+  wabaId              String?  // WhatsApp Business Account id
+  waPhoneNumberId     String?  @unique // Cloud API phone-number id (routing key)
+  waPhoneNumber       String?  // display number, e.g. +23480…
+  waConnectionStatus  String?  @default("disconnected") // "disconnected" | "connected" | "error"
+  waWebhookSubscribed Boolean  @default(false)
   // VAT summary settings. Off by default (most micro-traders aren't VAT-
   // registered). vatRate null → country default. vatInclusive: are recorded
   // amounts treated as VAT-inclusive (true, NG default) or exclusive.
@@ -169,6 +179,7 @@ model Business {
   igConversations   IgConversation[]
   quickReplies      QuickReply[]
   igAutoReplies     IgAutoReply[]
+  waConversations   WaConversation[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -297,6 +308,7 @@ model Customer {
   transactions    Transaction[]
   invoices        Invoice[]
   igConversations IgConversation[]
+  waConversations WaConversation[]
 
   @@unique([userId, phone])
   @@index([userId, businessId])
@@ -553,6 +565,47 @@ model IgMessage {
   direction      String         // "in" (from customer) | "out" (from merchant)
   text           String?
   attachmentUrl  String?        // inbound image/media URL (temporary, signed by Meta)
+  sentAt         DateTime       @default(now())
+
+  @@index([conversationId, sentAt])
+}
+
+// ── WhatsApp DM cache (Cloud API) ────────────────────────────────────────────
+// Mirrors IgConversation/IgMessage. One conversation per (business, customer
+// wa_id/phone). Populated by the webhook (inbound) and our own sends (outbound).
+// Carries the same auto-payment-confirm fields and stable customer link the IG
+// models gained through review — included from day one here.
+model WaConversation {
+  id                     String       @id @default(uuid())
+  businessId             String
+  business               Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  participantPhone       String       // the customer's wa_id (E.164 digits) — stable key
+  participantName        String?      // WhatsApp profile name
+  customerId             String?
+  customer               Customer?    @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  lastMessageAt          DateTime     @default(now())
+  lastInboundAt          DateTime?    // gates the 24h free-form send window
+  expectedAmount         Float?
+  expectedSince          DateTime?
+  lastPaymentConfirmedAt DateTime?
+  unread                 Boolean      @default(false)
+  createdAt              DateTime     @default(now())
+  messages               WaMessage[]
+
+  @@unique([businessId, participantPhone])
+  @@index([businessId, lastMessageAt])
+  @@index([businessId, expectedAmount])
+  @@index([customerId])
+}
+
+model WaMessage {
+  id             String         @id @default(uuid())
+  conversationId String
+  conversation   WaConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  waMessageId    String         @unique // wamid — dedups redelivered webhooks
+  direction      String         // "in" | "out"
+  text           String?
+  attachmentUrl  String?        // re-hosted media URL (media download needs auth — later batch)
   sentAt         DateTime       @default(now())
 
   @@index([conversationId, sentAt])

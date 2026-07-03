@@ -142,6 +142,11 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
       console.warn(`[reconcile] ig payment match failed for ${biz.name}: ${err.message}`),
     );
 
+    // Auto-confirm a matching WhatsApp payment request (fire-and-forget).
+    await require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch((err) =>
+      console.warn(`[reconcile] wa payment match failed for ${biz.name}: ${err.message}`),
+    );
+
     // Reflect the inbound credit in cash-at-bank immediately (display cache).
     try { require("./balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
 

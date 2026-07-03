@@ -54,6 +54,8 @@ const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
 const instagramRoutes = require("./src/routes/instagram");
 const instagramWebhookRoute = require("./src/routes/instagramWebhook");
+const whatsappRoutes = require("./src/routes/whatsapp");
+const whatsappWebhookRoute = require("./src/routes/whatsappWebhook");
 const transferRoutes = require("./src/routes/transfers");
 const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
@@ -196,6 +198,14 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   instagramWebhookRoute,
 );
+// WhatsApp Cloud API webhook — same raw-body-before-json requirement (signature
+// is HMAC over the exact bytes, keyed on the FB app secret).
+app.use(
+  "/webhooks/whatsapp",
+  webhookLimiter,
+  express.raw({ type: "application/json", limit: "1mb" }),
+  whatsappWebhookRoute,
+);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // RevenueCat webhook — header-token auth (no body signature), so it's fine
@@ -261,6 +271,7 @@ app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
 app.use("/sync", apiLimiter);
 app.use("/instagram", apiLimiter);
+app.use("/whatsapp", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
@@ -280,6 +291,7 @@ app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/sync", syncRoutes);
 app.use("/instagram", instagramRoutes);
+app.use("/whatsapp", whatsappRoutes);
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
