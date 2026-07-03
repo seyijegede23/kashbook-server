@@ -13,6 +13,9 @@ const CRON_INTERVAL_MIN = {
   reconcile: 5,
   snapshot: 10,
   kycPurge: 24 * 60,
+  instagramTokenRefresh: 24 * 60,
+  monthlyReport: 32 * 24 * 60, // monthly — allow the longest month + a day
+  recurringInvoices: 24 * 60,
 };
 
 async function pingDb() {

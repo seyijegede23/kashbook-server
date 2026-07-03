@@ -58,6 +58,7 @@ model User {
   inventoryItems       InventoryItem[]
   notifications        AppNotification[]
   recurringExpenses    RecurringExpense[]
+  recurringInvoices    RecurringInvoice[]
 }
 
 model AppNotification {
@@ -174,6 +175,7 @@ model Business {
   payables          Payable[]
   invoices          Invoice[]
   recurringExpenses RecurringExpense[]
+  recurringInvoices RecurringInvoice[]
   officers          BusinessOfficer[]
   beneficiaries     Beneficiary[]
   igConversations   IgConversation[]
@@ -309,6 +311,7 @@ model Customer {
   invoices        Invoice[]
   igConversations IgConversation[]
   waConversations WaConversation[]
+  recurringInvoices RecurringInvoice[]
 
   @@unique([userId, phone])
   @@index([userId, businessId])
@@ -636,6 +639,32 @@ model InventoryItem {
 
   @@index([userId, businessId])
   @@index([businessId, updatedAt])
+}
+
+// Recurring invoices — PREMIUM. A rule auto-creates a SENT invoice (+ share
+// link) for a customer on a schedule (same frequency strings + nextDue/active
+// discipline as RecurringExpense; processed by utils/recurringInvoiceRunner.js).
+model RecurringInvoice {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId    String
+  business      Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  description   String    // the invoice line item, e.g. "Weekly supply"
+  amount        Float
+  frequency     String    @default("monthly") // daily | weekly | monthly | yearly | custom_N
+  dueInDays     Int?      // dueDate = issueDate + N days; null = no due date
+  nextDue       DateTime
+  active        Boolean   @default(true)
+  lastRunAt     DateTime?
+  lastInvoiceId String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId, active])
+  @@index([nextDue, active])
 }
 
 model RecurringExpense {

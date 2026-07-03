@@ -255,6 +255,28 @@ router.get("/revenue", async (req, res) => {
   }
 });
 
+// POST /admin-api/run-monthly-report — manually trigger last month's P&L email
+// (testing / re-send after an outage). Same code path as the 1st-of-month cron.
+// Optional body { monthOffset } — 1 = last month (default), 2 = the month before.
+router.post("/run-monthly-report", async (req, res) => {
+  try {
+    const monthOffset = Math.min(24, Math.max(1, parseInt(req.body?.monthOffset, 10) || 1));
+    const result = await require("../utils/monthlyReport").sendMonthlyReports({ monthOffset });
+    await audit({
+      req,
+      action: "ADMIN_MONTHLY_REPORT_TRIGGERED",
+      resourceType: "system",
+      resourceId: "monthly-report",
+      severity: "info",
+      metadata: result,
+    });
+    res.json(result);
+  } catch (err) {
+    console.error("[admin/run-monthly-report]", err);
+    res.status(500).json({ error: "Failed to run monthly report" });
+  }
+});
+
 // POST /admin-api/run-daily-report — manually trigger the 8pm daily business
 // report (testing / re-send after an outage). Same code path as the cron.
 router.post("/run-daily-report", async (req, res) => {

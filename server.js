@@ -60,6 +60,7 @@ const transferRoutes = require("./src/routes/transfers");
 const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
+const recurringInvoiceRoutes = require("./src/routes/recurringInvoices");
 
 const { sendSms } = require("./src/utils/otp");
 const cron = require("node-cron");
@@ -269,6 +270,7 @@ app.use("/notifications", apiLimiter);
 app.use("/transfers", apiLimiter);
 app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
+app.use("/recurring-invoices", apiLimiter);
 app.use("/sync", apiLimiter);
 app.use("/instagram", apiLimiter);
 app.use("/whatsapp", apiLimiter);
@@ -289,6 +291,7 @@ app.use("/notifications", notificationRoutes);
 app.use("/transfers", transferRoutes);
 app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
+app.use("/recurring-invoices", recurringInvoiceRoutes);
 app.use("/sync", syncRoutes);
 app.use("/instagram", instagramRoutes);
 app.use("/whatsapp", whatsappRoutes);
@@ -348,6 +351,26 @@ cron.schedule(
       });
     } catch (err) {
       console.error("[cron dailyReport]", err.message);
+    }
+  },
+  { timezone: "Africa/Lagos" },
+);
+
+// ── Background cron: monthly P&L email — 1st of the month, 08:00 Lagos ───────
+// Last month's income/expenses/net per business, emailed to every owner with
+// activity. See src/utils/monthlyReport.js; manual trigger via
+// POST /admin-api/run-monthly-report.
+cron.schedule(
+  "0 8 1 * *",
+  async () => {
+    try {
+      await prisma.withCronLock(4009, async () => {
+        await require("./src/utils/snapshots").recordHeartbeat("monthlyReport");
+        const r = await require("./src/utils/monthlyReport").sendMonthlyReports();
+        console.log(`[Cron] monthly report — ${r.users} email(s) (${r.month || ""})`);
+      });
+    } catch (err) {
+      console.error("[Cron] monthly report error:", err.message);
     }
   },
   { timezone: "Africa/Lagos" },
@@ -420,6 +443,20 @@ cron.schedule("5 0 * * *", async () => {
     });
   } catch (err) {
     console.error("[Cron] Recurring expenses error:", err);
+  }
+});
+
+// ── Background cron: process due recurring invoices (daily at 00:15) ─────────
+// For each due PREMIUM rule: creates the SENT invoice + share link and pushes
+// the owner. See utils/recurringInvoiceRunner.js.
+cron.schedule("15 0 * * *", async () => {
+  try {
+    await prisma.withCronLock(4010, async () => {
+      await require("./src/utils/snapshots").recordHeartbeat("recurringInvoices");
+      await require("./src/utils/recurringInvoiceRunner").processRecurringInvoices();
+    });
+  } catch (err) {
+    console.error("[Cron] Recurring invoices error:", err);
   }
 });
 

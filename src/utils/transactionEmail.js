@@ -86,4 +86,5 @@ async function sendTransactionEmail(opts = {}) {
   }
 }
 
-module.exports = { sendTransactionEmail, _buildHtml: buildHtml };
+// getTransport is shared with monthlyReport.js (same mailbox + fallback chain).
+module.exports = { sendTransactionEmail, getTransport, _buildHtml: buildHtml };
