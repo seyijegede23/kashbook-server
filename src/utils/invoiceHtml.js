@@ -130,7 +130,8 @@ function buildInvoiceHtml({
 }
 
 function buildCtx({ invoice, business, customer, payment, shareUrl, qrDataUrl }) {
-  const today = new Date().toISOString().slice(0, 10);
+  // Lagos date (UTC+1) — dueDate is a Lagos wall-calendar "YYYY-MM-DD" string.
+  const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
   const liveStatus =
     invoice.status !== "paid" && invoice.status !== "void" && invoice.dueDate && invoice.dueDate < today
       ? "overdue"

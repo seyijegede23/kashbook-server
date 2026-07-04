@@ -54,21 +54,56 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   if (businesses.length === 0) return { range, users: [] };
   const bizIds = businesses.map((b) => b.id);
 
-  const [grouped, prevGrouped, expenseCats] = await Promise.all([
-    prisma.transaction.groupBy({
-      by: ["businessId", "type"],
-      where: { businessId: { in: bizIds }, date: { gte: range.start, lt: range.end } },
+  // Manual bookkeeping lives in Sales (income) / Expense (money out); the
+  // Transaction table holds bank movement only. Merge both sides, excluding
+  // bank credits already matched to a recorded sale (matchedSaleId) so a paid
+  // sale isn't counted twice — the same merge the Dashboard shows.
+  const dateThis = { gte: range.start, lt: range.end };
+  const datePrev = { gte: prev.start, lt: prev.end };
+  const bizScope = { businessId: { in: bizIds } };
+  const [salesG, expG, txIncomeG, txExpenseG, prevSalesG, prevTxIncomeG, expCats, txExpCats] = await Promise.all([
+    prisma.sales.groupBy({
+      by: ["businessId"],
+      where: { ...bizScope, date: dateThis },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.expense.groupBy({
+      by: ["businessId"],
+      where: { ...bizScope, date: dateThis },
       _sum: { amount: true },
       _count: { _all: true },
     }),
     prisma.transaction.groupBy({
-      by: ["businessId", "type"],
-      where: { businessId: { in: bizIds }, date: { gte: prev.start, lt: prev.end } },
+      by: ["businessId"],
+      where: { ...bizScope, type: "income", matchedSaleId: null, date: dateThis },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.transaction.groupBy({
+      by: ["businessId"],
+      where: { ...bizScope, type: "expense", date: dateThis },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    prisma.sales.groupBy({
+      by: ["businessId"],
+      where: { ...bizScope, date: datePrev },
+      _sum: { amount: true },
+    }),
+    prisma.transaction.groupBy({
+      by: ["businessId"],
+      where: { ...bizScope, type: "income", matchedSaleId: null, date: datePrev },
+      _sum: { amount: true },
+    }),
+    prisma.expense.groupBy({
+      by: ["businessId", "category"],
+      where: { ...bizScope, date: dateThis },
       _sum: { amount: true },
     }),
     prisma.transaction.groupBy({
       by: ["businessId", "category"],
-      where: { businessId: { in: bizIds }, type: "expense", date: { gte: range.start, lt: range.end } },
+      where: { ...bizScope, type: "expense", date: dateThis },
       _sum: { amount: true },
     }),
   ]);
@@ -78,17 +113,29 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     if (!stats.has(id)) stats.set(id, { income: 0, expense: 0, count: 0, prevIncome: 0, cats: [] });
     return stats.get(id);
   };
-  for (const g of grouped) {
+  for (const g of [...salesG, ...txIncomeG]) {
     const s = get(g.businessId);
-    if (g.type === "income") s.income += g._sum.amount || 0;
-    else if (g.type === "expense") s.expense += g._sum.amount || 0;
+    s.income += g._sum.amount || 0;
     s.count += g._count._all;
   }
-  for (const g of prevGrouped) {
-    if (g.type === "income") get(g.businessId).prevIncome += g._sum.amount || 0;
+  for (const g of [...expG, ...txExpenseG]) {
+    const s = get(g.businessId);
+    s.expense += g._sum.amount || 0;
+    s.count += g._count._all;
   }
-  for (const g of expenseCats) {
-    if (g._sum.amount > 0) get(g.businessId).cats.push({ category: g.category || "other", amount: g._sum.amount });
+  for (const g of [...prevSalesG, ...prevTxIncomeG]) {
+    get(g.businessId).prevIncome += g._sum.amount || 0;
+  }
+  // Expense categories from both sources, merged per (business, category).
+  const catTotals = new Map(); // "bizId|category" → amount
+  for (const g of [...expCats, ...txExpCats]) {
+    const key = `${g.businessId}|${g.category || "other"}`;
+    catTotals.set(key, (catTotals.get(key) || 0) + (g._sum.amount || 0));
+  }
+  for (const [key, amount] of catTotals) {
+    if (amount <= 0) continue;
+    const sep = key.indexOf("|"); // businessId is a uuid — first "|" is the divider
+    get(key.slice(0, sep)).cats.push({ category: key.slice(sep + 1), amount });
   }
   for (const s of stats.values()) s.cats.sort((a, b) => b.amount - a.amount);
 

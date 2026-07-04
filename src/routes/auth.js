@@ -465,6 +465,112 @@ router.post("/logout", authMiddleware, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+// POST /auth/delete-account — permanent, self-service (app-store requirement).
+// Fintech deletion = anonymize the PERSON, retain the LEDGER: financial and
+// KYC records stay (CBN/AML retention) but become unreachable — credentials
+// are scrambled, every session (incl. staff) is revoked, businesses close,
+// and social connections (IG/WA) are severed so webhooks stop routing.
+// Refuses while any business NUBAN still holds funds (fail-closed if the
+// balance can't be verified).
+// ─────────────────────────────────────────────
+router.post("/delete-account", authMiddleware, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: "Enter your password to confirm." });
+  try {
+    if (req.user.accountType === "staff") {
+      return res.status(403).json({ error: "Staff accounts are removed by the business owner from Staff Management." });
+    }
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.password) {
+      return res.status(400).json({ error: "Set a password first (use Forgot password), then try again." });
+    }
+    const match = await bcrypt.verify(password, user.password);
+    if (!match) return res.status(401).json({ error: "Password is incorrect." });
+
+    // Money-out guard: never delete around a bank balance.
+    const businesses = await prisma.business.findMany({
+      where: { userId: user.id },
+      select: { id: true, name: true, anchorAccountId: true, baseCurrency: true },
+    });
+    const anchor = require("../utils/anchor");
+    for (const biz of businesses.filter((b) => b.anchorAccountId)) {
+      try {
+        const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
+        if (balance > 0) {
+          return res.status(400).json({
+            code: "BALANCE_REMAINING",
+            error: `${biz.name} still has money in its bank account. Transfer it out first, then delete your account.`,
+          });
+        }
+      } catch (err) {
+        if (err.code === "ANCHOR_NOT_CONFIGURED") continue; // no live banking in this environment
+        return res.status(503).json({ error: "We couldn't verify your bank balance right now — try again in a few minutes." });
+      }
+    }
+
+    const crypto = require("crypto");
+    const scrambledPw = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12);
+    const stamp = (id) => `deleted_${id.slice(0, 8)}_${Date.now()}`;
+    const staff = await prisma.user.findMany({
+      where: { employerId: user.id },
+      select: { id: true },
+    });
+
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: user.id },
+        data: {
+          firstName: "Deleted",
+          lastName: "User",
+          email: `${stamp(user.id)}@deleted.invalid`,
+          phone: stamp(user.id),
+          password: scrambledPw,
+          transactionPin: null,
+          expoPushToken: null,
+          profileImage: null,
+          avatarUrl: null,
+          plan: "FREE",
+          accountStatus: "closed",
+          tokenVersion: { increment: 1 },
+        },
+      }),
+      // Staff logins die with the owner — scramble each (unique email/phone
+      // need per-row values; otherwise a staff password-reset via OTP would
+      // reopen access to the retained books).
+      ...staff.map((s) =>
+        prisma.user.update({
+          where: { id: s.id },
+          data: {
+            email: `${stamp(s.id)}@deleted.invalid`,
+            phone: stamp(s.id),
+            password: scrambledPw,
+            expoPushToken: null,
+            accountStatus: "closed",
+            tokenVersion: { increment: 1 },
+          },
+        }),
+      ),
+      prisma.business.updateMany({
+        where: { userId: user.id },
+        data: {
+          accountStatus: "closed",
+          instagramAccessToken: null,
+          igConnectionStatus: "disconnected",
+          waAccessToken: null,
+          waPhoneNumberId: null,
+        },
+      }),
+    ]);
+    await audit({ req, action: "ACCOUNT_DELETED", resourceType: "user", resourceId: user.id });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[delete-account]", err.message);
+    res.status(500).json({ error: "Failed to delete the account — try again." });
+  }
+});
+
+// ─────────────────────────────────────────────
 // PATCH /auth/profile
 // ─────────────────────────────────────────────
 router.patch("/profile", authMiddleware, async (req, res) => {

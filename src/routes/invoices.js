@@ -81,8 +81,10 @@ router.get("/", authMiddleware, async (req, res) => {
       orderBy: since ? { updatedAt: "asc" } : { createdAt: "desc" },
     });
 
-    // Recalculate overdue status on the fly
-    const now = new Date().toISOString().slice(0, 10);
+    // Recalculate overdue status on the fly. dueDate is a Lagos wall-calendar
+    // "YYYY-MM-DD" string — compare against the Lagos date, not UTC (they
+    // differ between 00:00 and 01:00 WAT).
+    const now = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
     const result = invoices.map((inv) => {
       if (
         inv.status !== "PAID" &&
@@ -350,7 +352,8 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
       });
 
       const newAmountPaid = inv.amountPaid + Number(amount);
-      const today = new Date().toISOString().slice(0, 10);
+      // Lagos date, matching the overdue recalculation above.
+      const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
       let newStatus;
       if (newAmountPaid >= inv.total) {
         newStatus = "PAID";
