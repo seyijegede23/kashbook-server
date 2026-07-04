@@ -817,6 +817,10 @@ router.post("/staff", authMiddleware, async (req, res) => {
   if (!firstName || !password || (!phone && !email)) {
     return res.status(400).json({ error: "First name, password, and a phone number or email are required" });
   }
+  // Same minimum as every other password entry point (register/reset/change).
+  if (String(password).length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
   const ph = phone ? normalizePhone(phone) : null;
   const em = email ? String(email).trim().toLowerCase() : null;
   if (em && !/\S+@\S+\.\S+/.test(em)) {
