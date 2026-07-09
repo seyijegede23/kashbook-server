@@ -66,7 +66,7 @@
   async function showDashboard() {
     document.getElementById("loginScreen").classList.add("hidden");
     document.getElementById("dashboard").classList.remove("hidden");
-    await Promise.all([loadStats(), loadUsers(), loadRevenue(), loadActivity(), loadFlags(), loadAudit(), loadHealth(), loadAnalytics()]);
+    await Promise.all([loadStats(), loadUsers(), loadRevenue(), loadActivity(), loadKyc(), loadFlags(), loadAudit(), loadHealth(), loadAnalytics()]);
   }
 
   async function loadStats() {
@@ -495,6 +495,114 @@
   document.getElementById("refreshFlagsBtn")?.addEventListener("click", loadFlags);
   document.getElementById("flagStatusFilter")?.addEventListener("change", loadFlags);
   document.getElementById("flagSeverityFilter")?.addEventListener("change", loadFlags);
+
+  // ── KYC / Account-opening review queue ─────────────────────────────────
+  async function loadKyc() {
+    try {
+      const status = document.getElementById("kycStatusFilter").value || "PENDING";
+      const { submissions, pendingCount } = await apiFetch(`/admin-api/kyc-submissions?status=${status}`);
+
+      const badge = document.getElementById("kycPendingBadge");
+      if (pendingCount > 0) {
+        badge.textContent = pendingCount;
+        badge.classList.remove("hidden");
+      } else {
+        badge.classList.add("hidden");
+      }
+
+      const list = document.getElementById("kycList");
+      const empty = document.getElementById("noKyc");
+      list.innerHTML = "";
+      if (!submissions.length) {
+        empty.classList.remove("hidden");
+        return;
+      }
+      empty.classList.add("hidden");
+
+      const statusColor = { PENDING: "amber", APPROVED: "emerald", DECLINED: "gray", FAILED: "red" };
+      submissions.forEach((s) => {
+        const sm = s.summary || {};
+        const typeLabel = s.businessKyb
+          ? (sm.businessType === "limited_company" ? "Limited Company" : "Sole Proprietorship")
+          : "Individual";
+        const owner = s.user ? esc(`${s.user.firstName || ""} ${s.user.lastName || ""}`.trim()) : "—";
+        const contact = s.user ? esc(s.user.email || s.user.phone || "") : "";
+        const c = statusColor[s.status] || "gray";
+        const ownersHtml = (sm.owners || []).length
+          ? `<p class="text-xs text-gray-500 mt-1">Owners: ${(sm.owners || []).map((o) => `${esc(o.name)} (${o.percentageOwned}%)`).join(", ")}</p>`
+          : "";
+        const canAct = s.status === "PENDING" || s.status === "FAILED";
+
+        const card = document.createElement("div");
+        card.className = "border border-gray-200 rounded-xl p-4";
+        card.innerHTML = `
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1 flex-wrap">
+                <span class="text-sm font-bold text-gray-800">${esc(sm.businessName || s.business?.name || "—")}</span>
+                <span class="text-xs font-semibold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded">${esc(typeLabel)}</span>
+                ${s.businessKyb ? '<span class="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded">Paid KYB ~₦1,000</span>' : ""}
+                <span class="text-xs font-semibold text-${c}-700 bg-${c}-50 px-2 py-0.5 rounded">${esc(s.status)}</span>
+                <span class="text-xs text-gray-400">· ${new Date(s.createdAt).toLocaleString()}</span>
+              </div>
+              <p class="text-xs text-gray-600">${owner}${contact ? " · " + contact : ""}${sm.ownerPhone && sm.ownerPhone !== contact ? " · " + esc(sm.ownerPhone) : ""}</p>
+              <p class="text-xs text-gray-500 mt-1">
+                BVN ${esc(sm.bvnMasked || "—")}${sm.cacNumber ? " · CAC " + esc(sm.cacNumber) : ""}${sm.industry ? " · " + esc(sm.industry) : ""}${sm.state ? ` · ${esc(sm.city || "")} ${esc(sm.state)}` : ""}
+              </p>
+              ${ownersHtml}
+              ${s.declineReason ? `<p class="text-xs text-gray-600 mt-1">Declined: ${esc(s.declineReason)}</p>` : ""}
+              ${s.processError ? `<p class="text-xs text-red-600 mt-1">Error: ${esc(s.processError)}</p>` : ""}
+            </div>
+            ${canAct ? `
+            <div class="flex flex-col gap-1 shrink-0">
+              <button data-kyc-id="${s.id}" data-action="approve" class="kyc-action px-3 py-1 text-xs font-semibold rounded bg-emerald-100 text-emerald-700 hover:bg-emerald-200">${s.status === "FAILED" ? "Retry" : "Approve"}</button>
+              <button data-kyc-id="${s.id}" data-action="decline" class="kyc-action px-3 py-1 text-xs font-semibold rounded bg-red-100 text-red-700 hover:bg-red-200">Decline</button>
+            </div>` : ""}
+          </div>
+        `;
+        list.appendChild(card);
+      });
+
+      list.querySelectorAll(".kyc-action").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const id = btn.dataset.kycId;
+          const action = btn.dataset.action;
+          try {
+            if (action === "approve") {
+              if (!confirm("Approve this request and send it to Anchor? This creates a real bank customer (and may incur the KYB fee for a business).")) return;
+              btn.disabled = true;
+              btn.textContent = "Approving…";
+              const r = await apiFetch(`/admin-api/kyc-submissions/${id}/approve`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: "{}",
+              });
+              alert("Approved. " + ((r.result && r.result.message) || r.status || "done"));
+            } else {
+              const reason = prompt("Reason for declining (the user will see this):", "");
+              if (!reason) return;
+              btn.disabled = true;
+              btn.textContent = "Declining…";
+              await apiFetch(`/admin-api/kyc-submissions/${id}/decline`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ reason }),
+              });
+            }
+            await loadKyc();
+          } catch (err) {
+            alert("Failed: " + err.message);
+            await loadKyc();
+          }
+        });
+      });
+    } catch (err) {
+      console.error("KYC error:", err);
+    }
+  }
+
+  document.getElementById("refreshKycBtn")?.addEventListener("click", loadKyc);
+  document.getElementById("kycStatusFilter")?.addEventListener("change", loadKyc);
 
   // ── Audit Log ─────────────────────────────────────────────────────────
   async function loadAudit() {

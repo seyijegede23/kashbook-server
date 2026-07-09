@@ -6,6 +6,11 @@ const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
 const { collectHealth } = require("../utils/healthCheck");
 const { getMetrics } = require("../utils/metrics");
+const { decrypt } = require("../utils/crypto");
+const {
+  validateVirtualAccountInput,
+  executeVirtualAccountProvisioning,
+} = require("../services/virtualAccountProvisioning");
 
 // CSRF defense-in-depth. Admin auth is Bearer-token (already CSRF-resistant since
 // a cross-site page can't set the Authorization header), but we additionally
@@ -326,6 +331,189 @@ router.post("/notify", async (req, res) => {
   } catch (err) {
     console.error("POST /admin/notify error:", err.message);
     res.status(500).json({ error: "Failed to send notification" });
+  }
+});
+
+// ── KYC review queue (admin approval gate before Anchor) ──────────────────
+// Account-opening requests are parked as KycSubmission(PENDING) by
+// businesses.js. Nothing reached Anchor yet. The admin approves (→ replay the
+// stored payload to Anchor) or declines (with a reason the user sees).
+
+// GET /admin-api/kyc-submissions?status=PENDING
+router.get("/kyc-submissions", async (req, res) => {
+  try {
+    const status = String(req.query.status || "PENDING").toUpperCase();
+    const valid = ["PENDING", "APPROVED", "DECLINED", "FAILED"];
+    const where = valid.includes(status) ? { status } : {};
+    const [submissions, pendingCount] = await Promise.all([
+      prisma.kycSubmission.findMany({
+        where,
+        orderBy: { createdAt: "asc" }, // FIFO — oldest waiting reviewed first
+        take: 200,
+        select: {
+          id: true, status: true, businessType: true, businessKyb: true,
+          summary: true, declineReason: true, processError: true,
+          createdAt: true, reviewedAt: true, processedAt: true,
+          business: { select: { id: true, name: true, country: true } },
+          user: { select: { id: true, firstName: true, lastName: true, email: true, phone: true } },
+        },
+      }),
+      prisma.kycSubmission.count({ where: { status: "PENDING" } }),
+    ]);
+    res.json({ submissions, pendingCount });
+  } catch (err) {
+    console.error("GET /admin/kyc-submissions error:", err.message);
+    res.status(500).json({ error: "Failed to fetch submissions" });
+  }
+});
+
+// POST /admin-api/kyc-submissions/:id/approve
+// Replays the stored payload → Anchor (create customer + trigger KYC/KYB).
+router.post("/kyc-submissions/:id/approve", async (req, res) => {
+  try {
+    const submission = await prisma.kycSubmission.findUnique({ where: { id: req.params.id } });
+    if (!submission) return res.status(404).json({ error: "Submission not found" });
+    if (!["PENDING", "FAILED"].includes(submission.status)) {
+      return res.status(409).json({ error: `This request was already ${submission.status.toLowerCase()}.` });
+    }
+
+    const [biz, user] = await Promise.all([
+      prisma.business.findUnique({ where: { id: submission.businessId } }),
+      prisma.user.findUnique({ where: { id: submission.userId } }),
+    ]);
+    if (!biz || !user) return res.status(404).json({ error: "Business or user no longer exists" });
+
+    // Idempotency: if a NUBAN already exists (e.g. double-approve), just close it out.
+    if (biz.virtualAccountNumber) {
+      await prisma.kycSubmission.update({
+        where: { id: submission.id },
+        data: { status: "APPROVED", reviewedById: req.user.id, reviewedAt: new Date(), processedAt: new Date(), payload: null },
+      });
+      return res.json({ status: "already_provisioned" });
+    }
+    if (!submission.payload) {
+      return res.status(400).json({ error: "The stored request is missing — ask the user to resubmit." });
+    }
+
+    // Atomically CLAIM the row before doing any Anchor work, so a concurrent
+    // double-approve (or an approve racing a resubmit) can't run provisioning
+    // twice. Only one caller flips PENDING/FAILED → APPROVED; the loser sees
+    // count 0 and backs off. We revert to FAILED/DECLINED below on any error.
+    const claim = await prisma.kycSubmission.updateMany({
+      where: { id: submission.id, status: { in: ["PENDING", "FAILED"] } },
+      data: { status: "APPROVED", reviewedById: req.user.id, reviewedAt: new Date() },
+    });
+    if (claim.count !== 1) {
+      return res.status(409).json({ error: "This request is already being processed." });
+    }
+
+    let body;
+    try {
+      body = JSON.parse(decrypt(submission.payload));
+    } catch {
+      await prisma.kycSubmission.update({
+        where: { id: submission.id },
+        data: { status: "FAILED", processError: "Could not read the stored request." },
+      });
+      return res.status(500).json({ error: "Could not read the stored request." });
+    }
+
+    // Re-validate — a racing business may have claimed this BVN/CAC since submit.
+    // A hard validation failure here is the USER's to fix, not a retryable Anchor
+    // error, so auto-DECLINE with the reason (they see it + can resubmit) rather
+    // than leaving them stuck on "under review".
+    const v = await validateVirtualAccountInput({ body, user, biz });
+    if (!v.ok) {
+      await prisma.kycSubmission.update({
+        where: { id: submission.id },
+        data: { status: "DECLINED", declineReason: v.error, payload: null },
+      });
+      pushTo(
+        user.id,
+        "Account request needs attention",
+        `${v.error} — please update your details and resubmit.`,
+      ).catch(() => {});
+      return res.status(v.httpStatus).json({ error: v.error, code: v.code });
+    }
+
+    let result;
+    try {
+      result = await executeVirtualAccountProvisioning({ biz, user, body, req });
+    } catch (e) {
+      console.error("[admin approve] provisioning failed:", e.message);
+      const msg = e.code === "ANCHOR_NOT_CONFIGURED"
+        ? "Anchor is not configured on this server."
+        : (e.message || "Provisioning failed");
+      // Transient/Anchor failure — keep the payload so the admin can retry.
+      await prisma.kycSubmission.update({
+        where: { id: submission.id },
+        data: { status: "FAILED", processError: String(msg).slice(0, 500) },
+      });
+      return res.status(400).json({ error: msg });
+    }
+
+    // Status is already APPROVED from the claim; just finalise + drop the payload.
+    await prisma.kycSubmission.update({
+      where: { id: submission.id },
+      data: { processedAt: new Date(), processError: null, payload: null },
+    });
+
+    pushTo(
+      user.id,
+      "Account approved 🎉",
+      "Your account request was approved. We're setting it up now — your account number will be ready shortly.",
+    ).catch(() => {});
+
+    await audit({
+      req, action: "KYC_APPROVE", resourceType: "business", resourceId: biz.id,
+      severity: "info", metadata: { submissionId: submission.id },
+    });
+
+    res.json({ status: "approved", result: result.body });
+  } catch (err) {
+    console.error("POST /admin/kyc-submissions/approve error:", err.message);
+    res.status(500).json({ error: "Failed to approve submission" });
+  }
+});
+
+// POST /admin-api/kyc-submissions/:id/decline  body: { reason }
+router.post("/kyc-submissions/:id/decline", async (req, res) => {
+  try {
+    const reason = String(req.body.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "A decline reason is required." });
+
+    const submission = await prisma.kycSubmission.findUnique({ where: { id: req.params.id } });
+    if (!submission) return res.status(404).json({ error: "Submission not found" });
+    if (!["PENDING", "FAILED"].includes(submission.status)) {
+      return res.status(409).json({ error: `This request was already ${submission.status.toLowerCase()}.` });
+    }
+
+    // Atomic claim (mutually exclusive with a concurrent approve) so we can't
+    // decline a request that is simultaneously being provisioned at Anchor.
+    const claim = await prisma.kycSubmission.updateMany({
+      where: { id: submission.id, status: { in: ["PENDING", "FAILED"] } },
+      // Drop the payload — no need to retain raw BVNs on a declined request.
+      data: { status: "DECLINED", declineReason: reason.slice(0, 500), reviewedById: req.user.id, reviewedAt: new Date(), payload: null },
+    });
+    if (claim.count !== 1) {
+      return res.status(409).json({ error: "This request is already being processed." });
+    }
+
+    pushTo(
+      submission.userId,
+      "Account request not approved",
+      `${reason} — you can update your details and resubmit.`,
+    ).catch(() => {});
+
+    await audit({
+      req, action: "KYC_DECLINE", resourceType: "business", resourceId: submission.businessId,
+      severity: "warning", metadata: { submissionId: submission.id, reason },
+    });
+
+    res.json({ status: "declined" });
+  } catch (err) {
+    console.error("POST /admin/kyc-submissions/decline error:", err.message);
+    res.status(500).json({ error: "Failed to decline submission" });
   }
 });
 

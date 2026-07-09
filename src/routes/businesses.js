@@ -9,10 +9,9 @@ const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require(".
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
-const {
-  runBvnCheck,
-  runCacCheck,
-} = require("../utils/kycCheck");
+// Dojah pre-check (runBvnCheck/runCacCheck) removed from the KYC flow — the admin
+// approval gate + Anchor's own authoritative KYC make it redundant. The
+// utils/kycCheck module is left in place for an easy re-enable.
 const {
   isValidNigerianState,
   checkAdultDob,
@@ -21,9 +20,31 @@ const {
   normaliseCacNumber,
 } = require("../utils/kycMatch");
 const { isValidAnchorIndustry } = require("../data/anchorIndustries");
+const { pushTo } = require("../utils/pushNotification");
+const {
+  validateVirtualAccountInput,
+  buildSubmissionSummary,
+} = require("../services/virtualAccountProvisioning");
 
 router.use(auth);
 router.use(requireUnfrozen);
+
+// Best-effort heads-up to every admin that a new account-opening request is
+// waiting for review. The admin web panel is the primary surface (it polls the
+// pending list); this just pushes to any admin who also uses the mobile app.
+// Never allowed to fail the submit.
+async function notifyAdminsOfKycSubmission(summary) {
+  const admins = await prisma.user.findMany({
+    where: { role: "ADMIN" },
+    select: { id: true },
+  });
+  const label = summary?.businessName || "A business";
+  await Promise.allSettled(
+    admins.map((a) =>
+      pushTo(a.id, "New account request", `${label} is waiting for KYC review.`),
+    ),
+  );
+}
 
 // Helper to resolve the correct business owner ID
 const getTargetUserId = (req) =>
@@ -354,538 +375,139 @@ router.post("/:id/virtual-account", async (req, res) => {
       });
     }
 
-    const {
-      bvn, dateOfBirth, gender,
-      businessType,            // "sole_proprietorship" | "limited_company"
-      industry,
-      dateOfRegistration,      // YYYY-MM-DD (CAC registration / incorporation)
-      businessAddress,         // { state, addressLine1, city, postalCode? }
-      owners,                  // [{ firstName, lastName, bvn, dateOfBirth, gender, percentageOwned, email?, phoneNumber?, addressLine1?, addressCity?, addressState? }]
-      cacNumber,               // optional for sole prop; required for LTD
-    } = req.body;
-
-    if (!bvn || bvn.length !== 11) {
-      return res.status(400).json({ error: "A valid 11-digit BVN is required.", code: "BVN_FORMAT_INVALID" });
-    }
-
-    const isLtd = businessType === "limited_company";
-
-    // Defence-in-depth: businessKyb=true means "run the paid Anchor
-    // BusinessCustomer KYB", which only makes sense for a registered entity.
-    // The shipped app never sends this combination (it sets
-    // businessKyb: businessType !== "individual"); reject a crafted request so
-    // nobody is charged ~₦1,000 KYB against an "individual" selection. Old app
-    // builds send businessKyb=undefined, so they're unaffected.
-    if (req.body.businessKyb === true && businessType === "individual") {
-      return res.status(400).json({
-        error: "Individual accounts use identity (BVN) verification, not business KYB.",
-        code: "KYB_TYPE_MISMATCH",
-      });
-    }
-
-    // LTD requires the owners array + incorporation date.
-    if (isLtd) {
-      if (!Array.isArray(owners) || owners.length === 0) {
-        return res.status(400).json({ error: "Limited companies must list at least one owner." });
-      }
-      if (!dateOfRegistration) {
-        return res.status(400).json({ error: "Date of incorporation is required for limited companies." });
-      }
-      const sum = owners.reduce((s, o) => s + Number(o.percentageOwned || 0), 0);
-      if (Math.abs(sum - 100) > 0.01) {
-        return res.status(400).json({ error: `Owner percentages must add up to 100% (got ${sum.toFixed(2)}%).` });
-      }
-      for (const o of owners) {
-        if (!o.firstName || !o.lastName) {
-          return res.status(400).json({ error: "Each owner needs a first and last name." });
-        }
-        if (!/^\d{11}$/.test(String(o.bvn || ""))) {
-          return res.status(400).json({ error: "Each owner needs a valid 11-digit BVN." });
-        }
-        if (!o.dateOfBirth) {
-          return res.status(400).json({ error: "Each owner needs a date of birth." });
-        }
-        if (Number(o.percentageOwned) < 5) {
-          return res.status(400).json({ error: "Each owner must hold at least 5%." });
-        }
-      }
-    }
-
+    // Load the merchant so validation can read their DOB/gender/phone fallbacks.
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    const dob = dateOfBirth ? new Date(dateOfBirth) : user.dateOfBirth;
-    if (!dob || isNaN(new Date(dob).getTime())) {
-      return res.status(400).json({ error: "A valid date of birth is required." });
-    }
-    const userGender = gender || user.gender;
-    if (!userGender) {
-      return res.status(400).json({ error: "Gender is required for KYC verification." });
-    }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase A · Format & sanity (every field we collect, free, sync)
-    // ─────────────────────────────────────────────────────────────────────
-    const dobCheck = checkAdultDob(dob);
-    if (!dobCheck.ok) {
-      return res.status(400).json({
-        error: dobCheck.code === "DOB_TOO_YOUNG"
-          ? "You must be 18 or older to open a KashBook bank account."
-          : "The date of birth doesn't look valid. Please correct it.",
-        code: `BVN_${dobCheck.code}`,
-      });
-    }
-    if (dateOfRegistration) {
-      const regCheck = checkRegistrationDate(dateOfRegistration);
-      if (!regCheck.ok) {
-        return res.status(400).json({
-          error: regCheck.code === "REGDATE_FUTURE"
-            ? "The registration date can't be in the future."
-            : "The registration date doesn't look valid.",
-          code: regCheck.code,
-        });
-      }
-    }
-    // Industry must be a known Anchor enum value. Anchor deserializes an
-    // unknown string to null and 400s with "industry must not be null",
-    // which costs a KYB attempt — catch it here instead.
-    if (industry && !isValidAnchorIndustry(industry)) {
-      return res.status(400).json({
-        error: "Pick an industry from the list — the one selected isn't recognised.",
-        code: "INDUSTRY_INVALID",
-      });
-    }
-    // Anchor requires the director's phone as exactly 11 local digits
-    // (0XXXXXXXXXX). A typo'd profile phone (registration only checks ≥6
-    // digits, and OTP may have gone to email) otherwise fails at Anchor with
-    // "phoneNumber size must be between 11 and 11".
-    if (user.phone && !anchor.isValidAnchorPhone(user.phone)) {
-      return res.status(400).json({
-        error: "Your profile phone number doesn't look like a valid Nigerian mobile number. Update it in Profile, then try again.",
-        code: "PHONE_INVALID",
-      });
-    }
-    for (const o of Array.isArray(owners) ? owners : []) {
-      if (o.phoneNumber && !anchor.isValidAnchorPhone(o.phoneNumber)) {
-        return res.status(400).json({
-          error: `${o.firstName || "A shareholder"}'s phone number doesn't look like a valid Nigerian mobile number.`,
-          code: "OWNER_PHONE_INVALID",
-        });
-      }
-    }
-    if (businessAddress) {
-      if (businessAddress.state && !isValidNigerianState(businessAddress.state)) {
-        return res.status(400).json({
-          error: `"${businessAddress.state}" isn't a valid Nigerian state.`,
-          code: "ADDRESS_INVALID_STATE",
-        });
-      }
-      if (businessAddress.addressLine1 && businessAddress.addressLine1.trim().length < 5) {
-        return res.status(400).json({
-          error: "Address line 1 looks too short. Please enter a full street address.",
-          code: "ADDRESS_LINE1_TOO_SHORT",
-        });
-      }
-      if (businessAddress.city && businessAddress.city.trim().length < 2) {
-        return res.status(400).json({
-          error: "City is required.",
-          code: "ADDRESS_CITY_REQUIRED",
-        });
-      }
-      if (businessAddress.postalCode && !/^\d{6}$/.test(businessAddress.postalCode.trim())) {
-        return res.status(400).json({
-          error: "Postal code must be 6 digits (or leave it blank).",
-          code: "ADDRESS_POSTAL_INVALID",
-        });
-      }
-    }
-    // CAC number is required for LTD, optional for sole prop.
-    if (isLtd && !cacNumber) {
-      return res.status(400).json({
-        error: "A CAC RC number is required for limited companies.",
-        code: "CAC_REQUIRED",
-      });
-    }
-    if (cacNumber && !isPlausibleCacNumber(cacNumber)) {
-      return res.status(400).json({
-        error: "Enter a valid RC or BN number (4-8 digits, optional RC/BN prefix).",
-        code: "CAC_FORMAT_INVALID",
-      });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase B · Dedup. Reject if another business already verified this BVN
-    // or CAC. Same-user resubmissions are allowed (the business id check).
-    // ─────────────────────────────────────────────────────────────────────
-    const bvnHash = hmacValue(bvn);
-    const cacHash = cacNumber ? hmacValue(normaliseCacNumber(cacNumber)) : null;
-
-    if (bvnHash) {
-      const conflict = await prisma.business.findFirst({
-        where: { kycBvnHash: bvnHash, id: { not: biz.id } },
-        select: { id: true },
-      });
-      if (conflict) {
-        return res.status(400).json({
-          error: "This BVN is already linked to another KashBook account. If this is you, please log in to the original account.",
-          code: "BVN_ALREADY_VERIFIED",
-        });
-      }
-    }
-    if (cacHash) {
-      const conflict = await prisma.business.findFirst({
-        where: { kycCacHash: cacHash, id: { not: biz.id } },
-        select: { id: true },
-      });
-      if (conflict) {
-        return res.status(400).json({
-          error: "This RC/BN number is already registered to another KashBook business.",
-          code: "CAC_ALREADY_VERIFIED",
-        });
-      }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase C · Third-party identity match (Dojah). Soft on provider outage —
-    // we log a warn and let Anchor do the substantive verification.
-    // ─────────────────────────────────────────────────────────────────────
-    const directorFirstName = user.firstName;
-    const directorLastName  = user.lastName || user.firstName;
-
-    const bvnRes = await runBvnCheck({
-      bvn,
-      userId: req.user.id,
-      expectedFirstName: directorFirstName,
-      expectedLastName:  directorLastName,
-      expectedDateOfBirth: dob,
-      req,
+    // Idempotency: if this business already cleared review and reached Anchor
+    // (an APPROVED request is being provisioned, or a deposit account is awaiting
+    // its webhook), don't queue a duplicate — report the in-flight state. Without
+    // this, an impatient resubmit during the pre-webhook window would create a
+    // second request that, if approved, re-fires KYC / duplicates the account.
+    const alreadyApproved = await prisma.kycSubmission.findFirst({
+      where: { businessId: biz.id, status: "APPROVED" },
+      select: { id: true },
     });
-    if (!bvnRes.ok && bvnRes.code !== "PROVIDER_UNAVAILABLE" && bvnRes.code !== "PROVIDER_ERROR") {
-      return res.status(bvnRes.code === "BVN_RATE_LIMITED" ? 429 : 400).json({
-        error: bvnRes.message,
-        code: bvnRes.code,
-      });
-    }
-
-    if (cacNumber) {
-      const expectedDirectorNames = isLtd
-        ? [`${directorFirstName} ${directorLastName}`]
-        : []; // sole-prop CAC lookup confirms the business name, no director match
-      const cacRes = await runCacCheck({
-        cacNumber,
-        userId: req.user.id,
-        expectedBusinessName: biz.name,
-        expectedDirectorNames,
-        req,
-      });
-      if (!cacRes.ok && cacRes.code !== "PROVIDER_UNAVAILABLE" && cacRes.code !== "PROVIDER_ERROR") {
-        return res.status(cacRes.code === "CAC_RATE_LIMITED" ? 429 : 400).json({
-          error: cacRes.message,
-          code: cacRes.code,
-        });
-      }
-    }
-
-    const registrationType = anchor.mapBusinessTypeToRegistration(businessType);
-
-    // Persist BVN encrypted; backfill DOB/gender on User if missing.
-    // Persist new KYB fields on Business so the picker selections survive a retry.
-    const bizPatch = {
-      kycBvn: encrypt(bvn),
-      kycBvnHash: bvnHash,
-    };
-    if (cacNumber) {
-      bizPatch.kycCacNumber = encrypt(normaliseCacNumber(cacNumber));
-      bizPatch.kycCacHash   = cacHash;
-    }
-    if (industry) {
-      bizPatch.industry = industry;
-      bizPatch.riskCategory = getRiskCategory(industry);
-    }
-    if (registrationType) bizPatch.registrationType = registrationType;
-    if (dateOfRegistration) {
-      bizPatch.dateOfRegistration = new Date(dateOfRegistration);
-      if (isLtd) bizPatch.dateOfIncorporation = new Date(dateOfRegistration);
-    }
-    if (businessAddress?.state) bizPatch.addressState = businessAddress.state;
-    if (businessAddress?.addressLine1) bizPatch.addressLine1 = businessAddress.addressLine1;
-    if (businessAddress?.city) bizPatch.addressCity = businessAddress.city;
-    if (businessAddress?.postalCode) bizPatch.addressPostalCode = businessAddress.postalCode;
-    if (isLtd) bizPatch.kycBusinessType = "limited_company";
-    else bizPatch.kycBusinessType = "sole_proprietor";
-
-    await prisma.business.update({ where: { id: biz.id }, data: bizPatch });
-
-    const userPatch = {};
-    if (!user.dateOfBirth) userPatch.dateOfBirth = new Date(dob);
-    if (!user.gender) userPatch.gender = userGender;
-    if (Object.keys(userPatch).length) {
-      await prisma.user.update({ where: { id: req.user.id }, data: userPatch });
-    }
-
-    // Persist LTD officers (BVN encrypted) BEFORE the Anchor call so retries work.
-    if (isLtd) {
-      // Wipe any prior attempt's officer rows (re-submit case).
-      await prisma.businessOfficer.deleteMany({ where: { businessId: biz.id } });
-      await prisma.businessOfficer.createMany({
-        data: [
-          {
-            businessId: biz.id,
-            role: "DIRECTOR",
-            firstName: user.firstName,
-            lastName: user.lastName || user.firstName,
-            bvn: encrypt(bvn),
-            bvnHash: hmacValue(bvn),
-            dateOfBirth: new Date(dob),
-            gender: userGender,
-            email: user.email,
-            phoneNumber: user.phone,
-            title: "CEO",
-            percentageOwned: 0,
-          },
-          ...owners.map((o) => ({
-            businessId: biz.id,
-            role: "OWNER",
-            firstName: o.firstName,
-            lastName: o.lastName,
-            middleName: o.middleName || null,
-            bvn: encrypt(o.bvn),
-            bvnHash: hmacValue(o.bvn),
-            dateOfBirth: new Date(o.dateOfBirth),
-            gender: o.gender || "Male",
-            email: o.email || null,
-            phoneNumber: o.phoneNumber || null,
-            title: o.title || "President",
-            percentageOwned: Number(o.percentageOwned),
-            addressLine1: o.addressLine1 || null,
-            addressCity: o.addressCity || null,
-            addressState: o.addressState || null,
-            addressPostalCode: o.addressPostalCode || null,
-          })),
-        ],
-      });
-    }
-
-    // 1. Ensure-or-adopt the Anchor customer (Business preferred, Individual
-    // fallback) — serialized per business so two concurrent virtual-account
-    // requests can't create duplicate Anchor customers (also backstopped by
-    // User.anchorCustomerId @unique).
-    let customerId = user.anchorCustomerId;
-    let customerType = "BusinessCustomer";
-    let adoptedAlreadyApproved = false;
-    await prisma.withBusinessLock(req.params.id, async () => {
-      // Re-read inside the lock: a racing request may have just set it.
-      const fresh = await prisma.user.findUnique({
-        where: { id: user.id },
-        select: { anchorCustomerId: true },
-      });
-      customerId = fresh?.anchorCustomerId || null;
-      if (customerId) return; // already created/adopted by a concurrent request
-      try {
-        // Two onboarding paths, chosen by the client:
-        //  • businessKyb=true  → real Anchor BusinessCustomer KYB (sole prop /
-        //    limited). Full CAC/registration + directors/owners + document
-        //    uploads (~₦1,000). The business name is on the Anchor customer.
-        //  • otherwise         → cheap IndividualCustomer Tier-2 BVN KYC (~₦50);
-        //    the business name goes on the virtual NUBAN minted after approval.
-        // The flag (not businessType) gates this so existing app builds — which
-        // send businessType:"sole_proprietorship" meaning individual KYC — keep
-        // the cheap path until they update to the entity-picker build.
-        if (req.body.businessKyb === true) {
-          const created = await anchor.createBusinessCustomer({
-            businessName: biz.name,
-            businessBvn: bvn,
-            dateOfRegistration,
-            industry,
-            registrationType,
-            businessAddress: businessAddress?.addressLine1
-              ? {
-                  state: businessAddress.state,
-                  addressLine_1: businessAddress.addressLine1,
-                  city: businessAddress.city,
-                  postalCode: businessAddress.postalCode,
-                }
-              : undefined,
-            user: {
-              firstName: user.firstName,
-              lastName: user.lastName || user.firstName,
-              email: user.email || `${user.id}@kashbook.app`,
-              phone: user.phone || "+2348000000000",
-              dateOfBirth: dob,
-              bvn,
-            },
-            // LTD lists shareholders; sole prop → user is the 100% owner (fallback).
-            owners: isLtd ? owners : undefined,
-          });
-          customerId = created.customerId;
-        } else {
-          const created = await anchor.createIndividualCustomer({
-            user: {
-              firstName: user.firstName,
-              lastName: user.lastName || user.firstName,
-              email: user.email || `${user.id}@kashbook.app`,
-              phone: user.phone || "+2348000000000",
-            },
-            address: businessAddress?.addressLine1
-              ? {
-                  state: businessAddress.state,
-                  addressLine_1: businessAddress.addressLine1,
-                  city: businessAddress.city,
-                  postalCode: businessAddress.postalCode,
-                }
-              : undefined,
-          });
-          customerId = created.customerId;
-        }
-      } catch (e) {
-        const isDuplicate =
-          /already exist/i.test(e.message || "") ||
-          (e.httpStatus === 400 &&
-            (e.anchorErrors?.[0]?.detail || "")
-              .toLowerCase()
-              .includes("already exist"));
-        if (!isDuplicate) throw e;
-
-        const phone = (user.phone || "").replace(/^\+/, "");
-        const searchValues = [biz.name, phone, user.email, bvn].filter(Boolean);
-        const customerTypes = ["BusinessCustomer", "IndividualCustomer"];
-
-        // Try every combination — Anchor's search returns a hit on phone/BVN
-        // even across customer types, so we expand the net.
-        let existing = null;
-        let existingType = null;
-        outer: for (const ct of customerTypes) {
-          for (const sv of searchValues) {
-            const hit = await anchor.searchCustomer({
-              searchValue: sv,
-              customerType: ct,
-            });
-            if (hit?.customerId) {
-              existing = hit;
-              existingType = ct;
-              console.log(
-                `[Anchor] found existing ${ct} ${hit.customerId} via "${sv}"`,
-              );
-              break outer;
-            }
-          }
-        }
-
-        if (!existing?.customerId) {
-          throw new Error(
-            "Anchor reports this user already exists but we can't look them up. Contact support.",
-          );
-        }
-        customerId = existing.customerId;
-        customerType = existingType;
-        // Adopted customers from earlier testing are usually already KYC-approved.
-        // Skip the KYB trigger and let createDepositAccount handle it directly.
-        adoptedAlreadyApproved = true;
-        console.log(
-          `[Anchor] adopted existing ${existingType} ${customerId} for ${biz.name}`,
-        );
-      }
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { anchorCustomerId: customerId },
-      });
-    });
-
-    // The Anchor ID suffix is the source of truth for customer type
-    // (-anc_ind_cst = individual, -anc_bus_cst = legacy business). A user who
-    // adopted a pre-existing customer, or is adding a 2nd business, must follow
-    // the type Anchor actually has — not the path we attempted above.
-    customerType = /-anc_ind_cst$/.test(customerId || "")
-      ? "IndividualCustomer"
-      : "BusinessCustomer";
-
-    // 2. Trigger KYC/KYB for newly-created customers that aren't verified yet.
-    if (!adoptedAlreadyApproved && user.kycStatus !== "verified") {
-      try {
-        if (customerType === "IndividualCustomer") {
-          await anchor.triggerIndividualKyc(customerId, {
-            bvn,
-            dateOfBirth: dob,
-            gender: userGender,
-          });
-        } else {
-          await anchor.triggerKYB(customerId);
-        }
-      } catch (e) {
-        if (e.httpStatus !== 409) {
-          console.warn("[KYC trigger] failed:", e.message);
-        }
-      }
-      await audit({
-        req,
-        action: "KYB_SUBMIT",
-        resourceType: "business",
-        resourceId: biz.id,
-        severity: "info",
-        metadata: {
-          businessType,
-          registrationType,
-          industry,
-          ownersCount: Array.isArray(owners) ? owners.length : 0,
-          riskCategory: bizPatch.riskCategory || "standard",
-        },
-      });
+    if (alreadyApproved || biz.anchorAccountId) {
       return res.status(202).json({
         status: "pending_kyc",
-        message:
-          "We're verifying your identity. You'll get a notification when your account is ready.",
+        message: "We're verifying your details. You'll get a notification when your account is ready.",
       });
     }
 
-    // Mark the user as verified locally since we're about to open an account
-    // for an already-approved customer (adopted or webhook-confirmed).
-    if (user.kycStatus !== "verified") {
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: { kycStatus: "verified" },
-      });
+    // Phase A + B validation — reject bad input immediately (before queuing) so
+    // the user gets specific feedback rather than a silent "under review".
+    const v = await validateVirtualAccountInput({ body: req.body, user, biz });
+    if (!v.ok) {
+      return res.status(v.httpStatus).json({ error: v.error, code: v.code });
     }
 
-    // 3. KYC verified — open the bank account synchronously.
-    if (customerType === "IndividualCustomer") {
-      // Individual path (e.g. adding a 2nd business after the 1st verified the
-      // user): open the SAVINGS settlement account + business-named virtual
-      // NUBAN right now — the raw BVN is in this request. Returns a ready,
-      // payable account immediately.
-      const r = await openIndividualBankAccount({ biz, customerId, bvn });
-      return res.status(200).json({
-        status: "ready",
-        accountNumber: r.accountNumber,
-        bankName: r.bankName,
-        accountName: r.accountName,
-      });
-    }
+    // Admin approval gate: park the request for review. NOTHING reaches Anchor
+    // here — an admin approves it later (routes/admin.js), which replays the
+    // stored payload via executeVirtualAccountProvisioning. The full request body
+    // is stored ENCRYPTED (it holds raw BVNs); a non-sensitive summary drives the
+    // admin list.
+    const payloadEnc = encrypt(JSON.stringify(req.body));
+    const summary = buildSubmissionSummary({ body: req.body, user, biz });
+    const businessType = req.body.businessType || null;
+    const businessKyb = req.body.businessKyb === true;
 
-    // Legacy business path: open a CURRENT account. The response's accountNumber
-    // is the masked DepositAccount shell — not payable — so we wait for the
-    // accountNumber.created webhook (usually <1s) to write the real NUBAN. We
-    // persist the deposit account id here so the webhook can match the business.
-    const acc = await anchor.createDepositAccount({ customerId, customerType });
-    await prisma.business.update({
-      where: { id: biz.id },
-      data: {
-        anchorAccountId: acc.accountId,
-        virtualAccountId: acc.accountId,
-        virtualAccountRef: acc.accountId,
-      },
+    // One active submission per business — reuse any non-approved row so a
+    // resubmit (after a decline / fix) updates in place instead of piling up.
+    const existing = await prisma.kycSubmission.findFirst({
+      where: { businessId: biz.id, status: { in: ["PENDING", "DECLINED", "FAILED"] } },
+      orderBy: { createdAt: "desc" },
     });
+    if (existing) {
+      await prisma.kycSubmission.update({
+        where: { id: existing.id },
+        data: {
+          status: "PENDING",
+          businessType,
+          businessKyb,
+          payload: payloadEnc,
+          summary,
+          declineReason: null,
+          processError: null,
+          reviewedById: null,
+          reviewedAt: null,
+          processedAt: null,
+        },
+      });
+    } else {
+      await prisma.kycSubmission.create({
+        data: {
+          businessId: biz.id,
+          userId: user.id,
+          status: "PENDING",
+          businessType,
+          businessKyb,
+          payload: payloadEnc,
+          summary,
+        },
+      });
+    }
+
+    notifyAdminsOfKycSubmission(summary).catch((e) =>
+      console.warn("[kyc submit] admin notify failed:", e.message),
+    );
+
+    await audit({
+      req,
+      action: "KYC_SUBMIT_FOR_REVIEW",
+      resourceType: "business",
+      resourceId: biz.id,
+      severity: "info",
+      metadata: { businessType, businessKyb },
+    });
+
     return res.status(202).json({
-      status: "pending_account",
-      message: "Your account is being provisioned. You'll get a notification shortly.",
+      status: "pending_review",
+      message:
+        "Your account request has been sent for review. We'll notify you once it's approved — usually within a few hours.",
     });
   } catch (err) {
-    if (err.code === "ANCHOR_NOT_CONFIGURED") {
-      return res
-        .status(503)
-        .json({ error: "Virtual accounts not configured on this server." });
+    console.error("Virtual account submit error:", err);
+    res.status(400).json({ error: "Failed to submit account request" });
+  }
+});
+
+// GET /businesses/:id/kyc-status
+// Lightweight poll for the account-opening wizard: where does this request sit
+// in the admin-review → Anchor pipeline? Drives the "under review" / "declined"
+// screens on the mobile side.
+router.get("/:id/kyc-status", async (req, res) => {
+  try {
+    const biz = await prisma.business.findFirst({
+      where: { id: req.params.id, userId: getTargetUserId(req) },
+      select: { id: true, virtualAccountNumber: true },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    if (biz.virtualAccountNumber) {
+      return res.json({ reviewStatus: "approved", hasAccount: true });
     }
-    console.error("Virtual account error:", err);
-    res
-      .status(400)
-      .json({ error: "Failed to create virtual account" });
+
+    const submission = await prisma.kycSubmission.findFirst({
+      where: { businessId: biz.id },
+      orderBy: { createdAt: "desc" },
+      select: { status: true, declineReason: true, processError: true },
+    });
+    if (!submission) {
+      return res.json({ reviewStatus: "none", hasAccount: false });
+    }
+    // PENDING → still queued. APPROVED → Anchor provisioning ran (KYC now in
+    // Anchor's hands; the app's normal kycStatus poll takes over). DECLINED →
+    // show the reason + let them resubmit. FAILED → a post-approval error; the
+    // admin can retry, so from the user's side it's still "under review".
+    const map = { PENDING: "pending", APPROVED: "approved", DECLINED: "declined", FAILED: "pending" };
+    return res.json({
+      reviewStatus: map[submission.status] || "pending",
+      declineReason: submission.status === "DECLINED" ? submission.declineReason : null,
+      hasAccount: false,
+    });
+  } catch (err) {
+    console.error("[kyc-status] error:", err.message);
+    res.status(500).json({ error: "Failed to fetch KYC status" });
   }
 });
 

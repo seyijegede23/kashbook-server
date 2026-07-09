@@ -7,58 +7,59 @@ datasource db {
 }
 
 model User {
-  id                   String         @id @default(uuid())
-  firstName            String
-  lastName             String
-  businessName         String
-  phone                String?        @unique
-  email                String?        @unique
-  password             String?
-  plan                 Plan           @default(FREE)
-  role                 Role           @default(USER)
-  accountType          AccountType    @default(OWNER)
-  employerId           String?
-  profileImage         String?        @db.Text
-  avatarUrl            String?
-  expoPushToken        String?
-  country              String         @default("NG")  // ISO 3166-1 alpha-2 — drives currency, language, calling code, KYC, AML
-  language             String         @default("en")
-  currency             String         @default("NGN")  // derived from country at write-time
-  notificationsEnabled Boolean        @default(true)
-  biometricEnabled     Boolean        @default(false)
-  autoDebitEnabled     Boolean        @default(true)   // global kill-switch for all recurring auto-debits
-  transactionPin             String?
-  transactionPinFailedCount  Int       @default(0)
-  transactionPinLockedUntil  DateTime?
-  failedLoginAttempts  Int            @default(0)
-  lockedUntil          DateTime?
+  id                        String      @id @default(uuid())
+  firstName                 String
+  lastName                  String
+  businessName              String
+  phone                     String?     @unique
+  email                     String?     @unique
+  password                  String?
+  plan                      Plan        @default(FREE)
+  role                      Role        @default(USER)
+  accountType               AccountType @default(OWNER)
+  employerId                String?
+  profileImage              String?     @db.Text
+  avatarUrl                 String?
+  expoPushToken             String?
+  country                   String      @default("NG") // ISO 3166-1 alpha-2 — drives currency, language, calling code, KYC, AML
+  language                  String      @default("en")
+  currency                  String      @default("NGN") // derived from country at write-time
+  notificationsEnabled      Boolean     @default(true)
+  biometricEnabled          Boolean     @default(false)
+  autoDebitEnabled          Boolean     @default(true) // global kill-switch for all recurring auto-debits
+  transactionPin            String?
+  transactionPinFailedCount Int         @default(0)
+  transactionPinLockedUntil DateTime?
+  failedLoginAttempts       Int         @default(0)
+  lockedUntil               DateTime?
   // Bumped on password change / logout-all; JWTs carry this value and are
   // rejected by authMiddleware once it no longer matches (session revocation).
-  tokenVersion         Int            @default(0)
-  dateOfBirth          DateTime?
-  gender               String?
-  anchorCustomerId     String?        @unique
-  paystackCustomerCode String?
-  kycStatus            String         @default("unverified")
-  accountStatus        String         @default("active")  // "active" | "restricted" | "frozen" | "closed"
-  complianceFreezeReason String?
-  complianceFrozenAt   DateTime?
-  complianceFrozenBy   String?
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
+  tokenVersion              Int         @default(0)
+  dateOfBirth               DateTime?
+  gender                    String?
+  anchorCustomerId          String?     @unique
+  paystackCustomerCode      String?
+  kycStatus                 String      @default("unverified")
+  accountStatus             String      @default("active") // "active" | "restricted" | "frozen" | "closed"
+  complianceFreezeReason    String?
+  complianceFrozenAt        DateTime?
+  complianceFrozenBy        String?
+  createdAt                 DateTime    @default(now())
+  updatedAt                 DateTime    @updatedAt
 
-  businesses           Business[]
-  customers            Customer[]
-  transactions         Transaction[]
-  sales                Sales[]
-  expenses             Expense[]
-  businessDebts        BusinessDebt[]
-  suggestions          Suggestion[]
-  reminders            Reminder[]
-  inventoryItems       InventoryItem[]
-  notifications        AppNotification[]
-  recurringExpenses    RecurringExpense[]
-  recurringInvoices    RecurringInvoice[]
+  businesses        Business[]
+  customers         Customer[]
+  transactions      Transaction[]
+  sales             Sales[]
+  expenses          Expense[]
+  businessDebts     BusinessDebt[]
+  suggestions       Suggestion[]
+  reminders         Reminder[]
+  inventoryItems    InventoryItem[]
+  notifications     AppNotification[]
+  recurringExpenses RecurringExpense[]
+  recurringInvoices RecurringInvoice[]
+  kycSubmissions    KycSubmission[]
 }
 
 model AppNotification {
@@ -75,58 +76,58 @@ model AppNotification {
 }
 
 model Business {
-  id               String          @id @default(uuid())
-  userId           String
-  user             User            @relation(fields: [userId], references: [id])
-  name             String
-  emoji            String          @default("🛍️")
-  color            String          @default("#6C3FC5")
-  logoUrl          String?
-  receiptFooter    String?
-  invoiceTemplate  String          @default("classic")
-  bankName         String?
-  bankAccountNumber String?
-  bankAccountName  String?
-  usePaymentOverride Boolean       @default(false)
-  riskCategory     String          @default("standard") // "standard" | "elevated" | "high"
-  accountStatus    String          @default("active")   // "active" | "restricted" | "frozen" | "closed"
-  country          String          @default("NG")       // immutable after creation; drives currency + KYC + AML + banking
-  baseCurrency     String          @default("NGN")      // locked to country; dashboard / cash totals / AML thresholds read this
-  kycId            String?                              // generic primary KYC identifier (encrypted)
-  kycIdType        String          @default("BVN")      // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
-  invoiceCounter       Int             @default(0)
-  taxId                String?                              // display-only Tax ID / RC number for documents (P&L, invoices)
-  virtualAccountRef    String?
-  virtualAccountId     String?
-  virtualAccountNumber String?
-  virtualAccountBank   String?
-  virtualAccountName   String?
-  anchorAccountId      String?
-  paystackDvaId        String?
-  bankAccountType      String          @default("SAVINGS")
-  kycBvn               String?
-  kycCacNumber         String?
+  id                         String    @id @default(uuid())
+  userId                     String
+  user                       User      @relation(fields: [userId], references: [id])
+  name                       String
+  emoji                      String    @default("🛍️")
+  color                      String    @default("#6C3FC5")
+  logoUrl                    String?
+  receiptFooter              String?
+  invoiceTemplate            String    @default("classic")
+  bankName                   String?
+  bankAccountNumber          String?
+  bankAccountName            String?
+  usePaymentOverride         Boolean   @default(false)
+  riskCategory               String    @default("standard") // "standard" | "elevated" | "high"
+  accountStatus              String    @default("active") // "active" | "restricted" | "frozen" | "closed"
+  country                    String    @default("NG") // immutable after creation; drives currency + KYC + AML + banking
+  baseCurrency               String    @default("NGN") // locked to country; dashboard / cash totals / AML thresholds read this
+  kycId                      String? // generic primary KYC identifier (encrypted)
+  kycIdType                  String    @default("BVN") // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
+  invoiceCounter             Int       @default(0)
+  taxId                      String? // display-only Tax ID / RC number for documents (P&L, invoices)
+  virtualAccountRef          String?
+  virtualAccountId           String?
+  virtualAccountNumber       String?
+  virtualAccountBank         String?
+  virtualAccountName         String?
+  anchorAccountId            String?
+  paystackDvaId              String?
+  bankAccountType            String    @default("SAVINGS")
+  kycBvn                     String?
+  kycCacNumber               String?
   // HMAC-SHA-256 fingerprints of the encrypted identifiers above. Searchable,
   // irreversible — used for dedup ("has anyone else registered this BVN/CAC")
   // and for the KycCheckCache lookup. See server/src/utils/crypto.js hmacValue().
-  kycBvnHash           String?  @db.VarChar(64)
-  kycCacHash           String?  @db.VarChar(64)
-  kycBusinessType      String?  @default("sole_proprietor")
-  cacCertificateUrl    String?
-  description          String?
-  industry             String?
-  registrationType     String?
-  dateOfRegistration   DateTime?
-  dateOfIncorporation  DateTime?
-  addressState         String?
-  addressLine1         String?
-  addressLine2         String?
-  addressCity          String?
-  addressPostalCode    String?
-  directorAddressSame  Boolean  @default(true)
-  directorAddressLine1 String?
-  directorAddressState String?
-  directorAddressCity  String?
+  kycBvnHash                 String?   @db.VarChar(64)
+  kycCacHash                 String?   @db.VarChar(64)
+  kycBusinessType            String?   @default("sole_proprietor")
+  cacCertificateUrl          String?
+  description                String?
+  industry                   String?
+  registrationType           String?
+  dateOfRegistration         DateTime?
+  dateOfIncorporation        DateTime?
+  addressState               String?
+  addressLine1               String?
+  addressLine2               String?
+  addressCity                String?
+  addressPostalCode          String?
+  directorAddressSame        Boolean   @default(true)
+  directorAddressLine1       String?
+  directorAddressState       String?
+  directorAddressCity        String?
   // ── Instagram (per-business OAuth connection — Path A: Instagram Login) ───
   // The merchant connects their IG Professional account (Instagram Login, no
   // Facebook Page) so they can read/reply to DMs and send their NUBAN payment
@@ -135,13 +136,13 @@ model Business {
   // utils/crypto.encrypt). The id/username are plaintext. Tokens are
   // per-Business (one user may own several businesses / IG accounts).
   // See docs/INSTAGRAM_API_SPEC.md for the verified Meta contracts.
-  instagramAccessToken       String?   // encrypt()-ed long-lived token — never returned to the client
+  instagramAccessToken       String? // encrypt()-ed long-lived token — never returned to the client
   // @unique: one IG account ↔ one business. Webhook routing is by this id, so a
   // duplicate would make routing ambiguous. Nullable-unique → Postgres allows
   // many NULLs (un-connected businesses) but rejects a second claim of the same
   // id, closing the connect-callback TOCTOU race (caught as P2002).
   instagramBusinessAccountId String?   @unique // the merchant's IG account id (IGID)
-  instagramUsername          String?   // @handle, for display
+  instagramUsername          String? // @handle, for display
   igTokenExpiresAt           DateTime?
   igConnectionStatus         String?   @default("disconnected") // "disconnected" | "connected" | "expired" | "error"
   igWebhookSubscribed        Boolean   @default(false) // did me/subscribed_apps succeed? if false, inbound DMs won't arrive
@@ -149,20 +150,20 @@ model Business {
   // Per-merchant WABA connection mirroring the Instagram block above. The token
   // is a business-scoped token (NO expiry — no refresh cron), stored encrypted.
   // waPhoneNumberId is the webhook routing key. See docs/WHATSAPP_API_SPEC.md.
-  waAccessToken       String?  // encrypt()-ed business token — never returned to clients
-  wabaId              String?  // WhatsApp Business Account id
-  waPhoneNumberId     String?  @unique // Cloud API phone-number id (routing key)
-  waPhoneNumber       String?  // display number, e.g. +23480…
-  waConnectionStatus  String?  @default("disconnected") // "disconnected" | "connected" | "error"
-  waWebhookSubscribed Boolean  @default(false)
+  waAccessToken              String? // encrypt()-ed business token — never returned to clients
+  wabaId                     String? // WhatsApp Business Account id
+  waPhoneNumberId            String?   @unique // Cloud API phone-number id (routing key)
+  waPhoneNumber              String? // display number, e.g. +23480…
+  waConnectionStatus         String?   @default("disconnected") // "disconnected" | "connected" | "error"
+  waWebhookSubscribed        Boolean   @default(false)
   // VAT summary settings. Off by default (most micro-traders aren't VAT-
   // registered). vatRate null → country default. vatInclusive: are recorded
   // amounts treated as VAT-inclusive (true, NG default) or exclusive.
-  vatEnabled           Boolean         @default(false)
-  vatRate              Float?
-  vatInclusive         Boolean         @default(true)
-  createdAt            DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
+  vatEnabled                 Boolean   @default(false)
+  vatRate                    Float?
+  vatInclusive               Boolean   @default(true)
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @updatedAt
 
   transactions      Transaction[]
   sales             Sales[]
@@ -182,6 +183,7 @@ model Business {
   quickReplies      QuickReply[]
   igAutoReplies     IgAutoReply[]
   waConversations   WaConversation[]
+  kycSubmissions    KycSubmission[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -212,18 +214,18 @@ model BusinessOfficer {
   id                String   @id @default(uuid())
   businessId        String
   business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  role              String   // "DIRECTOR" | "OWNER"
+  role              String // "DIRECTOR" | "OWNER"
   firstName         String
   lastName          String
   middleName        String?
-  bvn               String   // encrypted via utils/crypto.js — re-used as the ID value field; idType disambiguates
+  bvn               String // encrypted via utils/crypto.js — re-used as the ID value field; idType disambiguates
   // HMAC-SHA-256 fingerprint of the encrypted bvn above. Searchable, irreversible.
   // Used for officer-level BVN dedup ("this person is already a director of
   // another KashBook business"). See server/src/utils/crypto.js hmacValue().
   bvnHash           String?  @db.VarChar(64)
   idType            String   @default("BVN") // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   dateOfBirth       DateTime
-  gender            String   // "Male" | "Female"
+  gender            String // "Male" | "Female"
   email             String?
   phoneNumber       String?
   nationality       String   @default("NG")
@@ -251,17 +253,17 @@ model BusinessOfficer {
 //                     result JSON is the provider's normalised response.
 // ─────────────────────────────────────────────────────────────────────────────
 model KycCheckAttempt {
-  id            String   @id @default(cuid())
-  userId        String
-  checkType     String   // "bvn" | "cac" | "address" | future: "nin" | …
+  id           String   @id @default(cuid())
+  userId       String
+  checkType    String // "bvn" | "cac" | "address" | future: "nin" | …
   // SHA-256/HMAC hash of the checked value. For "address" it's a hash of the
   // normalised line1+city+state — lets us dedupe geocoding requests.
-  valueHash     String   @db.VarChar(64)
-  result        String   // see kycCheck.js for the full enum
-  provider      String?  // "dojah" | "google" | null for cheap-layer rejects
-  cached        Boolean  @default(false)
-  errorMessage  String?
-  createdAt     DateTime @default(now())
+  valueHash    String   @db.VarChar(64)
+  result       String // see kycCheck.js for the full enum
+  provider     String? // "dojah" | "google" | null for cheap-layer rejects
+  cached       Boolean  @default(false)
+  errorMessage String?
+  createdAt    DateTime @default(now())
 
   @@index([userId, createdAt])
   @@index([checkType, valueHash, createdAt])
@@ -270,17 +272,51 @@ model KycCheckAttempt {
 model KycCheckCache {
   // Composite key: checkType + valueHash. Composite primary key so we don't
   // accidentally collide hashes across check types.
-  checkType    String
-  valueHash    String   @db.VarChar(64)
-  provider     String
+  checkType String
+  valueHash String   @db.VarChar(64)
+  provider  String
   // Provider-specific normalised result. BVN: { firstName, lastName,
   // dateOfBirth, gender, phone? }. CAC: { businessName, registrationNumber,
   // status, directors[] }. Address: { lat, lng, formattedAddress, components }.
-  result       Json
-  cachedAt     DateTime @default(now())
+  result    Json
+  cachedAt  DateTime @default(now())
 
   @@id([checkType, valueHash])
   @@index([cachedAt])
+}
+
+// Admin approval gate for account-opening (KYC/KYB). A user's virtual-account
+// request is parked here as PENDING; nothing reaches Anchor until an admin
+// approves. On approve the server replays the stored payload → Anchor. On
+// decline the user sees the reason and may fix + resubmit.
+// See server/src/services/virtualAccountProvisioning.js + routes/admin.js.
+model KycSubmission {
+  id            String              @id @default(cuid())
+  businessId    String
+  business      Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status        KycSubmissionStatus @default(PENDING)
+  businessType  String? // "individual" | "sole_proprietorship" | "limited_company"
+  businessKyb   Boolean             @default(false)
+  // AES-256-GCM encrypted JSON of the full request body (raw BVNs, owners, dob,
+  // gender, address). Decrypted only at approval to call Anchor, then nulled
+  // once provisioning starts so raw BVNs aren't retained beyond need.
+  payload       String?             @db.Text
+  // Non-sensitive summary the admin list renders (business name, type, masked
+  // BVN, CAC, industry, owner names + %). Never holds a raw BVN.
+  summary       Json?
+  declineReason String?
+  processError  String?
+  reviewedById  String?
+  reviewedAt    DateTime?
+  processedAt   DateTime?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  @@index([status, createdAt])
+  @@index([businessId])
+  @@index([userId])
 }
 
 model CustomCategory {
@@ -293,24 +329,24 @@ model CustomCategory {
 }
 
 model Customer {
-  id              String      @id @default(uuid())
+  id              String    @id @default(uuid())
   userId          String
-  user            User        @relation(fields: [userId], references: [id])
+  user            User      @relation(fields: [userId], references: [id])
   businessId      String?
-  business        Business?   @relation(fields: [businessId], references: [id])
+  business        Business? @relation(fields: [businessId], references: [id])
   name            String
   phone           String?
-  totalOwed       Float       @default(0)
-  reminderEnabled Boolean     @default(false)
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  totalOwed       Float     @default(0)
+  reminderEnabled Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-  debts           Debt[]
-  sales           Sales[]
-  transactions    Transaction[]
-  invoices        Invoice[]
-  igConversations IgConversation[]
-  waConversations WaConversation[]
+  debts             Debt[]
+  sales             Sales[]
+  transactions      Transaction[]
+  invoices          Invoice[]
+  igConversations   IgConversation[]
+  waConversations   WaConversation[]
   recurringInvoices RecurringInvoice[]
 
   @@unique([userId, phone])
@@ -370,21 +406,21 @@ model PayablePayment {
 }
 
 model BusinessDebt {
-  id              String   @id @default(uuid())
+  id              String    @id @default(uuid())
   userId          String
-  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   businessId      String?
   business        Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
   name            String
-  type            String   @default("other")
+  type            String    @default("other")
   originalAmount  Float
   remainingAmount Float
   dueDate         DateTime?
   note            String?
-  status          String   @default("unpaid")
-  reminderEnabled Boolean  @default(false)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  status          String    @default("unpaid")
+  reminderEnabled Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   @@index([userId, businessId])
   @@index([userId, status])
@@ -392,18 +428,18 @@ model BusinessDebt {
 }
 
 model Sales {
-  id             String    @id @default(uuid())
-  userId         String
-  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  customerId     String?
-  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  businessId     String?
-  business       Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
-  amount         Float
+  id                   String    @id @default(uuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customerId           String?
+  customer             Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  businessId           String?
+  business             Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  amount               Float
   paymentMethod        String    @default("cash")
   isCredit             Boolean   @default(false)
   notes                String?
-  channel              String?   // sales channel: instagram | whatsapp | walk-in | online | other
+  channel              String? // sales channel: instagram | whatsapp | walk-in | online | other
   matchedTransactionId String?
   recordedBy           String?
   recordedByName       String?
@@ -437,40 +473,40 @@ model Expense {
 }
 
 model Transaction {
-  id             String    @id @default(uuid())
-  businessId     String
-  business       Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  type           String
-  amount         Float
-  description    String?
-  category       String?
-  customerId     String?
-  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  date           DateTime
-  paymentMethod        String    @default("cash")
-  matchedSaleId        String?
-  matchedCustomerId    String?
-  recordedBy           String?
-  recordedByName       String?
-  userId               String?
-  user                 User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
-  source               String?
-  channel              String?   // sales channel: instagram | whatsapp | walk-in | online | other
+  id                String    @id @default(uuid())
+  businessId        String
+  business          Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type              String
+  amount            Float
+  description       String?
+  category          String?
+  customerId        String?
+  customer          Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  date              DateTime
+  paymentMethod     String    @default("cash")
+  matchedSaleId     String?
+  matchedCustomerId String?
+  recordedBy        String?
+  recordedByName    String?
+  userId            String?
+  user              User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  source            String?
+  channel           String? // sales channel: instagram | whatsapp | walk-in | online | other
   // Deterministic idempotency key for Anchor-sourced money movement (transfers,
   // bills, inbound credits). The @@unique below makes "record this once" atomic:
   // a duplicate insert fails with P2002 instead of double-spending/double-crediting.
   // Null for manual/offline transactions (Postgres allows many nulls).
-  reference            String?
-  currency             String    @default("NGN")   // base currency at time of record; per-business default
-  flagSeverity         String?    // null | "low" | "medium" | "high"
-  complianceStatus     String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
+  reference         String?
+  currency          String    @default("NGN") // base currency at time of record; per-business default
+  flagSeverity      String? // null | "low" | "medium" | "high"
+  complianceStatus  String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
   // Outbound-transfer fee charged to the user (₦51/₦101 pass-through + margin).
   // `amount` stays the transfer amount so income/expense reports are truthful;
   // the fee is its own field. Zero for everything that isn't an external transfer.
-  fee                  Float     @default(0)
-  feeBreakdown         Json?     // { nip, stampDuty, platform }
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
+  fee               Float     @default(0)
+  feeBreakdown      Json? // { nip, stampDuty, platform }
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   @@unique([businessId, reference])
   @@index([businessId, date])
@@ -498,21 +534,21 @@ model ProcessedWebhook {
 // participant IGSID but not always a thread id, so the IGSID is the stable key
 // and igThreadId is filled lazily from the Conversations API.
 model IgConversation {
-  id                  String      @id @default(uuid())
-  businessId          String
-  business            Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  participantIgId     String      // the customer's IG-scoped user id (IGSID) — stable key
-  igThreadId          String?     // Meta conversation id, when known
-  participantUsername String?
+  id                     String      @id @default(uuid())
+  businessId             String
+  business               Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  participantIgId        String // the customer's IG-scoped user id (IGSID) — stable key
+  igThreadId             String? // Meta conversation id, when known
+  participantUsername    String?
   // Stable link to the bookkeeping Customer (set on first record-sale / invoice).
   // Used instead of matching by display name, which can collide.
-  customerId          String?
-  customer            Customer?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  lastMessageAt       DateTime    @default(now())
+  customerId             String?
+  customer               Customer?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  lastMessageAt          DateTime    @default(now())
   // Last time the CUSTOMER messaged us — gates the 24h standard / 7d HUMAN_AGENT
   // send window (Meta blocks replies outside it). Distinct from lastMessageAt,
   // which also moves on our own outbound replies. See docs/INSTAGRAM_API_SPEC.md §4.
-  lastInboundAt       DateTime?
+  lastInboundAt          DateTime?
   // Auto payment confirmation: when the merchant sends a "Request ₦X" in this
   // thread we store the expected amount + time. An inbound NUBAN credit that
   // matches it (within 48h, exactly one candidate) auto-replies "payment
@@ -521,9 +557,9 @@ model IgConversation {
   expectedAmount         Float?
   expectedSince          DateTime?
   lastPaymentConfirmedAt DateTime?
-  unread              Boolean     @default(false)
-  createdAt           DateTime    @default(now())
-  messages            IgMessage[]
+  unread                 Boolean     @default(false)
+  createdAt              DateTime    @default(now())
+  messages               IgMessage[]
 
   @@unique([businessId, participantIgId])
   @@index([businessId, lastMessageAt])
@@ -538,11 +574,11 @@ model IgAutoReply {
   id         String   @id @default(uuid())
   businessId String
   business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  kind       String   // "greeting" | "keyword" | "comment" | "away"
-  keyword    String?  // for kind="keyword"/"comment" (matched case-insensitively; null comment = any)
+  kind       String // "greeting" | "keyword" | "comment" | "away"
+  keyword    String? // for kind="keyword"/"comment" (matched case-insensitively; null comment = any)
   text       String   @db.VarChar(900)
-  fromHour   Int?     // for kind="away": window start hour 0-23 (Africa/Lagos)
-  toHour     Int?     // for kind="away": window end hour 0-23
+  fromHour   Int? // for kind="away": window start hour 0-23 (Africa/Lagos)
+  toHour     Int? // for kind="away": window end hour 0-23
   enabled    Boolean  @default(true)
   createdAt  DateTime @default(now())
 
@@ -565,9 +601,9 @@ model IgMessage {
   conversationId String
   conversation   IgConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   igMessageId    String         @unique // Meta message id (mid) — dedups redelivered webhooks
-  direction      String         // "in" (from customer) | "out" (from merchant)
+  direction      String // "in" (from customer) | "out" (from merchant)
   text           String?
-  attachmentUrl  String?        // inbound image/media URL (temporary, signed by Meta)
+  attachmentUrl  String? // inbound image/media URL (temporary, signed by Meta)
   sentAt         DateTime       @default(now())
 
   @@index([conversationId, sentAt])
@@ -579,20 +615,20 @@ model IgMessage {
 // Carries the same auto-payment-confirm fields and stable customer link the IG
 // models gained through review — included from day one here.
 model WaConversation {
-  id                     String       @id @default(uuid())
+  id                     String      @id @default(uuid())
   businessId             String
-  business               Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  participantPhone       String       // the customer's wa_id (E.164 digits) — stable key
-  participantName        String?      // WhatsApp profile name
+  business               Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  participantPhone       String // the customer's wa_id (E.164 digits) — stable key
+  participantName        String? // WhatsApp profile name
   customerId             String?
-  customer               Customer?    @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  lastMessageAt          DateTime     @default(now())
-  lastInboundAt          DateTime?    // gates the 24h free-form send window
+  customer               Customer?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  lastMessageAt          DateTime    @default(now())
+  lastInboundAt          DateTime? // gates the 24h free-form send window
   expectedAmount         Float?
   expectedSince          DateTime?
   lastPaymentConfirmedAt DateTime?
-  unread                 Boolean      @default(false)
-  createdAt              DateTime     @default(now())
+  unread                 Boolean     @default(false)
+  createdAt              DateTime    @default(now())
   messages               WaMessage[]
 
   @@unique([businessId, participantPhone])
@@ -606,36 +642,36 @@ model WaMessage {
   conversationId String
   conversation   WaConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   waMessageId    String         @unique // wamid — dedups redelivered webhooks
-  direction      String         // "in" | "out"
+  direction      String // "in" | "out"
   text           String?
-  attachmentUrl  String?        // re-hosted media URL (media download needs auth — later batch)
+  attachmentUrl  String? // re-hosted media URL (media download needs auth — later batch)
   sentAt         DateTime       @default(now())
 
   @@index([conversationId, sentAt])
 }
 
 model InventoryItem {
-  id             String    @id @default(uuid())
-  userId         String
-  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  businessId     String?
-  business       Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
-  name           String
-  description    String?
-  unit           String    @default("piece")
-  price          Float
-  cost           Float?
-  quantity       Int       @default(0)
-  lowStockAlert  Int       @default(5)
-  category       String?
-  sku            String?
-  barcode        String?
-  image          String?
-  lastRestocked  DateTime?
-  createdBy      String?
-  createdByName  String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId    String?
+  business      Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  name          String
+  description   String?
+  unit          String    @default("piece")
+  price         Float
+  cost          Float?
+  quantity      Int       @default(0)
+  lowStockAlert Int       @default(5)
+  category      String?
+  sku           String?
+  barcode       String?
+  image         String?
+  lastRestocked DateTime?
+  createdBy     String?
+  createdByName String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   @@index([userId, businessId])
   @@index([businessId, updatedAt])
@@ -652,10 +688,10 @@ model RecurringInvoice {
   business      Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   customerId    String?
   customer      Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  description   String    // the invoice line item, e.g. "Weekly supply"
+  description   String // the invoice line item, e.g. "Weekly supply"
   amount        Float
   frequency     String    @default("monthly") // daily | weekly | monthly | yearly | custom_N
-  dueInDays     Int?      // dueDate = issueDate + N days; null = no due date
+  dueInDays     Int? // dueDate = issueDate + N days; null = no due date
   nextDue       DateTime
   active        Boolean   @default(true)
   lastRunAt     DateTime?
@@ -668,31 +704,31 @@ model RecurringInvoice {
 }
 
 model RecurringExpense {
-  id            String    @id @default(uuid())
-  userId        String
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  businessId    String?
-  business      Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
-  category      String    @default("other")
-  amount        Float
-  paymentMethod String    @default("cash")
-  notes         String?
-  frequency     String    @default("monthly")
-  nextDue       DateTime
-  active        Boolean   @default(true)
+  id                  String    @id @default(uuid())
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId          String?
+  business            Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  category            String    @default("other")
+  amount              Float
+  paymentMethod       String    @default("cash")
+  notes               String?
+  frequency           String    @default("monthly")
+  nextDue             DateTime
+  active              Boolean   @default(true)
   // ── Auto-debit (off by default; backwards-compatible) ──────────────────
-  autoSend             Boolean   @default(false)
-  authorizedAt         DateTime?
-  payeeAccountNumber   String?
-  payeeBankCode        String?
-  payeeBankName        String?
-  payeeAccountName     String?
-  lastAutoSendAt       DateTime?
-  lastAutoSendStatus   String?   // "ok" | "insufficient_balance" | "blocked_aml" | "anchor_error" | "above_cap" | "skipped_paused"
-  lastAutoSendRef      String?
-  consecutiveFailures  Int       @default(0)
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  autoSend            Boolean   @default(false)
+  authorizedAt        DateTime?
+  payeeAccountNumber  String?
+  payeeBankCode       String?
+  payeeBankName       String?
+  payeeAccountName    String?
+  lastAutoSendAt      DateTime?
+  lastAutoSendStatus  String? // "ok" | "insufficient_balance" | "blocked_aml" | "anchor_error" | "above_cap" | "skipped_paused"
+  lastAutoSendRef     String?
+  consecutiveFailures Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
 
   @@index([userId, active])
   @@index([nextDue, active])
@@ -746,34 +782,34 @@ model Suggestion {
 }
 
 model Invoice {
-  id             String           @id @default(uuid())
+  id             String            @id @default(uuid())
   businessId     String
-  business       Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business       Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
   customerId     String?
-  customer       Customer?        @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customer       Customer?         @relation(fields: [customerId], references: [id], onDelete: SetNull)
   userId         String
   invoiceNumber  String
-  type           String           @default("invoice") // "invoice" | "quote" (quotes convert to invoices)
-  status         InvoiceStatus    @default(DRAFT)
+  type           String            @default("invoice") // "invoice" | "quote" (quotes convert to invoices)
+  status         InvoiceStatus     @default(DRAFT)
   issueDate      String
   dueDate        String?
-  currency       String           @default("NGN")
-  subtotal       Float            @default(0)
-  taxRate        Float            @default(0)
-  taxAmount      Float            @default(0)
+  currency       String            @default("NGN")
+  subtotal       Float             @default(0)
+  taxRate        Float             @default(0)
+  taxAmount      Float             @default(0)
   discountType   String?
-  discountValue  Float            @default(0)
-  discountAmount Float            @default(0)
-  total          Float            @default(0)
-  amountPaid     Float            @default(0)
+  discountValue  Float             @default(0)
+  discountAmount Float             @default(0)
+  total          Float             @default(0)
+  amountPaid     Float             @default(0)
   notes          String?
   terms          String?
-  template       String           @default("classic")
+  template       String            @default("classic")
   items          InvoiceItem[]
   payments       InvoicePayment[]
   shareLink      InvoiceShareLink?
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
 
   @@index([businessId, userId])
   @@index([businessId, status])
@@ -781,14 +817,14 @@ model Invoice {
 }
 
 model InvoiceItem {
-  id          String   @id @default(uuid())
+  id          String  @id @default(uuid())
   invoiceId   String
-  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoice     Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   name        String
   description String?
-  quantity    Float    @default(1)
-  rate        Float    @default(0)
-  amount      Float    @default(0)
+  quantity    Float   @default(1)
+  rate        Float   @default(0)
+  amount      Float   @default(0)
 }
 
 model InvoicePayment {
@@ -827,6 +863,13 @@ enum AccountType {
   STAFF
 }
 
+enum KycSubmissionStatus {
+  PENDING // awaiting admin review
+  APPROVED // admin approved; Anchor provisioning ran
+  DECLINED // admin declined (declineReason set); user may resubmit
+  FAILED // approved but validation/Anchor failed; admin can retry
+}
+
 enum InvoiceStatus {
   DRAFT
   SENT
@@ -840,7 +883,7 @@ enum InvoiceStatus {
 // action. Reviewed by admins via the compliance dashboard.
 model AuditLog {
   id           String   @id @default(cuid())
-  actorType    String   // "user" | "admin" | "system"
+  actorType    String // "user" | "admin" | "system"
   actorId      String?
   action       String
   resourceType String?
@@ -861,19 +904,19 @@ model AuditLog {
 // Open-review queue for the compliance team. Rules engine writes here; admins
 // transition status to cleared/escalated/frozen.
 model ComplianceFlag {
-  id            String   @id @default(uuid())
+  id            String    @id @default(uuid())
   userId        String
   businessId    String?
   transactionId String?
   ruleCode      String
-  severity      String   // "low" | "medium" | "high"
+  severity      String // "low" | "medium" | "high"
   description   String
   metadata      Json
-  status        String   @default("open") // "open" | "cleared" | "escalated" | "frozen"
+  status        String    @default("open") // "open" | "cleared" | "escalated" | "frozen"
   reviewedBy    String?
   reviewedAt    DateTime?
   reviewerNote  String?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime  @default(now())
 
   @@index([status, severity, createdAt])
   @@index([userId])
@@ -887,7 +930,7 @@ model ComplianceFlag {
 
 model MetricSnapshot {
   id      String   @id @default(uuid())
-  kind    String                            // "health" | "analytics"
+  kind    String // "health" | "analytics"
   takenAt DateTime @default(now())
   data    Json
 
@@ -895,14 +938,14 @@ model MetricSnapshot {
 }
 
 model CronHeartbeat {
-  name       String   @id                    // cron identifier
+  name       String   @id // cron identifier
   lastRunAt  DateTime
-  lastStatus String   @default("ok")          // "ok" | "error"
+  lastStatus String   @default("ok") // "ok" | "error"
   lastError  String?
 }
 
 model AlertState {
-  key         String   @id                    // alert rule key
+  key         String   @id // alert rule key
   lastFiredAt DateTime
   lastValue   String?
 }

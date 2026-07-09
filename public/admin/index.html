@@ -186,6 +186,28 @@
       </div>
     </section>
 
+    <!-- KYC / Account-opening review queue -->
+    <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mt-6">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-800">
+          Account Requests
+          <span id="kycPendingBadge" class="hidden ml-2 text-xs font-bold text-white bg-red-500 px-2 py-0.5 rounded-full align-middle"></span>
+        </h2>
+        <div class="flex items-center gap-2 text-sm">
+          <select id="kycStatusFilter" class="px-3 py-1.5 rounded-lg border border-gray-200 bg-white text-sm">
+            <option value="PENDING" selected>Pending</option>
+            <option value="APPROVED">Approved</option>
+            <option value="DECLINED">Declined</option>
+            <option value="FAILED">Failed</option>
+          </select>
+          <button id="refreshKycBtn" class="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">Refresh</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-400 mb-3">Nothing reaches the bank (Anchor) until you approve it here.</p>
+      <div id="kycList" class="space-y-2"></div>
+      <div id="noKyc" class="hidden text-center text-gray-400 py-8">No requests match this filter</div>
+    </section>
+
     <!-- Compliance Queue -->
     <section class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mt-6">
       <div class="flex items-center justify-between mb-4">
