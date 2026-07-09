@@ -370,6 +370,19 @@ router.post("/:id/virtual-account", async (req, res) => {
 
     const isLtd = businessType === "limited_company";
 
+    // Defence-in-depth: businessKyb=true means "run the paid Anchor
+    // BusinessCustomer KYB", which only makes sense for a registered entity.
+    // The shipped app never sends this combination (it sets
+    // businessKyb: businessType !== "individual"); reject a crafted request so
+    // nobody is charged ~₦1,000 KYB against an "individual" selection. Old app
+    // builds send businessKyb=undefined, so they're unaffected.
+    if (req.body.businessKyb === true && businessType === "individual") {
+      return res.status(400).json({
+        error: "Individual accounts use identity (BVN) verification, not business KYB.",
+        code: "KYB_TYPE_MISMATCH",
+      });
+    }
+
     // LTD requires the owners array + incorporation date.
     if (isLtd) {
       if (!Array.isArray(owners) || owners.length === 0) {
@@ -667,28 +680,61 @@ router.post("/:id/virtual-account", async (req, res) => {
       customerId = fresh?.anchorCustomerId || null;
       if (customerId) return; // already created/adopted by a concurrent request
       try {
-        // Individual-KYC path: onboard the OWNER as an Anchor IndividualCustomer
-        // (Tier-2 BVN KYC ≈ ₦50, vs ₦1,000 business KYB). The BUSINESS NAME is
-        // not on the Anchor customer — it goes on the virtual NUBAN we mint after
-        // approval (openIndividualBankAccount). Customers pay that business-named
-        // NUBAN; money settles into this individual's SAVINGS deposit account.
-        const created = await anchor.createIndividualCustomer({
-          user: {
-            firstName: user.firstName,
-            lastName: user.lastName || user.firstName,
-            email: user.email || `${user.id}@kashbook.app`,
-            phone: user.phone || "+2348000000000",
-          },
-          address: businessAddress?.addressLine1
-            ? {
-                state: businessAddress.state,
-                addressLine_1: businessAddress.addressLine1,
-                city: businessAddress.city,
-                postalCode: businessAddress.postalCode,
-              }
-            : undefined,
-        });
-        customerId = created.customerId;
+        // Two onboarding paths, chosen by the client:
+        //  • businessKyb=true  → real Anchor BusinessCustomer KYB (sole prop /
+        //    limited). Full CAC/registration + directors/owners + document
+        //    uploads (~₦1,000). The business name is on the Anchor customer.
+        //  • otherwise         → cheap IndividualCustomer Tier-2 BVN KYC (~₦50);
+        //    the business name goes on the virtual NUBAN minted after approval.
+        // The flag (not businessType) gates this so existing app builds — which
+        // send businessType:"sole_proprietorship" meaning individual KYC — keep
+        // the cheap path until they update to the entity-picker build.
+        if (req.body.businessKyb === true) {
+          const created = await anchor.createBusinessCustomer({
+            businessName: biz.name,
+            businessBvn: bvn,
+            dateOfRegistration,
+            industry,
+            registrationType,
+            businessAddress: businessAddress?.addressLine1
+              ? {
+                  state: businessAddress.state,
+                  addressLine_1: businessAddress.addressLine1,
+                  city: businessAddress.city,
+                  postalCode: businessAddress.postalCode,
+                }
+              : undefined,
+            user: {
+              firstName: user.firstName,
+              lastName: user.lastName || user.firstName,
+              email: user.email || `${user.id}@kashbook.app`,
+              phone: user.phone || "+2348000000000",
+              dateOfBirth: dob,
+              bvn,
+            },
+            // LTD lists shareholders; sole prop → user is the 100% owner (fallback).
+            owners: isLtd ? owners : undefined,
+          });
+          customerId = created.customerId;
+        } else {
+          const created = await anchor.createIndividualCustomer({
+            user: {
+              firstName: user.firstName,
+              lastName: user.lastName || user.firstName,
+              email: user.email || `${user.id}@kashbook.app`,
+              phone: user.phone || "+2348000000000",
+            },
+            address: businessAddress?.addressLine1
+              ? {
+                  state: businessAddress.state,
+                  addressLine_1: businessAddress.addressLine1,
+                  city: businessAddress.city,
+                  postalCode: businessAddress.postalCode,
+                }
+              : undefined,
+          });
+          customerId = created.customerId;
+        }
       } catch (e) {
         const isDuplicate =
           /already exist/i.test(e.message || "") ||

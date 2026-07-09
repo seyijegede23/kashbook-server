@@ -173,25 +173,29 @@ async function createBusinessCustomer({
     };
   }
 
-  // Build officers array.
-  const officers = [
-    // Signing user is always the DIRECTOR (CEO, 0%).
-    {
-      role: "DIRECTOR",
-      fullName: {
-        firstName: user.firstName,
-        lastName: user.lastName || user.firstName,
-      },
-      nationality: "NG",
-      address: dirAddr,
-      dateOfBirth: officerDob,
-      email: user.email,
-      phoneNumber: phone,
-      bvn: user.bvn,
-      title: "CEO",
-      percentageOwned: 0,
+  // Build officers array. The signing user is always the DIRECTOR/CEO. Anchor
+  // rejects two officers that carry the same BVN, so whenever the director also
+  // appears as an owner (the common single-owner LTD, and every sole prop) we
+  // FOLD that ownership stake into the director officer instead of pushing a
+  // second entry with a duplicate BVN. Each officer object already carries a
+  // percentageOwned, so a DIRECTOR@100% correctly encodes "CEO who owns it all".
+  const director = {
+    role: "DIRECTOR",
+    fullName: {
+      firstName: user.firstName,
+      lastName: user.lastName || user.firstName,
     },
-  ];
+    nationality: "NG",
+    address: dirAddr,
+    dateOfBirth: officerDob,
+    email: user.email,
+    phoneNumber: phone,
+    bvn: user.bvn,
+    title: "CEO",
+    percentageOwned: 0,
+  };
+  const officers = [director];
+  const directorBvn = String(user.bvn || "").trim();
 
   if (Array.isArray(owners) && owners.length > 0) {
     // Validate sum + per-owner minimum before serializing.
@@ -209,6 +213,13 @@ async function createBusinessCustomer({
       }
     }
     for (const o of owners) {
+      // Same person as the director → merge the stake into the director entry
+      // rather than emit a duplicate-BVN officer Anchor would reject.
+      if (directorBvn && String(o.bvn || "").trim() === directorBvn) {
+        director.percentageOwned =
+          (Number(director.percentageOwned) || 0) + Number(o.percentageOwned || 0);
+        continue;
+      }
       const dob =
         o.dateOfBirth instanceof Date
           ? o.dateOfBirth.toISOString().slice(0, 10)
@@ -231,22 +242,9 @@ async function createBusinessCustomer({
       });
     }
   } else {
-    // Sole-prop fallback: signing user is the 100% owner. Preserves prior behaviour.
-    officers.push({
-      role: "OWNER",
-      fullName: {
-        firstName: user.firstName,
-        lastName: user.lastName || user.firstName,
-      },
-      nationality: "NG",
-      address: dirAddr,
-      dateOfBirth: officerDob,
-      email: user.email,
-      phoneNumber: phone,
-      bvn: user.bvn,
-      title: "President",
-      percentageOwned: 100,
-    });
+    // Sole-prop fallback: the signing user is the 100% owner. They're already
+    // the director, so fold 100% into that single officer (no duplicate BVN).
+    director.percentageOwned = 100;
   }
 
   const body = {
