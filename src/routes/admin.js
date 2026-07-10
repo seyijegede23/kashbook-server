@@ -583,6 +583,23 @@ router.patch("/compliance/flags/:id", async (req, res) => {
         reviewerNote: reviewerNote || null,
       },
     });
+
+    // Reflect the decision on the linked transaction: CLEARING releases it back
+    // to "clean" (and drops its flag severity); escalating/freezing keeps it
+    // "held" for investigation. Without this the transaction stayed flagged/held
+    // in the app even after an admin cleared it.
+    if (flag.transactionId) {
+      await prisma.transaction
+        .update({
+          where: { id: flag.transactionId },
+          data:
+            status === "cleared"
+              ? { complianceStatus: "clean", flagSeverity: null }
+              : { complianceStatus: "held" },
+        })
+        .catch(() => {});
+    }
+
     await audit({
       req,
       action: `FLAG_${status.toUpperCase()}`,
