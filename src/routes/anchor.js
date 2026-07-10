@@ -481,9 +481,10 @@ router.post("/", async (req, res) => {
         attrs.creditAccount?.accountNumber ||
         attrs.accountNumber;
       const amountRaw = Number(attrs.amount || 0);
-      // Anchor's incoming events are sometimes in naira, sometimes in kobo
-      // depending on event source. >100000 implies kobo. Adjust defensively.
-      const amount = amountRaw > 100000 ? amountRaw / 100 : amountRaw;
+      // Anchor amounts are in kobo — always divide by 100. (The old
+      // `> 100000 ? /100 : raw` guard mis-recorded any transfer ≤ ₦1,000 at
+      // 100× its value, e.g. a ₦10 credit = 1000 kobo became ₦1,000.)
+      const amount = amountRaw / 100;
       if (!accountNumber || amount <= 0) return;
 
       const biz = await prisma.business.findFirst({
@@ -558,7 +559,7 @@ router.post("/", async (req, res) => {
       const srcAccountId =
         rels.account?.data?.id || rels.sourceAccount?.data?.id;
       const amountRaw = Number(attrs.amount || 0);
-      const amount = amountRaw > 100000 ? amountRaw / 100 : amountRaw;
+      const amount = amountRaw / 100; // kobo → naira (always)
       const reference = attrs.reference || event.data?.id || "";
 
       if (!destAccountId || amount <= 0) return;

@@ -41,11 +41,11 @@ async function fetchAnchorTransactions(accountId, size = 50) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function normalizeAmount(raw) {
-  // Anchor's transactions API returns amounts in kobo. Divide by 100.
-  // Values <= 10000 are treated as already-in-naira (e.g. tiny test amounts).
+  // Anchor's transactions API returns amounts in kobo — ALWAYS divide by 100.
+  // (The old `> 10000 ? /100 : raw` guard mis-recorded any transfer ≤ ₦100 at
+  // 100× its value, e.g. a ₦10 credit = 1000 kobo became ₦1,000.)
   const n = Number(raw || 0);
-  if (!n) return 0;
-  return n > 10000 ? n / 100 : n;
+  return n ? n / 100 : 0;
 }
 
 async function reconcileBusiness(biz, { onCreate } = {}) {
