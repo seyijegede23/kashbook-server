@@ -219,7 +219,7 @@ function buildUserEmail({ user, sections }, range) {
 <h1 class="kb-ink" style="margin:0 0 6px 0;font-family:${FONT};font-size:21px;font-weight:700;letter-spacing:-0.2px;color:#18181B;line-height:1.3;">Your ${escHtml(range.label)} report</h1>
 <p class="kb-sub" style="margin:0 0 26px 0;font-family:${FONT};font-size:15px;line-height:1.65;color:#71717A;">${first ? `Hi ${escHtml(first)}, here` : "Here"}&rsquo;s how your business${sections.length > 1 ? "es" : ""} performed last month.</p>
 ${sections.map((s, i) => businessSection(s, i === 0)).join("")}
-<p class="kb-faint" style="margin:26px 0 0 0;font-family:${FONT};font-size:13px;line-height:1.6;color:#A1A1AA;">Figures cover ${escHtml(range.label)} (Africa/Lagos time), from the transactions recorded in KashBook. VAT figures are estimates &mdash; confirm with your tax adviser.</p>`;
+<p class="kb-faint" style="margin:26px 0 0 0;font-family:${FONT};font-size:13px;line-height:1.6;color:#A1A1AA;">Figures cover ${escHtml(range.label)} (Africa/Lagos time), from the transactions recorded in KashBook. VAT figures are estimates. Confirm with your tax adviser.</p>`;
 
   // Whole-account net for the subject/preheader (mixed currencies just fall
   // back to the first business's symbol — the sections carry the detail).
