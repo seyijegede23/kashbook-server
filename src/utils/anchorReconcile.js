@@ -15,10 +15,46 @@ const { pushTo } = require("./pushNotification");
 const { recalcInvoiceStatus } = require("./invoiceStatus");
 const { SINGLE_FLAG_ABOVE } = require("../config/amlLimits");
 const {
-  extractSender,
+  resolveInboundSender,
+  fetchTransferInfo,
   buildInboundNotification,
   buildInboundDescription,
 } = require("./inboundCreditNotification");
+
+// Resolve the sender for an inbound credit transaction, following whichever
+// related resource actually carries the counterparty:
+//   • NIP inbound (external bank)  → the linked Payment (name/bank/account).
+//   • BOOK_TRANSFER (KashBook→KashBook) → the source DepositAccount, mapped to
+//     the local business that owns it.
+// Falls back to the transaction attrs (and a plain label) when neither resolves.
+async function resolveCreditSender(t, a) {
+  const paymentId = t.relationships?.payment?.data?.id || "";
+  if (paymentId) return resolveInboundSender(a, paymentId);
+
+  const transferId = t.relationships?.transfer?.data?.id || "";
+  if (transferId) {
+    const info = await fetchTransferInfo(transferId);
+    if (info?.sourceAccountId) {
+      const src = await prisma.business.findFirst({
+        where: { anchorAccountId: info.sourceAccountId },
+        select: { name: true, virtualAccountName: true },
+      });
+      const name = src ? src.virtualAccountName || src.name : "";
+      return {
+        sender: {
+          name,
+          bank: name ? "KashBook" : "",
+          accountNumber: "",
+          label: name || "another KashBook user",
+          hasName: !!name,
+        },
+        narration: info.reason || a.narration || a.reason || "",
+      };
+    }
+  }
+
+  return resolveInboundSender(a, "");
+}
 
 const BASE = () => process.env.ANCHOR_BASE_URL;
 const KEY = () => process.env.ANCHOR_API_KEY;
@@ -72,8 +108,9 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     });
     if (existing) continue;
 
-    const sender = extractSender(a);
-    const narration = a.narration || a.reason || "";
+    // The sender lives on a related resource (Payment for NIP, transfer for
+    // book) — not the transaction attrs. Follow whichever applies.
+    const { sender, narration } = await resolveCreditSender(t, a);
     const description = buildInboundDescription({ sender, narration, reference });
 
     // Read the owner's compliance status — inbound credits to a frozen
@@ -285,5 +322,6 @@ function startReconciliationLoop(intervalMs = 2 * 60 * 1000) {
 module.exports = {
   reconcileAll,
   reconcileBusiness,
+  resolveCreditSender,
   startReconciliationLoop,
 };

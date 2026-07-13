@@ -20,7 +20,7 @@ const { openIndividualBankAccount } = require("../utils/anchorBank");
 const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
 const {
-  extractSender,
+  resolveInboundSender,
   buildInboundNotification,
   buildInboundDescription,
 } = require("../utils/inboundCreditNotification");
@@ -496,8 +496,10 @@ router.post("/", async (req, res) => {
         return;
       }
 
-      const sender = extractSender(attrs);
-      const narration = attrs.narration || attrs.reason || "";
+      // Sender lives on the linked Payment for NIP inbound; fall back to it when
+      // the webhook attrs don't already carry a counterParty name.
+      const paymentId = rels.payment?.data?.id || attrs.paymentId || "";
+      const { sender, narration } = await resolveInboundSender(attrs, paymentId);
       const sessionId = attrs.sessionId || attrs.reference || "";
       const description = buildInboundDescription({ sender, narration, reference: sessionId });
 

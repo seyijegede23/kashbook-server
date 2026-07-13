@@ -12,7 +12,7 @@ const { formatAmountForBusiness } = require("../config/amlLimits");
 // field name that's been observed and fall back to a "Bank ****1234" label so
 // the user always knows roughly who paid them, even if Anchor didn't send a
 // usable name.
-function extractSender(attrs = {}) {
+function extractSender(attrs = {}, { quiet = false } = {}) {
   // Anchor nests the sender on inbound credits as a counterParty / source-account
   // object (capital P), while some partner payloads use flat fields. Check the
   // nested object first, then every flat variant we've seen.
@@ -47,7 +47,9 @@ function extractSender(attrs = {}) {
 
   // If we STILL couldn't find a name, log the raw sender-ish payload so we can map
   // whatever shape this partner/event used (then add it above). Only logs on miss.
-  if (!name) {
+  // `quiet` suppresses this when the caller has a fallback (e.g. it will next fetch
+  // the linked Payment, which is where the sender actually lives for NIP inbound).
+  if (!name && !quiet) {
     try {
       console.warn("[inbound] sender name not found — raw:", JSON.stringify({
         keys: Object.keys(attrs).slice(0, 40),
@@ -82,6 +84,69 @@ function cleanName(s) {
   return trimmed;
 }
 
+// ── Payment lookup ─────────────────────────────────────────────────────────
+// For a NIP inbound credit, Anchor's *transaction* payload carries NO sender —
+// the counterParty (name / bank / account) lives on the linked *Payment*
+// resource (transaction.relationships.payment.data.id). Fetch it on demand.
+const ANCHOR_BASE = () => process.env.ANCHOR_BASE_URL;
+const ANCHOR_KEY = () => process.env.ANCHOR_API_KEY;
+
+async function fetchPaymentAttributes(paymentId) {
+  if (!paymentId || !ANCHOR_BASE() || !ANCHOR_KEY()) return null;
+  try {
+    const res = await fetch(
+      `${ANCHOR_BASE()}/payments/${encodeURIComponent(paymentId)}`,
+      { headers: { "x-anchor-key": ANCHOR_KEY(), Accept: "application/json" } },
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.data?.attributes || null;
+  } catch {
+    return null;
+  }
+}
+
+// Book transfers (KashBook→KashBook, type BOOK_TRANSFER) carry the sender as the
+// SOURCE DepositAccount on the transfer's `account` relationship. Return the
+// source account id + reason so the caller can map it to a local business.
+async function fetchTransferInfo(transferId) {
+  if (!transferId || !ANCHOR_BASE() || !ANCHOR_KEY()) return null;
+  try {
+    const res = await fetch(
+      `${ANCHOR_BASE()}/transfers/${encodeURIComponent(transferId)}`,
+      { headers: { "x-anchor-key": ANCHOR_KEY(), Accept: "application/json" } },
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const d = data?.data || {};
+    return {
+      sourceAccountId: d.relationships?.account?.data?.id || "",
+      reason: d.attributes?.reason || "",
+      reference: d.attributes?.reference || "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the best sender + narration for an inbound credit. Tries the primary
+// payload first; if it has no usable name and we know the Payment id, fetch the
+// Payment (where the counterParty actually is) and use that instead.
+async function resolveInboundSender(attrs = {}, paymentId = "") {
+  const canFallBack = !!paymentId;
+  let sender = extractSender(attrs, { quiet: canFallBack });
+  let narration = attrs.narration || attrs.reason || "";
+  if (!sender.hasName && paymentId) {
+    const payAttrs = await fetchPaymentAttributes(paymentId);
+    if (payAttrs) {
+      // The Payment is strictly richer than the transaction-list attrs.
+      sender = extractSender(payAttrs);
+      if (!narration) narration = payAttrs.narration || payAttrs.reason || "";
+    }
+  }
+  return { sender, narration };
+}
+
 // Build the title + body for the push notification.
 // Title leads with the most important info (who + how much).
 function buildInboundNotification({ business, amount, sender, narration }) {
@@ -112,6 +177,9 @@ function buildInboundDescription({ sender, narration, reference }) {
 
 module.exports = {
   extractSender,
+  resolveInboundSender,
+  fetchPaymentAttributes,
+  fetchTransferInfo,
   buildInboundNotification,
   buildInboundDescription,
 };
