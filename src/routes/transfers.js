@@ -3,6 +3,9 @@ const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
+const { getProvider } = require("../providers");
+const { getCountryConfig } = require("../config/countries");
+const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { runPreTransferChecks } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
@@ -20,12 +23,19 @@ router.use(auth);
 router.use(requireUnfrozen);
 
 // GET /transfers/banks
-router.get("/banks", async (_req, res) => {
+// Bank list for the sender's country/currency, via their payment provider
+// (Fincra bank `code` is the payout bankCode; Anchor returns CBN codes). Sending
+// is local, so the sender's country drives which banks + which code namespace.
+router.get("/banks", async (req, res) => {
   try {
-    const banks = await anchor.getBanks();
+    const country = req.user.country || "NG";
+    const provider = getProvider(country);
+    if (!provider.supportsBanking) return res.json([]);
+    const currency = getCountryConfig(country).currency.code;
+    const banks = await provider.getBanks(currency);
     res.json(banks);
   } catch (err) {
-    if (err.code === "ANCHOR_NOT_CONFIGURED")
+    if (err.code === "ANCHOR_NOT_CONFIGURED" || err.code === "NOT_IMPLEMENTED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
     console.error("[transfers/banks]", err.message);
     res.status(500).json({ error: "Failed to fetch banks" });
@@ -48,7 +58,7 @@ router.post("/verify-account", async (req, res) => {
     const internal = await prisma.business.findFirst({
       where: {
         virtualAccountNumber: accountNumber,
-        anchorAccountId: { not: null },
+        OR: [{ providerAccountId: { not: null } }, { anchorAccountId: { not: null } }],
       },
       select: { name: true, virtualAccountName: true },
     });
@@ -59,12 +69,15 @@ router.post("/verify-account", async (req, res) => {
       });
     }
 
-    const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
+    const country = req.user.country || "NG";
+    const provider = getProvider(country);
+    const currency = getCountryConfig(country).currency.code;
+    const ne = await provider.verifyRecipient({ accountNumber, bankCode, currency });
     if (!ne.accountName)
       return res.status(400).json({ error: "Account not found" });
     res.json({ accountName: ne.accountName, internal: false });
   } catch (err) {
-    if (err.code === "ANCHOR_NOT_CONFIGURED")
+    if (err.code === "ANCHOR_NOT_CONFIGURED" || err.code === "NOT_IMPLEMENTED")
       return res.status(503).json({ error: "Transfers not configured on this server." });
     console.error("[transfers/verify-account]", err.message);
     res
@@ -86,9 +99,16 @@ router.get("/balance", async (req, res) => {
       where: { id: businessId, userId },
     });
     if (!biz) return res.status(404).json({ error: "Business not found" });
-    if (!biz.anchorAccountId) return res.json({ balance: 0 });
+    const bankingId = biz.providerAccountId || biz.anchorAccountId;
+    if (!bankingId) return res.json({ balance: 0 });
 
-    const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
+    const provider = getProvider(biz);
+    // Pooled-wallet providers (Fincra) have no per-business balance — derive it
+    // from our ledger. Anchor exposes a real per-account balance.
+    if (provider.pooledWallet) {
+      return res.json({ balance: await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN") });
+    }
+    const { balance } = await anchor.getAccountBalance(bankingId);
     res.json({ balance });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED") return res.json({ balance: 0 });
@@ -301,7 +321,7 @@ router.post("/send", async (req, res) => {
       });
     }
 
-    if (!biz.anchorAccountId)
+    if (!biz.providerAccountId && !biz.anchorAccountId)
       return res.status(400).json({
         error: "This business has no bank account. Set one up first.",
       });

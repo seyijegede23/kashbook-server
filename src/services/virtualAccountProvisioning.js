@@ -20,6 +20,8 @@ const { openIndividualBankAccount } = require("../utils/anchorBank");
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
+const { getProvider } = require("../providers");
+const { getCountryConfig } = require("../config/countries");
 const {
   isValidNigerianState,
   checkAdultDob,
@@ -31,6 +33,26 @@ const { isValidAnchorIndustry } = require("../data/anchorIndustries");
 
 const err = (httpStatus, error, code) => ({ ok: false, httpStatus, error, code });
 
+// Light validation for non-NGN Fincra countries (GHS/KES/TZS). Fincra's create
+// call needs only the individual's name (+ email for GHS); the national ID is
+// collected for our records but not required at issuance. Keep the adult check
+// when a DOB is on file.
+function validateUnifiedNonNgnInput({ user, currency }) {
+  if (!user.firstName) {
+    return err(400, "Add your name in Profile before opening an account.", "NAME_REQUIRED");
+  }
+  if (currency === "GHS" && !user.email) {
+    return err(400, "Add an email address in Profile to open a Ghana account.", "EMAIL_REQUIRED");
+  }
+  if (user.dateOfBirth) {
+    const c = checkAdultDob(user.dateOfBirth);
+    if (!c.ok && c.code === "DOB_TOO_YOUNG") {
+      return err(400, "You must be 18 or older to open a KashBook account.", "KYC_DOB_TOO_YOUNG");
+    }
+  }
+  return { ok: true };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase A (format/sanity) + Phase B (dedup). Free, synchronous, no writes and no
 // third-party calls. Returns { ok: true } or { ok: false, httpStatus, error, code }.
@@ -38,6 +60,16 @@ const err = (httpStatus, error, code) => ({ ok: false, httpStatus, error, code }
 // business may have claimed the BVN/CAC in between).
 // ─────────────────────────────────────────────────────────────────────────────
 async function validateVirtualAccountInput({ body, user, biz }) {
+  // Fincra countries other than NG issue an INDIVIDUAL account with light
+  // create-KYC (name only, + email for GHS). No BVN / national-ID at create, and
+  // none of the NG BusinessCustomer/KYB machinery. NG keeps its full, proven
+  // validation below (its create-KYC still needs a BVN on Fincra too).
+  const cfg = getCountryConfig(biz.country);
+  const currency = cfg?.currency?.code || "NGN";
+  if (currency !== "NGN") {
+    return validateUnifiedNonNgnInput({ user, currency });
+  }
+
   const {
     bvn,
     dateOfBirth,
@@ -184,6 +216,15 @@ async function validateVirtualAccountInput({ body, user, biz }) {
 // the submission FAILED. `req` is used only for the audit actor (the admin).
 // ─────────────────────────────────────────────────────────────────────────────
 async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
+  // Unified (one-call) providers — Fincra — issue the local account in a single
+  // call and return the account number synchronously. Anchor's granular chain
+  // is below. NG stays on Anchor until the country config flips (B8), so this
+  // branch is dormant until then.
+  const provider = getProvider(biz);
+  if (provider.unifiedProvisioning) {
+    return provisionViaUnifiedProvider({ provider, biz, user, body, req });
+  }
+
   const {
     bvn,
     dateOfBirth,
@@ -457,6 +498,115 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
       virtualAccountRef: acc.accountId,
     },
   });
+  return {
+    httpStatus: 202,
+    body: {
+      status: "pending_account",
+      message: "Your account is being provisioned. You'll get a notification shortly.",
+    },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One-call provisioning (Fincra): persist KYC, issue the LOCAL account, write the
+// account number. Instant for NGN/GHS/KES/TZS. THROWS on provider/DB errors so the
+// caller marks the submission FAILED (same contract as the Anchor path).
+// ─────────────────────────────────────────────────────────────────────────────
+async function provisionViaUnifiedProvider({ provider, biz, user, body, req }) {
+  const { bvn, dateOfBirth, gender } = body;
+  const cfg = getCountryConfig(biz.country);
+  const currency = cfg?.currency?.code || biz.baseCurrency || "NGN";
+
+  // Idempotency: a local account already exists → report it, don't re-issue.
+  if (biz.providerAccountId && biz.virtualAccountNumber) {
+    return {
+      httpStatus: 200,
+      body: {
+        status: "ready",
+        accountNumber: biz.virtualAccountNumber,
+        bankName: biz.virtualAccountBank,
+        accountName: biz.virtualAccountName,
+      },
+    };
+  }
+
+  // Persist the primary KYC id (generic encrypted) + BVN for NG back-compat.
+  const bizPatch = { localAccountStatus: "pending" };
+  if (bvn) {
+    bizPatch.kycBvn = encrypt(bvn);
+    bizPatch.kycBvnHash = hmacValue(bvn);
+    bizPatch.kycId = encrypt(bvn);
+    bizPatch.kycIdType = cfg?.kyc?.primaryIdType || "BVN";
+  }
+  await prisma.business.update({ where: { id: biz.id }, data: bizPatch });
+
+  const userPatch = {};
+  if (!user.dateOfBirth && dateOfBirth) userPatch.dateOfBirth = new Date(dateOfBirth);
+  if (!user.gender && gender) userPatch.gender = gender;
+  if (Object.keys(userPatch).length) {
+    await prisma.user.update({ where: { id: user.id }, data: userPatch });
+  }
+
+  const merchantReference = `kb_${biz.id}`;
+  let result;
+  try {
+    result = await provider.provisionLocalAccount({
+      currency,
+      accountType: "individual",
+      kyc: {
+        firstName: user.firstName,
+        lastName: user.lastName || user.firstName,
+        email: user.email || undefined,
+        bvn: bvn || undefined,
+      },
+      merchantReference,
+    });
+  } catch (e) {
+    // 409 DUPLICATE_REFERENCE: the account was already created at the provider
+    // under our deterministic merchantReference on a prior attempt that failed to
+    // persist. Recover it (re-fetch + back-fill) instead of orphaning it.
+    const isDup = e.status === 409 || /duplicate/i.test(`${e.body?.message || e.message || ""}`);
+    if (isDup && typeof provider.recoverLocalAccount === "function") {
+      result = await provider.recoverLocalAccount({ currency, merchantReference });
+    }
+    if (!result) throw e;
+  }
+
+  if (result?.accountNumber) {
+    await prisma.business.update({
+      where: { id: biz.id },
+      data: {
+        providerAccountId: result.providerRef || null,
+        paymentProviderRef: result.providerRef || null,
+        virtualAccountNumber: result.accountNumber,
+        virtualAccountBank: result.bankName || null,
+        virtualAccountName: result.accountName || null,
+        localAccountStatus: "issued",
+      },
+    });
+    if (user.kycStatus !== "verified") {
+      await prisma.user.update({ where: { id: user.id }, data: { kycStatus: "verified" } });
+    }
+    await audit({
+      req,
+      action: "ACCOUNT_ISSUED",
+      resourceType: "business",
+      resourceId: biz.id,
+      severity: "info",
+      metadata: { currency, provider: cfg?.paymentProvider, bank: result.bankName },
+    });
+    return {
+      httpStatus: 200,
+      body: {
+        status: "ready",
+        accountNumber: result.accountNumber,
+        bankName: result.bankName,
+        accountName: result.accountName,
+      },
+    };
+  }
+
+  // No account number yet (e.g. an FCY currency routed here) — leave pending.
   return {
     httpStatus: 202,
     body: {

@@ -488,15 +488,24 @@ router.post("/delete-account", authMiddleware, async (req, res) => {
     const match = await bcrypt.verify(password, user.password);
     if (!match) return res.status(401).json({ error: "Password is incorrect." });
 
-    // Money-out guard: never delete around a bank balance.
+    // Money-out guard: never delete around a bank balance. Fincra pools all VAs
+    // into one merchant wallet, so a Fincra business's cash-at-bank is its ledger
+    // (providerAccountId + pooledWallet), while Anchor exposes a per-account
+    // balance. Cover BOTH — a fail-closed guard that skipped Fincra would let a
+    // funded business be deleted (fail-open).
     const businesses = await prisma.business.findMany({
       where: { userId: user.id },
-      select: { id: true, name: true, anchorAccountId: true, baseCurrency: true },
+      select: { id: true, name: true, country: true, anchorAccountId: true, providerAccountId: true, baseCurrency: true },
     });
     const anchor = require("../utils/anchor");
-    for (const biz of businesses.filter((b) => b.anchorAccountId)) {
+    const { getProvider } = require("../providers");
+    const { computeLedgerBalance } = require("../utils/ledgerBalance");
+    for (const biz of businesses.filter((b) => b.providerAccountId || b.anchorAccountId)) {
       try {
-        const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
+        const provider = getProvider(biz);
+        const balance = provider.pooledWallet
+          ? await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN")
+          : (await anchor.getAccountBalance(biz.anchorAccountId)).balance;
         if (balance > 0) {
           return res.status(400).json({
             code: "BALANCE_REMAINING",

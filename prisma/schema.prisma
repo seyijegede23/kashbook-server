@@ -38,7 +38,7 @@ model User {
   dateOfBirth               DateTime?
   gender                    String?
   anchorCustomerId          String?     @unique
-  paystackCustomerCode      String?
+  fincraCustomerRef         String?
   kycStatus                 String      @default("unverified")
   accountStatus             String      @default("active") // "active" | "restricted" | "frozen" | "closed"
   complianceFreezeReason    String?
@@ -103,7 +103,11 @@ model Business {
   virtualAccountBank         String?
   virtualAccountName         String?
   anchorAccountId            String?
-  paystackDvaId              String?
+  // Provider-neutral banking identity (Fincra swap). New code gates "has
+  // banking" on providerAccountId instead of anchorAccountId.
+  providerAccountId          String?
+  paymentProviderRef         String?
+  localAccountStatus         String?   @default("none") // none | pending | issued
   bankAccountType            String    @default("SAVINGS")
   kycBvn                     String?
   kycCacNumber               String?
@@ -184,6 +188,7 @@ model Business {
   igAutoReplies     IgAutoReply[]
   waConversations   WaConversation[]
   kycSubmissions    KycSubmission[]
+  foreignAccounts   ForeignAccount[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -319,6 +324,36 @@ model KycSubmission {
   @@index([userId])
 }
 
+// Foreign-currency (USD/EUR/GBP) receive account issued by Fincra. Async +
+// consent-gated: created "pending", details land via the virtualaccount.issued
+// webhook. One per (business, currency). Coexists with the local NUBAN.
+model ForeignAccount {
+  id              String    @id @default(uuid())
+  businessId      String
+  business        Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  currency        String // USD | EUR | GBP
+  accountType     String    @default("individual") // individual | corporate
+  status          String    @default("pending") // pending | approved | issued | declined
+  fincraRequestId String?
+  fincraAccountId String?
+  accountNumber   String?
+  accountName     String?
+  bankName        String?
+  swift           String?
+  routing         String?
+  iban            String?
+  consentUrl      String?
+  declineReason   String?
+  inflowThisMonth Float     @default(0) // enforces the 10k USD/mo inflow cap
+  inflowMonth     String? // "YYYY-MM" the counter applies to
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([businessId, currency])
+  @@index([fincraRequestId])
+  @@index([accountNumber])
+}
+
 model CustomCategory {
   id         String   @id @default(uuid())
   businessId String
@@ -436,6 +471,7 @@ model Sales {
   businessId           String?
   business             Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
   amount               Float
+  currency             String    @default("NGN")
   paymentMethod        String    @default("cash")
   isCredit             Boolean   @default(false)
   notes                String?
@@ -461,6 +497,7 @@ model Expense {
   business      Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
   category      String    @default("other")
   amount        Float
+  currency      String    @default("NGN")
   paymentMethod String    @default("cash")
   date          DateTime  @default(now())
   notes         String?

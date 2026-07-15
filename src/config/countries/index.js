@@ -7,6 +7,7 @@ const COUNTRIES = {
   NG: require("./NG"),
   GH: require("./GH"),
   KE: require("./KE"),
+  TZ: require("./TZ"),
   ZA: require("./ZA"),
   EG: require("./EG"),
   UG: require("./UG"),

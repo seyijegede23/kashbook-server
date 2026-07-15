@@ -15,22 +15,28 @@ function notAvailable(method) {
 }
 
 class NullProvider extends PaymentProvider {
-  get supportsBanking() {
-    return false;
-  }
+  get supportsBanking() { return false; }
+  get supportsForeignAccounts() { return false; }
 
-  createBusinessCustomer() { notAvailable("createBusinessCustomer"); }
-  triggerKYB()             { notAvailable("triggerKYB"); }
-  createDepositAccount()   { notAvailable("createDepositAccount"); }
-  getAccountBalance()      { notAvailable("getAccountBalance"); }
-  getBanks()               { notAvailable("getBanks"); }
-  verifyCounterparty()     { notAvailable("verifyCounterparty"); }
-  createCounterparty()     { notAvailable("createCounterparty"); }
-  createTransfer()         { notAvailable("createTransfer"); }
-  createBookTransfer()     { notAvailable("createBookTransfer"); }
-  verifyWebhook()          { return false; }
-  listCustomerDocuments()  { notAvailable("listCustomerDocuments"); }
-  uploadDocument()         { notAvailable("uploadDocument"); }
+  provisionLocalAccount()   { notAvailable("provisionLocalAccount"); }
+  provisionForeignAccount() { notAvailable("provisionForeignAccount"); }
+  getAccountBalance()       { notAvailable("getAccountBalance"); }
+  getBanks()                { notAvailable("getBanks"); }
+  verifyRecipient()         { notAvailable("verifyRecipient"); }
+  payout()                  { notAvailable("payout"); }
+  verifyWebhook()           { return false; }
+  parseWebhookEvent()       { notAvailable("parseWebhookEvent"); }
+
+  // granular (deprecated)
+  createBusinessCustomer()  { notAvailable("createBusinessCustomer"); }
+  triggerKYB()              { notAvailable("triggerKYB"); }
+  createDepositAccount()    { notAvailable("createDepositAccount"); }
+  verifyCounterparty()      { notAvailable("verifyCounterparty"); }
+  createCounterparty()      { notAvailable("createCounterparty"); }
+  createTransfer()          { notAvailable("createTransfer"); }
+  createBookTransfer()      { notAvailable("createBookTransfer"); }
+  listCustomerDocuments()   { notAvailable("listCustomerDocuments"); }
+  uploadDocument()          { notAvailable("uploadDocument"); }
 }
 
 module.exports = NullProvider;

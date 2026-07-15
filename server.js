@@ -52,12 +52,12 @@ const invoiceRoutes = require("./src/routes/invoices");
 const adminRoutes = require("./src/routes/admin");
 const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
+const fincraWebhookRoute = require("./src/routes/fincra");
 const instagramRoutes = require("./src/routes/instagram");
 const instagramWebhookRoute = require("./src/routes/instagramWebhook");
 const whatsappRoutes = require("./src/routes/whatsapp");
 const whatsappWebhookRoute = require("./src/routes/whatsappWebhook");
 const transferRoutes = require("./src/routes/transfers");
-const billRoutes = require("./src/routes/bills");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
 const recurringInvoiceRoutes = require("./src/routes/recurringInvoices");
@@ -191,6 +191,14 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   anchorWebhookRoute,
 );
+// Fincra webhook — same raw-body-before-json requirement so the HMAC-SHA512
+// signature verifies against the exact bytes Fincra signed (header `signature`).
+app.use(
+  "/webhooks/fincra",
+  webhookLimiter,
+  express.raw({ type: "application/json", limit: "1mb" }),
+  fincraWebhookRoute,
+);
 // Instagram messaging webhook — same raw-body-before-json requirement so the
 // X-Hub-Signature-256 HMAC verifies against the exact bytes Meta sent. The GET
 // handshake carries no body, so express.raw is a no-op for it.
@@ -269,7 +277,6 @@ app.use("/reminders", apiLimiter);
 app.use("/invoices", apiLimiter);
 app.use("/notifications", apiLimiter);
 app.use("/transfers", apiLimiter);
-app.use("/bills", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
 app.use("/recurring-invoices", apiLimiter);
 app.use("/insights", apiLimiter);
@@ -291,7 +298,6 @@ app.use("/invoices", invoiceRoutes);
 app.use("/admin-api", adminRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/transfers", transferRoutes);
-app.use("/bills", billRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/recurring-invoices", recurringInvoiceRoutes);
 app.use("/insights", insightsRoutes);

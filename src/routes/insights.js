@@ -31,7 +31,7 @@ async function resolveBusiness(req, res) {
   }
   const biz = await prisma.business.findFirst({
     where: { id: businessId, userId: ownerId(req) },
-    select: { id: true, name: true, baseCurrency: true, anchorAccountId: true },
+    select: { id: true, name: true, baseCurrency: true, country: true, anchorAccountId: true, providerAccountId: true },
   });
   if (!biz) {
     res.status(404).json({ error: "Business not found" });

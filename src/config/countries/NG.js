@@ -25,7 +25,7 @@ module.exports = {
     { code: "limited_company",     label: "Limited Company",      regCode: "Private_Incorporated" },
   ],
 
-  paymentProvider: "anchor",
+  paymentProvider: "fincra", // Anchor→Fincra swap (Jul 2026). Instant NGN VA; Fincra allocates the partner bank.
 
   regionLabel: "State",
   regions: require("./regions/NG"),

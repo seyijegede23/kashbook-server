@@ -9,6 +9,8 @@ const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require(".
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
+const { getProvider } = require("../providers");
+const { computeLedgerBalance } = require("../utils/ledgerBalance");
 // Dojah pre-check (runBvnCheck/runCacCheck) removed from the KYC flow — the admin
 // approval gate + Anchor's own authoritative KYC make it redundant. The
 // utils/kycCheck module is left in place for an easy re-enable.
@@ -299,12 +301,22 @@ router.get("/:id/balance", async (req, res) => {
       where: { id: req.params.id, userId: getTargetUserId(req) },
     });
     if (!biz) return res.status(404).json({ error: "Business not found" });
-    if (!biz.anchorAccountId)
+    const bankingId = biz.providerAccountId || biz.anchorAccountId;
+    if (!bankingId)
       return res.json({ balance: 0, hasAccount: false });
 
     const cachedVal = balanceCache.getBalance(biz.id);
     if (cachedVal !== undefined) {
       return res.json({ balance: cachedVal, hasAccount: true, cached: true });
+    }
+
+    const provider = getProvider(biz);
+    // Pooled-wallet providers (Fincra): the provider has no per-business balance,
+    // so our ledger IS the balance (not a fallback).
+    if (provider.pooledWallet) {
+      const balance = await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN");
+      balanceCache.setBalance(biz.id, balance);
+      return res.json({ balance, hasAccount: true });
     }
 
     try {
@@ -313,25 +325,7 @@ router.get("/:id/balance", async (req, res) => {
       return res.json({ balance, hasAccount: true });
     } catch (anchorErr) {
       console.warn("[Anchor balance] falling back to local math:", anchorErr.message);
-      const [inAgg, outAgg] = await Promise.all([
-        prisma.transaction.aggregate({
-          where: { businessId: biz.id, type: "income", paymentMethod: "bank" },
-          _sum: { amount: true },
-        }),
-        prisma.transaction.aggregate({
-          where: {
-            businessId: biz.id,
-            type: "expense",
-            paymentMethod: "bank",
-            category: "transfer",
-          },
-          _sum: { amount: true },
-        }),
-      ]);
-      const balance = Math.max(
-        0,
-        Number(inAgg._sum.amount || 0) - Number(outAgg._sum.amount || 0),
-      );
+      const balance = await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN");
       return res.json({ balance, hasAccount: true, fallback: true });
     }
   } catch (err) {
@@ -367,7 +361,6 @@ router.post("/:id/virtual-account", async (req, res) => {
     }
 
     // Banking gate — bookkeeping-only countries can't open virtual accounts.
-    const { getProvider } = require("../providers");
     if (!getProvider(biz).supportsBanking) {
       return res.status(400).json({
         error: "Banking isn't available in your country yet. You can still use KashBook for invoicing and bookkeeping. We'll let you know when banking arrives.",

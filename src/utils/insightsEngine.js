@@ -939,19 +939,28 @@ const HANDLERS = {
   },
 
   async balance({ business }) {
-    if (!business.anchorAccountId) {
+    const bankingId = business.providerAccountId || business.anchorAccountId;
+    if (!bankingId) {
       return { answer: "This business doesn't have a bank account yet — open one from the Dashboard to see a balance." };
     }
     const cache = require("./balanceCache");
     let bal = cache.getBalance(business.id);
     if (bal === undefined) {
-      try {
-        const anchor = require("./anchor");
-        const r = await anchor.getAccountBalance(business.anchorAccountId);
-        bal = r.balance;
+      const provider = require("../providers").getProvider(business);
+      if (provider.pooledWallet) {
+        // Fincra pools all VAs into one wallet — the ledger is the balance.
+        const { computeLedgerBalance } = require("./ledgerBalance");
+        bal = await computeLedgerBalance(business.id, business.baseCurrency || "NGN");
         cache.setBalance(business.id, bal);
-      } catch {
-        return { answer: "I couldn't reach the bank right now — check the Dashboard for your balance." };
+      } else {
+        try {
+          const anchor = require("./anchor");
+          const r = await anchor.getAccountBalance(business.anchorAccountId);
+          bal = r.balance;
+          cache.setBalance(business.id, bal);
+        } catch {
+          return { answer: "I couldn't reach the bank right now — check the Dashboard for your balance." };
+        }
       }
     }
     return { answer: `Your bank balance is ${money(bal, business.baseCurrency)}.`, data: { balance: bal } };

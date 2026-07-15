@@ -24,6 +24,10 @@ module.exports = {
     { code: "limited_company",     label: "Limited Company",      regCode: "Private_Incorporated" },
   ],
 
+  // HELD "coming soon" until Fincra enables KES on our account (needs approved
+  // KYB + a main business account — Fincra support, Jul 2026). Everything else is
+  // wired (Fincra KES create-KYC = name only, Choice Bank). Flip null→"fincra"
+  // once Fincra confirms KES is live — no other change needed.
   paymentProvider: null,
 
   regionLabel: "County",

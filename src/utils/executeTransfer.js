@@ -23,6 +23,9 @@ const { audit } = require("./audit");
 const { recordComplianceFlags } = require("./amlChecks");
 const { formatAmountForBusiness } = require("../config/amlLimits");
 const { computeTransferFee } = require("../config/fees");
+const { getProvider } = require("../providers");
+const { getCountryConfig } = require("../config/countries");
+const { computeLedgerBalance } = require("./ledgerBalance");
 
 async function executeTransfer({
   business,
@@ -38,10 +41,22 @@ async function executeTransfer({
   req = null,    // for audit IP/user-agent; null in cron
   notify = true, // toggle the push notification
 } = {}) {
-  if (!business || !business.anchorAccountId) {
+  const bankingId = business?.providerAccountId || business?.anchorAccountId;
+  if (!business || !bankingId) {
     const err = new Error("Business has no banking account configured.");
     err.code = "NO_BANKING";
     throw err;
+  }
+
+  // Unified (one-call) providers — Fincra — use the payout API; Anchor's chain is
+  // below. getProvider keeps an Anchor-provisioned business on Anchor even after
+  // its country flips, so only Fincra-native businesses reach executeFincraPayout.
+  const provider = getProvider(business);
+  if (provider.unifiedProvisioning) {
+    return executeFincraPayout({
+      provider, business, userId, amount, accountNumber, bankCode,
+      accountName, bankName, narration, reference, amlCheck, req, notify,
+    });
   }
 
   const ref =
@@ -269,6 +284,122 @@ async function executeTransfer({
   }
 
   return { reference: ref, route, transactionId: txn.id, transaction: txn, fee };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fincra one-call payout path. Simpler than Anchor (no counterparty creation):
+// balance → resolve name → POST /disbursements/payouts → bookkeeping. No KashBook
+// fee for now (Fincra deducts its own; repricing is B9). ⚠️ NEEDS a funded
+// sandbox wallet for a real end-to-end send test before go-live.
+// ─────────────────────────────────────────────────────────────────────────────
+async function executeFincraPayout({
+  provider, business, userId, amount, accountNumber, bankCode,
+  accountName, bankName, narration, reference, amlCheck = {}, req = null, notify = true,
+}) {
+  const ref = reference || `kb_tf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const cfg = getCountryConfig(business.country);
+  const currency = cfg?.currency?.code || business.baseCurrency || "NGN";
+
+  // Idempotency — reference already recorded → skip the payout.
+  const existing = await prisma.transaction.findFirst({
+    where: { businessId: business.id, source: "fincra", reference: ref },
+    select: { id: true },
+  });
+  if (existing) {
+    return { reference: ref, route: "idempotent_skip", transactionId: existing.id, transaction: null };
+  }
+
+  // Live balance check. Fincra POOLS every virtual account into ONE merchant
+  // wallet per currency, so provider.getAccountBalance would return the shared
+  // total across ALL businesses — letting one business spend another's money.
+  // A pooled business's spendable cash is its OWN ledger (matches the /balance
+  // routes). Non-pooled providers keep the real per-account balance.
+  const balance = provider.pooledWallet
+    ? await computeLedgerBalance(business.id, currency)
+    : Number((await provider.getAccountBalance(business.providerAccountId, currency))?.balance ?? 0);
+  if (balance < Number(amount)) {
+    const err = new Error(`Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`);
+    err.code = "INSUFFICIENT_BALANCE";
+    err.availableBalance = balance;
+    throw err;
+  }
+
+  // Resolve the recipient name if the caller didn't supply it.
+  let resolvedName = accountName;
+  if (!resolvedName) {
+    const ne = await provider.verifyRecipient({ accountNumber, bankCode, currency });
+    if (!ne.accountName) {
+      const err = new Error("Could not resolve recipient account");
+      err.code = "RECIPIENT_UNVERIFIED";
+      throw err;
+    }
+    resolvedName = ne.accountName;
+  }
+  const first = resolvedName.split(" ")[0] || resolvedName;
+  const last = resolvedName.split(" ").slice(1).join(" ") || first;
+
+  await provider.payout({
+    business: process.env.FINCRA_BUSINESS_ID,
+    sourceCurrency: currency,
+    destinationCurrency: currency,
+    amount: String(amount),
+    description: narration || `Transfer from ${business.name}`,
+    paymentDestination: "bank_account",
+    customerReference: ref,
+    beneficiary: {
+      firstName: first,
+      lastName: last,
+      accountHolderName: resolvedName,
+      type: "individual",
+      accountNumber,
+      bankCode,
+      country: business.country || "NG",
+    },
+  });
+
+  // Bookkeeping — money has moved at Fincra; a DB failure must NOT surface as a
+  // transfer failure (double-send risk). Fail-soft, same as the Anchor path.
+  const recipientLabel = `${resolvedName} · ${bankName || currency} · ${accountNumber}`;
+  const description = narration
+    ? `${narration} — to ${recipientLabel} · Ref: ${ref}`
+    : `Transfer to ${recipientLabel} · Ref: ${ref}`;
+  let txn;
+  try {
+    txn = await prisma.transaction.create({
+      data: {
+        businessId: business.id, userId, type: "expense", amount: Number(amount),
+        description, category: "transfer", paymentMethod: "bank", date: new Date(),
+        source: "fincra", reference: ref, currency,
+        flagSeverity: amlCheck.maxSeverity || null,
+        complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
+      },
+    });
+  } catch (bookErr) {
+    console.error(`[executeFincraPayout] BOOKKEEPING FAILED after money moved (ref ${ref}):`, bookErr.message);
+    await audit({
+      req, action: "TRANSFER_BOOKKEEPING_FAILED", resourceType: "business", resourceId: business.id,
+      severity: "alert", metadata: { reference: ref, amount: Number(amount), provider: "fincra", error: bookErr.message },
+    }).catch(() => {});
+    return { reference: ref, route: "nip", transactionId: null, transaction: null, bookkeepingFailed: true };
+  }
+
+  await recordComplianceFlags({
+    userId, businessId: business.id, business, transactionId: txn.id,
+    amount: Number(amount), flags: amlCheck.flags || [],
+  });
+  await audit({
+    req, action: "TRANSFER_SENT", resourceType: "transaction", resourceId: txn.id,
+    severity: amlCheck.maxSeverity === "high" ? "alert" : amlCheck.maxSeverity === "medium" ? "warn" : "info",
+    metadata: { amount: Number(amount), reference: ref, route: "nip", provider: "fincra", accountNumber, bankName, currency, flags: (amlCheck.flags || []).map((f) => f.ruleCode), automated: !req },
+  });
+  if (notify) {
+    await pushTo(
+      userId,
+      `${req ? "" : "Auto-debit: "}Transfer Sent ✅`,
+      `${formatAmountForBusiness(business, amount)} → ${resolvedName} (Ref: ${ref.slice(-8)})`,
+    ).catch(() => {});
+  }
+  return { reference: ref, route: "nip", transactionId: txn.id, transaction: txn, fee: 0 };
 }
 
 module.exports = { executeTransfer };
