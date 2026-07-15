@@ -1,0 +1,196 @@
+{
+  "at": "2026-07-15T21:48:57.785Z",
+  "businesses": [
+    {
+      "id": "6b4b1c46-db8b-42da-b1f6-da42fefb21e2",
+      "name": "James and sons",
+      "userId": "be036097-e334-46a3-a71c-d23017e45e0f",
+      "anchorAccountId": "1780777062548133-anc_acc",
+      "virtualAccountNumber": "9934399248",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "James and sons",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "87a09e45-f945-4a30-9001-39a08d848df4",
+      "name": "Reliant Technology",
+      "userId": "bbd68d88-2d6a-4082-bab8-78e70b04819d",
+      "anchorAccountId": "178050280680037-anc_acc",
+      "virtualAccountNumber": "******4677",
+      "virtualAccountBank": "CORESTEP MICROFINANCE BANK",
+      "virtualAccountName": "Seyi Jegede",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "5e1c8d08-1127-4b57-8df1-87a5362136fe",
+      "name": "muna.inc",
+      "userId": "27736cd5-9fc4-47ee-b4a3-f8a402384540",
+      "anchorAccountId": "178059451821171-anc_acc",
+      "virtualAccountNumber": "9773782843",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "muna.inc",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "d2e3ff3e-e3d0-4db3-a875-a46963fcc236",
+      "name": "Moyo Enterprise",
+      "userId": "30dfd3f9-0086-4845-ab31-baff6bde69e8",
+      "anchorAccountId": "1780745455100129-anc_acc",
+      "virtualAccountNumber": "1679304441",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "Moyo Enterprise",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "7b410612-6622-4b60-a37a-b4900104cca3",
+      "name": "Jackk",
+      "userId": "66ea61b6-847c-4a77-906e-89ab10ed5d37",
+      "anchorAccountId": "1781272511712279-anc_acc",
+      "virtualAccountNumber": "7223492462",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "Jackk",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "9f011273-7528-4129-a329-30015fffa2ec",
+      "name": "munaa",
+      "userId": "dbbe248c-4013-46c6-89d1-0caa0651d99f",
+      "anchorAccountId": "178057877753053-anc_acc",
+      "virtualAccountNumber": "8936006740",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "munaa",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "84720e09-3b25-412e-8961-a60a8dfd83b2",
+      "name": "Mide and sons",
+      "userId": "d4c0395c-d798-49e8-bb8b-dd9deb444c6e",
+      "anchorAccountId": "178169165056129-anc_acc",
+      "virtualAccountNumber": "9649150411",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "Mide and sons",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "2f626e8b-525d-4342-8a1c-46a594d75953",
+      "name": "Okoro and sons",
+      "userId": "4ca1a8eb-e986-41e0-b8e6-b2fab5dd873f",
+      "anchorAccountId": "1782422179501355-anc_acc",
+      "virtualAccountNumber": "7585933517",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "Okoro and sons",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    },
+    {
+      "id": "d79aa697-9946-4e45-a5ae-1c1b4124e021",
+      "name": "Mr J enterprise",
+      "userId": "b5e56c3f-7924-47fb-881d-1aa8d8858c2c",
+      "anchorAccountId": "178052914425146-anc_acc",
+      "virtualAccountNumber": "3154102703",
+      "virtualAccountBank": "PROVIDUS BANK",
+      "virtualAccountName": "Mr J enterprise",
+      "providerAccountId": null,
+      "paymentProviderRef": null,
+      "localAccountStatus": "none"
+    }
+  ],
+  "users": [
+    {
+      "id": "b5e56c3f-7924-47fb-881d-1aa8d8858c2c",
+      "firstName": "Seyi",
+      "lastName": "Jegede",
+      "email": "support@relianttechnology.com.ng",
+      "anchorCustomerId": "178052632464847-anc_bus_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "3308ce1a-b930-4486-ad3c-84c7c41b8f67",
+      "firstName": "Seyi",
+      "lastName": "Jegede",
+      "email": "dami@relianttechnology.com.ng",
+      "anchorCustomerId": "178268157313144-anc_ind_cst",
+      "kycStatus": "unverified"
+    },
+    {
+      "id": "bbd68d88-2d6a-4082-bab8-78e70b04819d",
+      "firstName": "Jame",
+      "lastName": "Jack",
+      "email": "seyijegede23@gmail.com",
+      "anchorCustomerId": "1778752766096189-anc_ind_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "d4c0395c-d798-49e8-bb8b-dd9deb444c6e",
+      "firstName": "Mide",
+      "lastName": "James",
+      "email": "test3@relianttechnology.com.ng",
+      "anchorCustomerId": "178169161483063-anc_bus_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "30dfd3f9-0086-4845-ab31-baff6bde69e8",
+      "firstName": "Moyo",
+      "lastName": "Jegede",
+      "email": "moyosorejegede7@gmail.com",
+      "anchorCustomerId": "178059709634170-anc_bus_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "27736cd5-9fc4-47ee-b4a3-f8a402384540",
+      "firstName": "munachi",
+      "lastName": "ii",
+      "email": "munachiuche16@gmail.com",
+      "anchorCustomerId": "178057975305460-anc_bus_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "be036097-e334-46a3-a71c-d23017e45e0f",
+      "firstName": "James",
+      "lastName": "Okonkwo",
+      "email": "test2@relianttechnology.com.ng",
+      "anchorCustomerId": "1780776809841106-anc_bus_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "66ea61b6-847c-4a77-906e-89ab10ed5d37",
+      "firstName": "demi",
+      "lastName": "Jegede",
+      "email": "test@relianttechnology.com.ng",
+      "anchorCustomerId": "1781272460235505-anc_bus_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "4ca1a8eb-e986-41e0-b8e6-b2fab5dd873f",
+      "firstName": "Seyi",
+      "lastName": "Jenna",
+      "email": "test7@relianttechnology.com.ng",
+      "anchorCustomerId": "1782422117430522-anc_ind_cst",
+      "kycStatus": "verified"
+    },
+    {
+      "id": "dbbe248c-4013-46c6-89d1-0caa0651d99f",
+      "firstName": "Munachiso",
+      "lastName": "Uche",
+      "email": "yougene15@gmail.com",
+      "anchorCustomerId": "178052670703450-anc_bus_cst",
+      "kycStatus": "verified"
+    }
+  ],
+  "kycSubmissions": []
+}

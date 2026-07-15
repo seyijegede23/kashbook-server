@@ -112,6 +112,18 @@ function resolveAccount({ accountNumber, bankCode, currency = "NGN" }) {
   });
 }
 
+// List collections (inbound credits) for the merchant. GET /collections?business=
+// → data:{ results:[...], total }. Used by the reconcile backstop to backfill any
+// credit whose webhook never arrived. Fincra requires `business`; accepts
+// `perPage` + `page` (NOT currency/limit/status — filter those client-side). One
+// call returns collections across all currencies, each item carrying its own.
+function listCollections({ business = process.env.FINCRA_BUSINESS_ID, perPage = 50, page } = {}) {
+  const q = new URLSearchParams({ business: business || "" });
+  if (perPage) q.set("perPage", String(perPage));
+  if (page) q.set("page", String(page));
+  return fincraFetch(`/collections?${q.toString()}`);
+}
+
 // Create a bank-account payout. Endpoint CONFIRMED: POST /disbursements/payouts
 // (sandbox 422 "amount is required" on a partial body confirms the route).
 // Body: { business, sourceCurrency, destinationCurrency, amount, description,
@@ -152,6 +164,7 @@ module.exports = {
   getBanks,
   resolveAccount,
   createPayout,
+  listCollections,
   verifyWebhookSignature,
   BASE,
 };

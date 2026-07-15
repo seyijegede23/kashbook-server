@@ -14,8 +14,7 @@ const router = express.Router();
 const prisma = require("../utils/db");
 const FincraProvider = require("../providers/fincra");
 const { pushTo } = require("../utils/pushNotification");
-const { buildInboundNotification, buildInboundDescription } = require("../utils/inboundCreditNotification");
-const balanceCache = require("../utils/balanceCache");
+const { recordFincraInboundCredit } = require("../utils/fincraCredit");
 
 const fincra = new FincraProvider();
 
@@ -113,91 +112,11 @@ async function handleEvent(evt) {
       break;
     }
     case "inbound_credit":
-      await recordInboundCredit(d);
+      await recordFincraInboundCredit(d);
       break;
     default:
       break;
   }
-}
-
-// collection.successful → record an income Transaction for the credited account.
-async function recordInboundCredit(d) {
-  const accountNumber = String(
-    d.virtualAccount?.accountNumber || d.destinationAccountNumber || d.accountNumber || "",
-  );
-  const amount = Number(d.amount || d.amountReceived || 0); // ⚠️ confirm unit (major vs minor) on a real event
-  const currency = d.currency || "USD";
-  const reference = d.reference || d.id || d._id;
-  if (!accountNumber || amount <= 0 || !reference) return;
-
-  // Match the receiving account: FCY (ForeignAccount) first, then a local NUBAN.
-  const fa = await prisma.foreignAccount.findFirst({ where: { accountNumber } });
-  const biz = fa
-    ? await prisma.business.findUnique({ where: { id: fa.businessId } })
-    : await prisma.business.findFirst({ where: { virtualAccountNumber: accountNumber } });
-  if (!biz) {
-    console.warn(`[Fincra webhook] inbound credit — no business for account ${accountNumber}`);
-    return;
-  }
-
-  // Idempotency: the @@unique([businessId, reference]) blocks a double credit.
-  const sender = {
-    name: d.senderName || d.payerName || "",
-    bank: d.senderBank || "",
-    accountNumber: d.senderAccountNumber || "",
-    label: d.senderName || d.payerName || "a transfer",
-    hasName: !!(d.senderName || d.payerName),
-  };
-  const narration = d.narration || d.description || "";
-  try {
-    await prisma.transaction.create({
-      data: {
-        businessId: biz.id,
-        userId: biz.userId,
-        type: "income",
-        amount,
-        currency,
-        description: buildInboundDescription({ sender, narration, reference }),
-        category: "transfer",
-        paymentMethod: "bank",
-        date: new Date(),
-        source: "fincra",
-        reference,
-      },
-    });
-  } catch (e) {
-    if (e.code === "P2002") return; // duplicate reference — already recorded
-    throw e;
-  }
-
-  // FCY 10k/month inflow guardrail (tracked on the ForeignAccount).
-  if (fa) {
-    const month = new Date().toISOString().slice(0, 7);
-    const carry = fa.inflowMonth === month ? Number(fa.inflowThisMonth || 0) : 0;
-    const total = carry + amount;
-    await prisma.foreignAccount.update({
-      where: { id: fa.id },
-      data: { inflowThisMonth: total, inflowMonth: month },
-    });
-    if (total > 10000) {
-      await prisma.complianceFlag.create({
-        data: {
-          userId: biz.userId,
-          businessId: biz.id,
-          ruleCode: "FCY_MONTHLY_CAP",
-          severity: "medium",
-          description: `${currency} inflow this month (${total.toLocaleString()}) exceeds the 10,000/month cap.`,
-          metadata: { currency, total },
-        },
-      }).catch(() => {});
-    }
-  }
-
-  const { title, body } = buildInboundNotification({ business: biz, amount, sender, narration });
-  pushTo(biz.userId, title, body).catch(() => {});
-  try { balanceCache.adjustBalance(biz.id, amount); } catch { /* noop */ }
-  require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
-  require("../utils/waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
 }
 
 // Diagnostic: work out Fincra's exact webhook signing from a real event. Tries
