@@ -26,6 +26,14 @@ router.post("/", async (req, res) => {
       ? req.body
       : JSON.stringify(req.body || {});
 
+  // One-shot format probe (set FINCRA_WEBHOOK_DEBUG=true). Logs which header +
+  // HMAC variant matches the received signature so we can lock in Fincra's exact
+  // signing from ONE real event instead of guessing. Never logs the secret; turn
+  // off once the format is confirmed. Safe: does not affect verification/flow.
+  if (process.env.FINCRA_WEBHOOK_DEBUG === "true") {
+    try { logWebhookFormatProbe(req.headers, raw); } catch (e) { console.warn("[Fincra webhook probe]", e.message); }
+  }
+
   const bypass = process.env.FINCRA_VERIFY_WEBHOOK === "false" && process.env.NODE_ENV !== "production";
   if (!bypass && !fincra.verifyWebhook(raw, req.headers)) {
     return res.status(401).json({ error: "invalid signature" });
@@ -190,6 +198,37 @@ async function recordInboundCredit(d) {
   try { balanceCache.adjustBalance(biz.id, amount); } catch { /* noop */ }
   require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
   require("../utils/waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
+}
+
+// Diagnostic: work out Fincra's exact webhook signing from a real event. Tries
+// each candidate header × algorithm × signed-string and reports which combo
+// reproduces the received signature. Also prints the top-level payload keys +
+// the collection data keys so we can confirm recordInboundCredit's field paths.
+function logWebhookFormatProbe(headers, raw) {
+  const crypto = require("crypto");
+  const secret = process.env.FINCRA_WEBHOOK_SECRET || "";
+  const sigHeaderNames = ["signature", "x-fincra-signature", "x-webhook-signature", "fincra-signature"];
+  const present = sigHeaderNames.filter((h) => headers[h]);
+  let compact = raw;
+  try { compact = JSON.stringify(JSON.parse(raw)); } catch { /* keep raw */ }
+  const signedVariants = { rawBody: raw, stringifyPayload: compact };
+  const matches = [];
+  for (const [vName, str] of Object.entries(signedVariants)) {
+    for (const algo of ["sha512", "sha256"]) {
+      const hex = crypto.createHmac(algo, secret).update(str).digest("hex");
+      const b64 = crypto.createHmac(algo, secret).update(str).digest("base64");
+      for (const h of present) {
+        if (headers[h] === hex) matches.push(`${h} = HMAC-${algo}(${vName}) hex`);
+        if (headers[h] === b64) matches.push(`${h} = HMAC-${algo}(${vName}) base64`);
+      }
+    }
+  }
+  let event, dataKeys = [];
+  try { const b = JSON.parse(raw); event = b.event || b.type; dataKeys = Object.keys(b.data || {}); } catch { /* noop */ }
+  console.log(
+    "[Fincra webhook probe] event=%s | sig headers present=%j | MATCHES=%j | data keys=%j",
+    event, present, matches.length ? matches : "NONE (check secret / header / signed-string)", dataKeys,
+  );
 }
 
 module.exports = router;
