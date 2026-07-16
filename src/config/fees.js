@@ -36,6 +36,24 @@ function computeTransferFee(amount, route) {
   };
 }
 
+// ─── Fincra pay-out fees ────────────────────────────────────────────────────
+// Fincra charges KashBook 1% on every external pay-out (local + international).
+// We charge the customer FINCRA_FEE_PERCENT = 1.5% (1% pass-through + 0.5%
+// KashBook margin), optionally capped. On the POOLED model there's no separate
+// fee account: the margin simply stays in the merchant wallet unallocated to any
+// business ledger, i.e. it IS KashBook's revenue. Internal KashBook→KashBook book
+// transfers cost Fincra nothing and stay free. Applies to NGN/GHS/TZS pay-outs.
+const FINCRA_FEE_PERCENT = 1.5;   // total % charged to the customer
+const FINCRA_FEE_CAP = null;      // max fee per transfer in the local currency (null = uncapped)
+
+function computeFincraTransferFee(amount, { internal = false } = {}) {
+  if (internal) return { total: 0, breakdown: null };
+  const a = Number(amount) || 0;
+  let fee = Math.round(a * (FINCRA_FEE_PERCENT / 100) * 100) / 100; // 2 dp
+  if (FINCRA_FEE_CAP != null && fee > FINCRA_FEE_CAP) fee = FINCRA_FEE_CAP;
+  return { total: fee, breakdown: { percent: FINCRA_FEE_PERCENT, cap: FINCRA_FEE_CAP } };
+}
+
 module.exports = {
   NIP_FEE,
   STAMP_DUTY,
@@ -43,4 +61,7 @@ module.exports = {
   PLATFORM_MARGIN,
   feesEnabled,
   computeTransferFee,
+  FINCRA_FEE_PERCENT,
+  FINCRA_FEE_CAP,
+  computeFincraTransferFee,
 };

@@ -22,7 +22,7 @@ const { pushTo } = require("./pushNotification");
 const { audit } = require("./audit");
 const { recordComplianceFlags } = require("./amlChecks");
 const { formatAmountForBusiness } = require("../config/amlLimits");
-const { computeTransferFee } = require("../config/fees");
+const { computeTransferFee, computeFincraTransferFee } = require("../config/fees");
 const { getProvider } = require("../providers");
 const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("./ledgerBalance");
@@ -321,15 +321,21 @@ async function executeFincraPayout({
     return { reference: ref, route: "idempotent_skip", transactionId: existing.id, transaction: null };
   }
 
+  // Fincra pay-out fee (1% Fincra cost + 0.5% KashBook margin = 1.5%). The sender
+  // pays amount + fee; the recipient gets `amount`. On the pooled model the margin
+  // just stays in the wallet as KashBook revenue (no separate fee account).
+  const { total: fee, breakdown: feeBreakdown } = computeFincraTransferFee(amount, { internal: false });
+
   // Live balance check. Fincra POOLS every virtual account into ONE merchant
   // wallet per currency, so provider.getAccountBalance would return the shared
   // total across ALL businesses — letting one business spend another's money.
   // A pooled business's spendable cash is its OWN ledger (matches the /balance
-  // routes). Non-pooled providers keep the real per-account balance.
+  // routes). Non-pooled providers keep the real per-account balance. Must cover
+  // amount + fee.
   const balance = provider.pooledWallet
     ? await computeLedgerBalance(business.id, currency)
     : Number((await provider.getAccountBalance(business.providerAccountId, currency))?.balance ?? 0);
-  if (balance < Number(amount)) {
+  if (balance < Number(amount) + fee) {
     const err = new Error(`Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`);
     err.code = "INSUFFICIENT_BALANCE";
     err.availableBalance = balance;
@@ -382,6 +388,7 @@ async function executeFincraPayout({
         businessId: business.id, userId, type: "expense", amount: Number(amount),
         description, category: "transfer", paymentMethod: "bank", date: new Date(),
         source: "fincra", reference: ref, currency,
+        fee, feeBreakdown,
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
       },
@@ -411,7 +418,7 @@ async function executeFincraPayout({
       `${formatAmountForBusiness(business, amount)} → ${resolvedName} (Ref: ${ref.slice(-8)})`,
     ).catch(() => {});
   }
-  return { reference: ref, route: "nip", transactionId: txn.id, transaction: txn, fee: 0 };
+  return { reference: ref, route: "nip", transactionId: txn.id, transaction: txn, fee };
 }
 
 // Internal KashBook→KashBook transfer on a pooled provider (Fincra). Both accounts

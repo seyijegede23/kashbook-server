@@ -30,7 +30,9 @@ async function recordFincraPayoutOutcome(d, outcome) {
   }
 
   // FAILED / REVERSED — the money is back in the wallet. Restore the ledger with a
-  // compensating reversal. Idempotent via @@unique([businessId, reference]).
+  // compensating reversal of amount + fee (the sender was debited both).
+  // Idempotent via @@unique([businessId, reference]).
+  const restore = Number(expense.amount) + Number(expense.fee || 0);
   const reversalRef = `${reference}:reversal`;
   try {
     await prisma.transaction.create({
@@ -38,7 +40,7 @@ async function recordFincraPayoutOutcome(d, outcome) {
         businessId: expense.businessId,
         userId: expense.userId,
         type: "income",
-        amount: expense.amount,
+        amount: restore,
         currency: expense.currency,
         description: `Reversed: ${expense.description} (transfer failed — you were not charged)`.slice(0, 250),
         category: "transfer",
@@ -53,7 +55,7 @@ async function recordFincraPayoutOutcome(d, outcome) {
     throw e;
   }
 
-  try { balanceCache.adjustBalance(expense.businessId, Number(expense.amount)); } catch { /* noop */ }
+  try { balanceCache.adjustBalance(expense.businessId, restore); } catch { /* noop */ }
   pushTo(expense.userId, "Transfer failed", "Your transfer didn't go through — you were not charged.").catch(() => {});
   await audit({
     action: "TRANSFER_REVERSED",

@@ -26,12 +26,16 @@ async function computeLedgerBalance(businessId, currency = "NGN") {
     }),
     prisma.transaction.aggregate({
       where: { ...base, type: "expense", category: "transfer" },
-      _sum: { amount: true },
+      _sum: { amount: true, fee: true },
     }),
   ]);
+  // Outbound also costs the transfer FEE (Fincra pay-out fee), so it reduces the
+  // spendable balance alongside the amount.
   return Math.max(
     0,
-    Number(inAgg._sum.amount || 0) - Number(outAgg._sum.amount || 0),
+    Number(inAgg._sum.amount || 0)
+      - Number(outAgg._sum.amount || 0)
+      - Number(outAgg._sum.fee || 0),
   );
 }
 

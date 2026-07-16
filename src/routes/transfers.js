@@ -11,7 +11,7 @@ const { runPreTransferChecks } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
-const { computeTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
+const { computeTransferFee, computeFincraTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
 const {
   STEP_UP_OTP_ABOVE,
   TRANSFER_OTP_TYPE,
@@ -257,12 +257,20 @@ router.get("/fee-quote", async (req, res) => {
     if (!amount || amount <= 0)
       return res.status(400).json({ error: "amount required" });
 
-    // Fincra payouts currently carry no KashBook fee (executeFincraPayout books
-    // fee 0), so quote 0 for Fincra countries — otherwise the confirm screen
-    // shows an Anchor NIP fee that is never charged. Reprice in B9.
+    // Fincra: external pay-out fee is 1.5% (1% Fincra + 0.5% margin); internal
+    // KashBook→KashBook book transfers are free. Match executeFincraPayout.
     const provider = getProvider(req.user.country || "NG");
     if (provider.unifiedProvisioning) {
-      return res.json({ fee: 0, breakdown: null, route: "payout", total: amount });
+      let internal = false;
+      if (/^\d{10}$/.test(accountNumber)) {
+        const dest = await prisma.business.findFirst({
+          where: { virtualAccountNumber: accountNumber, providerAccountId: { not: null } },
+          select: { id: true },
+        });
+        if (dest) internal = true;
+      }
+      const { total, breakdown } = computeFincraTransferFee(amount, { internal });
+      return res.json({ fee: total, breakdown, route: internal ? "book" : "payout", total: amount + total });
     }
 
     let route = "nip";
