@@ -171,6 +171,14 @@ class FincraProvider extends PaymentProvider {
       "virtualaccount.issued": "account_issued",
       "collection.successful": "inbound_credit",
       "collection.failed": "inbound_failed",
+      // Outbound payout settlement (async; booked optimistically at send time).
+      "payout.successful": "payout_success",
+      "payout.completed": "payout_success",
+      "disbursement.successful": "payout_success",
+      "payout.failed": "payout_failed",
+      "payout.reversed": "payout_failed",
+      "payout.declined": "payout_failed",
+      "disbursement.failed": "payout_failed",
     };
     return { kind: KIND[event] || "unhandled", event, data, dedupId: data.id || data._id || data.reference };
   }

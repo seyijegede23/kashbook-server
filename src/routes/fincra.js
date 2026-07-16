@@ -15,6 +15,7 @@ const prisma = require("../utils/db");
 const FincraProvider = require("../providers/fincra");
 const { pushTo } = require("../utils/pushNotification");
 const { recordFincraInboundCredit } = require("../utils/fincraCredit");
+const { recordFincraPayoutOutcome } = require("../utils/fincraPayout");
 
 const fincra = new FincraProvider();
 
@@ -113,6 +114,12 @@ async function handleEvent(evt) {
     }
     case "inbound_credit":
       await recordFincraInboundCredit(d);
+      break;
+    case "payout_success":
+      await recordFincraPayoutOutcome(d, "success");
+      break;
+    case "payout_failed":
+      await recordFincraPayoutOutcome(d, "failed");
       break;
     default:
       break;
