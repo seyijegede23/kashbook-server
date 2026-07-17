@@ -308,7 +308,12 @@ async function executeFincraPayout({
   provider, business, userId, amount, accountNumber, bankCode,
   accountName, bankName, narration, reference, amlCheck = {}, req = null, notify = true,
 }) {
-  const ref = reference || `kb_tf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  // Encode the businessId in the customerReference (kb_tf_<bizId>_<suffix>) so the
+  // payout reconcile can attribute an orphaned SUCCESSFUL payout (one that Fincra
+  // processed but whose booking we lost to a timeout) back to this business. The
+  // caller's reference, if any, is preserved as the suffix for its idempotency.
+  const suffix = reference || `${Date.now()}${Math.random().toString(36).slice(2, 7)}`;
+  const ref = `kb_tf_${String(business.id).replace(/-/g, "")}_${suffix}`;
   const cfg = getCountryConfig(business.country);
   const currency = cfg?.currency?.code || business.baseCurrency || "NGN";
 

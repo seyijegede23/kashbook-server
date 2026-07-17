@@ -11,23 +11,35 @@ const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const balanceCache = require("./balanceCache");
 const { audit } = require("./audit");
+const { computeFincraTransferFee } = require("../config/fees");
 
 async function recordFincraPayoutOutcome(d, outcome) {
   const reference = d.customerReference || d.reference || d.merchantReference || d.id || d._id;
   if (!reference) return { handled: false, reason: "no_reference" };
 
   // The optimistic expense booked by executeFincraPayout (reference === the
-  // customerReference we sent Fincra). No match → nothing of ours to settle (safe
-  // no-op; also guards against a mis-parsed event acting on a random row).
+  // customerReference we sent Fincra). No match → we lost the booking (timeout /
+  // bookkeepingFailed) OR it's a foreign/mis-parsed event.
   const expense = await prisma.transaction.findFirst({
     where: { source: "fincra", type: "expense", reference: String(reference) },
   });
-  if (!expense) return { handled: false, reason: "no_expense", reference: String(reference) };
 
   if (outcome === "success") {
-    // Money left as booked — nothing to correct.
-    return { handled: true, outcome: "success", businessId: expense.businessId };
+    if (expense) return { handled: true, outcome: "success", businessId: expense.businessId };
+    // Orphaned success — the money left Fincra but our booking was lost. Backfill
+    // it here (event-driven, no scan window) so the ledger isn't left overstated.
+    // Attribution is keyed to the businessId encoded in the reference; a
+    // non-attributable ref is a safe no-op.
+    return backfillFincraPayout({
+      reference,
+      amount: d.amountSent || d.amount || d.amountReceived,
+      currency: d.sourceCurrency || d.currency,
+      beneficiaryName: d.beneficiaryName || d.accountHolderName,
+    });
   }
+
+  // FAILED / REVERSED with no local expense → nothing of ours to reverse.
+  if (!expense) return { handled: false, reason: "no_expense", reference: String(reference) };
 
   // FAILED / REVERSED — the money is back in the wallet. Restore the ledger with a
   // compensating reversal of amount + fee (the sender was debited both).
@@ -68,4 +80,50 @@ async function recordFincraPayoutOutcome(d, outcome) {
   return { handled: true, outcome: "failed", businessId: expense.businessId, reversed: Number(expense.amount) };
 }
 
-module.exports = { recordFincraPayoutOutcome };
+// Recover the businessId from a payout customerReference of the form
+// kb_tf_<32-hex-bizId>_<suffix> (see executeFincraPayout). Returns the UUID, or
+// null for a legacy/foreign reference the reconcile shouldn't attribute.
+function parseBizIdFromRef(ref) {
+  const m = /^kb_tf_([0-9a-fA-F]{32})_/.exec(String(ref || ""));
+  if (!m) return null;
+  const h = m[1].toLowerCase();
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+// Book the expense for a SUCCESSFUL payout whose original booking we lost
+// (timeout / bookkeepingFailed) — the money left the pooled wallet, so the ledger
+// must reflect it. Shared by the payout.successful webhook AND the payout
+// reconcile. Idempotent via @@unique([businessId, reference]); attributes via the
+// businessId encoded in the reference (a non-attributable ref is a safe no-op).
+async function backfillFincraPayout({ reference, amount, currency, beneficiaryName }) {
+  const ref = String(reference || "");
+  const bizId = parseBizIdFromRef(ref);
+  if (!bizId) return { handled: false, reason: "unattributable" };
+  const biz = await prisma.business.findUnique({ where: { id: bizId } });
+  if (!biz) return { handled: false, reason: "no_business" };
+  const amt = Number(amount || 0);
+  if (amt <= 0) return { handled: false, reason: "no_amount" };
+  const cur = currency || biz.baseCurrency || "NGN";
+  const { total: fee, breakdown } = computeFincraTransferFee(amt, { internal: false });
+  try {
+    await prisma.transaction.create({
+      data: {
+        businessId: biz.id, userId: biz.userId, type: "expense", amount: amt, currency: cur,
+        description: `Transfer to ${beneficiaryName || "recipient"} · Ref: ${ref} (reconciled)`,
+        category: "transfer", paymentMethod: "bank", date: new Date(), source: "fincra",
+        reference: ref, fee, feeBreakdown: breakdown,
+      },
+    });
+  } catch (e) {
+    if (e.code === "P2002") return { handled: false, reason: "already_booked", businessId: biz.id };
+    throw e;
+  }
+  try { balanceCache.adjustBalance(biz.id, -(amt + fee)); } catch { /* noop */ }
+  await audit({
+    action: "TRANSFER_BACKFILLED", resourceType: "business", resourceId: biz.id, severity: "warning",
+    metadata: { reference: ref, amount: amt, fee, currency: cur },
+  }).catch(() => {});
+  return { handled: true, outcome: "backfilled", businessId: biz.id, amount: amt, fee };
+}
+
+module.exports = { recordFincraPayoutOutcome, parseBizIdFromRef, backfillFincraPayout };

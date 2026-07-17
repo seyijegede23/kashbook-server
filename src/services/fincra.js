@@ -124,6 +124,17 @@ function listCollections({ business = process.env.FINCRA_BUSINESS_ID, perPage = 
   return fincraFetch(`/collections?${q.toString()}`);
 }
 
+// List disbursements/payouts for the merchant. GET /disbursements/payouts?business=
+// → data:{ results:[...], total, nextCursor }. Items carry customerReference (our
+// ref), status, amountSent, beneficiaryName, fee. Used by the payout reconcile to
+// resolve sends whose settlement we lost to a timeout. Cursor-paginated.
+function listPayouts({ business = process.env.FINCRA_BUSINESS_ID, perPage = 100, cursor } = {}) {
+  const q = new URLSearchParams({ business: business || "" });
+  if (perPage) q.set("perPage", String(perPage));
+  if (cursor) q.set("cursor", String(cursor));
+  return fincraFetch(`/disbursements/payouts?${q.toString()}`);
+}
+
 // Create a bank-account payout. Endpoint CONFIRMED: POST /disbursements/payouts
 // (sandbox 422 "amount is required" on a partial body confirms the route).
 // Body: { business, sourceCurrency, destinationCurrency, amount, description,
@@ -165,6 +176,7 @@ module.exports = {
   resolveAccount,
   createPayout,
   listCollections,
+  listPayouts,
   verifyWebhookSignature,
   BASE,
 };
