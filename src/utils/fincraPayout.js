@@ -13,28 +13,32 @@ const balanceCache = require("./balanceCache");
 const { audit } = require("./audit");
 const { computeFincraTransferFee } = require("../config/fees");
 
-async function recordFincraPayoutOutcome(d, outcome) {
+async function recordFincraPayoutOutcome(d, outcome, source = "fincra") {
   const reference = d.customerReference || d.reference || d.merchantReference || d.id || d._id;
   if (!reference) return { handled: false, reason: "no_reference" };
+  // Korapay carries the businessId in metadata (its reference is length-capped);
+  // Fincra encodes it in the reference. Either way it attributes an orphan.
+  const bizId = d.metadata?.business_id || d.metadata?.businessId || null;
 
-  // The optimistic expense booked by executeFincraPayout (reference === the
-  // customerReference we sent Fincra). No match → we lost the booking (timeout /
+  // The optimistic expense booked at send time (reference === the customerReference
+  // we sent the provider). No match → we lost the booking (timeout /
   // bookkeepingFailed) OR it's a foreign/mis-parsed event.
   const expense = await prisma.transaction.findFirst({
-    where: { source: "fincra", type: "expense", reference: String(reference) },
+    where: { source, type: "expense", reference: String(reference) },
   });
 
   if (outcome === "success") {
     if (expense) return { handled: true, outcome: "success", businessId: expense.businessId };
-    // Orphaned success — the money left Fincra but our booking was lost. Backfill
-    // it here (event-driven, no scan window) so the ledger isn't left overstated.
-    // Attribution is keyed to the businessId encoded in the reference; a
-    // non-attributable ref is a safe no-op.
+    // Orphaned success — the money left but our booking was lost. Backfill it here
+    // (event-driven, no scan window) so the ledger isn't left overstated. A
+    // non-attributable ref/metadata is a safe no-op.
     return backfillFincraPayout({
       reference,
       amount: d.amountSent || d.amount || d.amountReceived,
       currency: d.sourceCurrency || d.currency,
-      beneficiaryName: d.beneficiaryName || d.accountHolderName,
+      beneficiaryName: d.beneficiaryName || d.accountHolderName || d.customer?.name,
+      source,
+      bizId,
     });
   }
 
@@ -58,7 +62,7 @@ async function recordFincraPayoutOutcome(d, outcome) {
         category: "transfer",
         paymentMethod: "bank",
         date: new Date(),
-        source: "fincra",
+        source,
         reference: reversalRef,
       },
     });
@@ -95,22 +99,25 @@ function parseBizIdFromRef(ref) {
 // must reflect it. Shared by the payout.successful webhook AND the payout
 // reconcile. Idempotent via @@unique([businessId, reference]); attributes via the
 // businessId encoded in the reference (a non-attributable ref is a safe no-op).
-async function backfillFincraPayout({ reference, amount, currency, beneficiaryName }) {
+async function backfillFincraPayout({ reference, amount, currency, beneficiaryName, source = "fincra", bizId = null }) {
   const ref = String(reference || "");
-  const bizId = parseBizIdFromRef(ref);
-  if (!bizId) return { handled: false, reason: "unattributable" };
-  const biz = await prisma.business.findUnique({ where: { id: bizId } });
+  const attributedBizId = bizId || parseBizIdFromRef(ref); // Korapay: from metadata; Fincra: from the ref
+  if (!attributedBizId) return { handled: false, reason: "unattributable" };
+  const biz = await prisma.business.findUnique({ where: { id: attributedBizId } });
   if (!biz) return { handled: false, reason: "no_business" };
   const amt = Number(amount || 0);
   if (amt <= 0) return { handled: false, reason: "no_amount" };
   const cur = currency || biz.baseCurrency || "NGN";
-  const { total: fee, breakdown } = computeFincraTransferFee(amt, { internal: false });
+  // Fee: pass-through the provider fee for Korapay (unknown here → 0), Fincra's 1.5%.
+  const { total: fee, breakdown } = source === "fincra"
+    ? computeFincraTransferFee(amt, { internal: false })
+    : { total: 0, breakdown: null };
   try {
     await prisma.transaction.create({
       data: {
         businessId: biz.id, userId: biz.userId, type: "expense", amount: amt, currency: cur,
         description: `Transfer to ${beneficiaryName || "recipient"} · Ref: ${ref} (reconciled)`,
-        category: "transfer", paymentMethod: "bank", date: new Date(), source: "fincra",
+        category: "transfer", paymentMethod: "bank", date: new Date(), source,
         reference: ref, fee, feeBreakdown: breakdown,
       },
     });

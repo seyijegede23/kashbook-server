@@ -7,11 +7,11 @@ const { getProvider } = require("../providers");
 const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { verifyTransactionPin } = require("../utils/transactionPin");
-const { runPreTransferChecks } = require("../utils/amlChecks");
+const { runPreTransferChecks, MONEY_OUT_SOURCES } = require("../utils/amlChecks");
 const { audit } = require("../utils/audit");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
-const { computeTransferFee, computeFincraTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
+const { computeTransferFee, computeFincraTransferFee, computeKorapayTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
 const {
   STEP_UP_OTP_ABOVE,
   TRANSFER_OTP_TYPE,
@@ -163,7 +163,7 @@ router.get("/limits", async (req, res) => {
         businessId: biz.id,
         type: "expense",
         category: "transfer",
-        source: "anchor",
+        source: { in: MONEY_OUT_SOURCES }, // must match runPreTransferChecks (amlChecks.js)
         date: { gte: since30d },
       },
       select: { amount: true, date: true },
@@ -257,9 +257,38 @@ router.get("/fee-quote", async (req, res) => {
     if (!amount || amount <= 0)
       return res.status(400).json({ error: "amount required" });
 
+    // Resolve the provider from the ACTUAL business the send will use — the same
+    // getProvider(biz) that /send uses — so the quote can't diverge from the charge.
+    // req.user carries no country field (auth middleware never sets it), so we must
+    // NOT resolve from req.user.country; fall back to the NG default only when no
+    // business is supplied. Honours both the country config and the sticky rule.
+    const userId = req.user.accountType === "staff" ? req.user.employerId : req.user.id;
+    const biz = req.query.businessId
+      ? await prisma.business.findFirst({ where: { id: String(req.query.businessId), userId } })
+      : null;
+    const provider = biz ? getProvider(biz) : getProvider(req.user.country || "NG");
+    // Internal-destination detection for pooled providers keys on providerAccountId
+    // (Korapay + Fincra both stamp it); a KashBook→KashBook send is a free book move.
+    const isInternalPooled = async () => {
+      if (!/^\d{10}$/.test(accountNumber)) return false;
+      const dest = await prisma.business.findFirst({
+        where: { virtualAccountNumber: accountNumber, providerAccountId: { not: null } },
+        select: { id: true },
+      });
+      return !!dest;
+    };
+
+    // Korapay: flat NGN payout fee (estimate — Korapay returns the actual fee at
+    // send time; executeKorapayPayout books that pass-through). Must be quoted here
+    // and NOT via the Fincra 1.5% branch below (Korapay also has unifiedProvisioning).
+    if (provider.key === "korapay") {
+      const internal = await isInternalPooled();
+      const { total, breakdown } = computeKorapayTransferFee(amount, { internal });
+      return res.json({ fee: total, breakdown, route: internal ? "book" : "payout", total: amount + total });
+    }
+
     // Fincra: external pay-out fee is 1.5% (1% Fincra + 0.5% margin); internal
     // KashBook→KashBook book transfers are free. Match executeFincraPayout.
-    const provider = getProvider(req.user.country || "NG");
     if (provider.unifiedProvisioning) {
       let internal = false;
       if (/^\d{10}$/.test(accountNumber)) {

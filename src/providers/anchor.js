@@ -10,6 +10,7 @@ const PaymentProvider = require("./PaymentProvider");
 const anchor = require("../utils/anchor");
 
 class AnchorProvider extends PaymentProvider {
+  get key() { return "anchor"; }
   get supportsBanking() { return true; }
   get supportsForeignAccounts() { return false; }
 

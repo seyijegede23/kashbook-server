@@ -10,11 +10,12 @@ const { pushTo } = require("./pushNotification");
 const { buildInboundNotification, buildInboundDescription } = require("./inboundCreditNotification");
 const balanceCache = require("./balanceCache");
 
-async function recordFincraInboundCredit(d) {
+async function recordFincraInboundCredit(d, source = "fincra") {
   const accountNumber = String(
-    d.virtualAccount?.accountNumber || d.destinationAccountNumber || d.accountNumber || "",
+    d.virtualAccount?.accountNumber || d.destinationAccountNumber || d.accountNumber
+      || d.virtual_bank_account?.account_number || d.account_number || "",
   );
-  const amount = Number(d.amount || d.amountReceived || 0);
+  const amount = Number(d.amount || d.amountReceived || d.amount_paid || 0);
   const currency = d.currency || "NGN";
   const reference = d.reference || d.id || d._id;
   if (!accountNumber || amount <= 0 || !reference) return { recorded: false, reason: "invalid" };
@@ -46,7 +47,7 @@ async function recordFincraInboundCredit(d) {
         category: "transfer",
         paymentMethod: "bank",
         date: new Date(),
-        source: "fincra",
+        source,
         reference,
       },
     });

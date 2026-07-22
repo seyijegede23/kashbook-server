@@ -53,6 +53,7 @@ const adminRoutes = require("./src/routes/admin");
 const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
 const fincraWebhookRoute = require("./src/routes/fincra");
+const korapayWebhookRoute = require("./src/routes/korapay");
 const instagramRoutes = require("./src/routes/instagram");
 const instagramWebhookRoute = require("./src/routes/instagramWebhook");
 const whatsappRoutes = require("./src/routes/whatsapp");
@@ -199,6 +200,14 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   fincraWebhookRoute,
 );
+// Korapay webhook — raw body for the HMAC-SHA256 verify (header x-korapay-signature,
+// signed over the `data` object).
+app.use(
+  "/webhooks/korapay",
+  webhookLimiter,
+  express.raw({ type: "application/json", limit: "1mb" }),
+  korapayWebhookRoute,
+);
 // Instagram messaging webhook — same raw-body-before-json requirement so the
 // X-Hub-Signature-256 HMAC verifies against the exact bytes Meta sent. The GET
 // handshake carries no body, so express.raw is a no-op for it.
@@ -340,18 +349,23 @@ app.use((err, req, res, _next) => {
 // ── Start server (Prisma connects lazily — no explicit connect needed) ────────
 app.listen(PORT, () => console.log(`KashBook API running on port ${PORT}`));
 
-// ── Background loop: reconcile Anchor inbound credits every 5 min ────────────
-// Belt-and-braces safety net so users still get credits + push notifications
-// even when Anchor's webhook delivery drops or the event isn't subscribed.
-// Per-business calls are throttled inside the loop to stay under Anchor's
-// rate limit.
-require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
+// ── DORMANT: Anchor + Fincra reconcile loops ─────────────────────────────────
+// Korapay is the only active provider (Jul 2026). Anchor + Fincra are kept in the
+// tree but unwired/reversible. These boot loops are disabled: there are no Anchor
+// businesses (the loop would be a no-op) and the Fincra loop polls merchant-wide
+// feeds (wasted API calls + a cron-lock 4005 collision) with no Fincra businesses.
+// The /webhooks/anchor + /webhooks/fincra mounts stay in place (inert, fail-closed)
+// so an existing sticky-Anchor account or a re-activated Fincra country still works.
+// Re-enable by uncommenting if Anchor/Fincra is ever reactivated.
+//   require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
+//   require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
-// ── Background loop: reconcile Fincra inbound credits every 5 min ────────────
-// The webhook is the primary money-in path; this backfills any collection whose
-// collection.successful webhook Fincra failed to deliver (or that we 500'd on).
-// Idempotent (Transaction @@unique) + conservative (successful collections only).
-require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
+// ── Background loop: Korapay reconcile (money-in + money-out) every 5 min ─────
+// The durability net for the sole active provider. Backfills any successful pay-in
+// the webhook missed (GET /pay-ins → /charges) and reverses/backfills payouts vs
+// Korapay's authoritative status (GET /payouts + getPayout). Idempotent + leader-
+// elected (cron lock 4011). Field shapes are sandbox-verified.
+require("./src/utils/korapayReconcile").startKorapayReconcileLoop(5 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────
 // Summary of today's money in/out per user, or a nudge if nothing was

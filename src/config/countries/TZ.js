@@ -26,7 +26,10 @@ module.exports = {
     { code: "limited_company",     label: "Limited Company",      regCode: "Private_Incorporated" },
   ],
 
-  paymentProvider: "fincra",
+  // Bookkeeping-only: no local TZS banking provider. Anchor is Nigeria-only and
+  // Korapay has no TZS virtual accounts (only mobile-money collection + FX), so
+  // Tanzania has no account/payout rail. Revisit if a TZS provider is added.
+  paymentProvider: null,
 
   regionLabel: "Region",
   regions: require("./regions/TZ"),

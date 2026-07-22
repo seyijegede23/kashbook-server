@@ -25,7 +25,7 @@ module.exports = {
     { code: "limited_company",     label: "Limited Company",      regCode: "Private_Incorporated" },
   ],
 
-  paymentProvider: "fincra", // Anchor→Fincra swap (Jul 2026). Instant NGN VA; Fincra allocates the partner bank.
+  paymentProvider: "korapay", // Nigeria runs on Korapay (one-call NGN virtual accounts). Anchor kept dormant/reversible (Jul 2026).
 
   regionLabel: "State",
   regions: require("./regions/NG"),

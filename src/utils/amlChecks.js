@@ -17,6 +17,12 @@ const { runRules } = require("./amlRules");
 const { audit } = require("./audit");
 const { verifyOtp } = require("./otp");
 
+// Every money-out source that counts toward a business's cumulative velocity
+// limits. MUST include the active provider or the daily/weekly/monthly caps
+// silently never trip (Korapay books source:"korapay", Fincra "fincra", Anchor
+// "anchor"). The /transfers/limits UI query MUST use the same set (transfers.js).
+const MONEY_OUT_SOURCES = ["anchor", "fincra", "korapay"];
+
 // Pick the identifier we'll send the step-up OTP to. Email is preferred
 // (free, faster to deliver in this market); phone is the fallback when no
 // email is on file. Caller is responsible for actually dispatching.
@@ -126,7 +132,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp, bypassOt
       businessId: business.id,
       type: "expense",
       category: "transfer",
-      source: "anchor",
+      source: { in: MONEY_OUT_SOURCES },
       date: { gte: since30d },
     },
     select: { amount: true, date: true },
@@ -359,4 +365,4 @@ async function recordComplianceFlags({ userId, businessId, business, transaction
   });
 }
 
-module.exports = { runPreTransferChecks, recordComplianceFlags };
+module.exports = { runPreTransferChecks, recordComplianceFlags, MONEY_OUT_SOURCES };

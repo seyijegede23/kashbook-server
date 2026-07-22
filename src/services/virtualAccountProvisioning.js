@@ -559,6 +559,9 @@ async function provisionViaUnifiedProvider({ provider, biz, user, body, req }) {
         email: user.email || undefined,
         bvn: bvn || undefined,
       },
+      // Korapay stamps this as the NGN account_name (what payers see); Fincra
+      // ignores it. Business name for the account, per the account-name rule.
+      businessName: biz.name,
       merchantReference,
     });
   } catch (e) {

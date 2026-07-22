@@ -46,6 +46,7 @@ function readAccount(res) {
 }
 
 class FincraProvider extends PaymentProvider {
+  get key() { return "fincra"; }
   get supportsBanking() { return true; }
   get supportsForeignAccounts() { return true; }
   get unifiedProvisioning() { return true; }    // one-call local provisioning

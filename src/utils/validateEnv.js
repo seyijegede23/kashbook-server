@@ -26,6 +26,25 @@ function validateEnv() {
     problems.push("ANCHOR_VERIFY_WEBHOOK=false disables signature checks — forbidden in production");
   }
 
+  // Korapay is the active provider (banking + payouts + webhooks). Its secret key
+  // is BOTH the API bearer AND the webhook HMAC secret, so a missing/sandbox key
+  // breaks provisioning, payouts, and inbound-credit verification.
+  const korapayKey = process.env.KORAPAY_SECRET_KEY || "";
+  if (!korapayKey) {
+    problems.push("KORAPAY_SECRET_KEY is not set (Korapay provisioning/payouts/webhooks all fail)");
+  } else if (isProd && korapayKey.startsWith("sk_test_")) {
+    problems.push("KORAPAY_SECRET_KEY is a sandbox key (sk_test_*) in production — no real money moves");
+  }
+  if (isProd && process.env.KORAPAY_VERIFY_WEBHOOK === "false") {
+    problems.push("KORAPAY_VERIFY_WEBHOOK=false disables signature checks — forbidden in production");
+  }
+  // The NGN virtual-account sponsor bank. "000" is Korapay's SANDBOX test bank; a
+  // prod deploy that forgets to set a live sponsor code would silently issue every
+  // merchant a test-bank NUBAN that can't receive real money.
+  if (isProd && (!process.env.KORAPAY_VBA_BANK_CODE || process.env.KORAPAY_VBA_BANK_CODE === "000")) {
+    problems.push("KORAPAY_VBA_BANK_CODE is unset or the sandbox test bank (000) in production — accounts would be issued on the test bank");
+  }
+
   // Dojah: a sandbox key (test_sk_*) pointed at the live endpoint (or vice-versa)
   // silently breaks KYC/KYB — flag the mismatch.
   const dojahKey = process.env.DOJAH_SECRET_KEY || "";
