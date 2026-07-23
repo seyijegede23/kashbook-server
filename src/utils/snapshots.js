@@ -4,6 +4,7 @@
 const prisma = require("./db");
 const { collectHealth } = require("./healthCheck");
 const { getMetrics } = require("./metrics");
+const { collectLedgerIntegrity } = require("./ledgerReconcile");
 
 // Record that a cron ran (freshness signal read by collectHealth).
 async function recordHeartbeat(name, status = "ok", error = null) {
@@ -21,6 +22,10 @@ async function recordHeartbeat(name, status = "ok", error = null) {
 async function takeHealthSnapshot() {
   const health = await collectHealth();
   const m = getMetrics();
+  // Ledger integrity — the pool-vs-ledger coverage + negative-balance self-check.
+  // Computed here (cron-only) so GET /admin-api/health stays light. Attached to the
+  // health object for checkAlerts and persisted for trend/forensics.
+  health.ledger = await collectLedgerIntegrity();
   await prisma.metricSnapshot.create({
     data: {
       kind: "health",
@@ -31,6 +36,7 @@ async function takeHealthSnapshot() {
         dbLatencyMs: health.db?.latencyMs ?? null,
         errors: health.errors,
         heldTransactions: health.heldTransactions,
+        ledger: health.ledger,
         requests: { total: m.totalRequests, errors5xx: m.errors5xx, errorRate5xx: m.errorRate5xx },
       },
     },
@@ -57,7 +63,7 @@ async function collectAnalytics() {
     premiumUsers,
     newUsers24h,
     activeBusinesses,
-    revenueTotal: revAgg._sum.amount || 0,
+    revenueTotal: Number(revAgg._sum.amount || 0), // Decimal → Number before the JSON snapshot write
     transfers24h,
     bills24h,
     failedMoney24h,

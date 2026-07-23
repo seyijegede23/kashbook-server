@@ -39,8 +39,8 @@ async function sendDailyReports() {
   const statsByBusiness = new Map();
   for (const g of grouped) {
     const s = statsByBusiness.get(g.businessId) || { income: 0, expense: 0, count: 0 };
-    if (g.type === "income") s.income += g._sum.amount || 0;
-    else if (g.type === "expense") s.expense += g._sum.amount || 0;
+    if (g.type === "income") s.income += Number(g._sum.amount || 0);
+    else if (g.type === "expense") s.expense += Number(g._sum.amount || 0);
     s.count += g._count._all;
     statsByBusiness.set(g.businessId, s);
   }

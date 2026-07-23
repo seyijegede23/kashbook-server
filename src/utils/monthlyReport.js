@@ -115,22 +115,22 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   };
   for (const g of [...salesG, ...txIncomeG]) {
     const s = get(g.businessId);
-    s.income += g._sum.amount || 0;
+    s.income += Number(g._sum.amount || 0);
     s.count += g._count._all;
   }
   for (const g of [...expG, ...txExpenseG]) {
     const s = get(g.businessId);
-    s.expense += g._sum.amount || 0;
+    s.expense += Number(g._sum.amount || 0);
     s.count += g._count._all;
   }
   for (const g of [...prevSalesG, ...prevTxIncomeG]) {
-    get(g.businessId).prevIncome += g._sum.amount || 0;
+    get(g.businessId).prevIncome += Number(g._sum.amount || 0);
   }
   // Expense categories from both sources, merged per (business, category).
   const catTotals = new Map(); // "bizId|category" → amount
   for (const g of [...expCats, ...txExpCats]) {
     const key = `${g.businessId}|${g.category || "other"}`;
-    catTotals.set(key, (catTotals.get(key) || 0) + (g._sum.amount || 0));
+    catTotals.set(key, (catTotals.get(key) || 0) + Number(g._sum.amount || 0));
   }
   for (const [key, amount] of catTotals) {
     if (amount <= 0) continue;

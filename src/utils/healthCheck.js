@@ -11,6 +11,7 @@ const CRON_INTERVAL_MIN = {
   recurringExpenses: 24 * 60,
   reminders: 5,
   reconcile: 5,
+  "korapay-reconcile": 5, // the loop records this heartbeat name (korapayReconcile.js) — stale at >10 min
   snapshot: 10,
   kycPurge: 24 * 60,
   instagramTokenRefresh: 24 * 60,

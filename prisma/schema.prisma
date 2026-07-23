@@ -514,7 +514,7 @@ model Transaction {
   businessId        String
   business          Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   type              String
-  amount            Float
+  amount            Decimal   @db.Decimal(18, 2) // exact money (Phase C1); reads convert to Number at the API + arithmetic boundaries
   description       String?
   category          String?
   customerId        String?
@@ -540,7 +540,7 @@ model Transaction {
   // Outbound-transfer fee charged to the user (₦51/₦101 pass-through + margin).
   // `amount` stays the transfer amount so income/expense reports are truthful;
   // the fee is its own field. Zero for everything that isn't an external transfer.
-  fee               Float     @default(0)
+  fee               Decimal   @default(0) @db.Decimal(18, 2) // exact money (Phase C1)
   feeBreakdown      Json? // { nip, stampDuty, platform }
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt

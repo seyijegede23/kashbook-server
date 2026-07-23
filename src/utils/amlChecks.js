@@ -16,12 +16,14 @@ const {
 const { runRules } = require("./amlRules");
 const { audit } = require("./audit");
 const { verifyOtp } = require("./otp");
+const { PROVIDER_SOURCES } = require("../config/moneySources");
 
-// Every money-out source that counts toward a business's cumulative velocity
-// limits. MUST include the active provider or the daily/weekly/monthly caps
-// silently never trip (Korapay books source:"korapay", Fincra "fincra", Anchor
-// "anchor"). The /transfers/limits UI query MUST use the same set (transfers.js).
-const MONEY_OUT_SOURCES = ["anchor", "fincra", "korapay"];
+// Money-out sources that count toward a business's cumulative velocity limits —
+// the SAME provider allowlist the spendable ledger uses (config/moneySources), so
+// AML and the balance can never drift apart. Without the active provider here the
+// daily/weekly/monthly caps silently never trip. The /transfers/limits UI query
+// MUST use the same set (transfers.js imports MONEY_OUT_SOURCES).
+const MONEY_OUT_SOURCES = PROVIDER_SOURCES;
 
 // Pick the identifier we'll send the step-up OTP to. Email is preferred
 // (free, faster to deliver in this market); phone is the fallback when no
@@ -140,7 +142,7 @@ async function runPreTransferChecks({ req, user, business, amount, otp, bypassOt
   });
 
   const sum = (since, list = recent30) =>
-    list.filter((t) => t.date >= since).reduce((s, t) => s + t.amount, 0);
+    list.filter((t) => t.date >= since).reduce((s, t) => s + Number(t.amount), 0);
 
   const dailySoFar   = sum(since24h);
   const weeklySoFar  = sum(since7d);

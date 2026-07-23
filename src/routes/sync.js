@@ -7,6 +7,8 @@
 const router = require("express").Router();
 const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
+const { isBankLedgerRow } = require("../config/moneySources");
+const { audit } = require("../utils/audit");
 
 router.use(auth);
 
@@ -194,6 +196,13 @@ async function processOp(op, userId, userName) {
     // ── Transactions ──────────────────────────────────────────────────────────
     case "add_transaction": {
       await assertOwns(data.businessId);
+      // A synced offline row is manual bookkeeping only. Never let the client mint
+      // a bank-ledger row (that would inflate the spendable balance): reject a
+      // "bank" method or any provider source, and never copy those fields into the
+      // create (paymentMethod defaults to "cash").
+      if (data.paymentMethod === "bank" || data.source) {
+        throw Object.assign(new Error("Bank transactions can't be created here."), { code: "BANK_ROW_FORBIDDEN" });
+      }
       await prisma.transaction.upsert({
         where: { id: data.id },
         create: {
@@ -216,6 +225,17 @@ async function processOp(op, userId, userName) {
       const tx = await prisma.transaction.findUnique({ where: { id: data.id } });
       if (tx) {
         await assertOwns(tx.businessId);
+        // Bank-ledger rows are provider-owned + append-only. Deleting one would
+        // silently change the spendable balance (re-inflate a payout, drop a
+        // credit) — refuse and leave an audit trail. Manual/cash rows stay deletable.
+        if (isBankLedgerRow(tx)) {
+          await audit({
+            actorOverride: { type: "user", id: userId }, // attribute the blocked attempt to the caller
+            action: "SYNC_DELETE_BANK_BLOCKED", resourceType: "transaction", resourceId: tx.id,
+            severity: "warning", metadata: { source: tx.source, paymentMethod: tx.paymentMethod, category: tx.category, businessId: tx.businessId },
+          }).catch(() => {});
+          throw Object.assign(new Error("Bank transactions can't be deleted."), { code: "BANK_ROW_IMMUTABLE" });
+        }
         await prisma.transaction.delete({ where: { id: data.id } });
       }
       break;

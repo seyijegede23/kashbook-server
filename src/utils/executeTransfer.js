@@ -22,7 +22,7 @@ const { pushTo } = require("./pushNotification");
 const { audit } = require("./audit");
 const { recordComplianceFlags } = require("./amlChecks");
 const { formatAmountForBusiness } = require("../config/amlLimits");
-const { computeTransferFee, computeFincraTransferFee, computeKorapayTransferFee } = require("../config/fees");
+const { computeTransferFee, computeFincraTransferFee, computeKorapayTransferFee, MONEY_EPS } = require("../config/fees");
 const { getProvider } = require("../providers");
 const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("./ledgerBalance");
@@ -111,7 +111,7 @@ async function executeTransfer({
 
   // 3. Live balance check — must cover the transfer AND the fee.
   const { balance } = await anchor.getAccountBalance(business.anchorAccountId);
-  if (balance < Number(amount) + fee) {
+  if (balance + MONEY_EPS < Number(amount) + fee) {
     const err = new Error(
       fee > 0
         ? `Insufficient balance. This transfer needs ${formatAmountForBusiness(business, Number(amount) + fee)} (includes ${formatAmountForBusiness(business, fee)} fee). Available: ${formatAmountForBusiness(business, balance)}`
@@ -338,7 +338,7 @@ async function executeFincraPayout({
   const balance = provider.pooledWallet
     ? await computeLedgerBalance(business.id, currency)
     : Number((await provider.getAccountBalance(business.providerAccountId, currency))?.balance ?? 0);
-  if (balance < Number(amount) + fee) {
+  if (balance + MONEY_EPS < Number(amount) + fee) {
     const err = new Error(`Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`);
     err.code = "INSUFFICIENT_BALANCE";
     err.availableBalance = balance;
@@ -455,7 +455,7 @@ async function executeKorapayPayout({
 
   // Gate on the business's own ledger (pooled).
   const balance = await computeLedgerBalance(business.id, currency);
-  if (balance < Number(amount) + customerFee) {
+  if (balance + MONEY_EPS < Number(amount) + customerFee) {
     const err = new Error(`Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`);
     err.code = "INSUFFICIENT_BALANCE";
     err.availableBalance = balance;
@@ -529,6 +529,18 @@ async function executeFincraBookTransfer({ business, userId, amount, dest, narra
   const ref = reference || `kb_bk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const currency = getCountryConfig(business.country)?.currency?.code || business.baseCurrency || "NGN";
 
+  // Both legs are booked in ONE currency (below). If the recipient's base currency
+  // differs, crediting them in the sender's currency would make the money invisible
+  // to their balance (which filters by their own currency) — and a real cross-currency
+  // move needs FX we don't do here. Reject rather than mis-credit. (Latent while all
+  // accounts are NGN; guards the moment a second currency exists.)
+  const destCurrency = getCountryConfig(dest.country)?.currency?.code || dest.baseCurrency || currency;
+  if (destCurrency !== currency) {
+    const err = new Error("Cross-currency transfers between KashBook accounts aren't supported yet.");
+    err.code = "CROSS_CURRENCY_UNSUPPORTED";
+    throw err;
+  }
+
   // Idempotency — the send was already booked → skip.
   const existing = await prisma.transaction.findFirst({
     where: { businessId: business.id, source, reference: ref },
@@ -538,7 +550,7 @@ async function executeFincraBookTransfer({ business, userId, amount, dest, narra
 
   // Sender spends from ITS OWN ledger (pooled model), not the shared wallet.
   const balance = await computeLedgerBalance(business.id, currency);
-  if (balance < Number(amount)) {
+  if (balance + MONEY_EPS < Number(amount)) {
     const err = new Error(`Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`);
     err.code = "INSUFFICIENT_BALANCE";
     err.availableBalance = balance;

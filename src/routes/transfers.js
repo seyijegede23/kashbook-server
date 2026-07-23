@@ -170,7 +170,7 @@ router.get("/limits", async (req, res) => {
       orderBy: { date: "asc" },
     });
     const sumSince = (since) =>
-      recent30.filter((t) => t.date >= since).reduce((s, t) => s + t.amount, 0);
+      recent30.filter((t) => t.date >= since).reduce((s, t) => s + Number(t.amount), 0);
 
     const dailySoFar   = sumSince(since24h);
     const weeklySoFar  = sumSince(since7d);
@@ -328,7 +328,16 @@ router.post("/send", async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Staff cannot initiate transfers" });
 
-  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin, otp } = req.body;
+  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin, otp, idempotencyKey } = req.body;
+  // Client-supplied idempotency key → a STABLE payout reference so a retry after a
+  // timed-out-but-succeeded send hits the existing-reference short-circuit instead
+  // of a second real disburse. Keep the "kbtf_" prefix (the money-out reconcile
+  // attributes only refs starting with it). Absent → executeKorapayPayout mints a
+  // fresh random ref (unchanged behaviour).
+  const idemSanitized = idempotencyKey ? String(idempotencyKey).replace(/[^a-zA-Z0-9]/g, "").slice(0, 40) : "";
+  // Empty after sanitizing (a degenerate/punctuation-only key) → fall back to a
+  // fresh random ref, so it can't collide across all of a user's sends.
+  const idempotentRef = idemSanitized ? `kbtf_${idemSanitized}` : undefined;
   if (!businessId || !accountNumber || !bankCode || !amount)
     return res.status(400).json({ error: "Missing required fields" });
   if (isNaN(amount) || Number(amount) <= 0)
@@ -429,6 +438,7 @@ router.post("/send", async (req, res) => {
         accountName,
         bankName,
         narration,
+        reference: idempotentRef,
         amlCheck,
         req,
         notify: false, // route doesn't push — client UI shows the success state itself

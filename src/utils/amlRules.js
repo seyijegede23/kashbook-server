@@ -28,7 +28,7 @@ function ruleStructuring({ amount, history24h, business }) {
   const t = getThresholds(business);
   const w = t.velocity;
   const candidates = [...history24h, { amount, date: new Date() }].filter(
-    (x) => x.amount >= t.structuringSubThreshold && x.amount < t.singleFlagAbove,
+    (x) => Number(x.amount) >= t.structuringSubThreshold && Number(x.amount) < t.singleFlagAbove,
   );
   if (candidates.length < w.structuringCount) return null;
   return {
@@ -68,10 +68,10 @@ function ruleVelocitySpike({ amount, history30d, businessAgeDays, business }) {
   todayStart.setHours(0, 0, 0, 0);
   const today = history30d
     .filter((x) => new Date(x.date) >= todayStart)
-    .reduce((s, x) => s + x.amount, 0);
+    .reduce((s, x) => s + Number(x.amount), 0);
   const earlier = history30d
     .filter((x) => new Date(x.date) < todayStart)
-    .reduce((s, x) => s + x.amount, 0);
+    .reduce((s, x) => s + Number(x.amount), 0);
   const days = Math.max(1, Math.min(30, businessAgeDays));
   const dailyAvg = earlier / days;
   const projected = today + amount;

@@ -671,7 +671,7 @@ async function sumIncome(businessId, range, channel) {
     }),
   ]);
   return {
-    total: (sales._sum.amount || 0) + (bank._sum.amount || 0),
+    total: Number(sales._sum.amount || 0) + Number(bank._sum.amount || 0),
     count: sales._count._all + bank._count._all,
   };
 }
@@ -688,7 +688,7 @@ async function sumExpenses(businessId, range) {
     }),
   ]);
   return {
-    total: (exp._sum.amount || 0) + (bank._sum.amount || 0),
+    total: Number(exp._sum.amount || 0) + Number(bank._sum.amount || 0),
     count: exp._count._all + bank._count._all,
   };
 }
@@ -697,7 +697,7 @@ async function sumExpenses(businessId, range) {
 function mergeSums(target, rows, keyOf) {
   for (const r of rows) {
     const key = keyOf(r);
-    target.set(key, (target.get(key) || 0) + (r._sum.amount || 0));
+    target.set(key, (target.get(key) || 0) + Number(r._sum.amount || 0)); // Number(): Transaction _sum is Decimal
   }
   return target;
 }

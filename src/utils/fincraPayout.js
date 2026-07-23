@@ -11,7 +11,7 @@ const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const balanceCache = require("./balanceCache");
 const { audit } = require("./audit");
-const { computeFincraTransferFee } = require("../config/fees");
+const { computeFincraTransferFee, computeKorapayTransferFee } = require("../config/fees");
 
 async function recordFincraPayoutOutcome(d, outcome, source = "fincra") {
   const reference = d.customerReference || d.reference || d.merchantReference || d.id || d._id;
@@ -78,7 +78,7 @@ async function recordFincraPayoutOutcome(d, outcome, source = "fincra") {
     resourceType: "business",
     resourceId: expense.businessId,
     severity: "warning",
-    metadata: { reference: String(reference), amount: expense.amount, currency: expense.currency },
+    metadata: { reference: String(reference), amount: Number(expense.amount), currency: expense.currency },
   }).catch(() => {});
 
   return { handled: true, outcome: "failed", businessId: expense.businessId, reversed: Number(expense.amount) };
@@ -108,9 +108,11 @@ async function backfillFincraPayout({ reference, amount, currency, beneficiaryNa
   const amt = Number(amount || 0);
   if (amt <= 0) return { handled: false, reason: "no_amount" };
   const cur = currency || biz.baseCurrency || "NGN";
-  // Fee: pass-through the provider fee for Korapay (unknown here → 0), Fincra's 1.5%.
-  const { total: fee, breakdown } = source === "fincra"
-    ? computeFincraTransferFee(amt, { internal: false })
+  // Fee must MATCH what the live send path books, or a backfilled payout leaves the
+  // ledger overstated vs the pool: Fincra 1.5%, Korapay flat ₦50 (was wrongly 0).
+  const { total: fee, breakdown } =
+    source === "fincra" ? computeFincraTransferFee(amt, { internal: false })
+    : source === "korapay" ? computeKorapayTransferFee(amt, { internal: false })
     : { total: 0, breakdown: null };
   try {
     await prisma.transaction.create({

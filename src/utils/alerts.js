@@ -4,6 +4,7 @@ const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const { sendEmail } = require("./otp");
 const { getMetrics } = require("./metrics");
+const { MONEY_EPS } = require("../config/fees");
 
 const COOLDOWN_MS = 60 * 60 * 1000; // 1h per rule — avoids alert storms
 
@@ -61,6 +62,26 @@ async function checkAlerts(health = {}) {
       if (await fire("money_held", "Money events held for review",
         `${health.heldTransactions} transaction(s) are held for compliance review.`))
         fired.push("money_held");
+    }
+
+    // Ledger integrity (Phase B). COVERAGE: the pooled wallet must always be >= the
+    // sum of every business's spendable balance — a shortfall is undercollateralized
+    // (the pool can't honour all balances). NEGATIVE: no business's raw ledger may be
+    // below zero (corruption the display floor hides). Both are top-severity money bugs.
+    const ledger = health.ledger || {};
+    for (const c of ledger.perProvider || []) {
+      if (c.poolAvailable != null && c.shortfall > MONEY_EPS) {
+        const key = `ledger_pool_shortfall_${c.provider}_${c.currency}`;
+        if (await fire(key, "Ledger exceeds the wallet",
+          `${c.provider}/${c.currency}: business balances total ${c.spendable} but the wallet holds only ${c.poolAvailable} (short ${c.shortfall}). The pool can't cover all balances — freeze payouts and investigate.`))
+          fired.push(key);
+      }
+    }
+    if ((ledger.negatives || []).length) {
+      const n = ledger.negatives;
+      if (await fire("ledger_negative", "Negative business ledger(s)",
+        `${n.length} business ledger(s) went negative (money booked out that was never in — corruption the display hides): ${n.slice(0, 5).map((x) => `${x.businessId.slice(0, 8)}=${x.raw}${x.currency}`).join(", ")}${n.length > 5 ? " …" : ""}.`))
+        fired.push("ledger_negative");
     }
   } catch (e) {
     console.error("[alerts] checkAlerts failed:", e.message);

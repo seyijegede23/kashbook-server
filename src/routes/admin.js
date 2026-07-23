@@ -248,7 +248,7 @@ router.get("/revenue", async (req, res) => {
     }
     transactions.forEach((t) => {
       const key = new Date(t.date).toISOString().slice(0, 10);
-      if (key in map) map[key] += t.amount;
+      if (key in map) map[key] += Number(t.amount);
     });
 
     res.json(

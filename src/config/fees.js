@@ -15,6 +15,12 @@
 // after the NIP transfer succeeds. No ANCHOR_FEE_ACCOUNT_ID → fees are
 // disabled: quotes return ₦0 and nothing is collected.
 
+// Float money tolerance (½ kobo). Bridges IEEE-754 drift on balance-gate
+// comparisons and the pool-vs-ledger invariant until Phase C moves money to an
+// exact type — a shortfall smaller than this is treated as zero so a legitimate
+// send isn't blocked for a sub-kobo rounding artifact.
+const MONEY_EPS = 0.005;
+
 const NIP_FEE = 50;
 const STAMP_DUTY = 50;
 const STAMP_DUTY_THRESHOLD = 10000; // strictly over — ₦10,000.00 exactly pays no duty
@@ -81,6 +87,7 @@ function computeKorapayTransferFee(amount, { internal = false } = {}) {
 }
 
 module.exports = {
+  MONEY_EPS,
   NIP_FEE,
   STAMP_DUTY,
   STAMP_DUTY_THRESHOLD,

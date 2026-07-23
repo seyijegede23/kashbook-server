@@ -234,6 +234,9 @@ app.use((_req, res, next) => {
   res.setHeader("ngrok-skip-browser-warning", "1");
   next();
 });
+// Phase C1: money columns are Prisma Decimal — deep-convert them back to plain
+// Numbers in every JSON response so the client API contract stays numbers.
+app.use(require("./src/utils/decimalJson").decimalJsonMiddleware);
 app.use(express.static(path.join(__dirname, "public")));
 
 // ── Input sanitizer ───────────────────────────────────────────────────────────

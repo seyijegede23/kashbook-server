@@ -2,6 +2,13 @@ const router = require("express").Router();
 const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
 const { normalizeChannel } = require("../utils/salesChannel");
+const { isBankLedgerRow } = require("../config/moneySources");
+const { audit } = require("../utils/audit");
+
+// This router is NOT mounted today (manual bookkeeping goes to Sales/Expense), but
+// the client still references it. These guards ensure that even if it were mounted
+// it can NEVER create, edit, or delete a real bank-ledger row (which would corrupt
+// the spendable balance). Bank rows are provider-owned + append-only.
 
 router.use(auth);
 
@@ -72,6 +79,13 @@ router.post("/", async (req, res) => {
   if (!(await ownsBusiness(req,businessId)))
     return res.status(403).json({ error: "Forbidden" });
 
+  // Never create a bank-ledger row here — that's real money owned by the provider
+  // webhook/transfer paths, and a manual "bank" income would inflate the spendable
+  // balance. Reject a "bank" method or a client-supplied source.
+  if (paymentMethod === "bank" || req.body.source) {
+    return res.status(403).json({ error: "Bank transactions are created by the banking system, not here.", code: "BANK_ROW_FORBIDDEN" });
+  }
+
   try {
     const tx = await prisma.transaction.create({
       data: {
@@ -103,6 +117,13 @@ router.patch("/:id", async (req, res) => {
     if (!(await ownsBusiness(req,tx.businessId)))
       return res.status(403).json({ error: "Forbidden" });
     const { amount, description, category, paymentMethod, date } = req.body;
+    // Refuse to edit a bank-ledger row, or to convert a manual row INTO one — either
+    // would move the spendable balance behind the banking system's back.
+    if (isBankLedgerRow(tx) || paymentMethod === "bank" || req.body.source
+        || (paymentMethod === undefined && category === "transfer" && tx.paymentMethod === "bank")) {
+      await audit({ req, action: "TXN_EDIT_BANK_BLOCKED", resourceType: "transaction", resourceId: tx.id, severity: "warning", metadata: { source: tx.source, paymentMethod: tx.paymentMethod, category: tx.category } }).catch(() => {});
+      return res.status(403).json({ error: "Bank transactions can't be edited.", code: "BANK_ROW_IMMUTABLE" });
+    }
     const updated = await prisma.transaction.update({
       where: { id: req.params.id },
       data: {
@@ -128,6 +149,12 @@ router.delete("/:id", async (req, res) => {
     if (!tx) return res.status(404).json({ error: "Transaction not found" });
     if (!(await ownsBusiness(req,tx.businessId)))
       return res.status(403).json({ error: "Forbidden" });
+
+    // Deleting a bank-ledger row would re-inflate/understate the spendable balance.
+    if (isBankLedgerRow(tx)) {
+      await audit({ req, action: "TXN_DELETE_BANK_BLOCKED", resourceType: "transaction", resourceId: tx.id, severity: "warning", metadata: { source: tx.source, paymentMethod: tx.paymentMethod, category: tx.category } }).catch(() => {});
+      return res.status(403).json({ error: "Bank transactions can't be deleted.", code: "BANK_ROW_IMMUTABLE" });
+    }
 
     await prisma.transaction.delete({ where: { id: req.params.id } });
     res.json({ message: "Deleted" });
@@ -183,7 +210,7 @@ router.post("/:id/match-debt", async (req, res) => {
       orderBy: { date: "asc" },
     });
 
-    let remaining = tx.amount;
+    let remaining = Number(tx.amount);
     for (const debt of unpaidDebts) {
       if (remaining <= 0) break;
       const outstanding = debt.amount - debt.paidAmount;
@@ -208,7 +235,7 @@ router.post("/:id/match-debt", async (req, res) => {
     // Link transaction to customer
     await prisma.transaction.update({ where: { id: tx.id }, data: { matchedCustomerId: customerId } });
 
-    res.json({ matched: true, amountApplied: tx.amount - remaining });
+    res.json({ matched: true, amountApplied: Number(tx.amount) - remaining });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to match debt" });

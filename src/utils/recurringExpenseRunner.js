@@ -184,24 +184,29 @@ async function runAutoDebit(rec, now) {
   // 2. Deterministic reference for idempotency.
   const reference = `kashbook_rec_${rec.id}_${new Date(rec.nextDue).getTime()}`;
 
-  // 3. Execute the transfer.
+  // 3. Execute the transfer UNDER the per-business advisory lock — the same lock
+  // the interactive /send holds (routes/transfers.js). Without it a cron auto-debit
+  // and a manual send (or two auto-debits) could both read computeLedgerBalance
+  // before either books its expense, both pass the gate, and overdraw the pool.
   try {
-    await executeTransfer({
-      business,
-      userId: rec.userId,
-      amount: Number(rec.amount),
-      accountNumber: rec.payeeAccountNumber,
-      bankCode: rec.payeeBankCode,
-      accountName: rec.payeeAccountName,
-      bankName: rec.payeeBankName,
-      narration: rec.notes
-        ? `Auto-debit · ${rec.notes}`
-        : `Auto-debit · recurring ${rec.category}`,
-      reference,
-      amlCheck,
-      req: null,
-      notify: true,
-    });
+    await prisma.withBusinessLock(business.id, () =>
+      executeTransfer({
+        business,
+        userId: rec.userId,
+        amount: Number(rec.amount),
+        accountNumber: rec.payeeAccountNumber,
+        bankCode: rec.payeeBankCode,
+        accountName: rec.payeeAccountName,
+        bankName: rec.payeeBankName,
+        narration: rec.notes
+          ? `Auto-debit · ${rec.notes}`
+          : `Auto-debit · recurring ${rec.category}`,
+        reference,
+        amlCheck,
+        req: null,
+        notify: true,
+      }),
+    );
 
     await prisma.recurringExpense.update({
       where: { id: rec.id },
