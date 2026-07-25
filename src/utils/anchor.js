@@ -447,12 +447,18 @@ async function createVirtualNuban({ settlementAccountId, name, bvn, reference, p
 // flow works regardless of which product the org enabled, without an ops env change.
 // ANCHOR_INDIVIDUAL_PRODUCT / an explicit productName just sets which we try FIRST.
 async function createDepositAccount({ customerId, productName, customerType = "BusinessCustomer" }) {
-  // Products VALID for this customer type. SAVINGS is individual-only; CURRENT works
-  // for both. Anchor rejects SAVINGS on a BusinessCustomer with "not allowed for the
-  // selected customer type", so we never try it there (business path stays a single
-  // CURRENT attempt, unchanged).
+  // Products VALID for this customer type, confirmed against LIVE Anchor:
+  //   - IndividualCustomer → SAVINGS only. CURRENT is rejected with "Product,
+  //     CURRENT not eligible for customer type, IndividualCustomer" (CURRENT needs
+  //     a BusinessCustomer / KYB). So SAVINGS is the ONLY openable individual
+  //     product — if the org has it disabled, the account cannot open until Anchor
+  //     enables the SAVINGS deposit product for the organization.
+  //   - BusinessCustomer → CURRENT only. SAVINGS is rejected with "not allowed for
+  //     the selected customer type".
+  // Each type therefore has exactly one product; the loop below still guards against
+  // an org that disabled it by surfacing the precise "not enabled" error.
   const typeValid =
-    customerType === "IndividualCustomer" ? ["SAVINGS", "CURRENT"] : ["CURRENT"];
+    customerType === "IndividualCustomer" ? ["SAVINGS"] : ["CURRENT"];
   const preferred =
     productName ||
     (customerType === "BusinessCustomer" ? "CURRENT" : "SAVINGS");
