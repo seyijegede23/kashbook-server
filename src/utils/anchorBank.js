@@ -36,15 +36,21 @@ async function openIndividualBankAccount({ biz, customerId, bvn }) {
     throw new Error(`openIndividualBankAccount: no BVN available for business ${biz.id}`);
   }
 
-  // 1. Settlement deposit account (SAVINGS — individual only). Reuse an existing
-  //    one if a prior attempt already opened it (anchorAccountId set but NUBAN
-  //    write failed mid-way).
+  // 1. Settlement deposit account for the individual. Reuse an existing one if a
+  //    prior attempt already opened it (anchorAccountId set but NUBAN write failed
+  //    mid-way).
+  //
+  //    Product name is org-dependent on LIVE: the deposit product must be enabled
+  //    for the Anchor organization or the create fails with "The product <NAME> is
+  //    not enabled in this organization". Sandbox had SAVINGS on by default; a live
+  //    org commonly has CURRENT instead. ANCHOR_INDIVIDUAL_PRODUCT lets ops match
+  //    whatever Anchor enabled without a code change (default keeps sandbox behavior).
   let accountId = biz.anchorAccountId;
   if (!accountId) {
     const acc = await anchor.createDepositAccount({
       customerId,
       customerType: "IndividualCustomer",
-      productName: "SAVINGS",
+      productName: process.env.ANCHOR_INDIVIDUAL_PRODUCT || "SAVINGS",
     });
     accountId = acc.accountId;
   }

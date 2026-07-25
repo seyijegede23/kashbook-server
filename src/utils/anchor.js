@@ -437,30 +437,74 @@ async function createVirtualNuban({ settlementAccountId, name, bvn, reference, p
 // Must be called AFTER customer.identification.approved fires.
 // productName: "SAVINGS" (IndividualCustomer only) or "CURRENT" (both types).
 // customerType: "BusinessCustomer" (default) or "IndividualCustomer"
-// Anchor rejects SAVINGS on BusinessCustomer with "The product SAVINGS is not
-// allowed for the selected customer type", so default by customer type.
+//
+// Which deposit products exist is ORG-DEPENDENT: a live org may have CURRENT but
+// not SAVINGS (or vice-versa). Anchor rejects a disabled product with "The product
+// <NAME> is not enabled in this organization", and a type-mismatched one with "The
+// product <NAME> is not allowed for the selected customer type". BOTH are clean
+// pre-create validation rejections — no account is created — so on those (and only
+// those) we transparently fall through to the alternate product. This means the
+// flow works regardless of which product the org enabled, without an ops env change.
+// ANCHOR_INDIVIDUAL_PRODUCT / an explicit productName just sets which we try FIRST.
 async function createDepositAccount({ customerId, productName, customerType = "BusinessCustomer" }) {
-  const product =
+  // Products VALID for this customer type. SAVINGS is individual-only; CURRENT works
+  // for both. Anchor rejects SAVINGS on a BusinessCustomer with "not allowed for the
+  // selected customer type", so we never try it there (business path stays a single
+  // CURRENT attempt, unchanged).
+  const typeValid =
+    customerType === "IndividualCustomer" ? ["SAVINGS", "CURRENT"] : ["CURRENT"];
+  const preferred =
     productName ||
     (customerType === "BusinessCustomer" ? "CURRENT" : "SAVINGS");
-  const body = {
-    data: {
-      type: "DepositAccount",
-      attributes: { productName: product },
-      relationships: {
-        customer: { data: { type: customerType, id: customerId } },
+  // Try the preferred product first, then any other product valid for this type, so
+  // the open succeeds whichever one the org enabled. An explicit productName that
+  // isn't type-valid is dropped rather than sent to fail.
+  const candidates = [...new Set([preferred, ...typeValid])].filter((p) =>
+    typeValid.includes(p),
+  );
+
+  // ONLY this Anchor message means "that product isn't turned on for this org — safely
+  // try another". It's a pre-create validation rejection, so NO account is created.
+  // Any other error (auth, KYC-not-approved, customer-not-found, rate limit, other
+  // validation) is a real failure we must surface, never mask behind a fallback.
+  const isProductDisabled = (err) =>
+    /is not enabled in this organization/i.test(String(err && err.message));
+
+  let lastErr;
+  for (const product of candidates) {
+    const body = {
+      data: {
+        type: "DepositAccount",
+        attributes: { productName: product },
+        relationships: {
+          customer: { data: { type: customerType, id: customerId } },
+        },
       },
-    },
-  };
-  const res = await anchorFetch("/accounts", { method: "POST", body });
-  const attrs = res.data?.attributes ?? {};
-  return {
-    accountId: res.data?.id,
-    accountNumber: attrs.accountNumber,
-    accountName: attrs.accountName,
-    bankName: attrs.bank?.name || "Anchor",
-    raw: res.data,
-  };
+    };
+    try {
+      const res = await anchorFetch("/accounts", { method: "POST", body });
+      const attrs = res.data?.attributes ?? {};
+      if (product !== preferred) {
+        console.warn(
+          `[anchor] deposit product "${preferred}" not enabled for this org — opened "${product}" instead`,
+        );
+      }
+      return {
+        accountId: res.data?.id,
+        accountNumber: attrs.accountNumber,
+        accountName: attrs.accountName,
+        bankName: attrs.bank?.name || "Anchor",
+        productName: product,
+        raw: res.data,
+      };
+    } catch (err) {
+      lastErr = err;
+      if (!isProductDisabled(err)) throw err; // real failure — do not mask
+      console.warn(`[anchor] deposit product "${product}" not enabled: ${err.message}`);
+      // loop → try the next type-valid product
+    }
+  }
+  throw lastErr;
 }
 
 async function getAccountBalance(accountId) {
