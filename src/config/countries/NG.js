@@ -25,7 +25,7 @@ module.exports = {
     { code: "limited_company",     label: "Limited Company",      regCode: "Private_Incorporated" },
   ],
 
-  paymentProvider: "korapay", // Nigeria runs on Korapay (one-call NGN virtual accounts). Anchor kept dormant/reversible (Jul 2026).
+  paymentProvider: "anchor", // Nigeria runs on Anchor. Korapay kept dormant/reversible (reverted to Anchor Jul 2026).
 
   regionLabel: "State",
   regions: require("./regions/NG"),

@@ -352,23 +352,17 @@ app.use((err, req, res, _next) => {
 // ── Start server (Prisma connects lazily — no explicit connect needed) ────────
 app.listen(PORT, () => console.log(`KashBook API running on port ${PORT}`));
 
-// ── DORMANT: Anchor + Fincra reconcile loops ─────────────────────────────────
-// Korapay is the only active provider (Jul 2026). Anchor + Fincra are kept in the
-// tree but unwired/reversible. These boot loops are disabled: there are no Anchor
-// businesses (the loop would be a no-op) and the Fincra loop polls merchant-wide
-// feeds (wasted API calls + a cron-lock 4005 collision) with no Fincra businesses.
-// The /webhooks/anchor + /webhooks/fincra mounts stay in place (inert, fail-closed)
-// so an existing sticky-Anchor account or a re-activated Fincra country still works.
-// Re-enable by uncommenting if Anchor/Fincra is ever reactivated.
-//   require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
-//   require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
+// ── Background loop: reconcile Anchor inbound credits every 5 min ────────────
+// Anchor is the active provider for Nigeria again (reverted from Korapay Jul 2026).
+// Belt-and-braces so users still get credits + push notifications even when Anchor's
+// webhook delivery drops. /webhooks/anchor is mounted above.
+require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 
-// ── Background loop: Korapay reconcile (money-in + money-out) every 5 min ─────
-// The durability net for the sole active provider. Backfills any successful pay-in
-// the webhook missed (GET /pay-ins → /charges) and reverses/backfills payouts vs
-// Korapay's authoritative status (GET /payouts + getPayout). Idempotent + leader-
-// elected (cron lock 4011). Field shapes are sandbox-verified.
-require("./src/utils/korapayReconcile").startKorapayReconcileLoop(5 * 60 * 1000);
+// ── DORMANT: Korapay + Fincra reconcile loops ────────────────────────────────
+// Korapay + Fincra are kept in the tree but unwired/reversible (NG reverted to
+// Anchor). Their webhook mounts stay inert. Re-enable by uncommenting if reactivated.
+//   require("./src/utils/korapayReconcile").startKorapayReconcileLoop(5 * 60 * 1000);
+//   require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────
 // Summary of today's money in/out per user, or a nudge if nothing was
