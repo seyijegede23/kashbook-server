@@ -26,23 +26,19 @@ function validateEnv() {
     problems.push("ANCHOR_VERIFY_WEBHOOK=false disables signature checks — forbidden in production");
   }
 
-  // Korapay is the active provider (banking + payouts + webhooks). Its secret key
-  // is BOTH the API bearer AND the webhook HMAC secret, so a missing/sandbox key
-  // breaks provisioning, payouts, and inbound-credit verification.
-  const korapayKey = process.env.KORAPAY_SECRET_KEY || "";
-  if (!korapayKey) {
-    problems.push("KORAPAY_SECRET_KEY is not set (Korapay provisioning/payouts/webhooks all fail)");
-  } else if (isProd && korapayKey.startsWith("sk_test_")) {
-    problems.push("KORAPAY_SECRET_KEY is a sandbox key (sk_test_*) in production — no real money moves");
+  // Anchor is the active provider (Nigeria banking + payouts + webhooks). Require
+  // the API key + base URL, and in production flag a SANDBOX base URL — going live
+  // against the sandbox would issue fake NUBANs and move no real money.
+  // (Korapay is dormant — NG reverted to Anchor; its keys, if present, are harmless
+  // and not required.)
+  if (!process.env.ANCHOR_API_KEY) {
+    problems.push("ANCHOR_API_KEY is not set (Anchor provisioning/payouts will fail)");
   }
-  if (isProd && process.env.KORAPAY_VERIFY_WEBHOOK === "false") {
-    problems.push("KORAPAY_VERIFY_WEBHOOK=false disables signature checks — forbidden in production");
-  }
-  // The NGN virtual-account sponsor bank. "000" is Korapay's SANDBOX test bank; a
-  // prod deploy that forgets to set a live sponsor code would silently issue every
-  // merchant a test-bank NUBAN that can't receive real money.
-  if (isProd && (!process.env.KORAPAY_VBA_BANK_CODE || process.env.KORAPAY_VBA_BANK_CODE === "000")) {
-    problems.push("KORAPAY_VBA_BANK_CODE is unset or the sandbox test bank (000) in production — accounts would be issued on the test bank");
+  const anchorUrl = process.env.ANCHOR_BASE_URL || "";
+  if (!anchorUrl) {
+    problems.push("ANCHOR_BASE_URL is not set");
+  } else if (isProd && anchorUrl.includes("sandbox")) {
+    problems.push("ANCHOR_BASE_URL points at the SANDBOX in production — flip it to the live endpoint (https://api.getanchor.co/api/v1)");
   }
 
   // Dojah: a sandbox key (test_sk_*) pointed at the live endpoint (or vice-versa)
