@@ -481,8 +481,13 @@ async function createDepositAccount({ customerId, productName, customerType = "B
         },
       },
     };
+    // Idempotency: key on (customer, product) so a retried create — e.g. the admin
+    // re-approves after a create whose HTTP response was lost — returns the SAME
+    // deposit account instead of minting a duplicate. Product-scoped so the SAVINGS
+    // and CURRENT attempts never reuse one key with a different body.
+    const idempotencyKey = `depacct-${String(customerId).replace(/[^A-Za-z0-9_-]/g, "")}-${product}`;
     try {
-      const res = await anchorFetch("/accounts", { method: "POST", body });
+      const res = await anchorFetch("/accounts", { method: "POST", body, idempotencyKey });
       const attrs = res.data?.attributes ?? {};
       if (product !== preferred) {
         console.warn(

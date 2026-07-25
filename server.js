@@ -350,7 +350,12 @@ app.use((err, req, res, _next) => {
 });
 
 // ── Start server (Prisma connects lazily — no explicit connect needed) ────────
-app.listen(PORT, () => console.log(`KashBook API running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`KashBook API running on port ${PORT}`);
+  // Build marker — lets a deploy's boot log confirm which code is live. Bump the
+  // tag when shipping a change whose presence you need to verify from the logs.
+  console.log("[boot] build=anchor-deposit-fallback+idem");
+});
 
 // ── Background loop: reconcile Anchor inbound credits every 5 min ────────────
 // Anchor is the active provider for Nigeria again (reverted from Korapay Jul 2026).
