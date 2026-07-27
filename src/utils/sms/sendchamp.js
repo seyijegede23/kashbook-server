@@ -78,9 +78,23 @@ async function sendSms(phone, message) {
       return;
     } catch (err) {
       clearTimeout(timer);
-      const cause = err?.cause?.code || err?.cause?.message || err?.cause || "";
+      // Dig the full reason out of err.cause (undici wraps the socket error, and
+      // when multiple addresses are tried it's an AggregateError with .errors[]).
+      const c = err?.cause;
+      const parts = [];
+      if (c?.code) parts.push(`code=${c.code}`);
+      if (c?.name && c.name !== "Error") parts.push(`name=${c.name}`);
+      if (c?.message) parts.push(`msg=${c.message}`);
+      if (Array.isArray(c?.errors)) {
+        parts.push(
+          "errors=[" +
+            c.errors.map((e) => `${e?.code || e?.name || ""}${e?.address ? "@" + e.address : ""}`).filter(Boolean).join("; ") +
+            "]",
+        );
+      }
+      const detail = parts.length ? parts.join(" ") : c ? String(c) : "";
       console.error(
-        `[Sendchamp SMS error] attempt ${attempt}/2: ${err.message}${cause ? ` (cause: ${cause})` : ""}`,
+        `[Sendchamp SMS error] attempt ${attempt}/2: ${err.message}${detail ? ` (cause: ${detail})` : ""}`,
       );
       if (attempt < 2) await new Promise((r) => setTimeout(r, 800));
     }

@@ -1,4 +1,10 @@
 require("dotenv").config();
+// Prefer IPv4 for ALL outbound DNS. Some upstreams (e.g. the Cloudflare-fronted
+// api.sendchamp.com) publish AAAA records, and this container has no working IPv6
+// egress — an IPv6-first connect from Node's fetch throws a bare "fetch failed".
+// Forcing IPv4-first fixes it; every host we call also resolves to an A record, so
+// this is a safe global default. Must run before any module opens a socket.
+try { require("dns").setDefaultResultOrder("ipv4first"); } catch {}
 // Sentry must initialize before express/route modules so it can auto-instrument
 // HTTP + Express. No-op when SENTRY_DSN is unset. Also registers its own
 // unhandledRejection / uncaughtException handlers (captures + flushes + exits).
@@ -354,7 +360,7 @@ app.listen(PORT, () => {
   console.log(`KashBook API running on port ${PORT}`);
   // Build marker — lets a deploy's boot log confirm which code is live. Bump the
   // tag when shipping a change whose presence you need to verify from the logs.
-  console.log("[boot] build=sendchamp-fetch-retry+cause");
+  console.log("[boot] build=sendchamp-ipv4first");
 });
 
 // ── Background loop: reconcile Anchor inbound credits every 5 min ────────────
