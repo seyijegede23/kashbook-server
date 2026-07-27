@@ -5,6 +5,13 @@
 //
 // API: POST https://api.sendchamp.com/api/v1/sms/send
 // Auth: Authorization: Bearer <public/access key>  (Account Settings → API Keys)
+//
+// NOTE: this uses Node's native `https` (not global fetch/undici). From Render,
+// fetch() to the Cloudflare-fronted Sendchamp host failed with a bare, code-less
+// undici "fetch failed"; the classic https stack with family:4 (force IPv4) both
+// sidesteps that and, on any real failure, surfaces a proper error code
+// (ECONNRESET / ETIMEDOUT / cert…) so the cause is diagnosable.
+const https = require("https");
 
 // Sendchamp wants international format WITHOUT a leading "+" (e.g. 2348012345678).
 function normalizePhoneForSendchamp(phone) {
@@ -14,6 +21,43 @@ function normalizePhoneForSendchamp(phone) {
   if (digits.length === 11 && digits.startsWith("0")) return "234" + digits.slice(1);
   if (digits.length === 10) return "234" + digits;
   return digits;
+}
+
+// Minimal JSON POST over the native https stack. Forces IPv4 and returns
+// { status, body } or rejects with a coded socket/TLS error.
+function httpsPostJson({ urlStr, headers, body, timeoutMs = 15000 }) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(urlStr);
+    } catch (e) {
+      return reject(e);
+    }
+    const payload = Buffer.from(body);
+    const req = https.request(
+      {
+        method: "POST",
+        hostname: u.hostname,
+        path: u.pathname + (u.search || ""),
+        port: u.port || 443,
+        family: 4, // force IPv4 — Cloudflare publishes AAAA; Render has no IPv6 egress
+        timeout: timeoutMs,
+        headers: { ...headers, "Content-Length": payload.length },
+      },
+      (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (d) => (data += d));
+        res.on("end", () => resolve({ status: res.statusCode, body: data }));
+      },
+    );
+    req.on("timeout", () =>
+      req.destroy(Object.assign(new Error("request timeout"), { code: "ETIMEDOUT" })),
+    );
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
 }
 
 async function sendSms(phone, message) {
@@ -35,56 +79,44 @@ async function sendSms(phone, message) {
   }
 
   const to = normalizePhoneForSendchamp(phone);
-  // Registered Sender ID (request one on the dashboard) or Sendchamp's default.
   const sender_name = process.env.SENDCHAMP_SENDER_ID || "Sendchamp";
   // Route: "dnd" is the transactional route that reaches numbers on Nigeria's DND
-  // list — REQUIRED for OTP so registered-DND users still get their code. Override
-  // with SENDCHAMP_ROUTE ("non_dnd" cheaper but skips DND numbers, "international").
+  // list — REQUIRED for OTP. Override with SENDCHAMP_ROUTE ("non_dnd" / "international").
   const route = process.env.SENDCHAMP_ROUTE || "dnd";
   const base = process.env.SENDCHAMP_BASE_URL || "https://api.sendchamp.com/api/v1";
   const url = `${base}/sms/send`;
-  const payload = JSON.stringify({ to: [to], message, sender_name, route });
+  const body = JSON.stringify({ to: [to], message, sender_name, route });
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
 
-  // Retry once on a NETWORK-level failure ("fetch failed" = the request never
-  // reached Sendchamp — a transient DNS/connect blip, common right after a cold
-  // boot). A real HTTP response (even 4xx/5xx) is NOT retried. On failure we log
-  // err.cause (the undici reason: ENOTFOUND / ECONNREFUSED / connect timeout, …),
-  // not just "fetch failed", so a persistent problem is diagnosable.
+  // Retry once on a network-level failure (transient connect blip). A real HTTP
+  // response (even 4xx/5xx) is NOT retried.
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
     try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: payload,
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      const data = await res.json().catch(() => ({}));
+      const { status, body: resBody } = await httpsPostJson({ urlStr: url, headers, body });
+      let data = {};
+      try {
+        data = resBody ? JSON.parse(resBody) : {};
+      } catch {
+        /* non-JSON body — leave data empty, handled below */
+      }
       const ok =
-        res.ok &&
+        status >= 200 &&
+        status < 300 &&
         (data.status === "success" || String(data.status) === "200" || String(data.code) === "200");
       if (!ok) {
-        console.error(`[Sendchamp SMS error] http ${res.status}: ${JSON.stringify(data)}`);
+        console.error(`[Sendchamp SMS error] http ${status}: ${String(resBody).slice(0, 300)}`);
         return; // real response — do not retry
       }
       const id = data?.data?.id || data?.data?.[0]?.id || data?.data?.reference;
       console.log(`[Sendchamp SMS sent]${id ? ` id=${id}` : ""}`);
       return;
     } catch (err) {
-      clearTimeout(timer);
-      // Full dump — err.cause is a bare Error whose useful fields (code/errno/
-      // syscall/address) are non-enumerable, so showHidden:true is needed to see
-      // them. This finally names the real reason (ECONNRESET / ETIMEDOUT / cert / …).
-      const util = require("util");
       console.error(
-        `[Sendchamp SMS error] attempt ${attempt}/2: ${err.message}\n  cause=` +
-          util.inspect(err.cause, { depth: 6, showHidden: true }),
+        `[Sendchamp SMS error] attempt ${attempt}/2 (https): ${err.code || err.message}`,
       );
       if (attempt < 2) await new Promise((r) => setTimeout(r, 800));
     }
