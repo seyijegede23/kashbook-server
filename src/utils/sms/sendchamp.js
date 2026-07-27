@@ -78,23 +78,13 @@ async function sendSms(phone, message) {
       return;
     } catch (err) {
       clearTimeout(timer);
-      // Dig the full reason out of err.cause (undici wraps the socket error, and
-      // when multiple addresses are tried it's an AggregateError with .errors[]).
-      const c = err?.cause;
-      const parts = [];
-      if (c?.code) parts.push(`code=${c.code}`);
-      if (c?.name && c.name !== "Error") parts.push(`name=${c.name}`);
-      if (c?.message) parts.push(`msg=${c.message}`);
-      if (Array.isArray(c?.errors)) {
-        parts.push(
-          "errors=[" +
-            c.errors.map((e) => `${e?.code || e?.name || ""}${e?.address ? "@" + e.address : ""}`).filter(Boolean).join("; ") +
-            "]",
-        );
-      }
-      const detail = parts.length ? parts.join(" ") : c ? String(c) : "";
+      // Full dump — err.cause is a bare Error whose useful fields (code/errno/
+      // syscall/address) are non-enumerable, so showHidden:true is needed to see
+      // them. This finally names the real reason (ECONNRESET / ETIMEDOUT / cert / …).
+      const util = require("util");
       console.error(
-        `[Sendchamp SMS error] attempt ${attempt}/2: ${err.message}${detail ? ` (cause: ${detail})` : ""}`,
+        `[Sendchamp SMS error] attempt ${attempt}/2: ${err.message}\n  cause=` +
+          util.inspect(err.cause, { depth: 6, showHidden: true }),
       );
       if (attempt < 2) await new Promise((r) => setTimeout(r, 800));
     }
