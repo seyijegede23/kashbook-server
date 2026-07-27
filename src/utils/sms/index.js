@@ -5,11 +5,13 @@ const { getCountryConfig } = require("../../config/countries");
 const termii = require("./termii");
 const africasTalking = require("./africas_talking");
 const awsSns = require("./aws_sns");
+const sendchamp = require("./sendchamp");
 
 const ADAPTERS = {
   termii,
   africas_talking: africasTalking,
   aws_sns: awsSns,
+  sendchamp,
 };
 
 function pickAdapter(country) {

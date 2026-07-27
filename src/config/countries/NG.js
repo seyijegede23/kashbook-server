@@ -43,5 +43,5 @@ module.exports = {
   regulators: ["CBN", "NFIU"],
   primaryAct: "Money Laundering (Prevention and Prohibition) Act, 2022",
 
-  smsProvider: "africas_talking",
+  smsProvider: "sendchamp", // Nigerian SMS/OTP provider; Termii + Africa's Talking adapters remain available
 };
