@@ -42,27 +42,48 @@ async function sendSms(phone, message) {
   // with SENDCHAMP_ROUTE ("non_dnd" cheaper but skips DND numbers, "international").
   const route = process.env.SENDCHAMP_ROUTE || "dnd";
   const base = process.env.SENDCHAMP_BASE_URL || "https://api.sendchamp.com/api/v1";
+  const url = `${base}/sms/send`;
+  const payload = JSON.stringify({ to: [to], message, sender_name, route });
 
-  try {
-    const res = await fetch(`${base}/sms/send`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({ to: [to], message, sender_name, route }),
-    });
-    const data = await res.json().catch(() => ({}));
-    const ok = res.ok && (data.status === "success" || String(data.code) === "200");
-    if (!ok) {
-      console.error(`[Sendchamp SMS error] ${res.status}: ${JSON.stringify(data)}`);
+  // Retry once on a NETWORK-level failure ("fetch failed" = the request never
+  // reached Sendchamp — a transient DNS/connect blip, common right after a cold
+  // boot). A real HTTP response (even 4xx/5xx) is NOT retried. On failure we log
+  // err.cause (the undici reason: ENOTFOUND / ECONNREFUSED / connect timeout, …),
+  // not just "fetch failed", so a persistent problem is diagnosable.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: payload,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const data = await res.json().catch(() => ({}));
+      const ok =
+        res.ok &&
+        (data.status === "success" || String(data.status) === "200" || String(data.code) === "200");
+      if (!ok) {
+        console.error(`[Sendchamp SMS error] http ${res.status}: ${JSON.stringify(data)}`);
+        return; // real response — do not retry
+      }
+      const id = data?.data?.id || data?.data?.[0]?.id || data?.data?.reference;
+      console.log(`[Sendchamp SMS sent]${id ? ` id=${id}` : ""}`);
       return;
+    } catch (err) {
+      clearTimeout(timer);
+      const cause = err?.cause?.code || err?.cause?.message || err?.cause || "";
+      console.error(
+        `[Sendchamp SMS error] attempt ${attempt}/2: ${err.message}${cause ? ` (cause: ${cause})` : ""}`,
+      );
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 800));
     }
-    const id = data?.data?.id || data?.data?.[0]?.id || data?.data?.reference;
-    console.log(`[Sendchamp SMS sent]${id ? ` id=${id}` : ""}`);
-  } catch (err) {
-    console.error(`[Sendchamp SMS error] ${err.message}`);
   }
 }
 
