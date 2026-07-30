@@ -509,11 +509,18 @@ router.post("/", async (req, res) => {
       eventType === "payment.settled" ||
       eventType === "payment.received"
     ) {
+      // LIVE payload shape (verified 2026-07-30 via the keys-only probe): the
+      // whole payment — amount, narration, counterParty (sender!), and
+      // virtualNuban (our receiving account number) — nests under
+      // attributes.payment. Sandbox/classic shapes keep flat attrs. Read the
+      // nested shape first, fall through to every flat variant.
+      const pay = attrs.payment || {};
       const accountNumber =
+        pay.virtualNuban?.accountNumber ||
         attrs.destinationAccountNumber ||
         attrs.creditAccount?.accountNumber ||
         attrs.accountNumber;
-      const amountRaw = Number(attrs.amount || 0);
+      const amountRaw = Number(pay.amount ?? attrs.amount ?? 0);
       // Anchor amounts are in kobo — always divide by 100. (The old
       // `> 100000 ? /100 : raw` guard mis-recorded any transfer ≤ ₦1,000 at
       // 100× its value, e.g. a ₦10 credit = 1000 kobo became ₦1,000.)
@@ -529,26 +536,49 @@ router.post("/", async (req, res) => {
         return;
       }
 
-      // Sender lives on the linked Payment for NIP inbound; fall back to it when
-      // the webhook attrs don't already carry a counterParty name.
-      const paymentId = rels.payment?.data?.id || attrs.paymentId || "";
-      const { sender, narration } = await resolveInboundSender(attrs, paymentId);
-      const sessionId = attrs.sessionId || attrs.reference || "";
+      // One NIP credit fires several events (payment.received AND
+      // payment.settled), and the 5-min reconcile poller books the same money
+      // from /transactions. All paths converge on ONE row via the UNIQUE
+      // Transaction.reference keyed on Anchor's paymentId — whoever books
+      // first wins, every other writer hits P2002 and skips.
+      const paymentKey =
+        pay.paymentId || pay.paymentReference || rels.payment?.data?.id || attrs.paymentId || "";
+      const reference = paymentKey ? `anc_pay_${paymentKey}` : null;
+
+      // Sender: live payloads carry counterParty inline on the payment object
+      // (extractSender reads it); older shapes resolve via the linked Payment.
+      const { sender, narration } = await resolveInboundSender({ ...attrs, ...pay }, paymentKey);
+      const sessionId = pay.paymentReference || attrs.sessionId || attrs.reference || "";
       const description = buildInboundDescription({ sender, narration, reference: sessionId });
 
-      await prisma.transaction.create({
-        data: {
-          businessId: biz.id,
-          userId: biz.userId,
-          type: "income",
-          amount,
-          description,
-          category: "transfer",
-          paymentMethod: "bank",
-          date: attrs.transactionDate ? new Date(attrs.transactionDate) : new Date(),
-          source: "anchor",
-        },
-      });
+      try {
+        await prisma.transaction.create({
+          data: {
+            businessId: biz.id,
+            userId: biz.userId,
+            type: "income",
+            amount,
+            description,
+            category: "transfer",
+            paymentMethod: "bank",
+            date: pay.paidAt
+              ? new Date(pay.paidAt)
+              : attrs.transactionDate
+              ? new Date(attrs.transactionDate)
+              : new Date(),
+            source: "anchor",
+            ...(reference ? { reference } : {}),
+          },
+        });
+      } catch (createErr) {
+        if (createErr.code === "P2002") {
+          console.log(
+            `[Anchor webhook] credit ${reference} already booked (another event or reconcile) — skipping`,
+          );
+          return;
+        }
+        throw createErr;
+      }
 
       const { title, body } = buildInboundNotification({
         business: biz,

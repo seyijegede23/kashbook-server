@@ -127,21 +127,38 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     const flagSeverity = frozen ? "high" : (flagCTR ? "medium" : null);
     const complianceStatus = frozen ? "held" : (flagCTR ? "flagged" : "clean");
 
-    const txn = await prisma.transaction.create({
-      data: {
-        businessId: biz.id,
-        userId: biz.userId,
-        type: "income",
-        amount,
-        description,
-        category: "transfer",
-        paymentMethod: "bank",
-        date: a.createdAt ? new Date(a.createdAt) : new Date(),
-        source: "anchor",
-        flagSeverity,
-        complianceStatus,
-      },
-    });
+    // Cross-path dedup with the webhook: both writers key the UNIQUE
+    // ([businessId, reference]) on Anchor's paymentId when the credit has a
+    // linked Payment (the webhook only knows the paymentId, never the anc_txn
+    // id). A credit the webhook already booked makes this create hit P2002 —
+    // skip it, that's the design working.
+    const paymentId = t.relationships?.payment?.data?.id || "";
+    const dbReference = paymentId ? `anc_pay_${paymentId}` : `anc_txn_${reference}`;
+
+    let txn;
+    try {
+      txn = await prisma.transaction.create({
+        data: {
+          businessId: biz.id,
+          userId: biz.userId,
+          type: "income",
+          amount,
+          description,
+          category: "transfer",
+          paymentMethod: "bank",
+          date: a.createdAt ? new Date(a.createdAt) : new Date(),
+          source: "anchor",
+          reference: dbReference,
+          flagSeverity,
+          complianceStatus,
+        },
+      });
+    } catch (createErr) {
+      if (createErr.code === "P2002") {
+        continue; // webhook (or a concurrent tick) already booked this credit
+      }
+      throw createErr;
+    }
 
     // Persist ComplianceFlag rows for any inbound that warrants review.
     if (frozen || flagCTR) {
