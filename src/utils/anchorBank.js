@@ -53,31 +53,80 @@ async function openIndividualBankAccount({ biz, customerId, bvn }) {
       productName: process.env.ANCHOR_INDIVIDUAL_PRODUCT || "SAVINGS",
     });
     accountId = acc.accountId;
+    // Persist the account link IMMEDIATELY — before the NUBAN attempt. If the
+    // NUBAN step fails, (a) a re-approve reuses this account instead of relying
+    // only on Anchor's 24h idempotency window, and (b) the accountNumber.created
+    // webhook can match the business (it looks up by anchorAccountId) and write
+    // the account's own number as a fallback.
+    await prisma.business.update({
+      where: { id: biz.id },
+      data: { anchorAccountId: accountId, virtualAccountId: accountId, virtualAccountRef: accountId },
+    });
   }
 
   // 2. Business-named virtual NUBAN settling into it. `reference` keyed on the
   //    business id makes the create idempotent (Anchor returns the same NUBAN on
   //    a retry within the idempotency window).
-  const nuban = await anchor.createVirtualNuban({
-    settlementAccountId: accountId,
-    name: biz.name,
-    bvn: rawBvn,
-    reference: `kb-${biz.id}`,
-  });
+  try {
+    const nuban = await anchor.createVirtualNuban({
+      settlementAccountId: accountId,
+      name: biz.name,
+      bvn: rawBvn,
+      reference: `kb-${biz.id}`,
+    });
 
-  await prisma.business.update({
-    where: { id: biz.id },
-    data: {
-      anchorAccountId: accountId,
-      virtualAccountId: accountId,
-      virtualAccountRef: accountId,
-      virtualAccountNumber: nuban.accountNumber,
-      virtualAccountName: nuban.accountName || biz.name,
-      virtualAccountBank: nuban.bankName || "Providus Bank",
-    },
-  });
+    await prisma.business.update({
+      where: { id: biz.id },
+      data: {
+        virtualAccountNumber: nuban.accountNumber,
+        virtualAccountName: nuban.accountName || biz.name,
+        virtualAccountBank: nuban.bankName || "Providus Bank",
+      },
+    });
 
-  return { accountId, ...nuban };
+    return { accountId, ...nuban, businessNamed: true };
+  } catch (e) {
+    // Org/product limitation seen on LIVE: "The settlement account product does
+    // not support creating virtual nuban via the specified provider" — Providus
+    // virtual NUBANs can't settle into a SAVINGS account on this organization.
+    // FALL BACK to the deposit account's OWN NUBAN: a real, payable account
+    // number, just named after the PERSON (legal name) instead of the business.
+    // When Anchor enables business-named NUBANs on SAVINGS, minting the pretty
+    // one and overwriting these fields upgrades the account in place.
+    const unsupported = /does not support creating virtual nuban/i.test(String(e && e.message));
+    if (!unsupported) throw e;
+    console.warn(
+      `[anchorBank] business-named NUBAN unavailable for ${biz.name} (${e.message}) — using the settlement account's own number`,
+    );
+    let own = null;
+    try {
+      own = await anchor.getAccount(accountId);
+    } catch (fetchErr) {
+      console.warn(`[anchorBank] getAccount fallback failed: ${fetchErr.message}`);
+    }
+    // Only accept a REAL unmasked NUBAN (some Anchor payloads mask the number);
+    // otherwise leave it to the accountNumber.created webhook, which carries the
+    // full number and already writes it for a business matched by anchorAccountId.
+    const full = own && /^\d{10}$/.test(String(own.accountNumber || ""));
+    if (full) {
+      await prisma.business.update({
+        where: { id: biz.id },
+        data: {
+          virtualAccountNumber: own.accountNumber,
+          virtualAccountName: own.accountName || biz.name,
+          virtualAccountBank: own.bankName || "Anchor",
+        },
+      });
+      return {
+        accountId,
+        accountNumber: own.accountNumber,
+        accountName: own.accountName || biz.name,
+        bankName: own.bankName || "Anchor",
+        businessNamed: false,
+      };
+    }
+    return { accountId, pendingNuban: true };
+  }
 }
 
 module.exports = { openIndividualBankAccount };

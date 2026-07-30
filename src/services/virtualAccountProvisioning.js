@@ -465,6 +465,18 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
   // 3. KYC verified — open the bank account synchronously.
   if (customerType === "IndividualCustomer") {
     const r = await openIndividualBankAccount({ biz, customerId, bvn });
+    // pendingNuban: the settlement account exists but its number hasn't been
+    // issued yet — the accountNumber.created webhook writes it within moments
+    // (the business is already linked via anchorAccountId).
+    if (r.pendingNuban) {
+      return {
+        httpStatus: 202,
+        body: {
+          status: "pending_account",
+          message: "Account created — the account number is being issued and will appear shortly.",
+        },
+      };
+    }
     return {
       httpStatus: 200,
       body: {

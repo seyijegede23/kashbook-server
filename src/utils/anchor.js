@@ -497,7 +497,7 @@ async function createDepositAccount({ customerId, productName, customerType = "B
       const attrs = res.data?.attributes ?? {};
       if (product !== preferred) {
         console.warn(
-          `[anchor] deposit product "${preferred}" not enabled for this org — opened "${product}" instead`,
+          `[anchor] preferred deposit product "${preferred}" unavailable (disabled or not valid for ${customerType}) — opened "${product}"`,
         );
       }
       return {
