@@ -76,6 +76,15 @@ router.post("/", async (req, res) => {
       rawBody.toString("utf8").slice(0, 400),
     );
   }
+  // TEMP shape probe (live-payload adapter work): log a keys-only skeleton —
+  // structure without values, so no PII/amounts hit the logs. Remove once the
+  // live adapter is settled.
+  const skeleton = (o, depth = 0) => {
+    if (depth > 3 || o == null || typeof o !== "object") return typeof o;
+    if (Array.isArray(o)) return o.length ? [skeleton(o[0], depth + 1)] : [];
+    return Object.fromEntries(Object.entries(o).map(([k, v]) => [k, skeleton(v, depth + 1)]));
+  };
+  console.log(`[Anchor webhook] shape ${eventType}:`, JSON.stringify(skeleton(event)));
 
   try {
     // ── Idempotency: process each delivered event at most once ───────────────
