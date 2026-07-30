@@ -561,11 +561,30 @@ let banksCache = { value: null, expires: 0 };
 async function getBanks() {
   if (banksCache.value && banksCache.expires > Date.now()) return banksCache.value;
   const res = await anchorFetch("/banks");
-  const list = (res.data || []).map((b) => ({
-    id: b.id,
-    name: b.attributes?.name,
-    code: b.attributes?.cbnCode || b.attributes?.code,
-  }));
+  // LIVE gotcha: the sandbox attribute for the CBN/NIP code (cbnCode) is absent
+  // on the live org's /banks — codes came back undefined and JSON dropped the
+  // key, which broke the app's bank picker → name enquiry → send money. Try
+  // every plausible field name; the keys log below reveals the real live field
+  // if none of these hit (remove the log once confirmed).
+  const first = res.data?.[0];
+  if (first) {
+    console.log("[anchor] /banks attribute keys:", Object.keys(first.attributes || {}).join(","));
+  }
+  const list = (res.data || []).map((b) => {
+    const a = b.attributes || {};
+    return {
+      id: b.id,
+      name: a.name,
+      // LIVE fix: when no CBN-style code exists (615/616 live banks), the bank's
+      // own anc_bk ID becomes the code. Verified on live: /payments/verify-account
+      // accepts the anc_bk id in the bankCode position, and executeTransfer's
+      // `banks.find(b => b.code === bankCode)` then resolves the SAME bank for
+      // createCounterparty's bankId. Client keeps sending `code` — no app change.
+      code:
+        a.cbnCode || a.code || a.nipCode || a.bankCode || a.routingKey ||
+        a.sortCode || a.routingNumber || b.id,
+    };
+  });
   banksCache = { value: list, expires: Date.now() + 24 * 60 * 60 * 1000 };
   return list;
 }
