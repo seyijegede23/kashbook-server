@@ -325,6 +325,7 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
   let customerId = user.anchorCustomerId;
   let customerType = "BusinessCustomer";
   let adoptedAlreadyApproved = false;
+  let createdFresh = false; // customer minted in THIS call — always needs KYC
   await prisma.withBusinessLock(biz.id, async () => {
     const fresh = await prisma.user.findUnique({
       where: { id: user.id },
@@ -359,6 +360,7 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
           owners: isLtd ? owners : undefined,
         });
         customerId = created.customerId;
+        createdFresh = true;
       } else {
         const created = await anchor.createIndividualCustomer({
           user: {
@@ -377,6 +379,7 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
             : undefined,
         });
         customerId = created.customerId;
+        createdFresh = true;
       }
     } catch (e) {
       const isDuplicate =
@@ -420,8 +423,33 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
     ? "IndividualCustomer"
     : "BusinessCustomer";
 
-  // 2. Trigger KYC/KYB for newly-created customers that aren't verified yet.
-  if (!adoptedAlreadyApproved && user.kycStatus !== "verified") {
+  // A freshly-created customer ALWAYS needs the KYC trigger — our local
+  // kycStatus says nothing about a customer Anchor has never verified (stale
+  // "verified" flags from sandbox/other-provider eras caused exactly that:
+  // "Customer does not have kyc verification" on open). For a REUSED customer,
+  // the local flag can be equally stale — confirm with Anchor itself before
+  // trusting it.
+  let kycConfirmed = adoptedAlreadyApproved;
+  if (!kycConfirmed && !createdFresh && user.kycStatus === "verified") {
+    try {
+      const st = await anchor.getCustomerStatus(customerId);
+      kycConfirmed = /approved|verified/i.test(st?.status || "");
+    } catch (e) {
+      console.warn("[provisioning] getCustomerStatus check failed:", e.message);
+      kycConfirmed = false;
+    }
+    if (!kycConfirmed) {
+      // Un-stick the stale flag so nothing downstream trusts it either.
+      await prisma.user.update({ where: { id: user.id }, data: { kycStatus: "pending" } });
+      user.kycStatus = "pending";
+      console.warn(
+        `[provisioning] local kycStatus was "verified" but Anchor says customer ${customerId} is NOT approved — running real KYC`,
+      );
+    }
+  }
+
+  // 2. Trigger KYC/KYB unless the customer is provably approved at Anchor.
+  if (!kycConfirmed) {
     try {
       if (customerType === "IndividualCustomer") {
         await anchor.triggerIndividualKyc(customerId, { bvn, dateOfBirth: dob, gender: userGender });
