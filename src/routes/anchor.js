@@ -44,7 +44,21 @@ router.post("/", async (req, res) => {
   // Ack fast so Anchor doesn't retry while we work
   res.sendStatus(200);
 
-  const eventType = event.data?.type;
+  // Event-name resolution — Anchor has shipped more than one payload shape:
+  //   Sandbox/classic: { data: { type: "payment.settled", attributes, relationships }, included }
+  //   Live (2026):     the name can live at data.attributes.eventType (data.type is a
+  //                    generic resource label), or at a top-level event/type key.
+  // Try them in order; if none hit, log a bounded snippet so the real shape is
+  // diagnosable from Render logs instead of a bare "event=undefined".
+  let eventType = event.data?.type;
+  if (!eventType || eventType === "event" || eventType === "Event") {
+    eventType =
+      event.data?.attributes?.eventType ||
+      event.event ||
+      event.eventType ||
+      event.type ||
+      null;
+  }
   const attrs = event.data?.attributes || {};
   const rels = event.data?.relationships || {};
   const included = Array.isArray(event.included) ? event.included : [];
@@ -52,6 +66,16 @@ router.post("/", async (req, res) => {
   const findIncluded = (type, id) =>
     included.find((r) => r.type === type && r.id === id);
   console.log(`[Anchor webhook] event=${eventType}`);
+  if (!eventType) {
+    console.warn(
+      "[Anchor webhook] UNPARSED payload — topKeys:",
+      Object.keys(event || {}).join(","),
+      "dataKeys:",
+      Object.keys(event?.data || {}).join(","),
+      "snippet:",
+      rawBody.toString("utf8").slice(0, 400),
+    );
+  }
 
   try {
     // ── Idempotency: process each delivered event at most once ───────────────
