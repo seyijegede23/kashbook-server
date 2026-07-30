@@ -44,23 +44,23 @@ router.post("/", async (req, res) => {
   // Ack fast so Anchor doesn't retry while we work
   res.sendStatus(200);
 
-  // Event-name resolution — Anchor has shipped more than one payload shape:
+  // Envelope resolution — Anchor has shipped more than one payload shape:
   //   Sandbox/classic: { data: { type: "payment.settled", attributes, relationships }, included }
-  //   Live (2026):     the name can live at data.attributes.eventType (data.type is a
-  //                    generic resource label), or at a top-level event/type key.
-  // Try them in order; if none hit, log a bounded snippet so the real shape is
-  // diagnosable from Render logs instead of a bare "event=undefined".
-  let eventType = event.data?.type;
+  //   LIVE (verified 2026-07-30 via the keys-only probe): NO data wrapper — the
+  //   event resource sits at the TOP level: { id, type: "payment.settled",
+  //   attributes: { payment: {...} }, relationships: {...} }.
+  // Normalize to one `root` node and read type/attributes/relationships off it,
+  // so every handler below works for both shapes.
+  const root =
+    event.data && typeof event.data === "object" && !Array.isArray(event.data)
+      ? event.data
+      : event;
+  let eventType = root.type;
   if (!eventType || eventType === "event" || eventType === "Event") {
-    eventType =
-      event.data?.attributes?.eventType ||
-      event.event ||
-      event.eventType ||
-      event.type ||
-      null;
+    eventType = root.attributes?.eventType || event.event || event.eventType || null;
   }
-  const attrs = event.data?.attributes || {};
-  const rels = event.data?.relationships || {};
+  const attrs = root.attributes || {};
+  const rels = root.relationships || {};
   const included = Array.isArray(event.included) ? event.included : [];
   // Helper: find a related resource in `included` by JSON:API type + id
   const findIncluded = (type, id) =>
@@ -96,7 +96,7 @@ router.post("/", async (req, res) => {
     // Body-hash fallback so an id-less (or replayed id-less) event still dedups
     // instead of falling through unprotected.
     const dedupId =
-      event.data?.id ||
+      root.id ||
       attrs.reference ||
       attrs.sessionId ||
       crypto.createHash("sha256").update(rawBody).digest("hex");
@@ -420,6 +420,9 @@ router.post("/", async (req, res) => {
     // ── Informational lifecycle events (no DB action needed) ───────────────
     if (
       eventType === "account.initiated" ||
+      eventType === "nip.inbound.received" ||
+      eventType === "nip.inbound.settled" ||
+      eventType === "transaction.created" ||
       eventType === "customer.created" ||
       eventType === "virtualNuban.opened" ||
       eventType === "document.approved" ||
@@ -550,6 +553,42 @@ router.post("/", async (req, res) => {
       const { sender, narration } = await resolveInboundSender({ ...attrs, ...pay }, paymentKey);
       const sessionId = pay.paymentReference || attrs.sessionId || attrs.reference || "";
       const description = buildInboundDescription({ sender, narration, reference: sessionId });
+      const paidAt = pay.paidAt ? new Date(pay.paidAt) : null;
+
+      // Cross-path repair: the reconcile poller books credits it can't link to
+      // a Payment as "Anonymous sender" with an anc_txn_ (or legacy null)
+      // reference — a key the unique check below can't collide with. If this
+      // payment event matches such a row (same business + amount, booked within
+      // ±30 min of the payment's own paidAt), it IS that money: BACKFILL the
+      // real sender into the description and lock the row onto the anc_pay_
+      // key instead of booking a duplicate.
+      if (paidAt) {
+        const reconTwin = await prisma.transaction.findFirst({
+          where: {
+            businessId: biz.id,
+            source: "anchor",
+            type: "income",
+            amount,
+            OR: [{ reference: null }, { reference: { startsWith: "anc_txn_" } }],
+            date: {
+              gte: new Date(paidAt.getTime() - 30 * 60 * 1000),
+              lte: new Date(paidAt.getTime() + 30 * 60 * 1000),
+            },
+          },
+          orderBy: { date: "asc" },
+          select: { id: true, reference: true },
+        });
+        if (reconTwin) {
+          await prisma.transaction.update({
+            where: { id: reconTwin.id },
+            data: { description, ...(reference ? { reference } : {}) },
+          });
+          console.log(
+            `[Anchor webhook] credit ₦${amount} was reconcile-booked (${reconTwin.reference || "no ref"}) — backfilled sender + locked onto ${reference || "same ref"}`,
+          );
+          return;
+        }
+      }
 
       try {
         await prisma.transaction.create({

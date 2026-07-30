@@ -94,6 +94,15 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     const amount = normalizeAmount(a.amount);
     if (amount <= 0) continue;
 
+    // Grace window: the webhook books credits within seconds and keys them on
+    // anc_pay_<paymentId> — a key this poller can't always derive (the LIVE
+    // /transactions list often has no payment relationship). Booking the same
+    // credit here under a different key would double it, so give the webhook
+    // 10 minutes to claim a fresh credit; this net only books what the webhook
+    // demonstrably missed.
+    const ageMs = a.createdAt ? Date.now() - new Date(a.createdAt).getTime() : Infinity;
+    if (ageMs < 10 * 60 * 1000) continue;
+
     const reference =
       a.reference || a.sessionId || a.transactionReference || t.id;
     if (!reference) continue;
