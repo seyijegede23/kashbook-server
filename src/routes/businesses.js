@@ -526,23 +526,35 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
     const accountId = acc.id;
     const attrs = acc.attributes || {};
 
+    // Anchor's LIST endpoint masks account numbers (e.g. "*****0342"). Only a
+    // full 10-digit NUBAN may be persisted — a masked value is useless to payers
+    // AND would trip the accountNumber.created webhook's no-clobber guard,
+    // permanently blocking the real number from landing.
+    const fullNumber = /^\d{10}$/.test(String(attrs.accountNumber || ""))
+      ? attrs.accountNumber
+      : null;
+
     await prisma.business.update({
       where: { id: biz.id },
       data: {
         anchorAccountId: accountId,
         virtualAccountId: accountId,
         virtualAccountRef: accountId,
-        virtualAccountNumber: attrs.accountNumber || null,
+        ...(fullNumber ? { virtualAccountNumber: fullNumber } : {}),
         virtualAccountBank: attrs.bank?.name || "Anchor",
         virtualAccountName: attrs.accountName || biz.name,
       },
     });
 
     res.json({
-      status: "synced",
-      accountNumber: attrs.accountNumber,
+      status: fullNumber ? "synced" : "linked_masked",
+      accountNumber: fullNumber,
+      maskedNumber: fullNumber ? undefined : attrs.accountNumber || null,
       bankName: attrs.bank?.name || "Anchor",
       accountName: attrs.accountName || biz.name,
+      ...(fullNumber
+        ? {}
+        : { message: "Anchor returned a masked number — the full account number must come from the accountNumber webhook or the Anchor dashboard." }),
     });
   } catch (err) {
     if (err.code === "ANCHOR_NOT_CONFIGURED")
