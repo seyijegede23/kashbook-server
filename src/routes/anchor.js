@@ -131,7 +131,11 @@ router.post("/", async (req, res) => {
       eventType === "business.identification.approved" ||
       eventType === "business.verification.approved"
     ) {
-      const customerId = rels.customer?.data?.id || event.data?.id;
+      const customerId =
+        rels.customer?.data?.id ||
+        rels.resource?.data?.id ||
+        attrs.failureEventData?.resource?.id ||
+        event.data?.id;
       if (!customerId) {
         console.warn(`[Anchor webhook] approved event with no customerId`);
         return;
@@ -234,7 +238,11 @@ router.post("/", async (req, res) => {
       eventType === "business.verification.rejected" ||
       eventType === "business.identification.rejected"
     ) {
-      const customerId = rels.customer?.data?.id || event.data?.id;
+      const customerId =
+        rels.customer?.data?.id ||
+        rels.resource?.data?.id ||
+        attrs.failureEventData?.resource?.id ||
+        event.data?.id;
       if (!customerId) return;
       const user = await prisma.user.findFirst({
         where: { anchorCustomerId: customerId },
@@ -256,15 +264,55 @@ router.post("/", async (req, res) => {
           err.message,
         );
       }
+      // Live rejections carry the specifics in failureEventData (message +
+      // validationResult array) — surface them; sandbox used flat reason/message.
+      const fed = attrs.failureEventData || {};
+      const vr = Array.isArray(fed.validationResult)
+        ? fed.validationResult
+            .map((v) => (typeof v === "string" ? v : JSON.stringify(v)))
+            .join("; ")
+        : "";
       const reason =
-        attrs.reason || attrs.message || "Identity verification failed.";
+        [fed.message || attrs.reason || attrs.message, vr].filter(Boolean).join(" — ") ||
+        "Identity verification failed.";
+      console.warn(`[Anchor webhook] KYC rejected for ${customerId}: ${reason}`);
+      // Flip the newest account-request submission for this user's unbanked
+      // business(es) to DECLINED so the app's kyc-status poll shows the reason
+      // and offers resubmission (the admin approve had already marked it
+      // APPROVED before Anchor's async verdict landed).
+      try {
+        const bizIds = (
+          await prisma.business.findMany({
+            where: { userId: user.id, anchorAccountId: null },
+            select: { id: true },
+          })
+        ).map((b) => b.id);
+        const sub = bizIds.length
+          ? await prisma.kycSubmission.findFirst({
+              where: { businessId: { in: bizIds }, status: { in: ["APPROVED", "PENDING"] } },
+              orderBy: { createdAt: "desc" },
+            })
+          : null;
+        if (sub) {
+          await prisma.kycSubmission.update({
+            where: { id: sub.id },
+            data: { status: "DECLINED", declineReason: reason },
+          });
+        }
+      } catch (e) {
+        console.warn("[Anchor webhook] submission decline update failed:", e.message);
+      }
       await pushTo(user.id, "Verification failed", reason);
       return;
     }
 
     // ── Customer KYC in manual review ───────────────────────────────────────
     if (eventType === "customer.identification.manualReview") {
-      const customerId = rels.customer?.data?.id || event.data?.id;
+      const customerId =
+        rels.customer?.data?.id ||
+        rels.resource?.data?.id ||
+        attrs.failureEventData?.resource?.id ||
+        event.data?.id;
       if (!customerId) return;
       const user = await prisma.user.findFirst({
         where: { anchorCustomerId: customerId },
@@ -397,7 +445,11 @@ router.post("/", async (req, res) => {
 
     // ── KYB waiting on document upload — surface to the user ───────────────
     if (eventType === "customer.identification.awaitingDocument") {
-      const customerId = rels.customer?.data?.id || event.data?.id;
+      const customerId =
+        rels.customer?.data?.id ||
+        rels.resource?.data?.id ||
+        attrs.failureEventData?.resource?.id ||
+        event.data?.id;
       if (!customerId) return;
       const user = await prisma.user.findFirst({
         where: { anchorCustomerId: customerId },
