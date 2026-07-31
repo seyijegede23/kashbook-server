@@ -401,9 +401,13 @@ router.post("/", async (req, res) => {
           console.warn("[Anchor webhook] getAccount fallback failed:", e.message);
         }
       }
-      if (!accountNumber) {
+      // Only a FULL 10-digit NUBAN may be persisted. Anchor's fetch APIs mask
+      // numbers ("*****3875") — writing one is useless to payers AND blocks the
+      // real number via the no-clobber guard below. Leave it for the dashboard/
+      // manual path instead.
+      if (!/^\d{10}$/.test(String(accountNumber || ""))) {
         console.warn(
-          `[Anchor webhook] accountNumber.created — couldn't resolve NUBAN for ${depositAccountId}`,
+          `[Anchor webhook] accountNumber.created — no full NUBAN available for ${depositAccountId} (got "${accountNumber || "nothing"}") — not persisting`,
         );
         return;
       }
@@ -411,8 +415,10 @@ router.post("/", async (req, res) => {
       // The individual-KYC flow writes a BUSINESS-named virtual NUBAN explicitly
       // (openIndividualBankAccount). The SAVINGS settlement account's OWN
       // accountNumber.created — named after the PERSON — must not clobber it.
-      // Once a NUBAN is set, only an identical redelivery is allowed through.
-      if (biz.virtualAccountNumber && biz.virtualAccountNumber !== accountNumber) {
+      // Once a FULL NUBAN is set, only an identical redelivery is allowed
+      // through; a stored masked value is junk and may be overwritten.
+      const storedIsFull = /^\d{10}$/.test(String(biz.virtualAccountNumber || ""));
+      if (storedIsFull && biz.virtualAccountNumber !== accountNumber) {
         console.log(
           `[Anchor webhook] accountNumber.created ignored — ${biz.name} already has NUBAN ${biz.virtualAccountNumber} (incoming ${accountNumber})`,
         );
