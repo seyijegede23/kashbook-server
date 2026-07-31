@@ -374,6 +374,22 @@ function toLagosDateString(d) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lagos" }).format(dt);
 }
 
+// Update an existing IndividualCustomer's editable attributes. Anchor allows
+// this only while KYC is NOT completed — which is exactly the retry window we
+// need it for: NIBSS validates PHONE_NUMBER against the CUSTOMER record, so a
+// phone corrected in the app must be synced here or verification keeps failing
+// no matter what the user resubmits.
+async function updateIndividualCustomer(customerId, { phone, email }) {
+  const attributes = {};
+  if (phone) attributes.phoneNumber = normalizePhoneForAnchor(phone);
+  if (email) attributes.email = email;
+  const body = { data: { type: "IndividualCustomer", attributes } };
+  return anchorFetch(`/customers/individual/${encodeURIComponent(customerId)}`, {
+    method: "PUT",
+    body,
+  });
+}
+
 async function triggerIndividualKyc(customerId, { bvn, dateOfBirth, gender }) {
   const dob = toLagosDateString(dateOfBirth);
   console.log(`[anchor] KYC trigger for ${customerId}: dob=${dob} gender=${normalizeGenderForAnchor(gender)}`);
@@ -875,6 +891,7 @@ module.exports = {
   getCustomerStatus,
   createVirtualNuban,
   createDepositAccount,
+  updateIndividualCustomer,
   getAccountBalance,
   getAccount,
   listCustomerAccounts,

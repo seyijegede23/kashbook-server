@@ -450,6 +450,19 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
 
   // 2. Trigger KYC/KYB unless the customer is provably approved at Anchor.
   if (!kycConfirmed) {
+    // Sync the profile phone onto the Anchor customer before re-triggering.
+    // NIBSS validates PHONE_NUMBER against the CUSTOMER record — a phone the
+    // user corrected in the app never reaches Anchor otherwise, so retries
+    // kept failing on the stale number. (Update is only permitted pre-KYC-
+    // completion, i.e. exactly when a retry happens; failures are non-fatal.)
+    if (customerType === "IndividualCustomer" && !createdFresh && user.phone) {
+      try {
+        await anchor.updateIndividualCustomer(customerId, { phone: user.phone });
+        console.log(`[provisioning] synced profile phone onto customer ${customerId}`);
+      } catch (e) {
+        console.warn(`[provisioning] customer phone sync failed (continuing): ${e.message}`);
+      }
+    }
     try {
       if (customerType === "IndividualCustomer") {
         await anchor.triggerIndividualKyc(customerId, { bvn, dateOfBirth: dob, gender: userGender });
