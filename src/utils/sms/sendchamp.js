@@ -88,10 +88,14 @@ async function sendWhatsAppOtp(phone, code) {
     Accept: "application/json",
   };
   try {
+    // Sendchamp's verification endpoint routinely takes 15-20s to answer while
+    // it dispatches the WhatsApp message (delivery itself succeeds) — a short
+    // timeout misreads that as failure and double-sends via SMS. Give it 30s.
     const { status, body: resBody } = await httpsPostJson({
       urlStr: `${base}/verification/create`,
       headers,
       body,
+      timeoutMs: 30000,
     });
     let data = {};
     try {
