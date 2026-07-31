@@ -60,7 +60,67 @@ function httpsPostJson({ urlStr, headers, body, timeoutMs = 15000 }) {
   });
 }
 
-async function sendSms(phone, message) {
+// Deliver an OTP over Sendchamp's WHATSAPP channel via their Verification API.
+// KEY DETAIL: meta_data.token lets US supply the code, so KashBook's own OTP
+// engine (OtpCode table, atomic single-use verifyOtp, throttle) stays the
+// authority — Sendchamp only delivers. We never call their /verification/confirm.
+// WhatsApp delivery sidesteps the NG DND filter and sender-ID registration that
+// silently drop SMS from unregistered senders.
+// Returns { ok } — callers fall back to SMS when not ok.
+async function sendWhatsAppOtp(phone, code) {
+  const apiKey = process.env.SENDCHAMP_PUBLIC_KEY || process.env.SENDCHAMP_API_KEY;
+  if (!apiKey || process.env.SENDCHAMP_WA_OTP === "false") return { ok: false };
+
+  const to = normalizePhoneForSendchamp(phone);
+  const base = process.env.SENDCHAMP_BASE_URL || "https://api.sendchamp.com/api/v1";
+  const body = JSON.stringify({
+    channel: "whatsapp",
+    sender: process.env.SENDCHAMP_WA_SENDER || process.env.SENDCHAMP_SENDER_ID || "KashBook",
+    customer_mobile_number: to,
+    token_type: "numeric",
+    token_length: String(code).length,
+    expiration_time: 10, // minutes — matches our OtpCode expiry
+    meta_data: { token: String(code) },
+  });
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  try {
+    const { status, body: resBody } = await httpsPostJson({
+      urlStr: `${base}/verification/create`,
+      headers,
+      body,
+    });
+    let data = {};
+    try {
+      data = resBody ? JSON.parse(resBody) : {};
+    } catch {}
+    const ok =
+      status >= 200 && status < 300 &&
+      (data.status === "success" || String(data.status) === "200" || String(data.code) === "200");
+    if (!ok) {
+      console.warn(`[Sendchamp WA-OTP] http ${status}: ${String(resBody).slice(0, 250)} — falling back to SMS`);
+      return { ok: false };
+    }
+    console.log(`[Sendchamp WA-OTP sent] → ${String(phone).replace(/\d(?=\d{4})/g, "*")}`);
+    return { ok: true };
+  } catch (err) {
+    console.warn(`[Sendchamp WA-OTP] ${err.code || err.message} — falling back to SMS`);
+    return { ok: false };
+  }
+}
+
+async function sendSms(phone, message, opts = {}) {
+  // OTP delivery order: WhatsApp first (no DND/sender-ID pitfalls), SMS as the
+  // fallback. Only possible when the caller passes the raw code (opts.otpCode);
+  // plain notification texts go straight to SMS.
+  if (opts.otpCode) {
+    const wa = await sendWhatsAppOtp(phone, opts.otpCode);
+    if (wa.ok) return;
+  }
+
   // Dev: print the code to the console so it's visible. Prod: never log the
   // message (contains the code) or the full number (PII) — mask all but last 4.
   if (process.env.NODE_ENV !== "production") {
@@ -123,4 +183,4 @@ async function sendSms(phone, message) {
   }
 }
 
-module.exports = { sendSms };
+module.exports = { sendSms, sendWhatsAppOtp };

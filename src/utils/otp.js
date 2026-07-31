@@ -199,10 +199,11 @@ async function dispatchOtp(identifier, type, { country } = {}) {
       }
     }
     if (!delivered) {
-      // Country-aware SMS router; Termii adapter stays available as a direct
-      // export for anything that still imports sendSms() from this file.
+      // Country-aware SMS router. Passing the raw code lets the Sendchamp
+      // adapter deliver it over WhatsApp first (no DND/sender-ID pitfalls)
+      // and fall back to SMS — verification stays local either way.
       const smsRouter = require("./sms");
-      await smsRouter.sendSms(identifier, message, { country });
+      await smsRouter.sendSms(identifier, message, { country, otpCode: code });
     }
   }
 

@@ -20,9 +20,11 @@ function pickAdapter(country) {
   return ADAPTERS[key] || africasTalking;
 }
 
-async function sendSms(phone, message, { country } = {}) {
+async function sendSms(phone, message, { country, ...opts } = {}) {
   const adapter = pickAdapter(country);
-  return adapter.sendSms(phone, message);
+  // opts (e.g. otpCode) lets adapters pick richer channels — Sendchamp uses it
+  // to deliver OTPs over WhatsApp before falling back to SMS.
+  return adapter.sendSms(phone, message, opts);
 }
 
 module.exports = { sendSms, pickAdapter };
