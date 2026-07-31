@@ -84,6 +84,15 @@ async function runPreTransferChecks({ req, user, business, amount, otp, bypassOt
     };
   }
 
+  // ── AML kill switch ──────────────────────────────────────────────────────
+  // AML_ENABLED=false disables every check below (tier caps, velocity limits,
+  // step-up OTP, structuring, off-hours, review holds). The FROZEN gates above
+  // stay active regardless — freezing is an explicit admin action, not an AML
+  // rule. Flip the env var to re-arm everything; no code was removed.
+  if (process.env.AML_ENABLED === "false") {
+    return { ok: true, flags: [], maxSeverity: null, limits: null, dailySoFar: 0, weeklySoFar: 0, monthlySoFar: 0 };
+  }
+
   // 2. Tier limit check --------------------------------------------------
   const limits = resolveBusinessLimits(business);
 

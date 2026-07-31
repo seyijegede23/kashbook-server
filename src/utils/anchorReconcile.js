@@ -132,7 +132,9 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     const frozen =
       (owner?.accountStatus && owner.accountStatus !== "active") ||
       (biz.accountStatus && biz.accountStatus !== "active");
-    const flagCTR = amount >= SINGLE_FLAG_ABOVE;
+    // CTR auto-flagging follows the AML kill switch; the frozen hold does not
+    // (freezing is an explicit admin action).
+    const flagCTR = amount >= SINGLE_FLAG_ABOVE && process.env.AML_ENABLED !== "false";
     const flagSeverity = frozen ? "high" : (flagCTR ? "medium" : null);
     const complianceStatus = frozen ? "held" : (flagCTR ? "flagged" : "clean");
 

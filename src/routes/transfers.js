@@ -141,6 +141,10 @@ router.get("/balance", async (req, res) => {
 // zero here means even a bad client can't show stale limits.
 router.get("/limits", async (req, res) => {
   try {
+    // AML kill switch: no limits are enforced, so show none — the client's
+    // LimitsCard hides itself on a null payload.
+    if (process.env.AML_ENABLED === "false") return res.json(null);
+
     const { businessId } = req.query;
     if (!businessId) return res.status(400).json({ error: "businessId required" });
 
