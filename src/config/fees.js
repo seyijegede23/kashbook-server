@@ -21,10 +21,13 @@
 // send isn't blocked for a sub-kobo rounding artifact.
 const MONEY_EPS = 0.005;
 
-const NIP_FEE = 50;
+// Live-verified 2026-07-31: Anchor's actual NIP charge is ₦20/transfer (the fee
+// account shows ₦20 debits), not the ₦50 originally assumed. Repriced: customer
+// pays ₦30 (≤₦10k) / ₦80 (>₦10k incl. stamp duty) — ₦10 margin per transfer.
+const NIP_FEE = 20;
 const STAMP_DUTY = 50;
 const STAMP_DUTY_THRESHOLD = 10000; // strictly over — ₦10,000.00 exactly pays no duty
-const PLATFORM_MARGIN = 1;
+const PLATFORM_MARGIN = 10;
 
 function feesEnabled() {
   return !!process.env.ANCHOR_FEE_ACCOUNT_ID;

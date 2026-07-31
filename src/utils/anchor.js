@@ -122,14 +122,10 @@ async function createBusinessCustomer({
   //         email?, phoneNumber?, title?, address? }
   owners,
 }) {
-  const officerDob =
-    user.dateOfBirth instanceof Date
-      ? user.dateOfBirth.toISOString().slice(0, 10)
-      : user.dateOfBirth;
-  const regDate =
-    dateOfRegistration instanceof Date
-      ? dateOfRegistration.toISOString().slice(0, 10)
-      : dateOfRegistration;
+  // Lagos-date formatting (not UTC slice) — see toLagosDateString: midnight-
+  // Lagos encodings otherwise shift a day back and fail NIBSS matching.
+  const officerDob = toLagosDateString(user.dateOfBirth);
+  const regDate = toLagosDateString(dateOfRegistration);
   const phone = normalizePhoneForAnchor(user.phone || "07000000000");
 
   const defaultAddress = {
@@ -220,10 +216,7 @@ async function createBusinessCustomer({
           (Number(director.percentageOwned) || 0) + Number(o.percentageOwned || 0);
         continue;
       }
-      const dob =
-        o.dateOfBirth instanceof Date
-          ? o.dateOfBirth.toISOString().slice(0, 10)
-          : o.dateOfBirth;
+      const dob = toLagosDateString(o.dateOfBirth);
       officers.push({
         role: "OWNER",
         fullName: {
@@ -369,9 +362,21 @@ function normalizeGenderForAnchor(g) {
 // Trigger Tier-2 (BVN) KYC on an IndividualCustomer. Async → webhook
 // customer.identification.approved/.rejected follows (sandbox approves in
 // seconds). The "level: TIER_2 + level2.bvn" shape is what Anchor accepts.
+// Anchor wants a plain YYYY-MM-DD. Compute it in Africa/Lagos — clients encode
+// "27 March" as midnight Lagos time (23:00Z on the 26th), so a UTC slice
+// shifted DOBs a day back and NIBSS rejected DATE_OF_BIRTH on correct input.
+// Plain YYYY-MM-DD strings pass through untouched.
+function toLagosDateString(d) {
+  if (!d) return d;
+  if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt.getTime())) return d;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lagos" }).format(dt);
+}
+
 async function triggerIndividualKyc(customerId, { bvn, dateOfBirth, gender }) {
-  const dob =
-    dateOfBirth instanceof Date ? dateOfBirth.toISOString().slice(0, 10) : dateOfBirth;
+  const dob = toLagosDateString(dateOfBirth);
+  console.log(`[anchor] KYC trigger for ${customerId}: dob=${dob} gender=${normalizeGenderForAnchor(gender)}`);
   return anchorFetch(`/customers/${customerId}/verification/individual`, {
     method: "POST",
     body: {
