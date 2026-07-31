@@ -98,33 +98,41 @@ async function openIndividualBankAccount({ biz, customerId, bvn }) {
     console.warn(
       `[anchorBank] business-named NUBAN unavailable for ${biz.name} (${e.message}) — using the settlement account's own number`,
     );
-    let own = null;
+    // The AccountNumber sub-resource list is the UNMASKED source (the deposit
+    // account masks its own number). getAccount only enriches the display name.
+    let full = null;
+    let accountName = null;
     try {
-      own = await anchor.getAccount(accountId);
+      const nums = await anchor.listAccountNumbers(accountId);
+      full = nums.find((n) => /^\d{10}$/.test(String(n.accountNumber || ""))) || null;
     } catch (fetchErr) {
-      console.warn(`[anchorBank] getAccount fallback failed: ${fetchErr.message}`);
+      console.warn(`[anchorBank] listAccountNumbers failed: ${fetchErr.message}`);
     }
-    // Only accept a REAL unmasked NUBAN (some Anchor payloads mask the number);
-    // otherwise leave it to the accountNumber.created webhook, which carries the
-    // full number and already writes it for a business matched by anchorAccountId.
-    const full = own && /^\d{10}$/.test(String(own.accountNumber || ""));
+    try {
+      const acct = await anchor.getAccount(accountId);
+      accountName = acct.accountName || null;
+      if (full && !full.bankName) full.bankName = acct.bankName || null;
+    } catch (fetchErr) {
+      console.warn(`[anchorBank] getAccount name fetch failed: ${fetchErr.message}`);
+    }
     if (full) {
       await prisma.business.update({
         where: { id: biz.id },
         data: {
-          virtualAccountNumber: own.accountNumber,
-          virtualAccountName: own.accountName || biz.name,
-          virtualAccountBank: own.bankName || "Anchor",
+          virtualAccountNumber: full.accountNumber,
+          virtualAccountName: accountName || biz.name,
+          virtualAccountBank: full.bankName || "Anchor",
         },
       });
       return {
         accountId,
-        accountNumber: own.accountNumber,
-        accountName: own.accountName || biz.name,
-        bankName: own.bankName || "Anchor",
+        accountNumber: full.accountNumber,
+        accountName: accountName || biz.name,
+        bankName: full.bankName || "Anchor",
         businessNamed: false,
       };
     }
+    // Number not issued yet — the accountNumber.created webhook completes it.
     return { accountId, pendingNuban: true };
   }
 }

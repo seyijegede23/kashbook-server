@@ -389,12 +389,24 @@ router.post("/", async (req, res) => {
         return;
       }
 
-      // Last-resort fallback: fetch the deposit account directly if the
-      // included resource was missing or malformed.
-      if (!accountNumber) {
+      // The AccountNumber sub-resource list returns FULL unmasked numbers
+      // (the deposit-account resource masks its own) — this is the authoritative
+      // automatic source. getAccount stays only to enrich the display name.
+      if (!/^\d{10}$/.test(String(accountNumber || ""))) {
+        try {
+          const nums = await anchor.listAccountNumbers(depositAccountId);
+          const full = nums.find((n) => /^\d{10}$/.test(String(n.accountNumber || "")));
+          if (full) {
+            accountNumber = full.accountNumber;
+            bankName = bankName || full.bankName;
+          }
+        } catch (e) {
+          console.warn("[Anchor webhook] listAccountNumbers fallback failed:", e.message);
+        }
+      }
+      if (!accountName || !bankName) {
         try {
           const fresh = await anchor.getAccount(depositAccountId);
-          accountNumber = fresh.accountNumber || accountNumber;
           bankName = bankName || fresh.bankName;
           accountName = accountName || fresh.accountName;
         } catch (e) {

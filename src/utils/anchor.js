@@ -564,6 +564,26 @@ async function listCustomerAccounts(customerId) {
   return Array.isArray(res.data) ? res.data : res.data ? [res.data] : [];
 }
 
+// Full, UNMASKED account numbers live on the AccountNumber sub-resources —
+// the deposit-account resource masks its own number ("*****3875"). Verified in
+// docs/account-numbers: GET /account-numbers?AccountId=... returns them whole.
+// This is what makes NUBAN persistence fully automatic (no dashboard copying).
+async function listAccountNumbers(depositAccountId) {
+  const res = await anchorFetch(
+    `/account-numbers?AccountId=${encodeURIComponent(depositAccountId)}`,
+  );
+  const rows = Array.isArray(res.data) ? res.data : res.data ? [res.data] : [];
+  return rows.map((r) => {
+    const a = r.attributes || {};
+    return {
+      id: r.id,
+      accountNumber: a.accountNumber || a.virtualNuban || null,
+      bankName: a.bank?.name || a.bankName || null,
+      status: a.status || null,
+    };
+  });
+}
+
 // Fetch full account details — used by webhook handler when the event payload
 // doesn't include the NUBAN.
 async function getAccount(accountId) {
@@ -892,6 +912,7 @@ module.exports = {
   createVirtualNuban,
   createDepositAccount,
   updateIndividualCustomer,
+  listAccountNumbers,
   getAccountBalance,
   getAccount,
   listCustomerAccounts,

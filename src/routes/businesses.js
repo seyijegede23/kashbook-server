@@ -526,13 +526,26 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
     const accountId = acc.id;
     const attrs = acc.attributes || {};
 
-    // Anchor's LIST endpoint masks account numbers (e.g. "*****0342"). Only a
-    // full 10-digit NUBAN may be persisted — a masked value is useless to payers
-    // AND would trip the accountNumber.created webhook's no-clobber guard,
-    // permanently blocking the real number from landing.
-    const fullNumber = /^\d{10}$/.test(String(attrs.accountNumber || ""))
+    // Anchor's LIST endpoint masks account numbers (e.g. "*****0342") — the
+    // FULL number lives on the AccountNumber sub-resources. Only a full
+    // 10-digit NUBAN may be persisted; a masked value is useless to payers AND
+    // would trip the accountNumber.created webhook's no-clobber guard.
+    let fullNumber = /^\d{10}$/.test(String(attrs.accountNumber || ""))
       ? attrs.accountNumber
       : null;
+    let numBank = null;
+    if (!fullNumber) {
+      try {
+        const nums = await anchor.listAccountNumbers(accountId);
+        const full = nums.find((n) => /^\d{10}$/.test(String(n.accountNumber || "")));
+        if (full) {
+          fullNumber = full.accountNumber;
+          numBank = full.bankName || null;
+        }
+      } catch (e) {
+        console.warn("[sync-anchor-account] listAccountNumbers failed:", e.message);
+      }
+    }
 
     await prisma.business.update({
       where: { id: biz.id },
@@ -541,7 +554,9 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
         virtualAccountId: accountId,
         virtualAccountRef: accountId,
         ...(fullNumber ? { virtualAccountNumber: fullNumber } : {}),
-        virtualAccountBank: attrs.bank?.name || "Anchor",
+        // Payable-rail bank (e.g. 9PSB, from the AccountNumber resource) beats
+        // the deposit account's ledger shell bank (CORESTEP).
+        virtualAccountBank: numBank || attrs.bank?.name || "Anchor",
         virtualAccountName: attrs.accountName || biz.name,
       },
     });
@@ -550,7 +565,7 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
       status: fullNumber ? "synced" : "linked_masked",
       accountNumber: fullNumber,
       maskedNumber: fullNumber ? undefined : attrs.accountNumber || null,
-      bankName: attrs.bank?.name || "Anchor",
+      bankName: numBank || attrs.bank?.name || "Anchor",
       accountName: attrs.accountName || biz.name,
       ...(fullNumber
         ? {}
