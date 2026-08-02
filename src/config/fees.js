@@ -21,27 +21,42 @@
 // send isn't blocked for a sub-kobo rounding artifact.
 const MONEY_EPS = 0.005;
 
-// Live-verified 2026-07-31: Anchor's actual NIP charge is ₦20/transfer (the fee
-// account shows ₦20 debits), not the ₦50 originally assumed. Repriced: customer
-// pays ₦30 (≤₦10k) / ₦80 (>₦10k incl. stamp duty) — ₦10 margin per transfer.
+// Live-verified 2026-07-31: Anchor's actual NIP charge is ₦20/transfer.
+// Owner-set price 2026-08-02: OUR fee is ₦50 FLAT for every external transfer
+// (₦20 Anchor cost + ₦30 margin) — swept to the revenue account.
+//
+// STAMP_DUTY is NOT ours: under the Nigeria Tax Act 2025 (from Jan 2026) a ₦50
+// sender-side stamp duty applies to transfers ABOVE ₦10,000, and ANCHOR debits
+// it from the sending account and remits it (live-verified: "Stamp Duty Fee for
+// NIP Transfer" debit rows). We never charge, keep, or remit it — we only
+// ACCOUNT for it: the balance gate and the booked Transaction.fee include it so
+// the ledger matches the real account movement, and quotes disclose it.
 const NIP_FEE = 20;
 const STAMP_DUTY = 50;
 const STAMP_DUTY_THRESHOLD = 10000; // strictly over — ₦10,000.00 exactly pays no duty
-const PLATFORM_MARGIN = 10;
+const PLATFORM_MARGIN = 30;
 
 function feesEnabled() {
   return !!process.env.ANCHOR_FEE_ACCOUNT_ID;
 }
 
 // route: "nip" (external) | "book" (KashBook→KashBook internal)
+// Returns:
+//   total          — OUR fee (what we sweep): ₦50 flat
+//   statutoryStamp — the government's ₦50 (>₦10k), debited by the BANK, not us
+//   totalCost      — total + statutoryStamp = everything that leaves the account
+//                    beyond the amount (use for balance gates + booked fee)
 function computeTransferFee(amount, route) {
   if (!feesEnabled() || route === "book") {
-    return { total: 0, breakdown: null };
+    return { total: 0, statutoryStamp: 0, totalCost: 0, breakdown: null };
   }
-  const stampDuty = Number(amount) > STAMP_DUTY_THRESHOLD ? STAMP_DUTY : 0;
+  const statutoryStamp = Number(amount) > STAMP_DUTY_THRESHOLD ? STAMP_DUTY : 0;
+  const total = NIP_FEE + PLATFORM_MARGIN;
   return {
-    total: NIP_FEE + stampDuty + PLATFORM_MARGIN,
-    breakdown: { nip: NIP_FEE, stampDuty, platform: PLATFORM_MARGIN },
+    total,
+    statutoryStamp,
+    totalCost: total + statutoryStamp,
+    breakdown: { nip: NIP_FEE, platform: PLATFORM_MARGIN, stampDuty: statutoryStamp },
   };
 }
 

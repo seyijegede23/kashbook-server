@@ -318,8 +318,10 @@ router.get("/fee-quote", async (req, res) => {
       if (internalDest) route = "book";
     }
 
-    const { total, breakdown } = computeTransferFee(amount, route);
-    res.json({ fee: total, breakdown, route, total: amount + total });
+    const { total, statutoryStamp = 0, totalCost = total, breakdown } = computeTransferFee(amount, route);
+    // `fee` = OUR charge; `stampDuty` = the bank-debited government levy on
+    // >₦10k (disclosed, not ours); `total` = the true debit incl. both.
+    res.json({ fee: total, stampDuty: statutoryStamp, breakdown, route, total: amount + totalCost });
   } catch (err) {
     console.error("[transfers/fee-quote]", err);
     res.status(500).json({ error: "Failed to quote fee" });

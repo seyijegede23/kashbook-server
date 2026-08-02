@@ -104,17 +104,21 @@ async function executeTransfer({
     },
   });
 
-  const { total: fee, breakdown: feeBreakdown } = computeTransferFee(
+  const { total: fee, statutoryStamp = 0, breakdown: feeBreakdown } = computeTransferFee(
     Number(amount),
     internalDest ? "book" : "nip",
   );
+  // Everything that leaves the account beyond the amount: our fee (swept to the
+  // revenue account) + the government stamp duty Anchor debits on >₦10k (theirs,
+  // not ours — but it's real money off this account, so gate and book it).
+  const totalCost = fee + statutoryStamp;
 
-  // 3. Live balance check — must cover the transfer AND the fee.
+  // 3. Live balance check — must cover the transfer, our fee, AND the stamp duty.
   const { balance } = await anchor.getAccountBalance(business.anchorAccountId);
-  if (balance + MONEY_EPS < Number(amount) + fee) {
+  if (balance + MONEY_EPS < Number(amount) + totalCost) {
     const err = new Error(
-      fee > 0
-        ? `Insufficient balance. This transfer needs ${formatAmountForBusiness(business, Number(amount) + fee)} (includes ${formatAmountForBusiness(business, fee)} fee). Available: ${formatAmountForBusiness(business, balance)}`
+      totalCost > 0
+        ? `Insufficient balance. This transfer needs ${formatAmountForBusiness(business, Number(amount) + totalCost)} (includes ${formatAmountForBusiness(business, fee)} fee${statutoryStamp ? ` + ${formatAmountForBusiness(business, statutoryStamp)} government stamp duty` : ""}). Available: ${formatAmountForBusiness(business, balance)}`
         : `Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`,
     );
     err.code = "INSUFFICIENT_BALANCE";
@@ -224,7 +228,9 @@ async function executeTransfer({
         currency: business.baseCurrency || "NGN",
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
-        fee,
+        // Booked fee = our fee + the bank-debited stamp duty, so the ledger
+        // matches the account's true movement (only OUR fee gets swept below).
+        fee: totalCost,
         feeBreakdown: feeBreakdown || undefined,
       },
     });
