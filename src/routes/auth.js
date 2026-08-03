@@ -5,7 +5,7 @@ const { body, validationResult } = require("express-validator");
 const prisma         = require("../utils/db");
 const cloudinary     = require("../config/cloudinary");
 const { signToken }  = require("../utils/jwt");
-const { dispatchOtp, verifyOtp } = require("../utils/otp");
+const { dispatchOtp, verifyOtp, hashOtp } = require("../utils/otp");
 const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
 
@@ -233,7 +233,7 @@ router.post("/check-otp", async (req, res) => {
   if (!rawIden || !code) return res.status(400).json({ error: "Identifier and code required" });
   const iden = rawIden.includes("@") ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
   const record = await prisma.otpCode.findFirst({
-    where: { identifier: iden, code, type, used: false, expiresAt: { gt: new Date() } },
+    where: { identifier: iden, code: hashOtp(iden, code), type, used: false, expiresAt: { gt: new Date() } },
   });
   if (!record) return res.status(400).json({ error: "Invalid or expired code" });
   res.json({ valid: true });

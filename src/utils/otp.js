@@ -1,10 +1,24 @@
 const prisma = require("./db");
+const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const { renderOtpEmail } = require("./emailLayout");
 
 // ── Generate a 6-digit OTP ──────────────────────────────────────────────────
 function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// ── OTP at-rest hashing ─────────────────────────────────────────────────────
+// Codes are stored as HMAC-SHA256(identifier:code) keyed with JWT_SECRET, never
+// in plaintext: a leaked OtpCode table alone can't be used to log in (an
+// unsalted hash of a 6-digit code would brute-force offline instantly — the
+// server-side secret is what makes the stored value useless to an attacker).
+// The plaintext code exists only in the delivery message (WhatsApp/SMS/email).
+function hashOtp(identifier, code) {
+  return crypto
+    .createHmac("sha256", process.env.JWT_SECRET || "kb-otp-pepper")
+    .update(`${identifier}:${code}`)
+    .digest("hex");
 }
 
 // Per-identifier throttle (independent of the per-IP limiter) so one phone/email
@@ -45,7 +59,7 @@ async function saveOtp(identifier, type) {
   });
 
   await prisma.otpCode.create({
-    data: { identifier, code, type, expiresAt },
+    data: { identifier, code: hashOtp(identifier, code), type, expiresAt },
   });
   return code;
 }
@@ -59,7 +73,7 @@ async function verifyOtp(identifier, code, type) {
   const { count } = await prisma.otpCode.updateMany({
     where: {
       identifier,
-      code,
+      code: hashOtp(identifier, code),
       type,
       used: false,
       expiresAt: { gt: new Date() },
@@ -210,4 +224,4 @@ async function dispatchOtp(identifier, type, { country } = {}) {
   return code;
 }
 
-module.exports = { dispatchOtp, verifyOtp, sendSms, sendEmail };
+module.exports = { dispatchOtp, verifyOtp, sendSms, sendEmail, hashOtp };
