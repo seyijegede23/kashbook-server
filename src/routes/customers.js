@@ -206,8 +206,11 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
 
-    const debt = await prisma.debt.findUnique({
-      where: { id: req.params.debtId },
+    // SECURITY: the debt must belong to the customer we just authorised.
+    // Looking it up by id alone let an attacker with one owned customer write
+    // payments against — and settle — another merchant's debt.
+    const debt = await prisma.debt.findFirst({
+      where: { id: req.params.debtId, customerId: customer.id },
     });
     if (!debt) return res.status(404).json({ error: "Debt not found" });
 

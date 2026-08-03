@@ -5,7 +5,7 @@ const { body, validationResult } = require("express-validator");
 const prisma         = require("../utils/db");
 const cloudinary     = require("../config/cloudinary");
 const { signToken }  = require("../utils/jwt");
-const { dispatchOtp, verifyOtp, hashOtp } = require("../utils/otp");
+const { dispatchOtp, verifyOtp, peekOtp, hashOtp, sendEmail } = require("../utils/otp");
 const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
 
@@ -100,13 +100,24 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
   if (!iden)    return res.status(400).json({ error: "Email or phone number is required" });
   if (!otpCode) return res.status(400).json({ error: "Verification code is required" });
 
-  const type = req.body.type || "phone_register";
-  const otpValid = await verifyOtp(iden, otpCode, type);
+  // SECURITY: the OTP purpose is pinned server-side. Letting the caller choose
+  // (req.body.type) meant any code issued for ANY purpose — a password-reset
+  // code, a transfer step-up code — counted as proof of registration.
+  const otpValid = await verifyOtp(iden, otpCode, "phone_register");
   if (!otpValid) return res.status(400).json({ error: "Invalid or expired verification code" });
 
   try {
     const exists = await prisma.user.findFirst({ where: isEmail ? { email: iden } : { phone: iden } });
-    if (exists?.password) return res.status(409).json({ error: "Account already registered" });
+    // SECURITY: registration must NEVER mutate an existing account. It used to
+    // fall through for passwordless rows (social-login/legacy users) and
+    // overwrite their name, business and password — outright takeover. Any
+    // existing identifier is a conflict; recovery belongs to forgot-password.
+    if (exists) {
+      return res.status(409).json({
+        error: "An account with these details already exists. Please log in or reset your password.",
+        code: "ACCOUNT_EXISTS",
+      });
+    }
 
     const hashed = await bcrypt.hash(password, 12);
     const data = { firstName: fn, lastName: ln, businessName: biz, password: hashed,
@@ -118,14 +129,21 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
     data.currency = countryCfg.currency.code;
     data.language = countryCfg.language;
 
-    const user = exists
-      ? await prisma.user.update({ where: { id: exists.id }, data })
-      : await prisma.user.create({ data });
+    // Create only — the update branch was the takeover path (see the 409 above).
+    // A race on the unique index surfaces as P2002 and is handled below.
+    const user = await prisma.user.create({ data });
 
     await ensurePrimaryBusiness(user.id, biz, countryCode);
     const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion ?? 0 });
     res.status(201).json(userResponse(user, token));
   } catch (err) {
+    // Concurrent signups with the same identifier: report the conflict, not a 500.
+    if (err.code === "P2002") {
+      return res.status(409).json({
+        error: "An account with these details already exists. Please log in or reset your password.",
+        code: "ACCOUNT_EXISTS",
+      });
+    }
     console.error(err);
     res.status(500).json({ error: "Registration failed" });
   }
@@ -227,15 +245,24 @@ router.post("/send-otp", async (req, res) => {
 // ─────────────────────────────────────────────
 // POST /auth/check-otp (validates without consuming)
 // ─────────────────────────────────────────────
+// SECURITY: this endpoint deliberately does NOT consume the code (reset-password
+// does), which made it a free brute-force oracle. Two containments:
+//   1. `type` is no longer caller-chosen across all purposes — only the reset
+//      flow the app actually uses. It can never probe email_change, phone_change
+//      or TRANSFER_STEP_UP codes.
+//   2. peekOtp charges every miss to the same 5-attempt budget as verifyOtp, so
+//      guessing here burns the code exactly as it would anywhere else.
+const CHECKABLE_OTP_TYPES = new Set(["phone_reset"]);
+
 router.post("/check-otp", async (req, res) => {
   const { phone, email, identifier, code, type = "phone_reset" } = req.body;
   const rawIden = identifier || email || phone || "";
   if (!rawIden || !code) return res.status(400).json({ error: "Identifier and code required" });
+  if (!CHECKABLE_OTP_TYPES.has(type))
+    return res.status(400).json({ error: "Invalid or expired code" });
   const iden = rawIden.includes("@") ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
-  const record = await prisma.otpCode.findFirst({
-    where: { identifier: iden, code: hashOtp(iden, code), type, used: false, expiresAt: { gt: new Date() } },
-  });
-  if (!record) return res.status(400).json({ error: "Invalid or expired code" });
+  const valid = await peekOtp(iden, code, type);
+  if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
   res.json({ valid: true });
 });
 
@@ -583,17 +610,21 @@ router.post("/delete-account", authMiddleware, async (req, res) => {
 // PATCH /auth/profile
 // ─────────────────────────────────────────────
 router.patch("/profile", authMiddleware, async (req, res) => {
-  const { firstName, lastName, businessName, phone, email, profileImage, dateOfBirth, gender } = req.body;
+  const { firstName, lastName, businessName, profileImage, dateOfBirth, gender } = req.body;
   // Staff can update their own name/photo, but identity and business fields
   // belong to the owner — strip them rather than failing the whole save.
   const isStaff = req.user.accountType === "staff";
+  // SECURITY: email/phone are DELIBERATELY not settable here. They are the
+  // account-recovery identifiers — letting a bearer token rewrite them turns any
+  // stolen/borrowed session into permanent account takeover (change email →
+  // forgot-password → reset). Identifier changes must go through
+  // request-/confirm-email-change and request-/confirm-phone-change, which
+  // verify an OTP AND the current password, and revoke every existing session.
   try {
     const data = {};
     if (firstName)                 data.firstName    = firstName.trim();
     if (lastName)                  data.lastName     = lastName.trim();
     if (businessName && !isStaff)  data.businessName = businessName.trim();
-    if (phone && !isStaff)         data.phone        = phone.trim();
-    if (email && !isStaff)         data.email        = email.trim().toLowerCase();
     if (profileImage !== undefined) data.profileImage = profileImage;
     if (dateOfBirth !== undefined) {
       const dob = dateOfBirth ? new Date(dateOfBirth) : null;
@@ -708,10 +739,15 @@ router.post("/verify-password", authMiddleware, async (req, res) => {
 router.post("/request-email-change", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
-  const { newEmail } = req.body;
+  const { newEmail, currentPassword } = req.body;
   if (!newEmail?.includes("@")) return res.status(400).json({ error: "Valid email required" });
   const email = newEmail.trim().toLowerCase();
   try {
+    // Re-authenticate: the OTP only proves control of the NEW address (which an
+    // attacker holding a stolen token owns). The password proves it's the owner.
+    const me = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!me?.password || !currentPassword || !(await bcrypt.verify(currentPassword, me.password)))
+      return res.status(401).json({ error: "Current password is incorrect", code: "PASSWORD_REQUIRED" });
     const existing = await prisma.user.findFirst({ where: { email } });
     if (existing && existing.id !== req.user.id)
       return res.status(409).json({ error: "Email already in use" });
@@ -737,12 +773,25 @@ router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
   try {
     const valid = await verifyOtp(email, otpCode, "email_change");
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
+    const before = await prisma.user.findUnique({ where: { id: req.user.id }, select: { email: true } });
+    // Revoke every existing session on an identifier change — a token stolen
+    // before the change must not survive it.
     const user = await prisma.user.update({
       where: { id: req.user.id },
-      data: { email },
+      data: { email, tokenVersion: { increment: 1 } },
     });
+    // Tell the OLD address, so an unauthorised change is visible to the real owner.
+    if (before?.email && before.email !== email) {
+      sendEmail(
+        before.email,
+        "Your KashBook email was changed",
+        `<p>The email on your KashBook account was just changed to <b>${email}</b>.</p>
+         <p>If this wasn't you, contact support immediately — your account may be compromised.</p>`,
+      ).catch((e) => console.warn("[email-change] old-address notice failed:", e.message));
+    }
+    const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion });
     const { password: _, ...safe } = user;
-    res.json({ user: safe });
+    res.json({ user: safe, token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update email" });
@@ -756,10 +805,18 @@ router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
 router.post("/request-phone-change", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
-  const { newPhone } = req.body;
+  const { newPhone, currentPassword } = req.body;
   if (!newPhone) return res.status(400).json({ error: "Phone number required" });
-  const phone = newPhone.trim();
   try {
+    const me = await prisma.user.findUnique({ where: { id: req.user.id } });
+    if (!me?.password || !currentPassword || !(await bcrypt.verify(currentPassword, me.password)))
+      return res.status(401).json({ error: "Current password is incorrect", code: "PASSWORD_REQUIRED" });
+    // Normalize BEFORE the uniqueness check. Raw trim() let "08012345678" slip
+    // past a stored "+2348012345678", after which the SMS layer normalized it
+    // back to the victim's handset — an OTP delivered to someone else's phone.
+    const { getCountryConfig } = require("../config/countries");
+    const phone = normalizePhone(newPhone, getCountryConfig(me.country || "NG").callingCode);
+    if (!phone) return res.status(400).json({ error: "Valid phone number required" });
     const existing = await prisma.user.findFirst({ where: { phone } });
     if (existing && existing.id !== req.user.id)
       return res.status(409).json({ error: "Phone number already in use" });
@@ -781,16 +838,21 @@ router.patch("/confirm-phone-change", authMiddleware, async (req, res) => {
   const { newPhone, otpCode } = req.body;
   if (!newPhone || !otpCode)
     return res.status(400).json({ error: "Phone and verification code required" });
-  const phone = newPhone.trim();
   try {
+    const me = await prisma.user.findUnique({ where: { id: req.user.id }, select: { country: true } });
+    // Must normalize identically to request-phone-change or the OTP lookup misses.
+    const { getCountryConfig } = require("../config/countries");
+    const phone = normalizePhone(newPhone, getCountryConfig(me?.country || "NG").callingCode);
+    if (!phone) return res.status(400).json({ error: "Valid phone number required" });
     const valid = await verifyOtp(phone, otpCode, "phone_change");
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
     const user = await prisma.user.update({
       where: { id: req.user.id },
-      data: { phone },
+      data: { phone, tokenVersion: { increment: 1 } }, // revoke sessions on identifier change
     });
+    const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion });
     const { password: _, ...safe } = user;
-    res.json({ user: safe });
+    res.json({ user: safe, token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update phone number" });

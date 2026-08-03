@@ -74,11 +74,17 @@ async function executeTransfer({
 
   // 1. Idempotency check — if this exact reference is already on a Transaction,
   // skip the Anchor call entirely. Belt-and-braces for cron restarts.
+  //
+  // SECURITY: match the indexed `reference` column EXACTLY. The old
+  // `description: { contains: ref }` was a substring match on client-supplied
+  // input, so a shorter idempotency key ("ABC" after a real send with "ABCDEF")
+  // collided with the earlier transfer and returned `success` + a debit email
+  // for money that never moved.
   const existing = await prisma.transaction.findFirst({
     where: {
       businessId: business.id,
       source: "anchor",
-      description: { contains: ref },
+      reference: ref,
     },
     select: { id: true },
   });

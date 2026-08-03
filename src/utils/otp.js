@@ -4,8 +4,12 @@ const nodemailer = require("nodemailer");
 const { renderOtpEmail } = require("./emailLayout");
 
 // ── Generate a 6-digit OTP ──────────────────────────────────────────────────
+// crypto.randomInt, NOT Math.random: V8's PRNG is xorshift128+, whose internal
+// state is recoverable from a modest run of observed outputs. Since an attacker
+// can mint codes freely on identifiers they control, a predictable generator
+// would leak a victim's next code — including the transfer step-up OTP.
 function generateCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
 }
 
 // ── OTP at-rest hashing ─────────────────────────────────────────────────────
@@ -69,6 +73,10 @@ async function saveOtp(identifier, type) {
 // two concurrent verifications of the same code can't both succeed (the second
 // finds used=false no longer true → count 0). The code is single-use precisely
 // because exactly one caller can flip used:false → used:true.
+// Max wrong guesses before the code is burned. Without this the only limit on
+// brute-forcing a 6-digit code was per-IP request rate — defeated by a proxy pool.
+const MAX_OTP_ATTEMPTS = 5;
+
 async function verifyOtp(identifier, code, type) {
   const { count } = await prisma.otpCode.updateMany({
     where: {
@@ -77,10 +85,65 @@ async function verifyOtp(identifier, code, type) {
       type,
       used: false,
       expiresAt: { gt: new Date() },
+      attempts: { lt: MAX_OTP_ATTEMPTS },
     },
     data: { used: true },
   });
-  return count === 1;
+  if (count === 1) return true;
+
+  // Miss: charge the attempt against the live code for this identifier+type and
+  // burn it once the budget is spent, so guessing can't continue on that code.
+  const live = await prisma.otpCode.findFirst({
+    where: { identifier, type, used: false, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, attempts: true },
+  });
+  if (live) {
+    const attempts = live.attempts + 1;
+    await prisma.otpCode.update({
+      where: { id: live.id },
+      data: { attempts, ...(attempts >= MAX_OTP_ATTEMPTS ? { used: true } : {}) },
+    });
+    if (attempts >= MAX_OTP_ATTEMPTS) {
+      console.warn(
+        `[otp] code burned after ${MAX_OTP_ATTEMPTS} failed attempts for ${String(identifier).replace(/.(?=.{4})/g, "*")} (${type})`,
+      );
+    }
+  }
+  return false;
+}
+
+// Non-consuming check, used by the password-reset UI to validate a code before
+// showing the new-password step. It must NOT mark the code used (reset-password
+// consumes it) — but it MUST charge failed guesses to the same attempt budget as
+// verifyOtp, otherwise it's a free brute-force oracle.
+async function peekOtp(identifier, code, type) {
+  const hit = await prisma.otpCode.findFirst({
+    where: {
+      identifier,
+      code: hashOtp(identifier, code),
+      type,
+      used: false,
+      expiresAt: { gt: new Date() },
+      attempts: { lt: MAX_OTP_ATTEMPTS },
+    },
+    select: { id: true },
+  });
+  if (hit) return true;
+
+  const live = await prisma.otpCode.findFirst({
+    where: { identifier, type, used: false, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, attempts: true },
+  });
+  if (live) {
+    const attempts = live.attempts + 1;
+    await prisma.otpCode.update({
+      where: { id: live.id },
+      data: { attempts, ...(attempts >= MAX_OTP_ATTEMPTS ? { used: true } : {}) },
+    });
+  }
+  return false;
 }
 
 // Termii expects phone numbers in 234XXXXXXXXXX format (no plus, no leading 0)
@@ -224,4 +287,4 @@ async function dispatchOtp(identifier, type, { country } = {}) {
   return code;
 }
 
-module.exports = { dispatchOtp, verifyOtp, sendSms, sendEmail, hashOtp };
+module.exports = { dispatchOtp, verifyOtp, peekOtp, sendSms, sendEmail, hashOtp, MAX_OTP_ATTEMPTS };

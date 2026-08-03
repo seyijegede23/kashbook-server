@@ -2,6 +2,11 @@ const router = require("express").Router();
 const prisma = require("../utils/db");
 const authMiddleware = require("../middleware/auth");
 
+// Resolve the business owner (staff act on their employer's data) — same helper
+// convention as businesses.js / businessDebts.js.
+const getTargetUserId = (req) =>
+  req.user.accountType === "staff" ? req.user.employerId : req.user.id;
+
 // ── Helper: normalise phone ──────────────────────────────────────────────────
 function normalizePhone(phone = "") {
   const p = phone.replace(/\s+/g, "").trim();
@@ -46,19 +51,32 @@ router.post("/schedule", authMiddleware, async (req, res) => {
   }
 
   try {
+    // SECURITY: scope BOTH lookups to the caller. Previously the customer was
+    // matched on {id, businessId} with no owner check and the business was
+    // fetched by id alone, so any authenticated user could target another
+    // merchant's records — and the response leaked their customer + business
+    // names back to the attacker.
+    const userId = getTargetUserId(req);
+    const business = await prisma.business.findFirst({
+      where: { id: businessId, userId },
+    });
+    if (!business) {
+      return res.status(404).json({ error: "Business not found" });
+    }
+
     const customer = await prisma.customer.findFirst({
-      where: { id: customerId, businessId },
+      where: { id: customerId, businessId: business.id },
     });
     if (!customer) {
       return res.status(404).json({ error: "Customer not found" });
     }
+    const businessName = business.name || "KashBook Merchants";
 
-    let businessName = "KashBook Merchants";
-    const business = await prisma.business.findFirst({
-      where: { id: businessId },
-    });
-    if (business?.name) {
-      businessName = business.name;
+    // SECURITY: the recipient is the CUSTOMER's stored number. Taking it from
+    // the request body turned this endpoint into an SMS cannon that could text
+    // any number in Nigeria from KashBook's sender ID, at KashBook's cost.
+    if (!customer.phone) {
+      return res.status(400).json({ error: "This customer has no phone number on file." });
     }
 
     const formattedAmount = Number(amountOwed).toLocaleString();
@@ -72,7 +90,7 @@ router.post("/schedule", authMiddleware, async (req, res) => {
         type: "debt",
         amount: Number(amountOwed),
         recipientName: customer.name,
-        phone: normalizePhone(phone),
+        phone: normalizePhone(customer.phone),
         message,
         channel: "sms",
         status: "pending",

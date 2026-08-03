@@ -776,9 +776,14 @@ model OtpCode {
   id         String   @id @default(uuid())
   identifier String
   type       String
+  // HMAC-SHA256(identifier:code) keyed with a server secret — never plaintext.
   code       String
   expiresAt  DateTime
   used       Boolean  @default(false)
+  // Failed verification counter. The send-side throttle never limited GUESSING,
+  // so a 6-digit code was brute-forceable given enough source IPs. The code is
+  // burned at MAX_OTP_ATTEMPTS misses (utils/otp.js).
+  attempts   Int      @default(0)
   createdAt  DateTime @default(now())
 
   @@index([identifier, type])

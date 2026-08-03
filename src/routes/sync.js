@@ -310,7 +310,13 @@ async function processOp(op, userId, userName) {
       if (!customer) throw new Error("Customer not found");
       await assertOwns(customer.businessId);
 
-      const debt = await prisma.debt.findUnique({ where: { id: data.debtId } });
+      // SECURITY: bind the debt to the authorised customer. Fetching by id
+      // alone allowed a cross-tenant write — pass your own customerId (passes
+      // the ownership check above) plus a victim's debtId, and their receivable
+      // ledger gets modified. Mirrors record_payable_payment, which does this right.
+      const debt = await prisma.debt.findFirst({
+        where: { id: data.debtId, customerId: customer.id },
+      });
       if (debt) {
         const alreadyRecorded = await prisma.debtPayment.findUnique({
           where: { id: data.id },

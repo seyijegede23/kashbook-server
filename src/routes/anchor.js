@@ -601,12 +601,30 @@ router.post("/", async (req, res) => {
       const amount = amountRaw / 100;
       if (!accountNumber || amount <= 0) return;
 
+      // SECURITY: bind the credit to an ANCHOR account, not just a number.
+      // Matching on virtualAccountNumber alone meant a forged/misrouted Anchor
+      // event naming a POOLED-provider (Korapay/Fincra) business would write an
+      // "anchor"-sourced income row onto it — instantly spendable balance drawn
+      // from the shared merchant wallet. An Anchor event may only ever credit a
+      // business that actually holds an Anchor deposit account.
       const biz = await prisma.business.findFirst({
-        where: { virtualAccountNumber: accountNumber },
+        where: { virtualAccountNumber: accountNumber, anchorAccountId: { not: null } },
         include: { user: true },
       });
       if (!biz) {
-        console.warn(`[Anchor webhook] no business for account ${accountNumber}`);
+        console.warn(
+          `[Anchor webhook] no ANCHOR business for account ${String(accountNumber).replace(/.(?=.{4})/g, "*")} — ignoring credit`,
+        );
+        return;
+      }
+      // Defence in depth: the settlement account on the payload (when present)
+      // must be this business's own deposit account.
+      const payloadAccountId =
+        pay.settlementAccount?.accountId || rels.account?.data?.id || null;
+      if (payloadAccountId && biz.anchorAccountId && payloadAccountId !== biz.anchorAccountId) {
+        console.warn(
+          `[Anchor webhook] settlement account mismatch for ${biz.name} (payload ${payloadAccountId} vs ${biz.anchorAccountId}) — ignoring credit`,
+        );
         return;
       }
 
@@ -735,9 +753,21 @@ router.post("/", async (req, res) => {
         rels.account?.data?.id || rels.sourceAccount?.data?.id;
       const amountRaw = Number(attrs.amount || 0);
       const amount = amountRaw / 100; // kobo → naira (always)
-      const reference = attrs.reference || event.data?.id || "";
+      // Prefer the transfer's own resource id: it is assigned by Anchor and
+      // can't be varied by a caller, unlike attrs.reference.
+      const bookTransferId = root.id || rels.transfer?.data?.id || "";
+      const reference = attrs.reference || bookTransferId || "";
 
       if (!destAccountId || amount <= 0) return;
+      // SECURITY: a book-transfer credit MUST carry a stable unique reference.
+      // Without one the @@unique([businessId, reference]) index doesn't apply and
+      // the only dedup was a `description contains` match — so varying
+      // attrs.reference produced unlimited duplicate credits from replayed events.
+      if (!bookTransferId) {
+        console.warn("[Anchor webhook] book.transfer.successful without a resource id — ignoring");
+        return;
+      }
+      const dbReference = `anc_bk_${bookTransferId}`;
 
       const destBiz = await prisma.business.findFirst({
         where: { anchorAccountId: destAccountId },
@@ -782,19 +812,29 @@ router.post("/", async (req, res) => {
       const narration = attrs.reason || "";
       const description = buildInboundDescription({ sender, narration, reference });
 
-      await prisma.transaction.create({
-        data: {
-          businessId: destBiz.id,
-          userId: destBiz.userId,
-          type: "income",
-          amount,
-          description,
-          category: "transfer",
-          paymentMethod: "bank",
-          date: new Date(),
-          source: "anchor",
-        },
-      });
+      try {
+        await prisma.transaction.create({
+          data: {
+            businessId: destBiz.id,
+            userId: destBiz.userId,
+            type: "income",
+            amount,
+            description,
+            category: "transfer",
+            paymentMethod: "bank",
+            date: new Date(),
+            source: "anchor",
+            currency: destBiz.baseCurrency || "NGN",
+            reference: dbReference, // unique per business — the real dedup gate
+          },
+        });
+      } catch (createErr) {
+        if (createErr.code === "P2002") {
+          console.log(`[Anchor webhook] book transfer ${dbReference} already booked — skipping`);
+          return;
+        }
+        throw createErr;
+      }
 
       const { title, body } = buildInboundNotification({
         business: destBiz,
