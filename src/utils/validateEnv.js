@@ -29,8 +29,6 @@ function validateEnv() {
   // Anchor is the active provider (Nigeria banking + payouts + webhooks). Require
   // the API key + base URL, and in production flag a SANDBOX base URL — going live
   // against the sandbox would issue fake NUBANs and move no real money.
-  // (Korapay is dormant — NG reverted to Anchor; its keys, if present, are harmless
-  // and not required.)
   if (!process.env.ANCHOR_API_KEY) {
     problems.push("ANCHOR_API_KEY is not set (Anchor provisioning/payouts will fail)");
   }

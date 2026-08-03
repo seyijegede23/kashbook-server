@@ -1,11 +1,14 @@
-// Outbound-transfer fee schedule. Pass-through of Anchor's costs + ₦1
-// KashBook margin (user decision, June 2026; Anchor BaaS Standard pricing):
+// Outbound-transfer fee schedule (repriced Aug 2026 against Anchor's real,
+// live-verified cost):
 //
-//   Anchor NIP payout            ₦50   every external transfer
-//   CBN stamp duty               ₦50   only on transfers strictly over ₦10,000
-//   KashBook platform margin     ₦1    every external transfer
+//   Anchor NIP payout            ₦20   every external transfer (our cost)
+//   KashBook platform margin     ₦30   every external transfer (our revenue)
+//   → OUR FEE: ₦50 flat, any amount.
 //
-//   → ₦51 per transfer ≤ ₦10,000, ₦101 above.
+//   Government stamp duty        ₦50   only on transfers strictly over ₦10,000.
+//                                      NOT ours — Anchor debits and remits it.
+//                                      We only account for it so the ledger and
+//                                      the balance gate match reality.
 //
 // Internal KashBook→KashBook book transfers cost Anchor ₦0 and are free to
 // the user (product perk — keep it that way).
@@ -78,32 +81,6 @@ function computeFincraTransferFee(amount, { internal = false } = {}) {
   return { total: fee, breakdown: { percent: FINCRA_FEE_PERCENT, cap: FINCRA_FEE_CAP } };
 }
 
-// ─── Korapay pay-out fees ───────────────────────────────────────────────────
-// Flat ₦50 customer fee per external NGN transfer = ~₦30 Korapay pass-through cost
-// + ₦20 KashBook margin (user pricing decision, Jul 2026). On the POOLED model
-// there's no separate fee account: Korapay deducts its real cost from the merchant
-// wallet and the ₦20 margin simply stays there, unallocated to any business ledger
-// — i.e. it IS KashBook's revenue (same mechanic as the Fincra margin). /fee-quote
-// shows this flat ₦50 and executeKorapayPayout BOOKS ₦50 on the sender's ledger, so
-// quote == charge; the fee breakdown records the real Korapay cost + realized margin.
-// Internal KashBook→KashBook book transfers cost nothing and stay free.
-//
-// ⚠️ The ₦20 margin assumes Korapay's ~₦30 cost. If Korapay's actual fee on a
-// transfer ever exceeds ₦50, the margin compresses and KashBook absorbs the excess
-// (the customer still pays a flat ₦50). Revisit with Korapay's confirmed live NGN
-// payout schedule.
-const KORAPAY_COST_ESTIMATE = 30; // estimated Korapay pass-through cost (NGN)
-const KORAPAY_MARGIN = 20;        // KashBook margin per external transfer (NGN)
-const KORAPAY_TRANSFER_FEE = KORAPAY_COST_ESTIMATE + KORAPAY_MARGIN; // ₦50 charged to the customer
-
-function computeKorapayTransferFee(amount, { internal = false } = {}) {
-  if (internal) return { total: 0, breakdown: null };
-  return {
-    total: KORAPAY_TRANSFER_FEE,
-    breakdown: { korapay: KORAPAY_COST_ESTIMATE, margin: KORAPAY_MARGIN },
-  };
-}
-
 module.exports = {
   MONEY_EPS,
   NIP_FEE,
@@ -115,8 +92,4 @@ module.exports = {
   FINCRA_FEE_PERCENT,
   FINCRA_FEE_CAP,
   computeFincraTransferFee,
-  KORAPAY_TRANSFER_FEE,
-  KORAPAY_COST_ESTIMATE,
-  KORAPAY_MARGIN,
-  computeKorapayTransferFee,
 };

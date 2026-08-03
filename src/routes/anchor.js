@@ -603,7 +603,7 @@ router.post("/", async (req, res) => {
 
       // SECURITY: bind the credit to an ANCHOR account, not just a number.
       // Matching on virtualAccountNumber alone meant a forged/misrouted Anchor
-      // event naming a POOLED-provider (Korapay/Fincra) business would write an
+      // event naming a POOLED-provider (Fincra) business would write an
       // "anchor"-sourced income row onto it — instantly spendable balance drawn
       // from the shared merchant wallet. An Anchor event may only ever credit a
       // business that actually holds an Anchor deposit account.

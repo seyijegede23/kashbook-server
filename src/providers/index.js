@@ -4,14 +4,12 @@
 const { getCountryConfig } = require("../config/countries");
 const AnchorProvider = require("./anchor");
 const FincraProvider = require("./fincra");
-const KorapayProvider = require("./korapay");
 const NullProvider = require("./null");
 
 const PROVIDERS = {
-  anchor:  new AnchorProvider(),
-  fincra:  new FincraProvider(),
-  korapay: new KorapayProvider(),
-  null:    new NullProvider(),
+  anchor: new AnchorProvider(),
+  fincra: new FincraProvider(),
+  null:   new NullProvider(),
 };
 
 function getProvider(businessOrCountry) {
@@ -24,14 +22,12 @@ function getProvider(businessOrCountry) {
     if (b.anchorAccountId && !b.providerAccountId) return PROVIDERS.anchor;
     // Symmetric stickiness for POOLED providers: a business that already holds a
     // pooled account (providerAccountId set, no Anchor account) stays on the
-    // provider that ISSUED it, regardless of the country config. Without this a
-    // config rollback (e.g. NG korapay→anchor) would misroute a live Korapay
-    // account's money path to Anchor. Korapay account refs are "KPY-*"; Fincra refs
-    // are Mongo ids. (Add a persisted provider key on Business if a 3rd pooled
-    // provider is ever introduced — ref-shape disambiguation won't scale past two.)
-    if (b.providerAccountId && !b.anchorAccountId) {
-      return /^KPY/i.test(b.providerAccountId) ? PROVIDERS.korapay : PROVIDERS.fincra;
-    }
+    // provider that issued it, regardless of the country config — its funds and
+    // NUBAN live there until explicitly migrated. Fincra is now the only pooled
+    // provider (Korapay was removed Aug 2026 with zero accounts and zero
+    // transactions). If a second pooled provider is ever added, persist an
+    // explicit provider key on Business rather than inferring from ref shape.
+    if (b.providerAccountId && !b.anchorAccountId) return PROVIDERS.fincra;
   }
   const country =
     typeof businessOrCountry === "string"

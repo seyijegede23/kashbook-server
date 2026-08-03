@@ -59,7 +59,6 @@ const adminRoutes = require("./src/routes/admin");
 const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
 const fincraWebhookRoute = require("./src/routes/fincra");
-const korapayWebhookRoute = require("./src/routes/korapay");
 const instagramRoutes = require("./src/routes/instagram");
 const instagramWebhookRoute = require("./src/routes/instagramWebhook");
 const whatsappRoutes = require("./src/routes/whatsapp");
@@ -205,14 +204,6 @@ app.use(
   webhookLimiter,
   express.raw({ type: "application/json", limit: "1mb" }),
   fincraWebhookRoute,
-);
-// Korapay webhook — raw body for the HMAC-SHA256 verify (header x-korapay-signature,
-// signed over the `data` object).
-app.use(
-  "/webhooks/korapay",
-  webhookLimiter,
-  express.raw({ type: "application/json", limit: "1mb" }),
-  korapayWebhookRoute,
 );
 // Instagram messaging webhook — same raw-body-before-json requirement so the
 // X-Hub-Signature-256 HMAC verifies against the exact bytes Meta sent. The GET
@@ -360,19 +351,18 @@ app.listen(PORT, () => {
   console.log(`KashBook API running on port ${PORT}`);
   // Build marker — lets a deploy's boot log confirm which code is live. Bump the
   // tag when shipping a change whose presence you need to verify from the logs.
-  console.log("[boot] build=sec-phase1b-review-fixes");
+  console.log("[boot] build=korapay-removed");
 });
 
 // ── Background loop: reconcile Anchor inbound credits every 5 min ────────────
-// Anchor is the active provider for Nigeria again (reverted from Korapay Jul 2026).
-// Belt-and-braces so users still get credits + push notifications even when Anchor's
-// webhook delivery drops. /webhooks/anchor is mounted above.
+// Anchor is THE provider for Nigeria. Belt-and-braces so users still get credits
+// + push notifications even when Anchor's webhook delivery drops.
+// /webhooks/anchor is mounted above.
 require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 
-// ── DORMANT: Korapay + Fincra reconcile loops ────────────────────────────────
-// Korapay + Fincra are kept in the tree but unwired/reversible (NG reverted to
-// Anchor). Their webhook mounts stay inert. Re-enable by uncommenting if reactivated.
-//   require("./src/utils/korapayReconcile").startKorapayReconcileLoop(5 * 60 * 1000);
+// ── DORMANT: Fincra reconcile loop ───────────────────────────────────────────
+// Fincra remains in the tree for the non-NG markets (GHS/KES) but no country
+// currently routes to it. Re-enable by uncommenting if reactivated.
 //   require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────

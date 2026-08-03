@@ -22,7 +22,7 @@ const { pushTo } = require("./pushNotification");
 const { audit } = require("./audit");
 const { recordComplianceFlags } = require("./amlChecks");
 const { formatAmountForBusiness } = require("../config/amlLimits");
-const { computeTransferFee, computeFincraTransferFee, computeKorapayTransferFee, MONEY_EPS } = require("../config/fees");
+const { computeTransferFee, computeFincraTransferFee, MONEY_EPS } = require("../config/fees");
 const { getProvider } = require("../providers");
 const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("./ledgerBalance");
@@ -49,7 +49,7 @@ async function executeTransfer({
     throw err;
   }
 
-  // Pooled providers (Fincra, Korapay) use a merchant-wallet payout API; Anchor's
+  // Pooled providers (Fincra) use a merchant-wallet payout API; Anchor's
   // per-account chain is below. getProvider keeps an Anchor-provisioned business on
   // Anchor even after its country flips, so only pooled-native businesses get here.
   const provider = getProvider(business);
@@ -66,7 +66,7 @@ async function executeTransfer({
       return executeFincraBookTransfer({ business, userId, amount, dest, narration, reference, amlCheck, req, notify, source: provider.key });
     }
     const args = { provider, business, userId, amount, accountNumber, bankCode, accountName, bankName, narration, reference, amlCheck, req, notify };
-    return provider.key === "korapay" ? executeKorapayPayout(args) : executeFincraPayout(args);
+    return executeFincraPayout(args);
   }
 
   const ref =
@@ -435,108 +435,6 @@ async function executeFincraPayout({
   }
   return { reference: ref, route: "nip", transactionId: txn.id, transaction: txn, fee };
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Korapay one-call payout (pooled, same shape as Fincra). Gates on the business's
-// OWN ledger; charges a flat ₦50 customer fee (₦30 Korapay cost + ₦20 KashBook
-// margin, config/fees.js) and books exactly it, so /fee-quote == charge and the
-// margin stays in the merchant wallet as revenue. Carries the businessId in the
-// payout metadata for reconcile attribution. Korapay says do NOT treat a timeout
-// as failed — a verify/reconcile path (services/korapay.getPayout) settles
-// ambiguous sends and ships with the Korapay webhook route.
-// ─────────────────────────────────────────────────────────────────────────────
-async function executeKorapayPayout({
-  provider, business, userId, amount, accountNumber, bankCode,
-  accountName, bankName, narration, reference, amlCheck = {}, req = null, notify = true,
-}) {
-  // Korapay caps the reference length, so keep it short and carry the businessId
-  // in the payout metadata (for reconcile attribution) rather than in the ref.
-  const ref = reference || `kbtf_${Date.now()}${Math.random().toString(36).slice(2, 7)}`;
-  const cfg = getCountryConfig(business.country);
-  const currency = cfg?.currency?.code || business.baseCurrency || "NGN";
-
-  const existing = await prisma.transaction.findFirst({
-    where: { businessId: business.id, source: "korapay", reference: ref },
-    select: { id: true },
-  });
-  if (existing) return { reference: ref, route: "idempotent_skip", transactionId: existing.id, transaction: null };
-
-  // Flat ₦50 customer fee (₦30 Korapay cost + ₦20 KashBook margin). Known upfront,
-  // so we gate on amount + this fee and book exactly it (quote == charge).
-  const { total: customerFee } = computeKorapayTransferFee(amount, { internal: false });
-
-  // Gate on the business's own ledger (pooled).
-  const balance = await computeLedgerBalance(business.id, currency);
-  if (balance + MONEY_EPS < Number(amount) + customerFee) {
-    const err = new Error(`Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`);
-    err.code = "INSUFFICIENT_BALANCE";
-    err.availableBalance = balance;
-    throw err;
-  }
-
-  let resolvedName = accountName;
-  if (!resolvedName) {
-    const ne = await provider.verifyRecipient({ accountNumber, bankCode, currency });
-    if (!ne.accountName) {
-      const err = new Error("Could not resolve recipient account");
-      err.code = "RECIPIENT_UNVERIFIED";
-      throw err;
-    }
-    resolvedName = ne.accountName;
-  }
-
-  const result = await provider.payout({
-    reference: ref, amount, currency, accountNumber, bankCode,
-    accountName: resolvedName, narration: narration || `Transfer from ${business.name}`,
-    businessId: business.id,
-  });
-  // Charge the flat ₦50 customer fee; record the real Korapay cost + realized margin.
-  // The margin (₦50 − Korapay's actual cost) stays in the pooled merchant wallet as
-  // KashBook revenue. Margin floors at 0 if Korapay ever charges more than ₦50.
-  const korapayCost = Number(result?.fee || 0);
-  const fee = customerFee;
-  const feeBreakdown = { total: customerFee, korapay: korapayCost, margin: Math.max(0, customerFee - korapayCost) };
-
-  const recipientLabel = `${resolvedName} · ${bankName || currency} · ${accountNumber}`;
-  const description = narration
-    ? `${narration} — to ${recipientLabel} · Ref: ${ref}`
-    : `Transfer to ${recipientLabel} · Ref: ${ref}`;
-  let txn;
-  try {
-    txn = await prisma.transaction.create({
-      data: {
-        businessId: business.id, userId, type: "expense", amount: Number(amount),
-        description, category: "transfer", paymentMethod: "bank", date: new Date(),
-        source: "korapay", reference: ref, currency, fee, feeBreakdown,
-        flagSeverity: amlCheck.maxSeverity || null,
-        complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
-      },
-    });
-  } catch (bookErr) {
-    console.error(`[executeKorapayPayout] BOOKKEEPING FAILED after money moved (ref ${ref}):`, bookErr.message);
-    await audit({
-      req, action: "TRANSFER_BOOKKEEPING_FAILED", resourceType: "business", resourceId: business.id,
-      severity: "alert", metadata: { reference: ref, amount: Number(amount), provider: "korapay", error: bookErr.message },
-    }).catch(() => {});
-    return { reference: ref, route: "nip", transactionId: null, transaction: null, bookkeepingFailed: true };
-  }
-
-  await recordComplianceFlags({ userId, businessId: business.id, business, transactionId: txn.id, amount: Number(amount), flags: amlCheck.flags || [] });
-  await audit({
-    req, action: "TRANSFER_SENT", resourceType: "transaction", resourceId: txn.id,
-    severity: amlCheck.maxSeverity === "high" ? "alert" : amlCheck.maxSeverity === "medium" ? "warn" : "info",
-    metadata: { amount: Number(amount), reference: ref, route: "nip", provider: "korapay", accountNumber, bankName, currency, status: result?.status, flags: (amlCheck.flags || []).map((f) => f.ruleCode), automated: !req },
-  });
-  if (notify) {
-    await pushTo(userId, `${req ? "" : "Auto-debit: "}Transfer Sent ✅`, `${formatAmountForBusiness(business, amount)} → ${resolvedName} (Ref: ${ref.slice(-8)})`).catch(() => {});
-  }
-  return { reference: ref, route: "nip", transactionId: txn.id, transaction: txn, fee };
-}
-
-// Internal KashBook→KashBook transfer on a pooled provider (Fincra/Korapay). Both
-// accounts live in the same merchant wallet, so no external payout happens: we
-// atomically
-// debit the sender and credit the recipient in OUR ledger. Instant and free.
 async function executeFincraBookTransfer({ business, userId, amount, dest, narration, reference, amlCheck = {}, req = null, notify = true, source = "fincra" }) {
   const ref = reference || `kb_bk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const currency = getCountryConfig(business.country)?.currency?.code || business.baseCurrency || "NGN";
@@ -627,4 +525,4 @@ async function executeFincraBookTransfer({ business, userId, amount, dest, narra
   return { reference: ref, route: "book", transactionId: outTxn.id, transaction: outTxn, fee: 0 };
 }
 
-module.exports = { executeTransfer, executeKorapayPayout };
+module.exports = { executeTransfer };

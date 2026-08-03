@@ -11,12 +11,11 @@ const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const balanceCache = require("./balanceCache");
 const { audit } = require("./audit");
-const { computeFincraTransferFee, computeKorapayTransferFee } = require("../config/fees");
+const { computeFincraTransferFee } = require("../config/fees");
 
 async function recordFincraPayoutOutcome(d, outcome, source = "fincra") {
   const reference = d.customerReference || d.reference || d.merchantReference || d.id || d._id;
   if (!reference) return { handled: false, reason: "no_reference" };
-  // Korapay carries the businessId in metadata (its reference is length-capped);
   // Fincra encodes it in the reference. Either way it attributes an orphan.
   const bizId = d.metadata?.business_id || d.metadata?.businessId || null;
 
@@ -101,7 +100,7 @@ function parseBizIdFromRef(ref) {
 // businessId encoded in the reference (a non-attributable ref is a safe no-op).
 async function backfillFincraPayout({ reference, amount, currency, beneficiaryName, source = "fincra", bizId = null }) {
   const ref = String(reference || "");
-  const attributedBizId = bizId || parseBizIdFromRef(ref); // Korapay: from metadata; Fincra: from the ref
+  const attributedBizId = bizId || parseBizIdFromRef(ref);
   if (!attributedBizId) return { handled: false, reason: "unattributable" };
   const biz = await prisma.business.findUnique({ where: { id: attributedBizId } });
   if (!biz) return { handled: false, reason: "no_business" };
@@ -109,10 +108,9 @@ async function backfillFincraPayout({ reference, amount, currency, beneficiaryNa
   if (amt <= 0) return { handled: false, reason: "no_amount" };
   const cur = currency || biz.baseCurrency || "NGN";
   // Fee must MATCH what the live send path books, or a backfilled payout leaves the
-  // ledger overstated vs the pool: Fincra 1.5%, Korapay flat ₦50 (was wrongly 0).
+  // ledger overstated vs the pool: Fincra 1.5%.
   const { total: fee, breakdown } =
     source === "fincra" ? computeFincraTransferFee(amt, { internal: false })
-    : source === "korapay" ? computeKorapayTransferFee(amt, { internal: false })
     : { total: 0, breakdown: null };
   try {
     await prisma.transaction.create({

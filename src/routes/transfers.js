@@ -11,7 +11,7 @@ const { runPreTransferChecks, MONEY_OUT_SOURCES } = require("../utils/amlChecks"
 const { audit } = require("../utils/audit");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
-const { computeTransferFee, computeFincraTransferFee, computeKorapayTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
+const { computeTransferFee, computeFincraTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
 const {
   STEP_UP_OTP_ABOVE,
   TRANSFER_OTP_TYPE,
@@ -272,7 +272,7 @@ router.get("/fee-quote", async (req, res) => {
       : null;
     const provider = biz ? getProvider(biz) : getProvider(req.user.country || "NG");
     // Internal-destination detection for pooled providers keys on providerAccountId
-    // (Korapay + Fincra both stamp it); a KashBook→KashBook send is a free book move.
+    // (the provider stamps it); a KashBook→KashBook send is a free book move.
     const isInternalPooled = async () => {
       if (!/^\d{10}$/.test(accountNumber)) return false;
       const dest = await prisma.business.findFirst({
@@ -282,14 +282,6 @@ router.get("/fee-quote", async (req, res) => {
       return !!dest;
     };
 
-    // Korapay: flat NGN payout fee (estimate — Korapay returns the actual fee at
-    // send time; executeKorapayPayout books that pass-through). Must be quoted here
-    // and NOT via the Fincra 1.5% branch below (Korapay also has unifiedProvisioning).
-    if (provider.key === "korapay") {
-      const internal = await isInternalPooled();
-      const { total, breakdown } = computeKorapayTransferFee(amount, { internal });
-      return res.json({ fee: total, breakdown, route: internal ? "book" : "payout", total: amount + total });
-    }
 
     // Fincra: external pay-out fee is 1.5% (1% Fincra + 0.5% margin); internal
     // KashBook→KashBook book transfers are free. Match executeFincraPayout.
@@ -338,8 +330,8 @@ router.post("/send", async (req, res) => {
   // Client-supplied idempotency key → a STABLE payout reference so a retry after a
   // timed-out-but-succeeded send hits the existing-reference short-circuit instead
   // of a second real disburse. Keep the "kbtf_" prefix (the money-out reconcile
-  // attributes only refs starting with it). Absent → executeKorapayPayout mints a
-  // fresh random ref (unchanged behaviour).
+  // attributes only refs starting with it). Absent → the executor mints a fresh
+  // random ref (unchanged behaviour).
   const idemSanitized = idempotencyKey ? String(idempotencyKey).replace(/[^a-zA-Z0-9]/g, "").slice(0, 40) : "";
   // Empty after sanitizing (a degenerate/punctuation-only key) → fall back to a
   // fresh random ref, so it can't collide across all of a user's sends.

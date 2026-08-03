@@ -534,6 +534,12 @@ model Transaction {
   // a duplicate insert fails with P2002 instead of double-spending/double-crediting.
   // Null for manual/offline transactions (Postgres allows many nulls).
   reference         String?
+  // Immutable provider-side identifier for this money movement (Anchor payment
+  // id, transaction id or transfer id). `reference` is our own idempotency key
+  // and gets re-keyed when a webhook repairs a reconcile-booked row; this one
+  // records what the PROVIDER called it, so a row can always be traced back to
+  // the source event without parsing the description.
+  providerTxnId     String?
   currency          String    @default("NGN") // base currency at time of record; per-business default
   flagSeverity      String? // null | "low" | "medium" | "high"
   complianceStatus  String    @default("clean") // "clean" | "flagged" | "held" | "cleared"
