@@ -612,20 +612,44 @@ router.post("/", async (req, res) => {
         include: { user: true },
       });
       if (!biz) {
-        console.warn(
-          `[Anchor webhook] no ANCHOR business for account ${String(accountNumber).replace(/.(?=.{4})/g, "*")} — ignoring credit`,
+        // Never drop real money silently. Either this is a forged/misrouted
+        // event (correctly refused) or a genuine credit to a business whose
+        // anchorAccountId is missing — which the 5-min poller ALSO skips, so it
+        // would be lost forever. Audit it loudly so it's recoverable by hand.
+        const masked = String(accountNumber).replace(/.(?=.{4})/g, "*");
+        const numberOnly = await prisma.business.findFirst({
+          where: { virtualAccountNumber: accountNumber },
+          select: { id: true, name: true },
+        });
+        console.error(
+          `[Anchor webhook] REFUSED credit ₦${amount} to ${masked} — ${numberOnly ? `business "${numberOnly.name}" has NO anchorAccountId (needs sync-anchor-account)` : "no business owns this number"}`,
         );
+        await audit({
+          action: "ANCHOR_CREDIT_UNMATCHED",
+          resourceType: "business",
+          resourceId: numberOnly?.id || null,
+          severity: "alert",
+          metadata: { maskedAccount: masked, amount, reason: numberOnly ? "missing_anchor_account_id" : "unknown_account" },
+        }).catch(() => {});
         return;
       }
-      // Defence in depth: the settlement account on the payload (when present)
-      // must be this business's own deposit account.
-      const payloadAccountId =
-        pay.settlementAccount?.accountId || rels.account?.data?.id || null;
+      // Defence in depth: when the payload names a settlement account it must be
+      // this business's own. NOTE: advisory only — the live payload field shape
+      // isn't fully pinned down, and blocking on an unverified field would drop
+      // genuine money fleet-wide. A mismatch is alerted, not discarded; the
+      // anchorAccountId binding above is the real forgery control.
+      const payloadAccountId = pay.settlementAccount?.accountId || null;
       if (payloadAccountId && biz.anchorAccountId && payloadAccountId !== biz.anchorAccountId) {
-        console.warn(
-          `[Anchor webhook] settlement account mismatch for ${biz.name} (payload ${payloadAccountId} vs ${biz.anchorAccountId}) — ignoring credit`,
+        console.error(
+          `[Anchor webhook] SETTLEMENT MISMATCH for ${biz.name}: payload ${payloadAccountId} vs stored ${biz.anchorAccountId} — booking anyway, review this`,
         );
-        return;
+        await audit({
+          action: "ANCHOR_SETTLEMENT_MISMATCH",
+          resourceType: "business",
+          resourceId: biz.id,
+          severity: "alert",
+          metadata: { payloadAccountId, storedAccountId: biz.anchorAccountId, amount },
+        }).catch(() => {});
       }
 
       // One NIP credit fires several events (payment.received AND
@@ -753,9 +777,15 @@ router.post("/", async (req, res) => {
         rels.account?.data?.id || rels.sourceAccount?.data?.id;
       const amountRaw = Number(attrs.amount || 0);
       const amount = amountRaw / 100; // kobo → naira (always)
-      // Prefer the transfer's own resource id: it is assigned by Anchor and
-      // can't be varied by a caller, unlike attrs.reference.
-      const bookTransferId = root.id || rels.transfer?.data?.id || "";
+      // Prefer the TRANSFER's own resource id — it is stable for the transfer
+      // itself, whereas the event id differs per event (initiated/successful)
+      // and would let the same money book twice. Event id is the last resort.
+      const bookTransferId =
+        rels.transfer?.data?.id ||
+        rels.bookTransfer?.data?.id ||
+        rels.transaction?.data?.id ||
+        root.id ||
+        "";
       const reference = attrs.reference || bookTransferId || "";
 
       if (!destAccountId || amount <= 0) return;
@@ -780,17 +810,11 @@ router.post("/", async (req, res) => {
         return;
       }
 
-      // Dedup: if we've already recorded this reference for this business, skip.
-      if (reference) {
-        const existing = await prisma.transaction.findFirst({
-          where: {
-            businessId: destBiz.id,
-            source: "anchor",
-            description: { contains: reference },
-          },
-        });
-        if (existing) return;
-      }
+      // Dedup is enforced ONLY by the unique `reference` on create (below).
+      // The old `description: { contains: reference }` pre-check was removed: a
+      // substring match on a caller-influenced reference meant a short prefix
+      // collided with an unrelated earlier credit and PERMANENTLY DROPPED real
+      // money, and it ran ahead of the reliable index check.
 
       // Look up the sender (source DepositAccount) to give a friendly description.
       // BookTransfer is KashBook→KashBook, so we have full sender details locally.

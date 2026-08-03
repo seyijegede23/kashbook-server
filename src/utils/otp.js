@@ -91,20 +91,25 @@ async function verifyOtp(identifier, code, type) {
   });
   if (count === 1) return true;
 
-  // Miss: charge the attempt against the live code for this identifier+type and
-  // burn it once the budget is spent, so guessing can't continue on that code.
+  // Miss: charge the attempt against the live code. ATOMIC increment (not a
+  // read-modify-write) so parallel guessing can't race past the budget, and the
+  // burn is a second conditional update that only fires once the count is spent.
   const live = await prisma.otpCode.findFirst({
     where: { identifier, type, used: false, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: "desc" },
-    select: { id: true, attempts: true },
+    select: { id: true },
   });
   if (live) {
-    const attempts = live.attempts + 1;
-    await prisma.otpCode.update({
+    const bumped = await prisma.otpCode.update({
       where: { id: live.id },
-      data: { attempts, ...(attempts >= MAX_OTP_ATTEMPTS ? { used: true } : {}) },
+      data: { attempts: { increment: 1 } },
+      select: { attempts: true },
     });
-    if (attempts >= MAX_OTP_ATTEMPTS) {
+    if (bumped.attempts >= MAX_OTP_ATTEMPTS) {
+      await prisma.otpCode.updateMany({
+        where: { id: live.id, used: false },
+        data: { used: true },
+      });
       console.warn(
         `[otp] code burned after ${MAX_OTP_ATTEMPTS} failed attempts for ${String(identifier).replace(/.(?=.{4})/g, "*")} (${type})`,
       );
@@ -131,17 +136,30 @@ async function peekOtp(identifier, code, type) {
   });
   if (hit) return true;
 
+  // Misses here count against the SAME budget as verifyOtp — otherwise this
+  // unauthenticated endpoint is a free oracle: confirm a guess without spending
+  // it, then replay it at reset-password.
+  //
+  // Tradeoff accepted: an attacker who knows a victim's phone can spend the
+  // budget and invalidate the code the victim is typing. That is not a new
+  // capability — the same attacker can already invalidate it by requesting a
+  // fresh code (saveOtp marks prior codes used, 5/hr), and the victim's remedy
+  // is identical: request another code. Brute-force protection is worth more
+  // than removing a nuisance that already exists by another route.
   const live = await prisma.otpCode.findFirst({
     where: { identifier, type, used: false, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: "desc" },
-    select: { id: true, attempts: true },
+    select: { id: true },
   });
   if (live) {
-    const attempts = live.attempts + 1;
-    await prisma.otpCode.update({
+    const bumped = await prisma.otpCode.update({
       where: { id: live.id },
-      data: { attempts, ...(attempts >= MAX_OTP_ATTEMPTS ? { used: true } : {}) },
+      data: { attempts: { increment: 1 } },
+      select: { attempts: true },
     });
+    if (bumped.attempts >= MAX_OTP_ATTEMPTS) {
+      await prisma.otpCode.updateMany({ where: { id: live.id, used: false }, data: { used: true } });
+    }
   }
   return false;
 }

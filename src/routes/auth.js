@@ -227,10 +227,21 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
 // ─────────────────────────────────────────────
 // POST /auth/send-otp
 // ─────────────────────────────────────────────
+// SECURITY: this endpoint is UNAUTHENTICATED, so the OTP purpose must be
+// allowlisted. A caller-chosen `type` let anyone mint an `email_change` /
+// `phone_change` / `TRANSFER_STEP_UP` code for an identifier they control and
+// then drive the matching confirm endpoint — bypassing the password re-auth on
+// the request step entirely. Only signup/reset codes may originate here;
+// identifier-change codes are issued exclusively by request-*-change (which
+// verifies the current password), and step-up codes only by the transfer flow.
+const SENDABLE_OTP_TYPES = new Set(["phone_register", "phone_reset"]);
+
 router.post("/send-otp", async (req, res) => {
   const { phone, email, identifier, type = "phone_register" } = req.body;
   const rawIden = identifier || email || phone || "";
   if (!rawIden) return res.status(400).json({ error: "Identifier required" });
+  if (!SENDABLE_OTP_TYPES.has(type))
+    return res.status(400).json({ error: "Unsupported verification type" });
   const iden = rawIden.includes("@") ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
   try {
     await dispatchOtp(iden, type);
@@ -746,7 +757,15 @@ router.post("/request-email-change", authMiddleware, async (req, res) => {
     // Re-authenticate: the OTP only proves control of the NEW address (which an
     // attacker holding a stolen token owns). The password proves it's the owner.
     const me = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!me?.password || !currentPassword || !(await bcrypt.verify(currentPassword, me.password)))
+    if (!me) return res.status(404).json({ error: "Account not found" });
+    // Legacy rows with no password (social/OTP-only signups) can't be asked for
+    // one — tell them to set a password rather than locking them out forever.
+    if (!me.password)
+      return res.status(403).json({
+        error: "Set a password first, then you can change your email or phone number.",
+        code: "PASSWORD_NOT_SET",
+      });
+    if (!currentPassword || !(await bcrypt.verify(currentPassword, me.password)))
       return res.status(401).json({ error: "Current password is incorrect", code: "PASSWORD_REQUIRED" });
     const existing = await prisma.user.findFirst({ where: { email } });
     if (existing && existing.id !== req.user.id)
@@ -809,7 +828,15 @@ router.post("/request-phone-change", authMiddleware, async (req, res) => {
   if (!newPhone) return res.status(400).json({ error: "Phone number required" });
   try {
     const me = await prisma.user.findUnique({ where: { id: req.user.id } });
-    if (!me?.password || !currentPassword || !(await bcrypt.verify(currentPassword, me.password)))
+    if (!me) return res.status(404).json({ error: "Account not found" });
+    // Legacy rows with no password (social/OTP-only signups) can't be asked for
+    // one — tell them to set a password rather than locking them out forever.
+    if (!me.password)
+      return res.status(403).json({
+        error: "Set a password first, then you can change your email or phone number.",
+        code: "PASSWORD_NOT_SET",
+      });
+    if (!currentPassword || !(await bcrypt.verify(currentPassword, me.password)))
       return res.status(401).json({ error: "Current password is incorrect", code: "PASSWORD_REQUIRED" });
     // Normalize BEFORE the uniqueness check. Raw trim() let "08012345678" slip
     // past a stored "+2348012345678", after which the SMS layer normalized it

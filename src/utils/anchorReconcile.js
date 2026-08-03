@@ -107,12 +107,27 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
       a.reference || a.sessionId || a.transactionReference || t.id;
     if (!reference) continue;
 
-    // Dedup: skip if we've already recorded this reference for this business
+    // Dedup: check EVERY key a webhook may already have booked this money
+    // under, not a description substring. The webhook books NIP credits as
+    // anc_pay_<paymentId> and BOOK transfers as anc_bk_<transferId>; if the
+    // poller only matched its own anc_txn_ key it would double-credit internal
+    // transfers. The description scan is kept last for rows written before
+    // references existed.
+    const paymentRelId = t.relationships?.payment?.data?.id || "";
+    const transferRelId = t.relationships?.transfer?.data?.id || "";
+    const candidateRefs = [
+      paymentRelId ? `anc_pay_${paymentRelId}` : null,
+      transferRelId ? `anc_bk_${transferRelId}` : null,
+      `anc_txn_${reference}`,
+    ].filter(Boolean);
     const existing = await prisma.transaction.findFirst({
       where: {
         businessId: biz.id,
         source: "anchor",
-        description: { contains: reference },
+        OR: [
+          { reference: { in: candidateRefs } },
+          { description: { contains: reference } },
+        ],
       },
     });
     if (existing) continue;
