@@ -272,6 +272,9 @@ router.patch("/:id/branding", async (req, res) => {
         public_id: `biz_${biz.id}`,
         overwrite: true,
         resource_type: meta.resourceType,
+        // Strip EXIF/GPS: a photographed document can carry the location it was
+        // taken, which we have no reason to store or serve.
+        image_metadata: false,
         allowed_formats: ["png", "jpg", "jpeg", "webp"],
       });
       logoUrl = result.secure_url;
@@ -727,6 +730,9 @@ router.post("/:id/upload-cac", async (req, res) => {
       public_id: `cac_${crypto.randomUUID()}`,
       overwrite: false,
       resource_type: meta.resourceType,
+      // Strip EXIF/GPS: a photographed certificate can carry the location it was
+      // taken, which we have no reason to store or serve.
+      image_metadata: false,
       type: "private",
       access_mode: "authenticated",
     });

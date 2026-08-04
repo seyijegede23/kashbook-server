@@ -30,6 +30,60 @@ class UploadError extends Error {
   }
 }
 
+// ── Content verification ────────────────────────────────────────────────────
+// The declared MIME in a data URI is attacker-controlled, so it proves nothing.
+// Verify the actual bytes: "image/png" carrying an HTML/SVG payload would
+// otherwise be stored and later served/opened as whatever it really is.
+const MAGIC = {
+  "image/png":  (b) => b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  "image/jpeg": (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,
+  "image/webp": (b) => b.length > 12 && b.subarray(0, 4).toString("latin1") === "RIFF" && b.subarray(8, 12).toString("latin1") === "WEBP",
+  "application/pdf": (b) => b.subarray(0, 5).toString("latin1") === "%PDF-",
+};
+MAGIC["image/jpg"] = MAGIC["image/jpeg"];
+
+// PDFs are documents AND a scripting host. A KYB certificate never needs any of
+// this, and these files are forwarded to Anchor's reviewers, so anything active
+// is rejected rather than "sanitised" — rewriting a PDF to strip actions is
+// error-prone and can silently corrupt a legitimate document. The user simply
+// re-exports a clean PDF (any "Print to PDF" produces one).
+const PDF_ACTIVE_CONTENT = [
+  { token: "/JavaScript", label: "JavaScript" },
+  { token: "/JS", label: "JavaScript" },
+  { token: "/OpenAction", label: "an auto-run action" },
+  { token: "/AA", label: "an automatic action" },
+  { token: "/Launch", label: "a launch action" },
+  { token: "/EmbeddedFile", label: "an embedded file" },
+  { token: "/RichMedia", label: "embedded media" },
+  { token: "/XFA", label: "an XFA form" },
+  { token: "/SubmitForm", label: "a form submission action" },
+];
+
+function inspectPdf(buf) {
+  // Scan as latin1 so byte offsets line up with the tokens we're looking for.
+  const text = buf.toString("latin1");
+  if (/\/Encrypt[\s\d<]/.test(text)) {
+    throw new UploadError(
+      "Password-protected PDFs can't be accepted. Please upload an unprotected copy.",
+      "UPLOAD_PDF_ENCRYPTED",
+    );
+  }
+  for (const { token, label } of PDF_ACTIVE_CONTENT) {
+    // Token must appear as a PDF name (followed by a delimiter), so "/JS" does
+    // not match inside e.g. "/JSomething".
+    const re = new RegExp(`\\${token}(?![A-Za-z0-9])`);
+    if (re.test(text)) {
+      throw new UploadError(
+        `This PDF contains ${label} and can't be accepted. Please re-save it as a plain PDF (for example, print to PDF) and upload again.`,
+        "UPLOAD_PDF_ACTIVE_CONTENT",
+      );
+    }
+  }
+  if (!/%%EOF/.test(text.slice(-2048))) {
+    throw new UploadError("This PDF looks incomplete or corrupted.", "UPLOAD_PDF_MALFORMED");
+  }
+}
+
 /**
  * Validate a base64 data URI.
  * @returns {{ mime: string, bytes: number, resourceType: string }}
@@ -55,7 +109,8 @@ function validateDataUri(input, { allow = IMAGE_TYPES, maxBytes = 5 * 1024 * 102
       "UPLOAD_TYPE_NOT_ALLOWED",
     );
   }
-  // Decoded size, not the base64 length.
+  // Decoded size, not the base64 length. Check BEFORE decoding so an oversized
+  // payload is rejected without allocating it.
   const b64 = m[2].replace(/\s/g, "");
   const padding = (b64.match(/=+$/) || [""])[0].length;
   const bytes = Math.floor((b64.length * 3) / 4) - padding;
@@ -66,6 +121,18 @@ function validateDataUri(input, { allow = IMAGE_TYPES, maxBytes = 5 * 1024 * 102
       "UPLOAD_TOO_LARGE",
     );
   }
+
+  // The declared MIME is attacker-controlled — verify the real bytes.
+  const buf = Buffer.from(b64, "base64");
+  const check = MAGIC[mime];
+  if (!check || !check(buf)) {
+    throw new UploadError(
+      "The file contents don't match its type. Please upload a valid file.",
+      "UPLOAD_CONTENT_MISMATCH",
+    );
+  }
+  if (mime === "application/pdf") inspectPdf(buf);
+
   return { mime, bytes, resourceType: RESOURCE_TYPE[mime] || RESOURCE_TYPE.default };
 }
 

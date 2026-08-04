@@ -694,6 +694,9 @@ router.post("/upload-avatar", authMiddleware, async (req, res) => {
       const result = await cloudinary.uploader.upload(imageBase64, {
         folder: "kashbook/avatars", public_id: `user_${req.user.id}`, overwrite: true,
         resource_type: meta.resourceType,
+        // Strip EXIF/GPS: a photographed document can carry the location it was
+        // taken, which we have no reason to store or serve.
+        image_metadata: false,
         allowed_formats: ["png", "jpg", "jpeg", "webp"],
         transformation: [{ width: 400, height: 400, crop: "fill", gravity: "face" }],
       });
