@@ -1,4 +1,5 @@
 const router = require("express").Router();
+const crypto = require("crypto");
 const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
@@ -7,6 +8,7 @@ const anchor = require("../utils/anchor");
 const { openIndividualBankAccount } = require("../utils/anchorBank");
 const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require("../utils/businessName");
 const { encrypt, hmacValue } = require("../utils/crypto");
+const { validateDataUri, IMAGE_TYPES, DOC_TYPES } = require("../utils/uploadGuard");
 const { audit } = require("../utils/audit");
 const { getRiskCategory } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
@@ -256,10 +258,21 @@ router.patch("/:id/branding", async (req, res) => {
         .catch(() => {});
       logoUrl = null;
     } else if (logoBase64) {
+      // Logos are intentionally public (they render on invoices/receipts), but
+      // must still be a real, size-capped image — not arbitrary content hosted
+      // under our Cloudinary account, and not a remote URL for it to fetch.
+      let meta;
+      try {
+        meta = validateDataUri(logoBase64, { allow: IMAGE_TYPES, maxBytes: 3 * 1024 * 1024 });
+      } catch (e) {
+        return res.status(e.httpStatus || 400).json({ error: e.message, code: e.code });
+      }
       const result = await cloudinary.uploader.upload(logoBase64, {
         folder: "kashbook/businesses",
         public_id: `biz_${biz.id}`,
         overwrite: true,
+        resource_type: meta.resourceType,
+        allowed_formats: ["png", "jpg", "jpeg", "webp"],
       });
       logoUrl = result.secure_url;
     }
@@ -518,6 +531,20 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
     if (!user?.anchorCustomerId)
       return res.status(400).json({ error: "No Anchor customer for this user" });
 
+    // SECURITY: this hatch attaches an EXISTING Anchor account to a business, so
+    // it must not become a way to hand one KYC-verified account to many
+    // businesses. Require this business to have been through the admin KYC gate.
+    const approved = await prisma.kycSubmission.findFirst({
+      where: { businessId: biz.id, status: "APPROVED" },
+      select: { id: true },
+    });
+    if (!approved) {
+      return res.status(403).json({
+        error: "This business hasn't been approved for a bank account yet.",
+        code: "KYC_NOT_APPROVED",
+      });
+    }
+
     const accounts = await anchor.listCustomerAccounts(user.anchorCustomerId);
     if (!accounts.length)
       return res.status(404).json({ error: "No deposit accounts found on Anchor" });
@@ -525,6 +552,23 @@ router.post("/:id/sync-anchor-account", async (req, res) => {
     const acc = accounts[0];
     const accountId = acc.id;
     const attrs = acc.attributes || {};
+
+    // Refuse if ANOTHER business already holds this Anchor account. The unique
+    // indexes make the write fail anyway; this returns a clear error instead of
+    // a 500, and covers the case where only the account id is already claimed.
+    const claimedBy = await prisma.business.findFirst({
+      where: { anchorAccountId: accountId, NOT: { id: biz.id } },
+      select: { id: true, name: true },
+    });
+    if (claimedBy) {
+      console.warn(
+        `[sync-anchor-account] ${biz.name} tried to adopt account already held by ${claimedBy.name}`,
+      );
+      return res.status(409).json({
+        error: "That bank account already belongs to another business.",
+        code: "ACCOUNT_ALREADY_LINKED",
+      });
+    }
 
     // Anchor's LIST endpoint masks account numbers (e.g. "*****0342") — the
     // FULL number lives on the AccountNumber sub-resources. Only a full
@@ -663,16 +707,35 @@ router.post("/:id/upload-cac", async (req, res) => {
     });
     if (!biz) return res.status(404).json({ error: "Business not found" });
 
+    // SECURITY: KYB documents are identity documents. They were previously
+    // uploaded with Cloudinary's DEFAULT delivery (public) under a DETERMINISTIC
+    // public_id (`cac_<businessId>`) — and business UUIDs are handed out by
+    // GET /businesses — so anyone who saw an id could fetch the CAC certificate
+    // straight off the CDN, unauthenticated and forever.
+    //   • type "private" + access_mode "authenticated" → no anonymous delivery
+    //   • random public_id → not derivable from anything the client knows
+    //   • validated + pinned resource_type → no arbitrary content hosting
+    let meta;
+    try {
+      meta = validateDataUri(fileBase64, { allow: DOC_TYPES, maxBytes: 8 * 1024 * 1024 });
+    } catch (e) {
+      return res.status(e.httpStatus || 400).json({ error: e.message, code: e.code });
+    }
+
     const upload = await cloudinary.uploader.upload(fileBase64, {
       folder: "kashbook/kyb",
-      public_id: `cac_${biz.id}`,
-      overwrite: true,
-      resource_type: "auto",
+      public_id: `cac_${crypto.randomUUID()}`,
+      overwrite: false,
+      resource_type: meta.resourceType,
+      type: "private",
+      access_mode: "authenticated",
     });
 
+    // Store the public_id, NOT a delivery URL: a private asset is only reachable
+    // through a short-lived signed URL minted on demand by an authorised reader.
     await prisma.business.update({
       where: { id: biz.id },
-      data: { cacCertificateUrl: upload.secure_url },
+      data: { cacCertificateUrl: upload.public_id },
     });
 
     res.json({ url: upload.secure_url });

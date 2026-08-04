@@ -340,6 +340,12 @@ router.post("/send", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   if (isNaN(amount) || Number(amount) <= 0)
     return res.status(400).json({ error: "Invalid amount" });
+  // Money is 2-decimal. Anchor rounds to kobo when sending (Math.round(amount*100)),
+  // so a sub-kobo amount would leave the bank at one value and be BOOKED at
+  // another — a permanent ledger-vs-bank divergence. Reject rather than silently
+  // round, so the client and the ledger always agree on what was sent.
+  if (Math.round(Number(amount) * 100) !== Number(amount) * 100)
+    return res.status(400).json({ error: "Amount cannot have more than 2 decimal places" });
 
   // Require a valid transaction PIN before processing.
   const pinCheck = await verifyTransactionPin(req.user.id, pin);

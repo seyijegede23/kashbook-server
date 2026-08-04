@@ -148,10 +148,13 @@ app.use(
         defaultSrc: ["'self'"],
         // No 'unsafe-inline' — the admin SPA's JS lives in /admin/app.js (served
         // from 'self') and has no inline <script> or inline event handlers.
+        // cdn.jsdelivr.net REMOVED: it serves any file from any npm package or
+        // GitHub repo, so permitting it meant the CSP provided no XSS
+        // containment for the highest-privilege UI in the system. chart.js is
+        // now self-hosted at /admin/vendor/ with an SRI hash.
         scriptSrc: [
           "'self'",
           "cdn.tailwindcss.com",
-          "cdn.jsdelivr.net",
         ],
         // styleSrc keeps 'unsafe-inline' because the Tailwind Play CDN injects
         // generated styles at runtime (style injection, not script execution).
@@ -316,6 +319,9 @@ app.use("/whatsapp", whatsappRoutes);
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
+// Public invoice links are unauthenticated and each hit runs a 5-table join plus
+// CPU-bound QR generation — rate-limit them like any other public surface.
+app.use("/i", apiLimiter);
 app.use("/", require("./src/routes/publicInvoice"));
 
 // ── Admin panel (serves SPA) ──────────────────────────────────────────────────
@@ -324,7 +330,9 @@ app.get("/admin", adminSpaLimiter, (_req, res) =>
 );
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", async (_req, res) => {
+// /health executes a DB query on every call. Unlimited, it lets a trivial flood
+// starve the (small) connection pool for real traffic.
+app.get("/health", apiLimiter, async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
     res.json({ status: "ok", uptime: Math.round(process.uptime()) });
@@ -351,7 +359,7 @@ app.listen(PORT, () => {
   console.log(`KashBook API running on port ${PORT}`);
   // Build marker — lets a deploy's boot log confirm which code is live. Bump the
   // tag when shipping a change whose presence you need to verify from the logs.
-  console.log("[boot] build=korapay-removed");
+  console.log("[boot] build=sec-phase3-data-protection");
 });
 
 // ── Background loop: reconcile Anchor inbound credits every 5 min ────────────

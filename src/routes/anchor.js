@@ -668,37 +668,81 @@ router.post("/", async (req, res) => {
       const description = buildInboundDescription({ sender, narration, reference: sessionId });
       const paidAt = pay.paidAt ? new Date(pay.paidAt) : null;
 
-      // Cross-path repair: the reconcile poller books credits it can't link to
-      // a Payment as "Anonymous sender" with an anc_txn_ (or legacy null)
-      // reference — a key the unique check below can't collide with. If this
-      // payment event matches such a row (same business + amount, booked within
-      // ±30 min of the payment's own paidAt), it IS that money: BACKFILL the
-      // real sender into the description and lock the row onto the anc_pay_
-      // key instead of booking a duplicate.
+      // Cross-path repair. The reconcile poller reads Anchor's /transactions
+      // list, which carries no Payment link, so it books credits it cannot
+      // attribute as "Anonymous sender" under an anc_txn_ key. The webhook knows
+      // the paymentId but NOT that anc_txn id — the two views share no
+      // identifier, so a duplicate is otherwise unavoidable. This repair adopts
+      // the existing row instead of booking a second one.
+      //
+      // The match is heuristic, so it is deliberately strict:
+      //   • the row must be UNATTRIBUTED ("Anonymous sender") — a row that
+      //     already names a sender belongs to a different, identified credit;
+      //   • same business, same exact amount, source anchor, type income;
+      //   • within ±5 min of the payment's own paidAt (was ±30, which could
+      //     span several same-amount credits);
+      //   • only when EXACTLY ONE candidate matches — two same-amount
+      //     unattributed credits in the window are ambiguous, so we book
+      //     normally and let the unique index sort it out rather than risk
+      //     hijacking the wrong row and losing a real credit;
+      //   • held under the per-business lock so the poller can't interleave
+      //     between our read and our write.
+      // The original provider id is preserved in providerTxnId — the repair
+      // re-keys `reference`, so without this the anc_txn id would be lost.
       if (paidAt) {
-        const reconTwin = await prisma.transaction.findFirst({
-          where: {
-            businessId: biz.id,
-            source: "anchor",
-            type: "income",
-            amount,
-            OR: [{ reference: null }, { reference: { startsWith: "anc_txn_" } }],
-            date: {
-              gte: new Date(paidAt.getTime() - 30 * 60 * 1000),
-              lte: new Date(paidAt.getTime() + 30 * 60 * 1000),
+        const repaired = await prisma.withBusinessLock(biz.id, async () => {
+          const window = 5 * 60 * 1000;
+          const candidates = await prisma.transaction.findMany({
+            where: {
+              businessId: biz.id,
+              source: "anchor",
+              type: "income",
+              amount,
+              description: { contains: "Anonymous sender" },
+              OR: [{ reference: null }, { reference: { startsWith: "anc_txn_" } }],
+              date: {
+                gte: new Date(paidAt.getTime() - window),
+                lte: new Date(paidAt.getTime() + window),
+              },
             },
-          },
-          orderBy: { date: "asc" },
-          select: { id: true, reference: true },
-        });
-        if (reconTwin) {
-          await prisma.transaction.update({
-            where: { id: reconTwin.id },
-            data: { description, ...(reference ? { reference } : {}) },
+            take: 2,
+            select: { id: true, reference: true, providerTxnId: true },
           });
+          if (candidates.length !== 1) {
+            if (candidates.length > 1) {
+              console.warn(
+                `[Anchor webhook] ${candidates.length} ambiguous unattributed ₦${amount} credits for ${biz.name} — booking normally instead of repairing`,
+              );
+            }
+            return null;
+          }
+          const twin = candidates[0];
+          await prisma.transaction.update({
+            where: { id: twin.id },
+            data: {
+              description,
+              ...(reference ? { reference } : {}),
+              // Keep the provider id the poller saw; fall back to the payment id.
+              providerTxnId:
+                twin.providerTxnId ||
+                (twin.reference || "").replace(/^anc_txn_/, "") ||
+                paymentKey ||
+                null,
+            },
+          });
+          return twin;
+        });
+        if (repaired) {
           console.log(
-            `[Anchor webhook] credit ₦${amount} was reconcile-booked (${reconTwin.reference || "no ref"}) — backfilled sender + locked onto ${reference || "same ref"}`,
+            `[Anchor webhook] credit ₦${amount} was reconcile-booked (${repaired.reference || "no ref"}) — attributed sender + re-keyed to ${reference || "same ref"}`,
           );
+          await audit({
+            action: "ANCHOR_CREDIT_REPAIRED",
+            resourceType: "transaction",
+            resourceId: repaired.id,
+            severity: "info",
+            metadata: { amount, oldReference: repaired.reference, newReference: reference },
+          }).catch(() => {});
           return;
         }
       }
@@ -719,7 +763,9 @@ router.post("/", async (req, res) => {
               ? new Date(attrs.transactionDate)
               : new Date(),
             source: "anchor",
+            currency: biz.baseCurrency || "NGN",
             ...(reference ? { reference } : {}),
+            ...(paymentKey ? { providerTxnId: paymentKey } : {}),
           },
         });
       } catch (createErr) {
@@ -850,6 +896,7 @@ router.post("/", async (req, res) => {
             source: "anchor",
             currency: destBiz.baseCurrency || "NGN",
             reference: dbReference, // unique per business — the real dedup gate
+            providerTxnId: bookTransferId,
           },
         });
       } catch (createErr) {

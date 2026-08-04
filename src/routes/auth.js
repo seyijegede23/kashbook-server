@@ -6,6 +6,7 @@ const prisma         = require("../utils/db");
 const cloudinary     = require("../config/cloudinary");
 const { signToken }  = require("../utils/jwt");
 const { dispatchOtp, verifyOtp, peekOtp, hashOtp, sendEmail } = require("../utils/otp");
+const { validateDataUri, IMAGE_TYPES } = require("../utils/uploadGuard");
 const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
 
@@ -682,8 +683,18 @@ router.post("/upload-avatar", authMiddleware, async (req, res) => {
   try {
     let profileImage = null;
     if (imageBase64) {
+      // Public by design (avatars render in-app), but validated: real image
+      // types only, size-capped, and never a remote URL for Cloudinary to fetch.
+      let meta;
+      try {
+        meta = validateDataUri(imageBase64, { allow: IMAGE_TYPES, maxBytes: 3 * 1024 * 1024 });
+      } catch (e) {
+        return res.status(e.httpStatus || 400).json({ error: e.message, code: e.code });
+      }
       const result = await cloudinary.uploader.upload(imageBase64, {
         folder: "kashbook/avatars", public_id: `user_${req.user.id}`, overwrite: true,
+        resource_type: meta.resourceType,
+        allowed_formats: ["png", "jpg", "jpeg", "webp"],
         transformation: [{ width: 400, height: 400, crop: "fill", gravity: "face" }],
       });
       profileImage = result.secure_url;

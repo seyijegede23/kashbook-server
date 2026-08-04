@@ -22,9 +22,28 @@ async function recordFincraPayoutOutcome(d, outcome, source = "fincra") {
   // The optimistic expense booked at send time (reference === the customerReference
   // we sent the provider). No match → we lost the booking (timeout /
   // bookkeepingFailed) OR it's a foreign/mis-parsed event.
-  const expense = await prisma.transaction.findFirst({
-    where: { source, type: "expense", reference: String(reference) },
+  //
+  // SECURITY: `reference` is unique only PER BUSINESS (@@unique([businessId,
+  // reference])), and on the client-keyed path it derives from a caller-supplied
+  // idempotency key — so the same string can legitimately exist on two
+  // businesses. An unscoped findFirst would then pick an arbitrary row and the
+  // reversal below would credit the WRONG business's spendable ledger. Scope by
+  // business when the event tells us which one; refuse when it's ambiguous.
+  const refStr = String(reference);
+  const expenseWhere = { source, type: "expense", reference: refStr };
+  if (bizId) expenseWhere.businessId = bizId;
+  const matches = await prisma.transaction.findMany({
+    where: expenseWhere,
+    orderBy: { createdAt: "asc" },
+    take: 2,
   });
+  if (matches.length > 1) {
+    console.error(
+      `[${source}Payout] reference ${refStr} matches ${matches.length} businesses — refusing to act without an unambiguous target`,
+    );
+    return { handled: false, reason: "ambiguous_reference", reference: refStr };
+  }
+  const expense = matches[0] || null;
 
   if (outcome === "success") {
     if (expense) return { handled: true, outcome: "success", businessId: expense.businessId };

@@ -26,6 +26,16 @@ function validateEnv() {
     problems.push("ANCHOR_VERIFY_WEBHOOK=false disables signature checks — forbidden in production");
   }
 
+  // Same for the AML engine. With AML_ENABLED=false every limit, the step-up OTP,
+  // the rules engine and ALL ComplianceFlag writes are bypassed — a live
+  // money-transmitting product with no transaction monitoring and no record to
+  // show a regulator. It must be an explicit, deliberate, non-production choice.
+  if (isProd && process.env.AML_ENABLED === "false") {
+    problems.push(
+      "AML_ENABLED=false disables all transaction monitoring (limits, step-up OTP, compliance flags) — forbidden in production",
+    );
+  }
+
   // Anchor is the active provider (Nigeria banking + payouts + webhooks). Require
   // the API key + base URL, and in production flag a SANDBOX base URL — going live
   // against the sandbox would issue fake NUBANs and move no real money.

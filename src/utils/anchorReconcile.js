@@ -174,7 +174,11 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
           paymentMethod: "bank",
           date: a.createdAt ? new Date(a.createdAt) : new Date(),
           source: "anchor",
+          currency: biz.baseCurrency || "NGN",
           reference: dbReference,
+          // The provider-side id this row came from — survives a later webhook
+          // repair that re-keys `reference`, so the row stays traceable.
+          providerTxnId: paymentRelId || transferRelId || t.id || reference || null,
           flagSeverity,
           complianceStatus,
         },

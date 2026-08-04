@@ -5,7 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KashBook Admin</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Self-hosted (was cdn.jsdelivr.net). jsDelivr serves ANY file from ANY npm
+       package or GitHub repo, so allowing it in script-src meant the CSP gave the
+       admin panel no XSS containment at all. Local copy + SRI instead. -->
+  <script src="/admin/vendor/chart.umd.min.js"
+          integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g"
+          crossorigin="anonymous"></script>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
     .badge-premium { background: #FEF3C7; color: #92400E; }

@@ -99,13 +99,17 @@ model Business {
   taxId                      String? // display-only Tax ID / RC number for documents (P&L, invoices)
   virtualAccountRef          String?
   virtualAccountId           String?
-  virtualAccountNumber       String?
+  // @unique: one NUBAN belongs to exactly one business. Without this, the
+  // sync-anchor-account hatch could clone one KYC-verified account onto many
+  // businesses, each then resolving to its OWN full AML tier limits on the same
+  // real account (an N× multiplication of the regulator-facing cap).
+  virtualAccountNumber       String?   @unique
   virtualAccountBank         String?
   virtualAccountName         String?
-  anchorAccountId            String?
+  anchorAccountId            String?   @unique
   // Provider-neutral banking identity (Fincra swap). New code gates "has
   // banking" on providerAccountId instead of anchorAccountId.
-  providerAccountId          String?
+  providerAccountId          String?   @unique
   paymentProviderRef         String?
   localAccountStatus         String?   @default("none") // none | pending | issued
   bankAccountType            String    @default("SAVINGS")
@@ -552,6 +556,7 @@ model Transaction {
   updatedAt         DateTime  @updatedAt
 
   @@unique([businessId, reference])
+  @@index([businessId, providerTxnId])
   @@index([businessId, date])
   @@index([userId])
   @@index([businessId, updatedAt])

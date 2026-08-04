@@ -74,8 +74,17 @@ function getRiskCategory(industry) {
   return "standard";
 }
 
+// Tier drives the AML limits, so the test must reflect ACTUAL verification.
+// A NUBAN string alone is not proof: it is a column any account-attach path can
+// set, and treating it as the verification test meant limits could be claimed
+// without KYC. Require the account to be genuinely provisioned — a provider
+// account id (Anchor/Fincra) alongside the number — before granting a funded
+// tier. Businesses without one stay "unverified" (all-zero limits), which is
+// fail-closed: they simply can't send until provisioning completes.
 function resolveTierKey(business) {
   if (!business?.virtualAccountNumber) return "unverified";
+  const provisioned = !!(business.anchorAccountId || business.providerAccountId);
+  if (!provisioned) return "unverified";
   if ((business.kycBusinessType || "").toLowerCase() === "limited_company") {
     return "limited_company";
   }

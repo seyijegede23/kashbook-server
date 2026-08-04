@@ -141,10 +141,22 @@ router.get("/pull", async (req, res) => {
 // POST /sync
 // Body: { queue: [{ id, type, data, timestamp }] }
 // ─────────────────────────────────────────────────────────────────────────────
+// Cap the queue. Each op runs 1-5 sequential DB round-trips against a small
+// connection pool, so an unbounded queue (a 10MB body holds ~50k minimal ops)
+// was the cheapest way for one authenticated request to stall the whole API.
+const MAX_SYNC_OPS = 500;
+
 router.post("/", async (req, res) => {
   const { queue = [] } = req.body;
   if (!Array.isArray(queue) || !queue.length) {
     return res.json({ processed: [], errors: [] });
+  }
+  if (queue.length > MAX_SYNC_OPS) {
+    return res.status(413).json({
+      error: `Too many operations in one sync (${queue.length}). Send at most ${MAX_SYNC_OPS} per request.`,
+      code: "SYNC_QUEUE_TOO_LARGE",
+      maxOps: MAX_SYNC_OPS,
+    });
   }
 
   const processed = [];
@@ -155,8 +167,18 @@ router.post("/", async (req, res) => {
       await processOp(op, req.user.id, req.user.name);
       processed.push(op.id);
     } catch (err) {
+      // Log the real reason server-side, return a STABLE code to the client.
+      // Raw err.message here was leaking Prisma internals — table names, column
+      // names, constraint names and record values (e.g. "Unique constraint
+      // failed on the fields: (userId,phone)") — a free schema map, and an
+      // existence oracle when combined with a guessed id.
       console.error(`Sync op ${op.id} (${op.type}) failed:`, err.message);
-      errors.push({ id: op.id, type: op.type, error: err.message });
+      errors.push({
+        id: op.id,
+        type: op.type,
+        error: err.expose ? err.message : "This item could not be synced.",
+        code: err.code && !String(err.code).startsWith("P") ? err.code : "SYNC_OP_FAILED",
+      });
     }
   }
 
