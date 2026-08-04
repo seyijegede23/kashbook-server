@@ -89,4 +89,7 @@ async function checkAlerts(health = {}) {
   return fired;
 }
 
-module.exports = { checkAlerts };
+// `fire` is exported as fireAlert so jobs outside the health cron (e.g. the
+// nightly DB backup) can raise an admin alert through the same cooldown,
+// push and email path instead of only logging to stderr.
+module.exports = { checkAlerts, fireAlert: fire };

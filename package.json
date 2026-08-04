@@ -6,7 +6,12 @@
   "scripts": {
     "start": "npx prisma generate && npx prisma migrate deploy && node server.js",
     "dev": "nodemon server.js",
-    "migrate": "npx prisma migrate deploy"
+    "migrate": "npx prisma migrate deploy",
+    "backup:snapshot": "node -r dotenv/config scripts/backup-db.js --snapshot --keep 60",
+    "backup:list": "node -r dotenv/config scripts/backup-db.js --snapshots",
+    "backup:replicate": "node -r dotenv/config scripts/backup-db.js --replicate",
+    "backup:verify": "node -r dotenv/config scripts/backup-db.js --verify",
+    "backup:dump": "node -r dotenv/config scripts/backup-db.js --dump --out ../backups"
   },
   "dependencies": {
     "@node-rs/bcrypt": "^1.10.7",

@@ -16,6 +16,10 @@ const CRON_INTERVAL_MIN = {
   instagramTokenRefresh: 24 * 60,
   monthlyReport: 32 * 24 * 60, // monthly — allow the longest month + a day
   recurringInvoices: 24 * 60,
+  // A backup that silently stops running is worse than one that errors — the
+  // error at least alerts. Registering it here means the existing cron_stale
+  // rule catches the silence too.
+  dbBackup: 24 * 60,
 };
 
 async function pingDb() {

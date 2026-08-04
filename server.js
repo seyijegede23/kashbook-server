@@ -558,6 +558,39 @@ cron.schedule(
   { timezone: "Africa/Lagos" },
 );
 
+// ── Database backup: dated snapshot + standby mirror (daily 02:40 Lagos) ─────
+// This database is the ledger of record for real customer money and had no
+// backups at all. Two layers, both into the standby Postgres:
+//   • a dated snapshot, which is what survives logical corruption (a bad
+//     migration or bug that a mirror would faithfully copy over the good data);
+//   • a refreshed mirror, for fast recovery if the primary is lost outright.
+// Runs before the 03:30 jobs and after the 02:00 purge so it captures a settled
+// database. Leader-elected, so only one instance backs up per night.
+// No-ops when BACKUP_DATABASE_URL is unset. Failure alerts rather than throwing.
+cron.schedule(
+  "40 2 * * *",
+  async () => {
+    try {
+      await prisma.withCronLock(4011, async () => {
+        await require("./src/utils/snapshots").recordHeartbeat("dbBackup");
+        const r = await require("./scripts/backup-db").scheduledBackup({ keep: 60 });
+        if (r.skipped) return console.warn(`[Cron] DB backup SKIPPED — ${r.skipped}`);
+        console.log(`[Cron] DB backup ok — snapshot #${r.snapshotId}, ${r.rows} rows across ${r.tables} tables, ${(r.bytes / 1024).toFixed(0)}KB`);
+      });
+    } catch (err) {
+      console.error("[Cron] DB BACKUP FAILED:", err.message);
+      try {
+        await require("./src/utils/alerts").fireAlert(
+          "db_backup_failed",
+          "Database backup failed",
+          `The nightly backup did not complete: ${err.message}. The ledger of record is unprotected until this is fixed.`,
+        );
+      } catch { /* alerting must never mask the original failure */ }
+    }
+  },
+  { timezone: "Africa/Lagos" },
+);
+
 // ── Background cron: send pending reminders every 5 minutes ──────────────────
 // Reminders are scheduled at user-chosen times and rarely time-critical to
 // the minute. 5min cadence cuts cron-driven DB queries by 80%.
