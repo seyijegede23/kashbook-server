@@ -92,7 +92,10 @@ router.post("/schedule", authMiddleware, async (req, res) => {
         recipientName: customer.name,
         phone: normalizePhone(customer.phone),
         message,
-        channel: "sms",
+        // Intended channel. The cron overwrites this with the channel that
+        // actually delivered, so the merchant is never told "WhatsApp" for a
+        // message that fell back to SMS.
+        channel: process.env.SENDCHAMP_WA_REMINDER_TEMPLATE ? "whatsapp" : "sms",
         status: "pending",
         scheduledFor,
       },

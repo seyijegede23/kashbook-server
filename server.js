@@ -600,6 +600,9 @@ cron.schedule("*/5 * * * *", async () => {
     const now = new Date();
     const pendingReminders = await prisma.reminder.findMany({
       where: { status: "pending", scheduledFor: { lte: now } },
+      // business name is a WhatsApp template variable; currency is derived from
+      // country (Business has no currency column — it comes from countries/*.js)
+      include: { business: { select: { name: true, country: true } } },
     });
 
     if (pendingReminders.length > 0) {
@@ -617,13 +620,19 @@ cron.schedule("*/5 * * * *", async () => {
           });
           continue;
         }
-        await sendSms(reminder.phone, reminder.message || "KashBook reminder.");
+        // WhatsApp template first, SMS fallback — same order as OTP delivery.
+        // Record the channel that actually delivered, not the one requested, so
+        // the merchant sees where the message really went.
+        const { channel } = await require("./src/utils/reminderSender").sendReminder(reminder, {
+          businessName: reminder.business?.name || "",
+          country: reminder.business?.country || "NG",
+        });
         await prisma.reminder.update({
           where: { id: reminder.id },
-          data: { status: "sent", sentAt: new Date() },
+          data: { status: "sent", sentAt: new Date(), channel },
         });
       } catch (smsErr) {
-        console.error(`[Cron] Failed SMS to ${reminder.phone}:`, smsErr);
+        console.error(`[Cron] Failed reminder to ${String(reminder.phone).replace(/\d(?=\d{4})/g, "*")}:`, smsErr.message);
         await prisma.reminder.update({
           where: { id: reminder.id },
           data: { status: "failed" },

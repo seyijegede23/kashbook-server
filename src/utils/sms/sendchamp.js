@@ -116,6 +116,68 @@ async function sendWhatsAppOtp(phone, code) {
   }
 }
 
+// Send an APPROVED WhatsApp template message.
+//
+// This is a different Sendchamp product from sendWhatsAppOtp above. That one
+// uses /verification/create, which can only ever deliver a token — it renders
+// Sendchamp's own OTP wording, so it cannot carry a debt reminder. Arbitrary
+// business-initiated WhatsApp messages must go through an approved template:
+//
+//   POST /whatsapp/message/send  { sender, recipient, template_code,
+//                                  type: "template", custom_data: { body: {...} } }
+//
+// `vars` is positional, matching the {{1}}, {{2}}… placeholders in the template
+// registered on the Sendchamp dashboard. Order is defined by that template, so
+// changing the template means changing the caller.
+//
+// Returns { ok, reference } — callers fall back to SMS when not ok, exactly as
+// the OTP path does.
+async function sendWhatsAppTemplate(phone, templateCode, vars = []) {
+  const apiKey = process.env.SENDCHAMP_PUBLIC_KEY || process.env.SENDCHAMP_API_KEY;
+  const sender = process.env.SENDCHAMP_WA_SENDER;
+  if (!apiKey || !templateCode || !sender) {
+    return { ok: false, error: "NOT_CONFIGURED" };
+  }
+
+  const base = process.env.SENDCHAMP_BASE_URL || "https://api.sendchamp.com/api/v1";
+  const body = JSON.stringify({
+    sender,
+    recipient: normalizePhoneForSendchamp(phone),
+    template_code: templateCode,
+    type: "template",
+    // Sendchamp keys template variables by 1-based position, as strings.
+    custom_data: {
+      body: vars.reduce((acc, v, i) => ({ ...acc, [String(i + 1)]: String(v ?? "") }), {}),
+    },
+  });
+
+  try {
+    const { status, body: resBody } = await httpsPostJson({
+      urlStr: `${base}/whatsapp/message/send`,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body,
+      timeoutMs: 30000, // same allowance as the OTP path; WA dispatch is slow
+    });
+    let data = {};
+    try { data = resBody ? JSON.parse(resBody) : {}; } catch {}
+    const ok =
+      status >= 200 && status < 300 &&
+      (data.status === "success" || String(data.code) === "200");
+    if (!ok) {
+      console.warn(`[Sendchamp WA-template] http ${status}: ${String(resBody).slice(0, 250)}`);
+      return { ok: false, error: `HTTP_${status}` };
+    }
+    return { ok: true, reference: data?.data?.provider_reference || null };
+  } catch (err) {
+    console.warn(`[Sendchamp WA-template] ${err.code || err.message}`);
+    return { ok: false, error: err.code || "REQUEST_FAILED" };
+  }
+}
+
 async function sendSms(phone, message, opts = {}) {
   // OTP delivery order: WhatsApp first (no DND/sender-ID pitfalls), SMS as the
   // fallback. Only possible when the caller passes the raw code (opts.otpCode);
@@ -187,4 +249,4 @@ async function sendSms(phone, message, opts = {}) {
   }
 }
 
-module.exports = { sendSms, sendWhatsAppOtp };
+module.exports = { sendSms, sendWhatsAppOtp, sendWhatsAppTemplate };
