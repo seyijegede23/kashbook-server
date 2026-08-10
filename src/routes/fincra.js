@@ -67,18 +67,115 @@ router.post("/", async (req, res) => {
   }
 });
 
+// Match a lifecycle event to our row.
+//
+// `data.id` on virtualaccount.* is the VIRTUAL-ACCOUNT id, which is not stated
+// to equal the id returned by POST /profile/virtual-accounts/requests (what we
+// store as fincraRequestId). If they differ and no account number is known yet,
+// nothing matches and the account never leaves "pending". So we also try
+// accountInformation.reference, and every handler writes fincraAccountId on the
+// first sighting so later events match on it.
 async function findForeignAccount(d) {
-  const requestId = d._id || d.id || d.virtualAccount?._id || d.reference;
-  const accountNumber = d.accountNumber || d.accountInformation?.accountNumber;
+  const info = d.accountInformation || {};
+  const ids = [d._id, d.id, d.virtualAccount?._id, d.virtualAccount, d.reference, info.reference]
+    .filter((v) => v && typeof v !== "object")
+    .map(String);
+  const accountNumbers = [d.accountNumber, info.accountNumber, info.otherInfo?.accountNumber]
+    .filter(Boolean)
+    .map(String);
+  if (!ids.length && !accountNumbers.length) return null;
   return prisma.foreignAccount.findFirst({
     where: {
       OR: [
-        requestId ? { fincraRequestId: String(requestId) } : undefined,
-        requestId ? { fincraAccountId: String(requestId) } : undefined,
-        accountNumber ? { accountNumber: String(accountNumber) } : undefined,
-      ].filter(Boolean),
+        ...ids.flatMap((v) => [{ fincraRequestId: v }, { fincraAccountId: v }]),
+        ...accountNumbers.map((v) => ({ accountNumber: v })),
+      ],
     },
   });
+}
+
+// Map an issued/approved/changed payload onto our columns, handling BOTH the
+// individual shape (details nested in accountInformation.otherInfo) and the
+// flat corporate shape (swiftCode/bankAddress directly on accountInformation).
+function mapAccountDetails(d, fa) {
+  const info = d.accountInformation || {};
+  const other = info.otherInfo || {};
+  return {
+    // For an individual GB account, info.accountNumber is the full IBAN while
+    // otherInfo.accountNumber is the short local number. Prefer the local one
+    // for display and keep the IBAN in its own column.
+    accountNumber: other.accountNumber || d.accountNumber || info.accountNumber || fa.accountNumber,
+    accountName: info.accountName || fa.accountName,
+    bankName: info.bankName || fa.bankName,
+    iban: other.iban || (String(info.accountNumber || "").length > 15 ? info.accountNumber : null) || fa.iban,
+    sortCode: other.sortCode || fa.sortCode,
+    swift: other.bankSwiftCode || info.swiftCode || fa.swift,
+    // No "routing" key exists; the ACH routing number is the top-level bankCode.
+    routing: info.bankCode || fa.routing,
+    bankAddress: other.bankAddress || info.bankAddress || fa.bankAddress,
+    addressableIn: other.addressableIn || fa.addressableIn,
+    memo: other.memo || fa.memo,
+    alternateAccountDetails: Array.isArray(info.alternateAccountDetails)
+      ? info.alternateAccountDetails
+      : fa.alternateAccountDetails,
+  };
+}
+
+// An event we cannot tie to a row is a real operational problem, not a no-op:
+// it means an account will never leave "pending", or money is landing somewhere
+// we don't track. Never swallow it.
+function logUnmatched(evt, d) {
+  console.error(
+    `[Fincra webhook] ${evt.event}: no ForeignAccount matched ` +
+    `(id=${d._id || d.id || "?"} ref=${d.reference || d.accountInformation?.reference || "?"} ` +
+    `acct=${d.accountNumber || d.accountInformation?.accountNumber || "?"})`,
+  );
+}
+
+// Fincra is asking for supporting documents on an inbound payment. Their own
+// guidance: "Although the webhook may contain an additionalInfo array, you
+// should call the Get RFIs endpoint to retrieve the complete and current list."
+// The deadline is short and missing it returns the customer's money, so this
+// alerts the admin as well as notifying the merchant.
+async function handleCollectionRfi(d) {
+  // NOTE: the collection id here is an INTEGER (e.g. 16376096), not a Mongo id.
+  const collectionId = d._id || d.id;
+  const requests = Array.isArray(d.additionalInfo) ? d.additionalInfo : [];
+  const summary = requests.map((r) => r?.request).filter(Boolean).join("; ").slice(0, 400);
+
+  // Resolve the affected merchant the same way an inbound credit would.
+  const vaId = typeof d.virtualAccount === "string" ? d.virtualAccount : d.virtualAccount?._id;
+  let biz = null;
+  if (vaId) {
+    const fa = await prisma.foreignAccount.findFirst({
+      where: { OR: [{ fincraAccountId: String(vaId) }, { fincraRequestId: String(vaId) }] },
+    });
+    biz = fa
+      ? await prisma.business.findUnique({ where: { id: fa.businessId } })
+      : await prisma.business.findFirst({ where: { providerAccountId: String(vaId) } });
+  }
+
+  console.error(
+    `[Fincra RFI] collection=${collectionId} business=${biz?.id || "UNRESOLVED"} ` +
+    `requests=${requests.length} — funds are returned to the sender if unanswered. ${summary}`,
+  );
+
+  try {
+    await require("../utils/alerts").fireAlert(
+      `fincra_rfi_${collectionId}`,
+      "Fincra needs information on an inbound payment",
+      `Collection ${collectionId}${biz ? ` for ${biz.name}` : ""} needs supporting documents. ` +
+      `If this is not answered in time the money is returned to the sender with a fee. ${summary}`,
+    );
+  } catch { /* alerting must never mask the event */ }
+
+  if (biz) {
+    pushTo(
+      biz.userId,
+      "Action needed on a payment",
+      "Your bank needs more information about a payment you received. Please respond as soon as possible.",
+    ).catch(() => {});
+  }
 }
 
 async function handleEvent(evt) {
@@ -86,30 +183,93 @@ async function handleEvent(evt) {
   switch (evt.kind) {
     case "account_approved": {
       const fa = await findForeignAccount(d);
-      if (fa) await prisma.foreignAccount.update({ where: { id: fa.id }, data: { status: "approved" } });
+      if (!fa) return logUnmatched(evt, d);
+      // Corporate .approved already carries the full (flat) account block, so
+      // map details here too rather than waiting for .issued.
+      await prisma.foreignAccount.update({
+        where: { id: fa.id },
+        data: {
+          status: "approved",
+          fincraAccountId: String(d._id || d.id || fa.fincraAccountId || ""),
+          ...mapAccountDetails(d, fa),
+        },
+      });
       break;
     }
     case "account_issued": {
-      const info = d.accountInformation || {};
-      const other = info.otherInfo || {};
       const fa = await findForeignAccount(d);
-      if (fa) {
-        await prisma.foreignAccount.update({
-          where: { id: fa.id },
-          data: {
-            status: "issued",
-            fincraAccountId: String(d._id || d.id || fa.fincraAccountId || ""),
-            accountNumber: d.accountNumber || info.accountNumber || fa.accountNumber,
-            accountName: info.accountName || fa.accountName,
-            bankName: info.bankName || fa.bankName,
-            swift: other.swift || other.swiftCode || null,
-            routing: other.routing || other.routingNumber || null,
-            iban: other.iban || null,
-          },
-        });
-        const biz = await prisma.business.findUnique({ where: { id: fa.businessId }, select: { userId: true } });
-        if (biz) pushTo(biz.userId, "Account ready 🎉", `Your ${fa.currency} account is now active.`).catch(() => {});
+      if (!fa) return logUnmatched(evt, d);
+      await prisma.foreignAccount.update({
+        where: { id: fa.id },
+        data: {
+          // Derived from evt.kind on purpose: the issued payload's own
+          // data.status reads "approved", so trusting it would stall the row.
+          status: "issued",
+          fincraAccountId: String(d._id || d.id || fa.fincraAccountId || ""),
+          declineReason: null,
+          ...mapAccountDetails(d, fa),
+        },
+      });
+      const biz = await prisma.business.findUnique({ where: { id: fa.businessId }, select: { userId: true } });
+      if (biz) pushTo(biz.userId, "Account ready 🎉", `Your ${fa.currency} account is now active.`).catch(() => {});
+      break;
+    }
+    // Fincra rejected the request. Without this the row sat at "pending"
+    // forever and the user never learned why.
+    case "account_declined": {
+      const fa = await findForeignAccount(d);
+      if (!fa) return logUnmatched(evt, d);
+      const reason = d.reason || d.declineReason || "";
+      await prisma.foreignAccount.update({
+        where: { id: fa.id },
+        data: { status: "declined", declineReason: String(reason).slice(0, 500) },
+      });
+      const biz = await prisma.business.findUnique({ where: { id: fa.businessId }, select: { userId: true } });
+      if (biz) {
+        pushTo(biz.userId, `${fa.currency} account not approved`,
+          reason ? String(reason).slice(0, 160) : "Please review your details and try again.").catch(() => {});
       }
+      break;
+    }
+    // Account details were replaced. Continuing to show the old ones sends the
+    // payer's money to an account we no longer track.
+    case "account_changed": {
+      const fa = await findForeignAccount(d);
+      if (!fa) return logUnmatched(evt, d);
+      await prisma.foreignAccount.update({
+        where: { id: fa.id },
+        data: {
+          fincraAccountId: String(d._id || d.id || fa.fincraAccountId || ""),
+          ...mapAccountDetails(d, fa),
+        },
+      });
+      const biz = await prisma.business.findUnique({ where: { id: fa.businessId }, select: { userId: true } });
+      if (biz) {
+        pushTo(biz.userId, `${fa.currency} account details updated`,
+          "Your account details have changed. Please share the new ones with anyone paying you.").catch(() => {});
+      }
+      break;
+    }
+    // Permanently deactivated by Fincra: further inbound payments are rejected.
+    case "account_closed": {
+      const fa = await findForeignAccount(d);
+      if (!fa) return logUnmatched(evt, d);
+      await prisma.foreignAccount.update({
+        where: { id: fa.id },
+        data: { status: "closed", declineReason: String(d.reason || "").slice(0, 500) },
+      });
+      const biz = await prisma.business.findUnique({ where: { id: fa.businessId }, select: { userId: true } });
+      if (biz) {
+        pushTo(biz.userId, `${fa.currency} account closed`,
+          "This account can no longer receive money. Please stop sharing its details.").catch(() => {});
+      }
+      break;
+    }
+    // Fincra wants more information about an inbound payment. If nobody
+    // responds in time the funds are RETURNED TO THE SENDER with a fee, so this
+    // must reach the merchant and be visible to the admin.
+    case "collection_rfi": {
+      await handleCollectionRfi(d);
       break;
     }
     case "inbound_credit":

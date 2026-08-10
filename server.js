@@ -298,6 +298,10 @@ app.use("/whatsapp", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
+// FCY (USD/EUR/GBP) accounts hang off /businesses/:id/foreign-accounts. Mounted
+// BEFORE businessRoutes so its :businessId paths resolve first; it inherits the
+// same apiLimiter applied to /businesses above.
+app.use("/businesses", require("./src/routes/foreignAccounts"));
 app.use("/businesses", businessRoutes);
 app.use("/customers", customerRoutes);
 app.use("/inventory", inventoryRoutes);

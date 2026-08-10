@@ -343,10 +343,23 @@ model ForeignAccount {
   accountNumber   String?
   accountName     String?
   bankName        String?
+  // Wire details. Fincra's key is `bankSwiftCode` (individual, under otherInfo)
+  // or a flat `swiftCode` (corporate). There is no "routing" key: the ACH
+  // routing number is the top-level `bankCode`, and `addressableIn` names the
+  // rail those details belong to (ACH | SWIFT | FEDWIRE | SEPA | FPS…).
   swift           String?
-  routing         String?
+  routing         String? // = accountInformation.bankCode (ACH routing number)
   iban            String?
+  sortCode        String? // GBP (FPS/CHAPS)
+  bankAddress     String?
+  addressableIn   String?
+  memo            String? // reference the payer MUST include; differs per rail
+  // Per-rail records, each with its own swift/memo/bankAddress. Stored whole:
+  // flattening lets one rail's memo be displayed beside another rail's SWIFT,
+  // which gets the wire rejected or misrouted.
+  alternateAccountDetails Json?
   consentUrl      String?
+  consentExpiresAt DateTime? // corporate FCY only; request expires if unused
   declineReason   String?
   inflowThisMonth Float     @default(0) // enforces the 10k USD/mo inflow cap
   inflowMonth     String? // "YYYY-MM" the counter applies to

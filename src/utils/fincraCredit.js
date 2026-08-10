@@ -11,30 +11,83 @@ const { buildInboundNotification, buildInboundDescription } = require("./inbound
 const balanceCache = require("./balanceCache");
 
 async function recordFincraInboundCredit(d, source = "fincra") {
+  // `collection.successful` identifies the receiving account as `virtualAccount`,
+  // which is a STRING id, not an object. The previous code read
+  // `d.virtualAccount?.accountNumber` and four other keys that do not exist on
+  // this payload at all, so the account resolved to "" and every inbound credit
+  // returned { recorded:false, reason:"invalid" } — silently, for both the
+  // webhook and the reconcile backstop that share this function.
+  const vaId = typeof d.virtualAccount === "string"
+    ? d.virtualAccount
+    : (d.virtualAccount?._id || d.virtualAccount?.id || "");
+  // Legacy/alternate shapes still carry a plain account number; keep as fallback.
   const accountNumber = String(
     d.virtualAccount?.accountNumber || d.destinationAccountNumber || d.accountNumber
       || d.virtual_bank_account?.account_number || d.account_number || "",
   );
-  const amount = Number(d.amount || d.amountReceived || d.amount_paid || 0);
-  const currency = d.currency || "NGN";
-  const reference = d.reference || d.id || d._id;
-  if (!accountNumber || amount <= 0 || !reference) return { recorded: false, reason: "invalid" };
 
-  // Match the receiving account: FCY (ForeignAccount) first, then a local NUBAN.
-  const fa = await prisma.foreignAccount.findFirst({ where: { accountNumber } });
-  const biz = fa
-    ? await prisma.business.findUnique({ where: { id: fa.businessId } })
-    : await prisma.business.findFirst({ where: { virtualAccountNumber: accountNumber } });
-  if (!biz) return { recorded: false, reason: "no_business", accountNumber };
+  // `d.amount` does not exist. `amountReceived` is the settled, fee-net figure
+  // and is what the merchant actually got — do NOT subtract `fee` from it again.
+  const amount = Number(d.amountReceived ?? d.destinationAmount ?? d.amount ?? d.amount_paid ?? 0);
+  const fee = Number(d.fee ?? 0);
+  const reference = d.reference || d.sessionId || d.id || d._id;
 
+  // Resolve the account BEFORE deciding the currency, so an FCY account can
+  // supply it if the payload somehow omits it.
+  let fa = null;
+  if (vaId) {
+    fa = await prisma.foreignAccount.findFirst({
+      where: { OR: [{ fincraAccountId: vaId }, { fincraRequestId: vaId }] },
+    });
+  }
+  if (!fa && accountNumber) {
+    fa = await prisma.foreignAccount.findFirst({ where: { accountNumber } });
+  }
+  let biz = null;
+  if (fa) {
+    biz = await prisma.business.findUnique({ where: { id: fa.businessId } });
+  } else if (vaId) {
+    // Local (pooled) accounts store Fincra's virtual-account id on the business.
+    biz = await prisma.business.findFirst({ where: { providerAccountId: vaId } });
+  }
+  if (!biz && accountNumber) {
+    biz = await prisma.business.findFirst({ where: { virtualAccountNumber: accountNumber } });
+  }
+
+  // `d.currency` does not exist either; the payload carries source/destination
+  // currencies. Pair the currency with the amount we took above
+  // (`amountReceived`/`destinationAmount` are DESTINATION-side figures).
+  const currency = d.destinationCurrency || fa?.currency || biz?.baseCurrency || d.sourceCurrency || d.currency;
+
+  // Fail LOUDLY. A silent "invalid" on money-in is exactly what hid this bug.
+  if (!biz) {
+    console.error(
+      `[fincraCredit] UNRESOLVED inbound credit — virtualAccount=${vaId || "?"} ` +
+      `accountNumber=${accountNumber || "?"} ref=${reference || "?"} amount=${amount} ${currency || "?"}`,
+    );
+    return { recorded: false, reason: "no_business", virtualAccount: vaId, accountNumber };
+  }
+  if (!(amount > 0) || !reference || !currency) {
+    console.error(
+      `[fincraCredit] MALFORMED inbound credit for business ${biz.id} — ` +
+      `amount=${amount} ref=${reference || "?"} currency=${currency || "?"}`,
+    );
+    return { recorded: false, reason: "invalid", businessId: biz.id };
+  }
+
+  // Documented sender fields are senderAccountName / senderBankName /
+  // senderAccountNumber / customerName. The previous senderName/payerName/
+  // senderBank keys do not exist, so every credit showed "a transfer".
+  // senderAccountNumber is null on the successful sample, so treat it as optional.
+  const senderName = d.senderAccountName || d.customerName || "";
   const sender = {
-    name: d.senderName || d.payerName || "",
-    bank: d.senderBank || "",
+    name: senderName,
+    bank: d.senderBankName || "",
     accountNumber: d.senderAccountNumber || "",
-    label: d.senderName || d.payerName || "a transfer",
-    hasName: !!(d.senderName || d.payerName),
+    label: senderName || "a transfer",
+    hasName: !!senderName,
   };
-  const narration = d.narration || d.description || "";
+  const narration = d.description || d.narration || "";
   try {
     await prisma.transaction.create({
       data: {
@@ -42,6 +95,7 @@ async function recordFincraInboundCredit(d, source = "fincra") {
         userId: biz.userId,
         type: "income",
         amount,
+        fee,
         currency,
         description: buildInboundDescription({ sender, narration, reference }),
         category: "transfer",
@@ -81,7 +135,16 @@ async function recordFincraInboundCredit(d, source = "fincra") {
 
   const { title, body } = buildInboundNotification({ business: biz, amount, sender, narration });
   pushTo(biz.userId, title, body).catch(() => {});
-  try { balanceCache.adjustBalance(biz.id, amount); } catch { /* noop */ }
+  // The cached balance is single-currency (the business's own base currency).
+  // Adjusting it with an FCY amount would add dollars onto a naira balance, so
+  // only apply it when the credit is in the base currency; FCY balances are
+  // derived from the ledger instead.
+  const baseCurrency = biz.baseCurrency || "NGN";
+  if (String(currency).toUpperCase() === String(baseCurrency).toUpperCase()) {
+    try { balanceCache.adjustBalance(biz.id, amount); } catch { /* noop */ }
+  } else {
+    try { balanceCache.bustBalance(biz.id); } catch { /* noop */ }
+  }
   require("./igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
   require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
   return { recorded: true, businessId: biz.id, amount, currency };

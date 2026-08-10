@@ -15,8 +15,11 @@ const SECRET = () => process.env.FINCRA_SECRET_KEY;
 const PUBLIC = () => process.env.FINCRA_PUBLIC_KEY;
 const WEBHOOK_SECRET = () => process.env.FINCRA_WEBHOOK_SECRET;
 
+// Only `api-key` is mandated for API requests; `x-pub-key` is not required on
+// the endpoints we use. Requiring both made an account provisioned without a
+// public key report itself as unconfigured.
 function isConfigured() {
-  return !!(SECRET() && PUBLIC());
+  return !!SECRET();
 }
 
 async function fincraFetch(path, { method = "GET", body } = {}) {
@@ -39,6 +42,11 @@ async function fincraFetch(path, { method = "GET", body } = {}) {
     const err = new Error(msg);
     err.status = res.status;
     err.body = data;
+    // errorType distinguishes cases that must be handled differently:
+    //   NO_ENOUGH_MONEY_IN_WALLET → user-actionable
+    //   SERVICE_UNAVAILABLE       → requery, never fail the user (money may move)
+    //   ACCESS_DENIED             → 403, request never reached the engine, no money moved
+    err.errorType = data?.errorType || null;
     throw err;
   }
   return data;
@@ -55,7 +63,22 @@ async function fincraFetch(path, { method = "GET", body } = {}) {
 //   KYCInformation  currency/type-specific KYC block (see docs/FINCRA_USD_ACCOUNT_SPEC.md)
 //   channel        optional NGN partner-bank id ("wema" | "globus" | ...)
 //   merchantReference  our idempotency ref
-async function createVirtualAccount({ currency, accountType = "individual", KYCInformation, documents, channel, merchantReference }) {
+// NGN partner banks Fincra currently issues on. `bold` and `providus` are
+// disabled and `opay` is "coming soon"; note `habari` IS Guaranty Trust Bank,
+// the value is not the bank's name. Forwarding an unvalidated channel produces
+// an opaque provider error, so pin it here.
+const NGN_CHANNELS = ["globus", "wema", "habari", "sterling", "moniepoint", "uba"];
+
+async function createVirtualAccount({
+  currency, accountType = "individual", KYCInformation, channel, merchantReference,
+  // FCY document URLs are TOP-LEVEL keys. There is no `documents` field in the
+  // Fincra API; the previous code spread one, which the API would reject.
+  meansOfId, utilityBill, bankStatement,
+  monthlyTransactionCount, monthlyTransactionVolume,
+}) {
+  if (channel && !NGN_CHANNELS.includes(channel)) {
+    throw new Error(`Unsupported Fincra channel "${channel}" (allowed: ${NGN_CHANNELS.join(", ")})`);
+  }
   // NOTE: no `business` field — the virtual-accounts endpoint identifies the
   // merchant via the api-key and rejects a `business` in the body ("business is
   // not allowed"). Only the payout/wallets endpoints take a businessID.
@@ -63,7 +86,11 @@ async function createVirtualAccount({ currency, accountType = "individual", KYCI
     currency,
     accountType,
     KYCInformation,
-    ...(documents ? { documents } : {}),
+    ...(meansOfId ? { meansOfId } : {}),
+    ...(utilityBill ? { utilityBill } : {}),
+    ...(bankStatement ? { bankStatement } : {}),
+    ...(monthlyTransactionCount != null ? { monthlyTransactionCount: String(monthlyTransactionCount) } : {}),
+    ...(monthlyTransactionVolume != null ? { monthlyTransactionVolume: String(monthlyTransactionVolume) } : {}),
     ...(channel ? { channel } : {}),
     ...(merchantReference ? { merchantReference } : {}),
   };
@@ -114,14 +141,49 @@ function resolveAccount({ accountNumber, bankCode, currency = "NGN" }) {
 
 // List collections (inbound credits) for the merchant. GET /collections?business=
 // → data:{ results:[...], total }. Used by the reconcile backstop to backfill any
-// credit whose webhook never arrived. Fincra requires `business`; accepts
-// `perPage` + `page` (NOT currency/limit/status — filter those client-side). One
-// call returns collections across all currencies, each item carrying its own.
-function listCollections({ business = process.env.FINCRA_BUSINESS_ID, perPage = 50, page } = {}) {
+// credit whose webhook never arrived.
+//
+// Filtering IS supported, contrary to the previous comment here: the documented
+// parameters are `virtualAccount` and `destinationCurrency`. The likely reason an
+// earlier attempt failed is that the currency parameter is NOT called `currency`.
+//
+// ⚠️ Two doc pages disagree on what `virtualAccount` takes: one calls it the
+// "virtual account number", another "the ID of the multicurrency account".
+// Passing the wrong one most likely returns an EMPTY result rather than an
+// error, which a reconcile would read as "no deposits". Prefer the unfiltered
+// merchant-wide sweep until that is confirmed against a real response.
+function listCollections({
+  business = process.env.FINCRA_BUSINESS_ID, perPage = 50, page,
+  virtualAccount, destinationCurrency,
+} = {}) {
   const q = new URLSearchParams({ business: business || "" });
   if (perPage) q.set("perPage", String(perPage));
   if (page) q.set("page", String(page));
+  if (virtualAccount) q.set("virtualAccount", String(virtualAccount));
+  if (destinationCurrency) q.set("destinationCurrency", String(destinationCurrency));
   return fincraFetch(`/collections?${q.toString()}`);
+}
+
+// Requests for additional information (RFI) on a collection. Fincra's guidance:
+// the webhook's additionalInfo array may be incomplete, so always re-read this.
+// Unanswered RFIs cause the money to be returned to the sender with a fee.
+function getCollectionRfis(collectionId) {
+  return fincraFetch(`/collections/${encodeURIComponent(collectionId)}/additional-information`);
+}
+
+// Respond to an RFI. `body` carries the answers/document URLs Fincra asked for.
+function respondToCollectionRfi(collectionId, body) {
+  return fincraFetch(`/collections/${encodeURIComponent(collectionId)}/additional-information`, {
+    method: "PATCH",
+    body,
+  });
+}
+
+// Chargebacks are NOT delivered by webhook anywhere in Fincra's docs, yet they
+// debit the merchant wallet directly (plus 15 EUR / 35 USD in fees). Polling is
+// the only way to detect one, so the reconcile loop must check this.
+function listChargebacks({ business = process.env.FINCRA_BUSINESS_ID } = {}) {
+  return fincraFetch(`/collections/chargebacks?business=${encodeURIComponent(business || "")}`);
 }
 
 // List disbursements/payouts for the merchant. GET /disbursements/payouts?business=
@@ -176,6 +238,9 @@ module.exports = {
   resolveAccount,
   createPayout,
   listCollections,
+  getCollectionRfis,
+  respondToCollectionRfi,
+  listChargebacks,
   listPayouts,
   verifyWebhookSignature,
   BASE,

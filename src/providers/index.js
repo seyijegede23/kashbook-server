@@ -38,4 +38,22 @@ function getProvider(businessOrCountry) {
   return PROVIDERS[key] || PROVIDERS.null;
 }
 
-module.exports = { getProvider };
+// Provider for FOREIGN-CURRENCY (USD/EUR/GBP) receive accounts.
+//
+// Deliberately NOT getProvider(). That one picks by country, and a Nigerian
+// business resolves to Anchor, which does not issue foreign accounts at all —
+// so routing FCY through it would tell every Nigerian merchant "not supported"
+// when the capability exists.
+//
+// FCY is orthogonal to the local account: a merchant keeps their NGN NUBAN at
+// Anchor and holds USD/EUR/GBP at Fincra at the same time. Fincra is an
+// additional provider for a different currency, not a replacement.
+//
+// Returns null when no configured provider can issue foreign accounts, so
+// callers can answer "not available" without guessing.
+function getForeignAccountProvider() {
+  const p = PROVIDERS.fincra;
+  return p && p.supportsForeignAccounts ? p : null;
+}
+
+module.exports = { getProvider, getForeignAccountProvider };

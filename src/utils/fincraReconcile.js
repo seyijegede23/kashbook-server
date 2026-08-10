@@ -18,8 +18,14 @@ const fincra = require("../services/fincra");
 const { recordFincraInboundCredit } = require("./fincraCredit");
 const { recordFincraPayoutOutcome, backfillFincraPayout } = require("./fincraPayout");
 
-const SUCCESS = new Set(["successful", "success", "approved", "completed", "paid", "received"]);
-const PAYOUT_SUCCESS = new Set(["successful", "success", "completed", "paid", "approved"]);
+const SUCCESS = new Set(["successful", "success", "completed", "paid", "received"]);
+// "approved" is DELIBERATELY absent. Fincra uses it to mean "accepted for
+// processing" (see virtualaccount.approved), not "settled". Treating it as
+// success would book an expense for money that has not left the wallet. The
+// only payout success literal documented anywhere is "successful"; the general
+// status table lists "success" and "successful" as distinct values with the
+// same meaning, so both are kept.
+const PAYOUT_SUCCESS = new Set(["successful", "success", "completed", "paid"]);
 const PAYOUT_FAIL = new Set(["failed", "reversed", "declined", "cancelled", "returned"]);
 const FINCRA_RECONCILE_LOCK = 4005;
 

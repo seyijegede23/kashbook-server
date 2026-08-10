@@ -19,7 +19,15 @@ function buildLocalKyc(currency, kyc = {}) {
     case "NGN":
       return { ...base, bvn };
     case "GHS":
-      return email ? { ...base, email } : base;
+      // Fincra marks KYCInformation.email REQUIRED for GHS (individual and
+      // corporate). Sending the request without it cannot succeed, so fail here
+      // with a clear message instead of at the provider.
+      if (!email) {
+        const err = new Error("An email address is required to open a Ghanaian account.");
+        err.code = "FINCRA_GHS_EMAIL_REQUIRED";
+        throw err;
+      }
+      return { ...base, email };
     case "KES":
     case "TZS":
       return base; // email is rejected by Fincra for these
@@ -29,9 +37,16 @@ function buildLocalKyc(currency, kyc = {}) {
 }
 
 // Pull the account details out of a Fincra virtual-account response.
+//
+// Two incompatible shapes exist and both must be handled:
+//   • individual — details nested under accountInformation.otherInfo
+//   • corporate  — FLAT accountInformation { accountNumber, bankName,
+//                  bankAddress, accountName, swiftCode }, no otherInfo at all
+// Reading only otherInfo loses SWIFT/IBAN/sort code entirely for corporates.
 function readAccount(res) {
   const d = res?.data || res || {};
   const info = d.accountInformation || {};
+  const other = info.otherInfo || {};
   return {
     status: d.status, // "approved" (instant) | "pending" (async FCY)
     providerRef: d._id || d.id,
@@ -39,8 +54,28 @@ function readAccount(res) {
     accountName: info.accountName || null,
     bankName: info.bankName || d.bankName || null,
     bankCode: info.bankCode || null,
-    consentUrl: d.consentUrl || d.consent?.url || null,
+    // Wire details. `bankSwiftCode` is the documented key (individual, under
+    // otherInfo); corporate uses a flat `swiftCode`. There is NO "routing" key:
+    // the ACH routing number is the top-level bankCode, and the rail it belongs
+    // to is named by otherInfo.addressableIn.
+    iban: other.iban || null,
+    sortCode: other.sortCode || null,
+    swift: other.bankSwiftCode || info.swiftCode || null,
+    bankAddress: other.bankAddress || info.bankAddress || null,
+    addressableIn: other.addressableIn || null,
+    memo: other.memo || null,
+    // Per-rail records (FEDWIRE/SWIFT/ACH), each with its OWN memo and swift.
+    // Kept whole: flattening lets one rail's memo be shown beside another
+    // rail's SWIFT code, which gets the wire rejected or misrouted.
+    alternateAccountDetails: Array.isArray(info.alternateAccountDetails)
+      ? info.alternateAccountDetails
+      : null,
+    reference: info.reference || null,
+    // Corporate FCY returns consentLink (+ consentExpiresAt); individual has no
+    // consent step at all.
+    consentUrl: d.consentLink || d.consentUrl || d.consent?.url || null,
     consentId: d.consentId || null,
+    consentExpiresAt: d.consentExpiresAt || null,
     business: d.business || null,
   };
 }
@@ -170,8 +205,17 @@ class FincraProvider extends PaymentProvider {
     const KIND = {
       "virtualaccount.approved": "account_approved",
       "virtualaccount.issued": "account_issued",
+      // Lifecycle events that were previously dropped. Without these an account
+      // sits at "pending" forever after a rejection, and we keep advertising an
+      // account number that Fincra has closed or replaced.
+      "virtualaccount.declined": "account_declined",
+      "virtualaccount.changed": "account_changed",
+      "virtualaccount.closed": "account_closed",
       "collection.successful": "inbound_credit",
       "collection.failed": "inbound_failed",
+      // Fincra is asking for more information about an inbound payment. If
+      // nobody answers in time the funds are RETURNED TO THE SENDER with a fee.
+      "collection.additional-info-requested": "collection_rfi",
       // Outbound payout settlement (async; booked optimistically at send time).
       "payout.successful": "payout_success",
       "payout.completed": "payout_success",
@@ -181,7 +225,17 @@ class FincraProvider extends PaymentProvider {
       "payout.declined": "payout_failed",
       "disbursement.failed": "payout_failed",
     };
-    return { kind: KIND[event] || "unhandled", event, data, dedupId: data.id || data._id || data.reference };
+    // `reference` first: it is the stable, documented unique identifier.
+    // `id` is a small INTEGER on payouts (14380) and on RFI collections
+    // (16376096), so preferring it risks collisions between different records.
+    // Collections carry no id/_id at all, so they already fell through to
+    // reference by accident; this makes that deliberate and uniform.
+    return {
+      kind: KIND[event] || "unhandled",
+      event,
+      data,
+      dedupId: data.reference || data._id || data.id || data.sessionId,
+    };
   }
 }
 
