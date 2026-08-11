@@ -24,8 +24,51 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const authMiddleware = require("../middleware/auth");
+const crypto = require("crypto");
+const cloudinary = require("../config/cloudinary");
 const { getForeignAccountProvider } = require("../providers");
 const { audit } = require("../utils/audit");
+const { buildFcyRequest, FcyKycError } = require("../utils/fcyKyc");
+const { isFcyRestricted } = require("../config/fcyRestrictedCountries");
+const { validateDataUri, DOC_TYPES } = require("../utils/uploadGuard");
+
+// Store FCY KYC documents PRIVATELY, like the KYB certificates: a passport or a
+// utility bill must never sit on a public CDN URL. buildFcyRequest turns these
+// public_ids into short-lived signed URLs for Fincra to fetch.
+async function uploadFcyDocs(docs = {}) {
+  const put = async (dataUri, kind) => {
+    const meta = validateDataUri(dataUri, { allow: DOC_TYPES, maxBytes: 8 * 1024 * 1024 });
+    const up = await cloudinary.uploader.upload(dataUri, {
+      folder: "kashbook/fcy",
+      public_id: `${kind}_${crypto.randomUUID()}`,
+      overwrite: false,
+      resource_type: meta.resourceType,
+      image_metadata: false, // strip EXIF/GPS from a photographed document
+      type: "private",
+      access_mode: "authenticated",
+    });
+    return { id: up.public_id, type: meta.resourceType };
+  };
+
+  const out = { meansOfIdIds: [] };
+  if (docs.utilityBill) {
+    const r = await put(docs.utilityBill, "ub");
+    out.utilityBillId = r.id;
+    out.utilityBillType = r.type;
+  }
+  if (docs.bankStatement) {
+    const r = await put(docs.bankStatement, "bs");
+    out.bankStatementId = r.id;
+    out.bankStatementType = r.type;
+  }
+  // Passport is one page; other IDs need front and back, hence an array.
+  for (const [i, uri] of [].concat(docs.meansOfId || []).filter(Boolean).entries()) {
+    if (i >= 2) break; // Fincra takes at most front + back
+    const r = await put(uri, "id");
+    out.meansOfIdIds.push(r.id);
+  }
+  return out;
+}
 
 // Staff act on their employer's data — same convention as the other routes.
 const getTargetUserId = (req) =>
@@ -77,8 +120,13 @@ router.get("/:businessId/foreign-accounts", authMiddleware, async (req, res) => 
       where: { businessId: biz.id },
       orderBy: { createdAt: "asc" },
     });
+    // Fincra refuses FCY accounts for a list of countries (Uganda is on it and
+    // is in our own country list), so advertise nothing there rather than
+    // letting a merchant complete a full KYC form only to be declined.
+    const restricted = isFcyRestricted(biz.country);
     res.json({
-      supported: FCY_ENABLED && getForeignAccountProvider() ? SUPPORTED : [],
+      supported: FCY_ENABLED && getForeignAccountProvider() && !restricted ? SUPPORTED : [],
+      restricted,
       accounts: rows.map(publicView),
     });
   } catch (err) {
@@ -106,18 +154,34 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
         error: "Foreign currency accounts aren't available right now.",
       });
     }
-
-    // KYC gate — reuse the admin-approved identity check from the naira account
-    // rather than sending an unvetted merchant to the provider.
-    const approvedKyc = await prisma.kycSubmission.findFirst({
-      where: { businessId: biz.id, status: "APPROVED" },
-      orderBy: { reviewedAt: "desc" },
-    });
-    if (!approvedKyc) {
+    if (isFcyRestricted(biz.country)) {
       return res.status(403).json({
-        code: "KYC_REQUIRED",
-        error: "Verify your business and set up your local account first, then you can add a foreign currency account.",
+        code: "COUNTRY_RESTRICTED",
+        error: "Our banking partner can't open foreign currency accounts for businesses in your country.",
       });
+    }
+
+    // KYC gate, but ONLY where a local account exists to have been verified.
+    //
+    // Requiring an APPROVED KycSubmission unconditionally would permanently lock
+    // out every merchant in a country with no local rail (South Africa, Egypt):
+    // that submission is created by the local-account flow they can never run.
+    // For them the FCY form IS the first KYC — it carries full identity plus a
+    // government ID and a utility bill, and Fincra runs its own review on top.
+    // Where a local rail does exist we keep reusing its admin-vetted approval,
+    // so the owner never reviews the same merchant twice.
+    const { supportsLocalAccount } = require("../config/countries");
+    if (supportsLocalAccount(biz.country)) {
+      const approvedKyc = await prisma.kycSubmission.findFirst({
+        where: { businessId: biz.id, status: "APPROVED" },
+        orderBy: { reviewedAt: "desc" },
+      });
+      if (!approvedKyc) {
+        return res.status(403).json({
+          code: "KYC_REQUIRED",
+          error: "Verify your business and set up your local account first, then you can add a foreign currency account.",
+        });
+      }
     }
 
     // One per (business, currency). Return the existing row rather than erroring
@@ -149,18 +213,47 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
           },
         });
 
+    // Upload the KYC documents PRIVATELY (never public: these are passports and
+    // utility bills). buildFcyRequest signs them into expiring URLs for Fincra
+    // to fetch. Same validation as every other upload: MIME + magic bytes + size
+    // cap + no remote URLs + PDF active-content rejection.
+    let uploaded;
+    try {
+      uploaded = await uploadFcyDocs(req.body?.documents || {});
+    } catch (err) {
+      return res
+        .status(err.httpStatus || 400)
+        .json({ error: err.message, code: err.code || "UPLOAD_FAILED", field: err.field });
+    }
+
+    // Assemble the REAL payload. Fincra needs ~25 fields plus two fetched
+    // documents; most come from data we already hold, the rest from `kyc` in the
+    // request body. This throws a field-tagged FcyKycError before we consume a
+    // provider request slot, so the user gets a precise fix rather than an
+    // opaque provider rejection.
+    let fincraBody;
+    try {
+      fincraBody = buildFcyRequest({
+        user: owner,
+        business: biz,
+        currency,
+        extra: req.body?.kyc || {},
+        documents: uploaded,
+      });
+    } catch (err) {
+      if (err instanceof FcyKycError) {
+        // Not a provider failure — nothing was sent, so the row stays pending
+        // and the user can correct and resubmit.
+        return res.status(err.httpStatus || 400).json({ error: err.message, code: err.code, field: err.field });
+      }
+      throw err;
+    }
+
     let result;
     try {
       result = await provider.provisionForeignAccount({
-        currency,
-        accountType: row.accountType,
+        ...fincraBody,
         merchantReference: `fa_${row.id}`,
-        KYCInformation: {
-          firstName: owner.firstName || "",
-          lastName: owner.lastName || "",
-          email: owner.email || "",
-          ...(biz.businessKyb ? { businessName: biz.name } : {}),
-        },
       });
     } catch (err) {
       // Leave no half-open request: mark it declined with the reason so the user

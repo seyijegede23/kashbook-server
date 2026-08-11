@@ -29,7 +29,10 @@ module.exports = {
   // Bookkeeping-only: no local TZS banking provider. Anchor is Nigeria-only and
   // Korapay has no TZS virtual accounts (only mobile-money collection + FX), so
   // Tanzania has no account/payout rail. Revisit if a TZS provider is added.
-  paymentProvider: null,
+  // Fincra TZS instant virtual account. Create-KYC is name only (no email, same
+  // as KES) — see buildLocalKyc. Rails: TIPS instant with no cutoff, TISS same
+  // day with a 5pm cutoff, mobile money instant. Account opening fee is 0.
+  paymentProvider: "fincra",
 
   regionLabel: "Region",
   regions: require("./regions/TZ"),

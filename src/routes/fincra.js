@@ -97,27 +97,45 @@ async function findForeignAccount(d) {
 // Map an issued/approved/changed payload onto our columns, handling BOTH the
 // individual shape (details nested in accountInformation.otherInfo) and the
 // flat corporate shape (swiftCode/bankAddress directly on accountInformation).
-function mapAccountDetails(d, fa) {
+// `replace` = the incoming payload is authoritative and must NOT inherit from the
+// existing row. Required for virtualaccount.changed, where Fincra supersedes the
+// account entirely (its own example flips the currency USD → EUR).
+//
+// Why this matters: Fincra sends EMPTY STRINGS for rails that do not apply to an
+// account (otherInfo = { iban: "", sortCode: "", bankSwiftCode: "", memo: "" }).
+// "" is falsy, so a plain `other.memo || fa.memo` silently resurrects the OLD
+// account's memo next to the NEW account number — one rail's details beside
+// another's, which is exactly how a wire gets misrouted or rejected.
+// `pick` therefore treats "" and null as "absent", and on a replace we simply
+// never offer the old row as a fallback.
+function mapAccountDetails(d, fa, { replace = false } = {}) {
   const info = d.accountInformation || {};
   const other = info.otherInfo || {};
+  const blank = (v) => v === null || v === undefined || String(v).trim() === "";
+  const pick = (...vals) => {
+    for (const v of vals) if (!blank(v)) return v;
+    return null;
+  };
+  // On a replace, the old row contributes nothing.
+  const prev = replace ? {} : fa;
   return {
     // For an individual GB account, info.accountNumber is the full IBAN while
     // otherInfo.accountNumber is the short local number. Prefer the local one
     // for display and keep the IBAN in its own column.
-    accountNumber: other.accountNumber || d.accountNumber || info.accountNumber || fa.accountNumber,
-    accountName: info.accountName || fa.accountName,
-    bankName: info.bankName || fa.bankName,
-    iban: other.iban || (String(info.accountNumber || "").length > 15 ? info.accountNumber : null) || fa.iban,
-    sortCode: other.sortCode || fa.sortCode,
-    swift: other.bankSwiftCode || info.swiftCode || fa.swift,
+    accountNumber: pick(other.accountNumber, d.accountNumber, info.accountNumber, prev.accountNumber),
+    accountName: pick(info.accountName, prev.accountName),
+    bankName: pick(info.bankName, prev.bankName),
+    iban: pick(other.iban, String(info.accountNumber || "").length > 15 ? info.accountNumber : null, prev.iban),
+    sortCode: pick(other.sortCode, prev.sortCode),
+    swift: pick(other.bankSwiftCode, info.swiftCode, prev.swift),
     // No "routing" key exists; the ACH routing number is the top-level bankCode.
-    routing: info.bankCode || fa.routing,
-    bankAddress: other.bankAddress || info.bankAddress || fa.bankAddress,
-    addressableIn: other.addressableIn || fa.addressableIn,
-    memo: other.memo || fa.memo,
+    routing: pick(info.bankCode, prev.routing),
+    bankAddress: pick(other.bankAddress, info.bankAddress, prev.bankAddress),
+    addressableIn: pick(other.addressableIn, prev.addressableIn),
+    memo: pick(other.memo, prev.memo),
     alternateAccountDetails: Array.isArray(info.alternateAccountDetails)
       ? info.alternateAccountDetails
-      : fa.alternateAccountDetails,
+      : (replace ? null : fa.alternateAccountDetails),
   };
 }
 
@@ -240,7 +258,11 @@ async function handleEvent(evt) {
         where: { id: fa.id },
         data: {
           fincraAccountId: String(d._id || d.id || fa.fincraAccountId || ""),
-          ...mapAccountDetails(d, fa),
+          // replace: the new payload supersedes the account outright, so nothing
+          // may be inherited from the old row. Fincra blanks rails that no longer
+          // apply, and carrying those forward would leave the previous account's
+          // memo/SWIFT sitting beside the new account number.
+          ...mapAccountDetails(d, fa, { replace: true }),
         },
       });
       const biz = await prisma.business.findUnique({ where: { id: fa.businessId }, select: { userId: true } });

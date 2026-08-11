@@ -10,6 +10,7 @@ const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require(".
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { validateDataUri, IMAGE_TYPES, DOC_TYPES } = require("../utils/uploadGuard");
 const { audit } = require("../utils/audit");
+const { getBaseCurrency, DEFAULT_COUNTRY } = require("../config/countries");
 const { getRiskCategory } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
@@ -111,10 +112,31 @@ router.post("/", async (req, res) => {
       });
     }
 
+    // Country and currency are DERIVED from the owner, never taken from the
+    // request body, and never editable afterwards.
+    //
+    // This block previously omitted both, so they fell through to the schema
+    // defaults (country "NG", baseCurrency "NGN"). A South African owner adding
+    // a second business silently got a Nigerian one priced in naira, with
+    // Nigerian AML limits and a KYC form asking for a BVN.
+    //
+    // One country per user, one currency per country: the currency is a
+    // consequence of the country, not an independent choice. Everything
+    // downstream (AML thresholds, KYC scheme, banking rail, report totals)
+    // reads these, so a mutable currency would silently re-denominate history.
+    const owner = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { country: true },
+    });
+    const ownerCountry = String(owner?.country || DEFAULT_COUNTRY).toUpperCase();
+    const baseCurrency = getBaseCurrency(ownerCountry);
+
     const biz = await prisma.business.create({
       data: {
         userId: req.user.id,
         name: cleanName,
+        country: ownerCountry,
+        baseCurrency,
         emoji,
         color,
         customCategories: {
@@ -146,7 +168,20 @@ router.patch("/:id", async (req, res) => {
     return res.status(403).json({ error: "Staff cannot update businesses" });
   }
 
+  // `country` and `baseCurrency` are deliberately NOT destructured here, and must
+  // never be. They are fixed at creation from the owner's country and are the
+  // input to AML thresholds, the KYC scheme, the banking rail and every report
+  // total. Letting either change would silently re-denominate existing history:
+  // yesterday's ₦500,000 of sales would read as $500,000 today, and a business
+  // that passed AML checks under one set of limits would be judged under another.
+  // A country move means a new business, not an edit.
   const { name, emoji, color, customCategories, vatEnabled, vatRate, vatInclusive } = req.body;
+  if (req.body?.country !== undefined || req.body?.baseCurrency !== undefined || req.body?.currency !== undefined) {
+    return res.status(400).json({
+      code: "COUNTRY_IMMUTABLE",
+      error: "A business keeps the country and currency it was created with. To trade in another country, create a new business.",
+    });
+  }
   try {
     // Verify ownership
     const existing = await prisma.business.findFirst({

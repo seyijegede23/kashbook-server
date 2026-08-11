@@ -92,9 +92,22 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
   const isEmail = rawIdentifier.includes("@");
   const iden = isEmail ? rawIdentifier.trim().toLowerCase() : normalizePhone(rawIdentifier, callingCode);
   // Country is the source of truth for currency + language + KYC scheme.
-  // Default to NG if the client didn't send one (legacy registration flow).
-  const { getCountryConfig, isSupported } = require("../config/countries");
-  const countryCode = (country && isSupported(country)) ? String(country).toUpperCase() : "NG";
+  // Every country we hold config for can register and keep books; whether we can
+  // also issue them a LOCAL receiving account is a separate question answered by
+  // supportsLocalAccount(). A country we hold no config for is still refused
+  // rather than silently rewritten to NG, which would hand that merchant naira,
+  // Nigerian AML limits and a KYC form demanding a BVN they cannot hold.
+  const { getCountryConfig, isSupported, listEnabledCountries } = require("../config/countries");
+  let countryCode = "NG";
+  if (country) {
+    if (!isSupported(country)) {
+      return res.status(400).json({
+        code: "COUNTRY_NOT_SUPPORTED",
+        error: `KashBook isn't available in that country yet. Available in: ${listEnabledCountries().map((c) => c.name).join(", ")}.`,
+      });
+    }
+    countryCode = String(country).toUpperCase();
+  }
   const countryCfg = getCountryConfig(countryCode);
 
   if (!fn)      return res.status(400).json({ error: "First name is required" });

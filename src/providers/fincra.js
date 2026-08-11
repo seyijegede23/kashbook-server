@@ -143,13 +143,16 @@ class FincraProvider extends PaymentProvider {
   // Async foreign-currency receive account (USD…). Returns { status:"pending",
   // providerRef, consentUrl }; the real details arrive via the
   // virtualaccount.issued webhook. (Requires FCY enabled on the Fincra account.)
-  async provisionForeignAccount({ currency = "USD", accountType = "individual", KYCInformation, documents, merchantReference }) {
+  // `body` is the fully-assembled Fincra request from utils/fcyKyc.js. It is
+  // passed through WHOLE rather than destructured: the FCY contract has
+  // top-level utilityBill / meansOfId / monthlyTransactionCount /
+  // monthlyTransactionVolume alongside KYCInformation, and an earlier version
+  // that named only a few fields silently dropped the rest.
+  async provisionForeignAccount(body = {}) {
     const res = await fincra.createVirtualAccount({
-      currency,
-      accountType,
-      KYCInformation,
-      documents,
-      merchantReference,
+      accountType: "individual",
+      currency: "USD",
+      ...body,
     });
     const a = readAccount(res);
     return {

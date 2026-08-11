@@ -28,7 +28,12 @@ module.exports = {
   // KYB + a main business account — Fincra support, Jul 2026). Everything else is
   // wired (Fincra KES create-KYC = name only, Choice Bank). Flip null→"fincra"
   // once Fincra confirms KES is live — no other change needed.
-  paymentProvider: null,
+  // Fincra KES instant virtual account. Create-KYC is name only (Fincra rejects
+  // an email on KES/TZS, unlike GHS which requires it) — see buildLocalKyc.
+  // NOTE: Fincra states KES merchant onboarding "typically takes up to 120 hours",
+  // so the first account in a new Fincra environment is not instant. Collections
+  // above KES 999,999 may trigger a Request For Information.
+  paymentProvider: "fincra",
 
   regionLabel: "County",
   regions: require("./regions/KE"),

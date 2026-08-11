@@ -3,7 +3,13 @@ module.exports = {
   code: "UG",
   name: "Uganda",
   flag: "🇺🇬",
-  enabled: true,
+  // OFF at signup: Uganda has no local rail (Fincra issues local virtual
+  // accounts for NGN/GHS/KES/TZS only) AND sits on Fincra's FCY
+  // restricted-country list, so there is no account of any kind we can open for
+  // a Ugandan merchant. Bookkeeping alone is not enough to offer.
+  // The config stays so an existing account would still resolve its currency,
+  // banks and regions; flip back to true if a UGX provider is ever added.
+  enabled: false,
 
   callingCode: "256",
   currency: { code: "UGX", symbol: "USh", locale: "en-UG", subunit: 100 },
@@ -24,6 +30,11 @@ module.exports = {
     { code: "limited_company",     label: "Limited Company",      regCode: "Private_Incorporated" },
   ],
 
+  // Deliberately OFF, not an oversight. Fincra issues local virtual accounts for
+  // NGN, GHS, KES and TZS only. UGX is a PAYOUT and cross-currency collection
+  // currency, so a Ugandan merchant cannot be given an account to receive into.
+  // Uganda is also on Fincra's FCY restricted-country list, so no USD/EUR/GBP
+  // account either. Do not flip this on without a provider that issues UGX.
   paymentProvider: null,
 
   regionLabel: "Region",

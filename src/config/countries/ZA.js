@@ -24,6 +24,10 @@ module.exports = {
     { code: "limited_company",     label: "Private Company (Pty Ltd)", regCode: "Private_Incorporated" },
   ],
 
+  // Deliberately OFF. Fincra issues local virtual accounts for NGN, GHS, KES and
+  // TZS only; ZAR is payout/cross-currency-collection only, so there is no
+  // account for a South African merchant to receive into. Do not flip this on
+  // without a provider that issues ZAR.
   paymentProvider: null,
 
   regionLabel: "Province",
