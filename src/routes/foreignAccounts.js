@@ -139,6 +139,18 @@ router.get("/:businessId/foreign-accounts", authMiddleware, async (req, res) => 
 router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) => {
   const currency = String(req.body?.currency || "").toUpperCase();
   try {
+    // Staff may VIEW the business's foreign accounts (they need the details to
+    // invoice customers), but they must not OPEN one. This request submits the
+    // OWNER's personal identity to a bank: their date of birth, government ID,
+    // utility bill and declared income band. That is the owner's to give, not an
+    // employee's, and the same rule already applies to creating or editing the
+    // business itself (businesses.js).
+    if (req.user.accountType === "staff") {
+      return res.status(403).json({
+        code: "OWNER_ONLY",
+        error: "Only the business owner can open a foreign currency account.",
+      });
+    }
     if (!SUPPORTED.includes(currency)) {
       return res.status(400).json({ error: `Choose one of ${SUPPORTED.join(", ")}.` });
     }
