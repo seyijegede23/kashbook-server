@@ -58,15 +58,27 @@ async function collectHealth() {
       prisma.auditLog.count({ where: { action: { contains: "FAILED" }, createdAt: { gte: since24h } } }),
     ]);
 
+  // A heartbeat row outlives the cron that wrote it. When a job is retired, its
+  // row stays behind, is not in CRON_INTERVAL_MIN, falls back to the 60-minute
+  // default, and is therefore permanently "stale" — alerting forever about a
+  // cron that no longer exists. korapay-reconcile did exactly that for 18 days
+  // after Korapay was removed, and fincra-reconcile is doing it while that loop
+  // is commented out.
+  //
+  // A name absent from CRON_INTERVAL_MIN means the code no longer schedules it,
+  // so it is reported as `retired` and never counted as stale. Registering a new
+  // cron there is what opts it into staleness alerting.
   const crons = heartbeats.map((h) => {
     const ageMin = (now - new Date(h.lastRunAt).getTime()) / 60000;
-    const expected = CRON_INTERVAL_MIN[h.name] || 60;
+    const expected = CRON_INTERVAL_MIN[h.name];
+    const retired = expected === undefined;
     return {
       name: h.name,
       lastRunAt: h.lastRunAt,
       ageMin: Math.round(ageMin),
       status: h.lastStatus,
-      stale: ageMin > expected * 2,
+      retired,
+      stale: !retired && ageMin > expected * 2,
     };
   });
 
