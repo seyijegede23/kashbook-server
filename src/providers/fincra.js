@@ -11,16 +11,66 @@
 const PaymentProvider = require("./PaymentProvider");
 const fincra = require("../services/fincra");
 
-// Build the per-currency individual KYCInformation block from a normalized input.
-function buildLocalKyc(currency, kyc = {}) {
-  const { firstName, lastName, email, bvn } = kyc;
-  const base = { firstName, lastName };
+// Fincra's VirtualAccountPrimaryBusiness enum, required for KES corporate.
+// Our Business.industry is free text, so map what we can and fall back to a
+// generic trade category rather than sending something Fincra will reject.
+const PRIMARY_BUSINESS = [
+  "accounting", "banking", "finance", "insurance", "broker", "payment_processor",
+  "software", "saas", "cybersecurity", "ecommerce", "healthtech", "edtech",
+  "consulting", "legal", "professional_services", "architecture", "engineering",
+  "construction", "aerospace", "textiles", "furniture", "consumer_goods",
+  "beauty_cosmetics", "food_beverage", "travel_tourism", "pharmaceuticals",
+  "veterinary", "media", "arts_entertainment", "gaming", "music", "sports",
+  "logistics_distribution", "oil_gas", "mining", "forestry", "fishing",
+  "electricity", "government", "nonprofit", "charity",
+];
+
+function toPrimaryBusiness(industry) {
+  const s = String(industry || "").toLowerCase().replace(/[\s-]+/g, "_");
+  if (PRIMARY_BUSINESS.includes(s)) return s;
+  const hit = PRIMARY_BUSINESS.find((v) => s.includes(v) || v.includes(s));
+  return hit || "consumer_goods"; // safe default for a general trader
+}
+
+/**
+ * Build the per-currency KYCInformation block for a LOCAL virtual account.
+ *
+ * CORPORATE vs INDIVIDUAL matters for more than compliance: for corporate,
+ * `businessName` becomes the account name the PAYER sees. Verified in Fincra's
+ * own examples, GHS request businessName "Oma's Empire" returns accountName
+ * "Oma's Empire", and TZS "OmaTZS" returns "OmaTZS" verbatim. An individual
+ * account is named after the person instead, which is why a merchant's customer
+ * would otherwise see "Neema Juma" rather than "Neema Trading".
+ *
+ * Local corporate needs NONE of the FCY corporate apparatus: no incorporation
+ * documents, no articles of association, no beneficial-ownership certificate, no
+ * source-of-funds. Those requirements are FCY-only. Local corporate is still
+ * issued instantly.
+ */
+function buildLocalKyc(currency, kyc = {}, accountType = "individual") {
+  const { firstName, lastName, email, bvn, bvnName, businessName, industry, country } = kyc;
+  const corporate = accountType === "corporate";
+
+  if (corporate && !businessName) {
+    const err = new Error("A business name is required to open a business account.");
+    err.code = "FINCRA_BUSINESS_NAME_REQUIRED";
+    throw err;
+  }
+
+  const base = corporate ? { businessName } : { firstName, lastName };
+
   switch (currency) {
     case "NGN":
-      return { ...base, bvn };
+      // Corporate NGN additionally needs bvnName, which Fincra matches against
+      // the BVN holder, and that person must be a director or shareholder on the
+      // CAC record. (Moot while NG runs on Anchor, but correct if it ever flips.)
+      return corporate
+        ? { ...base, bvn, bvnName: bvnName || `${firstName || ""} ${lastName || ""}`.trim() }
+        : { ...base, bvn };
+
     case "GHS":
-      // Fincra marks KYCInformation.email REQUIRED for GHS (individual and
-      // corporate). Sending the request without it cannot succeed, so fail here
+      // Fincra marks KYCInformation.email REQUIRED for GHS, individual AND
+      // corporate. Sending the request without it cannot succeed, so fail here
       // with a clear message instead of at the provider.
       if (!email) {
         const err = new Error("An email address is required to open a Ghanaian account.");
@@ -28,9 +78,23 @@ function buildLocalKyc(currency, kyc = {}) {
         throw err;
       }
       return { ...base, email };
+
     case "KES":
+      // KES corporate is the only local currency needing incorporation context,
+      // and it is metadata, not documents.
+      return corporate
+        ? {
+            ...base,
+            businessRegistrationCountry: String(country || "KE").toUpperCase().slice(0, 2),
+            incorporationCountryCode: String(country || "KE").toUpperCase().slice(0, 2),
+            primaryBusiness: toPrimaryBusiness(industry),
+          }
+        : base;
+
     case "TZS":
-      return base; // email is rejected by Fincra for these
+      // Simplest of the four: businessName alone. email/phone are optional.
+      return base;
+
     default:
       return email ? { ...base, email } : base;
   }
@@ -90,12 +154,15 @@ class FincraProvider extends PaymentProvider {
   // Instant local virtual account (NGN/GHS/KES/TZS). `currency` from the
   // business's country. Returns { status:"issued", accountNumber, bankName,
   // accountName, providerRef, bankCode } synchronously.
-  async provisionLocalAccount({ currency, accountType = "individual", kyc, channel, merchantReference }) {
+  async provisionLocalAccount({ currency, accountType = "corporate", kyc, channel, merchantReference }) {
     const res = await fincra.createVirtualAccount({
       currency,
       accountType,
-      KYCInformation: buildLocalKyc(currency, kyc),
-      channel,
+      KYCInformation: buildLocalKyc(currency, kyc, accountType),
+      // NGN corporate is issued on `wema` by default, not the `globus` used for
+      // individual. Only matters if NG ever moves off Anchor, but a wrong channel
+      // is a silent misroute rather than an error, so it is set deliberately.
+      channel: channel || (currency === "NGN" && accountType === "corporate" ? "wema" : undefined),
       merchantReference,
     });
     const a = readAccount(res);

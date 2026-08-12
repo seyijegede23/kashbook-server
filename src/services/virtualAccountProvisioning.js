@@ -603,14 +603,31 @@ async function provisionViaUnifiedProvider({ provider, biz, user, body, req }) {
   const merchantReference = `kb_${biz.id}`;
   let result;
   try {
+    // CORPORATE, so the account carries the BUSINESS name. For corporate,
+    // KYCInformation.businessName becomes the account name the payer sees
+    // (verified in Fincra's own GHS and TZS examples), whereas an individual
+    // account is named after the owner. A customer paying "Neema Trading" should
+    // not be asked to send money to "Neema Juma", and a receiver-name mismatch
+    // can get an inflow returned.
+    //
+    // Local corporate requires none of the FCY corporate apparatus (incorporation
+    // documents, articles, beneficial ownership, source of funds) and is still
+    // issued instantly.
     result = await provider.provisionLocalAccount({
       currency,
-      accountType: "individual",
+      accountType: "corporate",
       kyc: {
+        businessName: biz.name,
         firstName: user.firstName,
         lastName: user.lastName || user.firstName,
         email: user.email || undefined,
         bvn: bvn || undefined,
+        // NGN corporate matches bvnName against the BVN holder, who must be a
+        // director or shareholder on the CAC record.
+        bvnName: [user.firstName, user.lastName].filter(Boolean).join(" ") || undefined,
+        // KES corporate needs incorporation context (metadata, not documents).
+        country: biz.country,
+        industry: biz.industry || undefined,
       },
       // The provider stamps this as the NGN account_name (what payers see); Fincra
       // ignores it. Business name for the account, per the account-name rule.
