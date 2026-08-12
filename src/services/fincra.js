@@ -22,8 +22,47 @@ function isConfigured() {
   return !!SECRET();
 }
 
-async function fincraFetch(path, { method = "GET", body } = {}) {
+// Is this failure worth another attempt?
+//
+// undici intermittently throws a bare, code-less "fetch failed" against
+// Cloudflare-fronted hosts (the same class of failure that forced the native
+// https + family:4 workaround in sms/sendchamp.js). It cost a merchant their
+// account during a Tanzania provisioning test: the first call died with "fetch
+// failed" and left the business with no account, while an identical retry
+// seconds later succeeded.
+//
+// Only TRANSPORT and SERVER-SIDE failures qualify. A 4xx is a bad request and
+// will fail identically forever, so retrying it just delays the error.
+function isTransient(err) {
+  if (err?.status) return err.status >= 500 || err.status === 429;
+  const s = `${err?.code || ""} ${err?.message || ""} ${err?.cause?.code || ""}`.toLowerCase();
+  return /fetch failed|etimedout|econnreset|econnrefused|enotfound|eai_again|socket hang up|network/.test(s);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fincraFetch(path, { method = "GET", body, attempts = 3 } = {}) {
   if (!isConfigured()) throw new Error("Fincra not configured (FINCRA_SECRET_KEY / FINCRA_PUBLIC_KEY)");
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fincraFetchOnce(path, { method, body });
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts || !isTransient(err)) throw err;
+      // Retrying a create is safe because merchantReference is deterministic
+      // (`kb_<businessId>`): if the first attempt did reach Fincra, the retry
+      // returns 409 duplicate, which provisioning already recovers from by
+      // re-fetching the existing account. Without that, a retry could double-issue.
+      const waitMs = 400 * attempt;
+      console.warn(`[fincra] ${method} ${path} transient failure (${err.code || err.status || err.message}) — retry ${attempt}/${attempts - 1} in ${waitMs}ms`);
+      await sleep(waitMs);
+    }
+  }
+  throw lastErr;
+}
+
+async function fincraFetchOnce(path, { method = "GET", body } = {}) {
   const res = await fetch(`${BASE()}${path}`, {
     method,
     headers: {

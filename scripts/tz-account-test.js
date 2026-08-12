@@ -58,6 +58,7 @@ async function main() {
   const user = await prisma.user.create({
     data: {
       firstName: "Neema", lastName: "Juma",
+      businessName: `${TAG} Neema Trading Ltd`, // User.businessName is required
       email: EMAIL, phone: PHONE,
       password: "x".repeat(60),           // unusable hash: this account cannot be logged into
       country: "TZ",
