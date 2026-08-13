@@ -121,23 +121,44 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
   if (!otpValid) return res.status(400).json({ error: "Invalid or expired verification code" });
 
   try {
-    const exists = await prisma.user.findFirst({ where: isEmail ? { email: iden } : { phone: iden } });
+    // Check BOTH channels, not just the one the OTP was sent to.
+    //
+    // Registration now collects an email AND a phone number, so the *other*
+    // channel can collide with an existing account. Checking only the identifier
+    // let that through to user.create, where the unique index threw P2002 and
+    // became a generic "account already exists" — after the user had already
+    // spent their verification code, and without saying which field was the
+    // problem. P2002 is still handled below as the race backstop.
+    const cleanEmail = email?.includes("@") ? email.trim().toLowerCase() : (isEmail ? iden : null);
+    const cleanPhone = phone ? normalizePhone(phone, callingCode || countryCfg.callingCode) : (isEmail ? null : iden);
+
+    const clash = await prisma.user.findFirst({
+      where: { OR: [cleanEmail ? { email: cleanEmail } : null, cleanPhone ? { phone: cleanPhone } : null].filter(Boolean) },
+      select: { email: true, phone: true },
+    });
+    if (clash) {
+      const onEmail = cleanEmail && clash.email === cleanEmail;
+      return res.status(409).json({
+        code: "ACCOUNT_EXISTS",
+        field: onEmail ? "email" : "phone",
+        error: onEmail
+          ? "An account with this email already exists. Please log in or reset your password."
+          : "An account with this phone number already exists. Please log in or reset your password.",
+      });
+    }
     // SECURITY: registration must NEVER mutate an existing account. It used to
     // fall through for passwordless rows (social-login/legacy users) and
     // overwrite their name, business and password — outright takeover. Any
-    // existing identifier is a conflict; recovery belongs to forgot-password.
-    if (exists) {
-      return res.status(409).json({
-        error: "An account with these details already exists. Please log in or reset your password.",
-        code: "ACCOUNT_EXISTS",
-      });
-    }
+    // existing identifier is a conflict, handled by the clash check above;
+    // recovery belongs to forgot-password, never to register.
 
     const hashed = await bcrypt.hash(password, 12);
-    const data = { firstName: fn, lastName: ln, businessName: biz, password: hashed,
-      ...(isEmail ? { email: iden } : { phone: iden }) };
-    if (email?.includes("@")) data.email = email.trim().toLowerCase();
-    if (phone) data.phone = normalizePhone(phone, callingCode || countryCfg.callingCode);
+    // Both channels are stored when supplied. The verified identifier is always
+    // one of them; the second is unverified at this point but gives the account a
+    // recovery route if the first is ever lost.
+    const data = { firstName: fn, lastName: ln, businessName: biz, password: hashed };
+    if (cleanEmail) data.email = cleanEmail;
+    if (cleanPhone) data.phone = cleanPhone;
     // Currency is derived from country — country is the lock.
     data.country  = countryCode;
     data.currency = countryCfg.currency.code;
