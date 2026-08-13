@@ -84,7 +84,7 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const { firstName, lastName, name, businessName, email, password, phone, identifier, otpCode, country, callingCode } = req.body;
+  const { firstName, middleName, lastName, name, businessName, email, password, phone, identifier, otpCode, country, callingCode, gender, referredByCode } = req.body;
   const fn  = firstName?.trim() || splitName(name).firstName;
   const ln  = lastName?.trim()  || splitName(name).lastName;
   const biz = businessName?.trim() || "My Business";
@@ -159,6 +159,17 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
     const data = { firstName: fn, lastName: ln, businessName: biz, password: hashed };
     if (cleanEmail) data.email = cleanEmail;
     if (cleanPhone) data.phone = cleanPhone;
+    // Legal middle name, as printed on the ID. Optional: many Nigerian IDs carry
+    // none, and Anchor/Fincra KYC match on first + last.
+    if (middleName?.trim()) data.middleName = middleName.trim();
+    // Collected at signup because KYC needs it later; asking once here beats
+    // interrupting the merchant mid-onboarding for it.
+    if (gender && ["male", "female", "other"].includes(String(gender).toLowerCase())) {
+      data.gender = String(gender).toLowerCase();
+    }
+    // Stored raw and UNVALIDATED — nothing consumes it yet. Capped so a pasted
+    // essay cannot bloat the row.
+    if (referredByCode?.trim()) data.referredByCode = referredByCode.trim().slice(0, 32);
     // Currency is derived from country — country is the lock.
     data.country  = countryCode;
     data.currency = countryCfg.currency.code;
