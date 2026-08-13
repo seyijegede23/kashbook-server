@@ -372,10 +372,19 @@ app.listen(PORT, () => {
 // /webhooks/anchor is mounted above.
 require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 
-// ── DORMANT: Fincra reconcile loop ───────────────────────────────────────────
-// Fincra remains in the tree for the non-NG markets (GHS/KES) but no country
-// currently routes to it. Re-enable by uncommenting if reactivated.
-//   require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
+// ── Background loop: reconcile Fincra collections + payouts every 5 min ──────
+// NOT optional, and no longer dormant. Ghana, Kenya and Tanzania route to Fincra,
+// and webhooks are ack-then-process: we return 200 and then do the work, so an
+// event lost between the ack and the write is gone. Fincra publishes NO webhook
+// retry policy anywhere in its documentation, which makes this poll the ONLY
+// guarantee that a merchant's inbound money is ever booked.
+//
+// It re-reads Fincra's own collection and payout records and books anything the
+// webhook missed, sharing recordFincraInboundCredit with the webhook path so the
+// Transaction @@unique([businessId, reference]) gate makes double-crediting
+// impossible. Leader-elected via withCronLock, and it no-ops when Fincra is
+// unconfigured, so it is safe on every instance.
+require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────
 // Summary of today's money in/out per user, or a nudge if nothing was
