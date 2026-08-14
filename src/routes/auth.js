@@ -80,11 +80,35 @@ async function ensurePrimaryBusiness(userId, businessName, country) {
 // ─────────────────────────────────────────────
 // POST /auth/register
 // ─────────────────────────────────────────────
-router.post("/register", body("password").isLength({ min: 8 }).withMessage("Password must be at least 8 characters"), async (req, res) => {
+// Password strength is enforced HERE, not only in the app. The signup screen
+// shows the same five rules live, but a client is not a control: anything that
+// posts straight to this endpoint would otherwise set a one-character password
+// on an account that holds a real bank balance.
+//
+// Deliberately NOT applied to login or to existing accounts: 15 users already
+// have passwords predating this, and rejecting them at login would lock them out
+// of their own money. Existing accounts upgrade when they next reset.
+const PASSWORD_RULES = [
+  { test: (v) => v.length >= 8,        message: "at least 8 characters" },
+  { test: (v) => /[A-Z]/.test(v),      message: "an uppercase letter" },
+  { test: (v) => /[a-z]/.test(v),      message: "a lowercase letter" },
+  { test: (v) => /[0-9]/.test(v),      message: "a number" },
+  { test: (v) => /[^A-Za-z0-9]/.test(v), message: "a special character" },
+];
+
+function passwordProblems(password = "") {
+  return PASSWORD_RULES.filter((r) => !r.test(String(password))).map((r) => r.message);
+}
+
+router.post("/register", body("password").custom((v) => {
+  const missing = passwordProblems(v);
+  if (missing.length) throw new Error(`Password needs ${missing.join(", ")}`);
+  return true;
+}), async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const { firstName, middleName, lastName, name, businessName, email, password, phone, identifier, otpCode, country, callingCode, gender, referredByCode } = req.body;
+  const { firstName, middleName, lastName, name, businessName, email, password, phone, identifier, otpCode, country, callingCode, gender, referredByCode, marketingOptIn } = req.body;
   const fn  = firstName?.trim() || splitName(name).firstName;
   const ln  = lastName?.trim()  || splitName(name).lastName;
   const biz = businessName?.trim() || "My Business";
@@ -170,6 +194,11 @@ router.post("/register", body("password").isLength({ min: 8 }).withMessage("Pass
     // Stored raw and UNVALIDATED — nothing consumes it yet. Capped so a pasted
     // essay cannot bloat the row.
     if (referredByCode?.trim()) data.referredByCode = referredByCode.trim().slice(0, 32);
+    // Consent records. Terms acceptance is stamped server-side rather than taking
+    // a client timestamp, so the record reflects when we actually created the
+    // account. Marketing defaults to false: silence is never consent.
+    data.marketingOptIn = marketingOptIn === true;
+    data.termsAcceptedAt = new Date();
     // Currency is derived from country — country is the lock.
     data.country  = countryCode;
     data.currency = countryCfg.currency.code;

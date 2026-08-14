@@ -43,6 +43,11 @@ model User {
   // The code this user typed at signup, i.e. who referred THEM. Stored raw and
   // unvalidated for now; nothing consumes it yet.
   referredByCode            String?
+  // Consent records. NDPA treats marketing consent as something that must be
+  // evidenced, and terms acceptance is the legal basis for the account, so both
+  // are stored rather than assumed from the fact that signup completed.
+  marketingOptIn            Boolean   @default(false)
+  termsAcceptedAt           DateTime?
   anchorCustomerId          String?     @unique
   fincraCustomerRef         String?
   kycStatus                 String      @default("unverified")
