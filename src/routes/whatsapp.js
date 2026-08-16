@@ -8,6 +8,7 @@
  */
 const router = require("express").Router();
 const auth = require("../middleware/auth");
+const { requirePermission } = require("../middleware/requirePermission");
 const prisma = require("../utils/db");
 const wa = require("../utils/whatsappCloud");
 const ig = require("../utils/instagram"); // formatAmount/buildPaymentText are channel-agnostic
@@ -280,8 +281,13 @@ router.get("/conversations/:id/messages", async (req, res) => {
         expectedAmount: convo.expectedAmount,
         lastPaymentConfirmedAt: convo.lastPaymentConfirmedAt,
       },
+      // Same rule as the Instagram inbox: payment messages spell out the NUBAN,
+      // so a staff member without canViewBalance must not read it here.
       messages: messages.map((m) => ({
-        id: m.id, direction: m.direction, text: m.text, attachmentUrl: m.attachmentUrl, sentAt: m.sentAt,
+        id: m.id, direction: m.direction, attachmentUrl: m.attachmentUrl, sentAt: m.sentAt,
+        text: req.user.permissions?.canViewBalance === true
+          ? m.text
+          : ig.redactAccountNumber(m.text, business),
       })),
     });
   } catch (err) { return fail(res, err); }
@@ -337,7 +343,11 @@ router.post("/conversations/:id/reply", async (req, res) => {
 
 // POST /whatsapp/conversations/:id/send-payment { amount?, note? } — DM the NUBAN,
 // optionally arming auto payment confirmation (waPaymentMatch).
-router.post("/conversations/:id/send-payment", async (req, res) => {
+// Sending the merchant's account number to a customer IS using the bank
+// account, and it is also the one route that MINTS the NUBAN into a thread on
+// demand — so without this gate a staff member could simply generate a payment
+// message and read their employer's account number off it.
+router.post("/conversations/:id/send-payment", requirePermission("canViewBalance"), async (req, res) => {
   try {
     const amount = parseAmount(req.body.amount) || 0;
     const convo = await prisma.waConversation.findUnique({ where: { id: req.params.id } });

@@ -10,7 +10,7 @@ const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require(".
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { validateDataUri, IMAGE_TYPES, DOC_TYPES } = require("../utils/uploadGuard");
 const { audit } = require("../utils/audit");
-const { requirePermission } = require("../middleware/requirePermission");
+const { requirePermission, ownerOnly } = require("../middleware/requirePermission");
 const { getBaseCurrency, DEFAULT_COUNTRY } = require("../config/countries");
 const { getRiskCategory } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
@@ -594,7 +594,14 @@ router.get("/:id/kyc-status", async (req, res) => {
 // POST /businesses/:id/sync-anchor-account
 // Reconciliation hatch: pulls the user's deposit accounts from Anchor and
 // backfills the Business row if we missed a webhook (e.g. transient failure).
-router.post("/:id/sync-anchor-account", async (req, res) => {
+// OWNER-ONLY, explicitly. This returns the full unmasked NUBAN and rebinds the
+// business's bank identifiers — the account the entire money path resolves
+// against. It was safe only because its lookup happens to use req.user.id while
+// its neighbours use ownerIdOf, so staff silently got a 404. That is scoping,
+// not a permission check, and it stops holding the moment someone
+// "consistency-fixes" the query. State the rule instead of relying on the
+// accident.
+router.post("/:id/sync-anchor-account", ownerOnly("Only the business owner can link a bank account."), async (req, res) => {
   try {
     const biz = await prisma.business.findFirst({
       where: { id: req.params.id, userId: req.user.id },

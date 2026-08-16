@@ -351,6 +351,29 @@ const send = (amount, over = {}) =>
     assert.strictEqual(planted, null, "staff must not be able to create a business they own");
     void r;
   });
+  await test("the NUBAN is redacted out of DM message text", async () => {
+    // The inbox is a staff surface, but payment messages spell out the account
+    // number — so the inbox must not become a way to read the field
+    // GET /businesses strips for them.
+    const { redactAccountNumber } = require("../src/utils/instagram");
+    const msg = `Bank: GTBank\nAccount Number: ${biz.virtualAccountNumber}\nAccount Name: Ada Stores`;
+    const out = redactAccountNumber(msg, biz);
+    assert.ok(!out.includes(biz.virtualAccountNumber), `NUBAN survived redaction: ${out}`);
+    assert.ok(out.includes(biz.virtualAccountNumber.slice(-4)), "keep the last 4 so it stays recognisable");
+    // An owner-visible message is returned untouched.
+    assert.strictEqual(redactAccountNumber(msg, { virtualAccountNumber: null }), msg);
+  });
+  await test("redaction never mangles a customer's own numbers", async () => {
+    const { redactAccountNumber } = require("../src/utils/instagram");
+    // A generic 10-digit regex would destroy all of these. Only OUR number goes.
+    const msg = "my number is 0812345678 and my ref is 1234567890";
+    assert.strictEqual(redactAccountNumber(msg, biz), msg);
+  });
+  await test("staff cannot rebind the bank account via sync-anchor-account", async () => {
+    const r = await POST(`/businesses/${biz.id}/sync-anchor-account`, tStaff, {});
+    assert.strictEqual(r.status, 403);
+    assert.strictEqual(r.body.code, "OWNER_ONLY");
+  });
   await test("insights refuses the balance question behind canViewReports", async () => {
     // The capability that governs "how much is in my account" is canViewBalance,
     // not canViewReports. Otherwise the distinction is a phrasing trick.

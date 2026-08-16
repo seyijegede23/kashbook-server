@@ -10,6 +10,7 @@
  */
 const router = require("express").Router();
 const auth = require("../middleware/auth");
+const { requirePermission } = require("../middleware/requirePermission");
 const prisma = require("../utils/db");
 const ig = require("../utils/instagram");
 const { encrypt, decrypt } = require("../utils/crypto");
@@ -347,6 +348,7 @@ router.get("/conversations/:id/messages", async (req, res) => {
     const business = await resolveBusiness(req, convo.businessId);
     if (!business) return res.status(404).json({ error: "Conversation not found." });
 
+    const canSeeBank = req.user.permissions?.canViewBalance === true;
     const messages = await prisma.igMessage.findMany({
       where: { conversationId: convo.id },
       orderBy: { sentAt: "asc" },
@@ -363,8 +365,12 @@ router.get("/conversations/:id/messages", async (req, res) => {
         expectedAmount: convo.expectedAmount,
         lastPaymentConfirmedAt: convo.lastPaymentConfirmedAt,
       },
+      // Payment messages spell out the NUBAN. Redact it for a staff member the
+      // owner did not trust with the bank account — otherwise the DM inbox is a
+      // way to read the exact field GET /businesses strips for them.
       messages: messages.map((m) => ({
-        id: m.id, direction: m.direction, text: m.text, attachmentUrl: m.attachmentUrl, sentAt: m.sentAt,
+        id: m.id, direction: m.direction, attachmentUrl: m.attachmentUrl, sentAt: m.sentAt,
+        text: canSeeBank ? m.text : ig.redactAccountNumber(m.text, business),
       })),
     });
   } catch (err) { return fail(res, err); }
@@ -422,7 +428,11 @@ router.post("/conversations/:id/reply", async (req, res) => {
 });
 
 // POST /instagram/conversations/:id/send-payment → DM the merchant's NUBAN
-router.post("/conversations/:id/send-payment", async (req, res) => {
+// Sending the merchant's account number to a customer IS using the bank
+// account, and it is also the one route that MINTS the NUBAN into a thread on
+// demand — so without this gate a staff member could simply generate a payment
+// message and read their employer's account number off it.
+router.post("/conversations/:id/send-payment", requirePermission("canViewBalance"), async (req, res) => {
   try {
     const amount = parseAmount(req.body.amount) || 0;
     const convo = await prisma.igConversation.findUnique({ where: { id: req.params.id } });

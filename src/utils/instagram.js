@@ -316,6 +316,24 @@ function buildPaymentText(business, { amount, note } = {}) {
   return lines.join("\n");
 }
 
+// Hide the business's own NUBAN inside message text.
+//
+// The DM inbox is a staff surface — replying to customers is the job — but the
+// threads contain payment messages, and those spell out the account number. That
+// makes the inbox a way to read the very field businesses.js strips from
+// GET /businesses for a staff member without canViewBalance. Same secret, a
+// different door.
+//
+// Replaces the KNOWN account number rather than pattern-matching any 10-digit
+// run: a customer's own account number, an order reference or a phone number
+// would all match a generic regex, and mangling a customer's message to protect
+// data that isn't ours is worse than the leak. Exact string, exact intent.
+function redactAccountNumber(text, business) {
+  const acct = business?.virtualAccountNumber;
+  if (!text || !acct) return text;
+  return String(text).split(String(acct)).join("••••••" + String(acct).slice(-4));
+}
+
 // ── Webhooks ─────────────────────────────────────────────────────────────────
 // GET handshake — echo hub.challenge (raw) when mode+verify_token match.
 // Returns the challenge string to echo, or null to reject (403).
@@ -344,6 +362,7 @@ function verifyWebhookSignature(rawBody, headers) {
 }
 
 module.exports = {
+  redactAccountNumber,
   isConfigured,
   getConfig,
   // oauth
