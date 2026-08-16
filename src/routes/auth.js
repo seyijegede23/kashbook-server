@@ -9,6 +9,13 @@ const { dispatchOtp, verifyOtp, peekOtp, hashOtp, sendEmail } = require("../util
 const { validateDataUri, IMAGE_TYPES } = require("../utils/uploadGuard");
 const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
+const { verifyTransactionPin } = require("../utils/transactionPin");
+
+// Hard ceiling on what an owner can delegate in a rolling 24h, in the business's
+// own currency. Not a security boundary — the owner's AML tier limits are still
+// the real ceiling — but a typo guard: an extra zero on a staff member's daily
+// limit is a plausible mistake with a very expensive tail.
+const MAX_STAFF_DAILY_CAP = 50_000_000;
 
 // ── Helper: safe user response ────────────────────────────────────────────────
 function userResponse(user, token) {
@@ -987,9 +994,37 @@ router.get("/staff", authMiddleware, async (req, res) => {
   try {
     const staffList = await prisma.user.findMany({
       where: { employerId: req.user.id },
-      select: { id: true, firstName: true, lastName: true, phone: true, email: true, accountType: true, createdAt: true },
+      select: {
+        id: true, firstName: true, lastName: true, phone: true, email: true,
+        accountType: true, createdAt: true,
+        // So the list can show what each person can do without an N+1 fetch.
+        staffPermission: {
+          select: {
+            canViewBalance: true, canTransfer: true, canViewReports: true,
+            canManagePayables: true, dailyTransferCap: true, employerId: true,
+          },
+        },
+      },
     });
-    res.json(staffList);
+    // Flatten, and apply the SAME cross-check authMiddleware does: a grant row
+    // naming a different employer is ignored there, so it must not be displayed
+    // as active here. A settings screen that disagrees with what the server
+    // enforces is worse than one that shows nothing.
+    res.json(
+      staffList.map(({ staffPermission, ...s }) => {
+        const g = staffPermission && staffPermission.employerId === req.user.id ? staffPermission : null;
+        return {
+          ...s,
+          permissions: {
+            canViewBalance: g?.canViewBalance === true,
+            canTransfer: g?.canTransfer === true,
+            canViewReports: g?.canViewReports === true,
+            canManagePayables: g?.canManagePayables === true,
+          },
+          dailyTransferCap: Number(g?.dailyTransferCap ?? 0) || 0,
+        };
+      }),
+    );
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch staff list" });
   }
@@ -1039,12 +1074,136 @@ router.post("/staff", authMiddleware, async (req, res) => {
         employerId: req.user.id,
       },
     });
+    await audit({
+      req,
+      action: "STAFF_CREATED",
+      resourceType: "user",
+      resourceId: newStaff.id,
+      severity: "warn",
+      // A new staff account starts with NO permissions — there is no grant row,
+      // and authMiddleware reads a missing row as nothing granted. Recorded so
+      // the trail shows the starting point every later grant departs from.
+      metadata: { staffName: `${firstName} ${lastName || ""}`.trim(), staffEmail: em, staffPhone: ph, permissions: "none" },
+    }).catch(() => {});
+
     // Never return the password hash to the client.
     const { password: _pw, ...safe } = newStaff;
-    res.status(201).json(safe);
+    res.status(201).json({
+      ...safe,
+      permissions: { canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false },
+      dailyTransferCap: 0,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to create staff account" });
+  }
+});
+
+// ─────────────────────────────────────────────
+// PATCH /auth/staff/:id/permissions
+//
+// The grant surface. Three gates, and all three are deliberate:
+//   1. owner-only        — a staff member must never be able to widen their own
+//                          access, nor a colleague's
+//   2. Pro plan          — staff are a paid feature; permissions are part of it
+//   3. transaction PIN   — the same proof required to move money, because
+//                          granting canTransfer IS granting the ability to move
+//                          money. A password-authenticated session that has been
+//                          left open on a shop counter must not be enough.
+// ─────────────────────────────────────────────
+router.patch("/staff/:id/permissions", authMiddleware, async (req, res) => {
+  if (req.user.accountType === "staff")
+    return res.status(403).json({ error: "Only the business owner can change staff permissions.", code: "OWNER_ONLY" });
+  if (req.user.plan !== "PREMIUM")
+    return res.status(403).json({ error: "Staff permissions require a Pro plan.", code: "PRO_REQUIRED" });
+
+  const { pin, permissions = {}, dailyTransferCap } = req.body || {};
+
+  try {
+    const staff = await prisma.user.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, employerId: true, accountType: true, firstName: true, lastName: true },
+    });
+    if (!staff || staff.employerId !== req.user.id)
+      return res.status(404).json({ error: "Staff not found" });
+    if (staff.accountType !== "STAFF")
+      return res.status(400).json({ error: "That account is not a staff member." });
+
+    const pinCheck = await verifyTransactionPin(req.user.id, pin);
+    if (!pinCheck.ok) {
+      await audit({
+        req, action: "PIN_FAILED", resourceType: "user", resourceId: req.user.id,
+        severity: "warn", metadata: { code: pinCheck.code, context: "grant_staff_permissions" },
+      }).catch(() => {});
+      return res.status(pinCheck.status || 401).json({ error: pinCheck.error, code: pinCheck.code });
+    }
+
+    // Strict booleans only. A missing key means false, not "leave it alone":
+    // this endpoint sets the whole grant, so a partial body can never leave a
+    // capability switched on by accident.
+    const next = {
+      canViewBalance: permissions.canViewBalance === true,
+      canTransfer: permissions.canTransfer === true,
+      canViewReports: permissions.canViewReports === true,
+      canManagePayables: permissions.canManagePayables === true,
+    };
+
+    // A cap is meaningless without the permission it bounds, and a negative or
+    // non-finite cap would be read as 0 downstream anyway — reject it here so
+    // the owner sees the problem instead of silently getting a zero.
+    let cap = null;
+    if (dailyTransferCap !== undefined && dailyTransferCap !== null && dailyTransferCap !== "") {
+      cap = Number(dailyTransferCap);
+      if (!Number.isFinite(cap) || cap < 0)
+        return res.status(400).json({ error: "Enter a valid daily limit." });
+      if (cap > MAX_STAFF_DAILY_CAP)
+        return res.status(400).json({ error: `The daily limit can't be more than ${MAX_STAFF_DAILY_CAP.toLocaleString()}.` });
+    }
+
+    const before = await prisma.staffPermission.findUnique({ where: { userId: staff.id } });
+
+    const grant = await prisma.staffPermission.upsert({
+      where: { userId: staff.id },
+      create: { userId: staff.id, employerId: req.user.id, ...next, dailyTransferCap: cap, grantedById: req.user.id },
+      // employerId is rewritten on every update so a grant can never keep
+      // pointing at a previous employer — authMiddleware refuses a mismatched
+      // row outright, which would look like a permission that won't stick.
+      update: { employerId: req.user.id, ...next, dailyTransferCap: cap, grantedById: req.user.id },
+    });
+
+    // One row per change, at warn severity, naming what moved. Granting the
+    // ability to move someone else's money is exactly the kind of event that
+    // has to be reconstructable months later.
+    const changed = Object.keys(next).filter((k) => (before?.[k] === true) !== next[k]);
+    const capChanged = Number(before?.dailyTransferCap ?? 0) !== Number(cap ?? 0);
+    if (changed.length || capChanged || !before) {
+      await audit({
+        req,
+        action: changed.some((k) => next[k]) || capChanged ? "STAFF_PERMISSION_GRANTED" : "STAFF_PERMISSION_REVOKED",
+        resourceType: "user",
+        resourceId: staff.id,
+        severity: "warn",
+        metadata: {
+          staffUserId: staff.id,
+          granted: Object.keys(next).filter((k) => next[k]),
+          revoked: Object.keys(next).filter((k) => !next[k] && before?.[k] === true),
+          dailyTransferCapBefore: Number(before?.dailyTransferCap ?? 0) || 0,
+          dailyTransferCapAfter: Number(cap ?? 0) || 0,
+        },
+      }).catch(() => {});
+    }
+
+    // Permissions are read from the database on every request and never cached
+    // in the JWT, so this takes effect on the staff member's very next call —
+    // no logout required, which is what makes a revoke actually a revoke.
+    res.json({
+      id: staff.id,
+      permissions: next,
+      dailyTransferCap: Number(grant.dailyTransferCap ?? 0) || 0,
+    });
+  } catch (err) {
+    console.error("[auth/staff/permissions]", err);
+    res.status(500).json({ error: "Failed to update permissions" });
   }
 });
 
@@ -1057,7 +1216,29 @@ router.delete("/staff/:id", authMiddleware, async (req, res) => {
     const staff = await prisma.user.findUnique({ where: { id: req.params.id } });
     if (!staff) return res.status(404).json({ error: "Staff not found" });
     if (staff.employerId !== req.user.id) return res.status(403).json({ error: "Not authorized" });
+
+    // Close anything they left in the approval queue BEFORE the delete. The
+    // approve route refuses a request from a departed staff member anyway, but
+    // leaving live-looking rows in the owner's pending list invites them to tap
+    // approve on money for someone who no longer works there.
+    await prisma.staffTransferRequest.updateMany({
+      where: { requestedById: staff.id, status: "pending" },
+      data: { status: "cancelled", reason: "The staff member was removed from the business.", decidedAt: new Date() },
+    }).catch(() => {});
+
     await prisma.user.delete({ where: { id: req.params.id } });
+
+    // Staff removal wrote no audit row at all until now — the one event most
+    // worth having when reconstructing who could do what, and when.
+    await audit({
+      req,
+      action: "STAFF_DELETED",
+      resourceType: "user",
+      resourceId: staff.id,
+      severity: "warn",
+      metadata: { staffName: `${staff.firstName || ""} ${staff.lastName || ""}`.trim(), staffEmail: staff.email || null },
+    }).catch(() => {});
+
     res.json({ message: "Staff account successfully removed" });
   } catch (err) {
     console.error(err);
