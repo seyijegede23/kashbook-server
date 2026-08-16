@@ -17,12 +17,57 @@ const { verifyTransactionPin } = require("../utils/transactionPin");
 // limit is a plausible mistake with a very expensive tail.
 const MAX_STAFF_DAILY_CAP = 50_000_000;
 
+// Resolve what a user may do, for the CLIENT's benefit only — it decides which
+// buttons to render. Enforcement lives in authMiddleware + requirePermission and
+// re-runs on every request; nothing here is trusted by the server.
+//
+// Mirrors authMiddleware exactly, including the employer cross-check and the
+// strict === true, because a client that believes it has a capability the server
+// refuses produces a button that fails, and a client that believes it lacks one
+// produces a feature the owner paid for and cannot find.
+const NO_PERMISSIONS = Object.freeze({
+  canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false,
+});
+const ALL_PERMISSIONS = Object.freeze({
+  canViewBalance: true, canTransfer: true, canViewReports: true, canManagePayables: true,
+});
+function resolvePermissions(user) {
+  if (String(user.accountType).toUpperCase() !== "STAFF") {
+    return { permissions: ALL_PERMISSIONS, dailyTransferCap: null };
+  }
+  // `undefined` means the caller forgot `include: { staffPermission: true }`,
+  // which is different from `null` (loaded, no grant). Both fail closed, but the
+  // first is a bug that would look like "permissions don't stick" — say so
+  // loudly rather than letting it read as a legitimately empty grant.
+  if (user.staffPermission === undefined) {
+    console.warn(`[auth] resolvePermissions: staffPermission not loaded for staff ${user.id} — permissions will read as none`);
+  }
+  const g = user.staffPermission;
+  const usable = g && user.employerId && g.employerId === user.employerId ? g : null;
+  if (!usable) return { permissions: NO_PERMISSIONS, dailyTransferCap: 0 };
+  return {
+    permissions: {
+      canViewBalance: usable.canViewBalance === true,
+      canTransfer: usable.canTransfer === true,
+      canViewReports: usable.canViewReports === true,
+      canManagePayables: usable.canManagePayables === true,
+    },
+    dailyTransferCap: Number(usable.dailyTransferCap ?? 0) || 0,
+  };
+}
+
 // ── Helper: safe user response ────────────────────────────────────────────────
 function userResponse(user, token) {
+  const { permissions, dailyTransferCap } = resolvePermissions(user);
   return {
     token,
     user: {
       id:           user.id,
+      // What this staff member may do, and how much they may move in a rolling
+      // 24h before it needs the owner's approval. Owners get every capability
+      // and a null cap (the concept doesn't apply to them).
+      permissions,
+      dailyTransferCap,
       // GET /auth/me returns this but login/register did not, so straight after
       // signing in the client saw `undefined` and sent anyone with a PIN through
       // the "set a PIN" flow on their first transfer — until the 10-minute
@@ -248,6 +293,10 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
     const isEmailLike = identifier.includes("@");
     const user = await prisma.user.findFirst({
       where: isEmailLike ? { email: identifier.trim().toLowerCase() } : { phone: normalizePhone(identifier) },
+      // Staff log in here too, and userResponse reports what they may do. Without
+      // this the app would open with every capability hidden until the 10-minute
+      // /auth/me poll corrected it.
+      include: { staffPermission: true },
     });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
     if (!user.password) {
@@ -377,7 +426,10 @@ router.post("/verify-otp", async (req, res) => {
     const valid = await verifyOtp(iden, code, "phone_register");
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
     const { firstName, lastName } = splitName(name || "KashBook User");
-    let user = await prisma.user.findFirst({ where: isEmail ? { email: iden } : { phone: iden } });
+    let user = await prisma.user.findFirst({
+      where: isEmail ? { email: iden } : { phone: iden },
+      include: { staffPermission: true }, // an existing staff account can sign in this way too
+    });
     if (!user) {
       user = await prisma.user.create({
         data: { firstName, lastName, businessName: businessName?.trim() || "My Business",
@@ -449,13 +501,21 @@ router.post("/reset-password", async (req, res) => {
 // ─────────────────────────────────────────────
 router.get("/me", authMiddleware, async (req, res) => {
   try {
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    // This is the endpoint the client re-polls every 10 minutes, so it is also
+    // how a revoked permission reaches a running app.
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      include: { staffPermission: true },
+    });
     if (!user) return res.status(404).json({ error: "User not found" });
     // Strip raw secret-like fields before sending the user object.
-    const { password: _, transactionPin: _pin, transactionPinFailedCount: _c, transactionPinLockedUntil: _l, ...safe } = user;
+    const { password: _, transactionPin: _pin, transactionPinFailedCount: _c, transactionPinLockedUntil: _l, staffPermission: _sp, ...safe } = user;
+    const { permissions, dailyTransferCap } = resolvePermissions(user);
     res.json({
       user: {
         ...safe,
+        permissions,
+        dailyTransferCap,
         hasTransactionPin: !!user.transactionPin,
         accountType: safe.accountType.toLowerCase(),
         settings: {
