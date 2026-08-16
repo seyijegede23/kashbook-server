@@ -16,6 +16,11 @@ function userResponse(user, token) {
     token,
     user: {
       id:           user.id,
+      // GET /auth/me returns this but login/register did not, so straight after
+      // signing in the client saw `undefined` and sent anyone with a PIN through
+      // the "set a PIN" flow on their first transfer — until the 10-minute
+      // refresh happened to correct it.
+      hasTransactionPin: !!user.transactionPin,
       firstName:    user.firstName,
       lastName:     user.lastName,
       businessName: user.businessName,

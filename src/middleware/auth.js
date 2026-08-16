@@ -25,7 +25,7 @@ async function authMiddleware(req, res, next) {
       where: { id: payload.userId },
       select: {
         id: true, accountType: true, employerId: true, firstName: true,
-        lastName: true, role: true, plan: true,
+        lastName: true, role: true, plan: true, country: true,
         accountStatus: true, complianceFreezeReason: true, tokenVersion: true,
       },
     });
@@ -91,6 +91,11 @@ async function authMiddleware(req, res, next) {
       employerId:    user.employerId ?? null,
       name:          `${user.firstName} ${user.lastName}`.trim(),
       role:          user.role,
+      // transfers.js reads req.user.country in three places to pick the payment
+      // provider and the bank list, but nothing ever set it — so every caller
+      // silently fell back to "NG". A Ghanaian merchant was being shown Nigerian
+      // banks and routed to the Nigerian provider.
+      country:       user.country || "NG",
       plan:          user.plan ?? "FREE",
       effectivePlan,
       // Always present, always all four keys, always a real boolean — so no
