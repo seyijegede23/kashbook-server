@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
+const { ownerOnly } = require("../middleware/requirePermission");
 const { computeNextDue } = require("../utils/recurringSchedule");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { audit } = require("../utils/audit");
@@ -9,6 +10,24 @@ const { getProvider } = require("../providers");
 const { getThresholds } = require("../config/amlLimits");
 
 router.use(auth);
+
+// OWNER-ONLY, and never a grantable capability — this is the sharpest privilege
+// escalation in the whole permission model.
+//
+// A recurring auto-debit is a STANDING INSTRUCTION that moves money unattended:
+// the cron calls executeTransfer directly (recurringExpenseRunner.js) with
+// bypassOtp, which means it runs outside the interactive OTP gate AND outside
+// any per-staff daily cap, because no staff request is involved at execution
+// time. A staff member who could create one would therefore hold an uncapped,
+// unapproved, OTP-free tap on the owner's account — strictly more power than
+// the transfer permission they were actually granted.
+//
+// These routes are safe TODAY only by accident: every query scopes on
+// `req.user.id`, so a staff member silently gets 404s. That accident evaporates
+// the moment someone "consistency-fixes" them to ownerIdOf(req), which is
+// exactly the tidy-up this codebase invites. Hence an explicit gate that states
+// the reason, rather than relying on the scoping to keep holding.
+router.use(ownerOnly("Only the business owner can set up recurring payments."));
 
 // Mask an account number for audit-log metadata.
 const maskAccount = (n) =>
