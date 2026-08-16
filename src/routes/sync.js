@@ -95,23 +95,29 @@ router.get("/", async (req, res) => {
     //                  over makes canViewBalance decorative: the balance is
     //                  hidden while the entire ledger that produces it is not.
     //   recurring    — standing auto-debit instructions INCLUDING the payee
-    //                  account numbers. Those routes are owner-only for a
-    //                  reason (see recurringExpenses.js); leaking their
-    //                  contents through the sync is the same disclosure by
-    //                  another door.
+    //                  account numbers. The whole recurringExpenses router is
+    //                  ownerOnly precisely because NO capability is meant to
+    //                  unlock a standing instruction, so gating these on
+    //                  canViewBalance would have been the wrong gate: it would
+    //                  hand them to a trusted staff member the owner-only rule
+    //                  says must never see them. Owners only, full stop.
+    //   debts        — what the business owes, the same class as payables,
+    //                  which businessDebts.js and payables.js both gate.
     //
-    // Sales, expenses, customers, inventory, debts and invoices are the
-    // bookkeeping a staff member is employed to do, and stay.
+    // Sales, expenses, customers, inventory and invoices are the bookkeeping a
+    // staff member is employed to do, and stay.
     const canSeeBank = req.user.permissions?.canViewBalance === true;
+    const isOwner = req.user.accountType !== "staff";
+    const canSeeDebts = req.user.permissions?.canManagePayables === true;
     res.json({
       sales,
       expenses,
       transactions: canSeeBank ? transactions : [],
       customers,
       inventory,
-      debts,
+      debts: canSeeDebts ? debts : [],
       invoices,
-      recurring: canSeeBank ? recurring : [],
+      recurring: isOwner ? recurring : [],
       // Told, not silently emptied — the client can distinguish "no bank
       // activity" from "not yours to see" instead of rendering a confident zero.
       bankWithheld: !canSeeBank,
@@ -161,7 +167,9 @@ router.get("/pull", async (req, res) => {
       transactions: canSeeBank ? transactions : [],
       customers,
       inventory,
-      payables,
+      // payables.js gates every one of its own routes on canManagePayables.
+      // Returning them here ungated is the same data through a different door.
+      payables: req.user.permissions?.canManagePayables === true ? payables : [],
       bankWithheld: !canSeeBank,
     });
   } catch (err) {
@@ -197,7 +205,7 @@ router.post("/", async (req, res) => {
 
   for (const op of queue) {
     try {
-      await processOp(op, req.user.id, req.user.name);
+      await processOp(op, req.user.id, req.user.name, req.user.accountType);
       processed.push(op.id);
     } catch (err) {
       // Log the real reason server-side, return a STABLE code to the client.
@@ -221,7 +229,7 @@ router.post("/", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Process a single sync queue operation
 // ─────────────────────────────────────────────────────────────────────────────
-async function processOp(op, userId, userName) {
+async function processOp(op, userId, userName, accountType) {
   const { type, data } = op;
 
   async function assertOwns(businessId) {
@@ -234,6 +242,20 @@ async function processOp(op, userId, userName) {
 
     // ── Businesses ────────────────────────────────────────────────────────────
     case "add_business": {
+      // Every other op in this switch calls assertOwns() first. This one wrote a
+      // Business row with userId taken from the CALLER, checking nothing — so a
+      // staff member could create a business they personally own, through the
+      // sync endpoint, while POST /businesses refuses them outright and enforces
+      // the free-plan limit. That row would then be outside their employer's
+      // control entirely.
+      //
+      // Business creation is owner-only and belongs to POST /businesses, which
+      // applies the plan cap, the country/currency binding and the name rules.
+      // None of that can be reproduced here, so the op is refused rather than
+      // half-implemented.
+      if (accountType === "staff") {
+        throw new Error("Forbidden: staff cannot create businesses");
+      }
       await prisma.business.upsert({
         where: { id: data.id },
         create: {

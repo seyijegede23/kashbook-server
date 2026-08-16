@@ -55,7 +55,12 @@ router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
     if (!question) return res.status(400).json({ error: "Ask a question first." });
     const context = typeof req.body.context === "string" ? req.body.context.slice(0, 40) : null;
 
-    const result = await answerQuestion(question, biz, context);
+    // "What is my balance" is a BALANCE question wearing a reports costume.
+    // The route gate is canViewReports; the engine must still refuse the one
+    // intent that reads the bank.
+    const result = await answerQuestion(question, biz, context, {
+      canViewBalance: req.user.permissions?.canViewBalance === true,
+    });
     res.json(result);
   } catch (err) {
     console.error("[insights ask]", err.message);

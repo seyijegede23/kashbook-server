@@ -80,13 +80,39 @@ const prisma = new PrismaClient({ adapter });
 //     stuck holder can't pin a business's money-out forever (the waiter aborts).
 //     While fn() runs, this connection is idle-in-transaction (no statement),
 //     so the timeout doesn't kill the in-flight work.
+// Accepts one key or several. SEVERAL KEYS ARE TAKEN ON THE SAME CONNECTION,
+// deliberately, and this matters more than it looks.
+//
+// A staff transfer needs two critical sections at once: per-business (the
+// balance and AML read-then-spend) and per-staff (the daily cap, which sums
+// across every business that staff member acts for). The obvious way to get
+// both is to nest two withBusinessLock calls — and that is a trap. Each call
+// checks out a pooled client and holds it idle-in-transaction for the whole of
+// fn(), while the Prisma work INSIDE fn() draws from that same pool (max 25).
+// Nesting doubles the held connections per request, and enough concurrent staff
+// sends would leave every connection parked waiting for one that can never be
+// freed — a self-inflicted deadlock, on the money path.
+//
+// Taking both locks in one transaction costs one connection instead of two and
+// removes the lock-ordering question entirely: a single transaction acquires
+// them in the order given, so there is no cycle to construct.
+//
+//   - pg_advisory_xact_lock auto-releases on COMMIT/ROLLBACK or if the
+//     connection drops (process crash) — the lock can never leak.
+//   - SET LOCAL statement_timeout bounds ONLY the lock-acquisition wait, so a
+//     stuck holder can't pin a business's money-out forever (the waiter aborts).
+//     While fn() runs, this connection is idle-in-transaction (no statement),
+//     so the timeout doesn't kill the in-flight work.
 async function withBusinessLock(businessId, fn) {
-  if (!businessId) return fn();
+  const keys = (Array.isArray(businessId) ? businessId : [businessId]).filter(Boolean);
+  if (!keys.length) return fn();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await client.query("SET LOCAL statement_timeout = '25000'");
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [businessId]);
+    for (const k of keys) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [String(k)]);
+    }
     const result = await fn();
     await client.query("COMMIT");
     return result;

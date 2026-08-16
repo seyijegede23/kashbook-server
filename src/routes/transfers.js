@@ -466,15 +466,14 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
     // leaves. Reachable today for Fincra countries (GH/KE/TZ), whose
     // provisioning has no one-account-per-owner constraint.
     //
-    // So staff sends take a second lock keyed on the ACTOR, outermost. Order is
-    // always actor -> business and each request takes at most one of each, so no
-    // cycle and no deadlock. Owners are untouched and pay nothing.
-    const runLocked = (fn) =>
-      isStaff
-        ? prisma.withBusinessLock(`staffcap:${actorId}`, () => prisma.withBusinessLock(biz.id, fn))
-        : prisma.withBusinessLock(biz.id, fn);
+    // So a staff send takes a second lock keyed on the ACTOR. Both are acquired
+    // in ONE transaction on ONE connection (see withBusinessLock) — nesting two
+    // calls would hold two pooled clients per request while the Prisma work
+    // inside draws from that same pool, which is how a busy instance deadlocks
+    // itself. Owners are untouched and pay nothing.
+    const lockKeys = isStaff ? [`staffcap:${actorId}`, biz.id] : [biz.id];
 
-    const outcome = await runLocked(async () => {
+    const outcome = await prisma.withBusinessLock(lockKeys, async () => {
       const amlCheck = await runPreTransferChecks({
         req,
         user: ownerFull,   // compliance subject: freeze, tier, velocity windows
@@ -982,7 +981,14 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
       // caller proceeds to spend money. Everything before this point is a read
       // and can legitimately race; nothing after it can run twice.
       const claim = await prisma.staffTransferRequest.updateMany({
-        where: { id: request.id, status: "pending" },
+        // expiresAt is re-checked HERE, not only at the earlier read. Between
+        // that read and this line the request survives a business lookup, a
+        // provider resolve, two user lookups and a wait for the advisory lock —
+        // so a request that was live when we looked can be past its expiry by
+        // the time we spend. The TTL exists because an approval granted late is
+        // an approval the owner no longer means; enforcing it anywhere but the
+        // claim leaves exactly that window open.
+        where: { id: request.id, status: "pending", expiresAt: { gt: new Date() } },
         data: { status: "approving", decidedById: req.user.id, decidedAt: new Date() },
       });
       if (claim.count !== 1) {

@@ -938,7 +938,18 @@ const HANDLERS = {
     };
   },
 
-  async balance({ business }) {
+  async balance({ business, canViewBalance = true }) {
+    // The BALANCE capability governs this answer, not the reports one.
+    //
+    // /insights/ask is gated on canViewReports, which is the right gate for
+    // "how were sales last month". It is the wrong gate for "how much is in my
+    // account" — that is canViewBalance, and an owner who grants reports but
+    // withholds the bank account has said so explicitly. Without this check the
+    // whole distinction collapses to a phrasing trick: a staff member simply
+    // types "what's in my account" and the engine fetches it live.
+    if (!canViewBalance) {
+      return { answer: "You don't have access to the bank balance. Ask the business owner to turn it on for you." };
+    }
     const bankingId = business.providerAccountId || business.anchorAccountId;
     if (!bankingId) {
       return { answer: "This business doesn't have a bank account yet — open one from the Dashboard to see a balance." };
@@ -1231,12 +1242,16 @@ const FALLBACK =
   "I didn't understand that one. Try asking about income, expenses, profit, debts, customers, stock, invoices, channels or your bank balance — for example: “How much did I make this week?”";
 
 // ── Public API ───────────────────────────────────────────────────────────────
-// answerQuestion(question, business, context?) → { intent, answer, data? }
-async function answerQuestion(question, business, context = null) {
+// answerQuestion(question, business, opts?) → { intent, answer, data? }
+//
+// `canViewBalance` defaults TRUE so the cron-driven monthly P&L email and every
+// existing owner-side caller behave exactly as before. Only the HTTP route,
+// which knows who is asking, passes it as false.
+async function answerQuestion(question, business, context = null, { canViewBalance = true } = {}) {
   const parsed = parseQuestion(question, context);
   if (!parsed.intent) return { intent: null, answer: FALLBACK };
   const handler = HANDLERS[parsed.intent];
-  const result = await handler({ business, ...parsed });
+  const result = await handler({ business, canViewBalance, ...parsed });
   return { intent: parsed.intent, answer: result.answer, data: result.data };
 }
 

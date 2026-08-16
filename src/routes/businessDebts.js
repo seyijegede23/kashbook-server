@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const auth = require("../middleware/auth");
+const { requirePermission } = require("../middleware/requirePermission");
 const prisma = require("../utils/db");
 
 router.use(auth);
@@ -9,7 +10,10 @@ const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
 
 // GET /business-debts?status=&businessId=
-router.get("/", async (req, res) => {
+// Money the business OWES is the same class of data as payables, which the
+// payables router gates wholesale. The write paths here already block staff by
+// accountType; the read was the one door left open.
+router.get("/", requirePermission("canManagePayables"), async (req, res) => {
   try {
     const { status, businessId, since } = req.query;
     const where = { userId: getTargetUserId(req) };

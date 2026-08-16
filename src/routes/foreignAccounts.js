@@ -24,6 +24,7 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const authMiddleware = require("../middleware/auth");
+const { requirePermission } = require("../middleware/requirePermission");
 const crypto = require("crypto");
 const cloudinary = require("../config/cloudinary");
 const { getForeignAccountProvider } = require("../providers");
@@ -111,7 +112,14 @@ async function ownedBusiness(req, businessId) {
 }
 
 // GET /businesses/:businessId/foreign-accounts — list + poll status.
-router.get("/:businessId/foreign-accounts", authMiddleware, async (req, res) => {
+//
+// Gated on canViewBalance, matching every other bank-identifier surface
+// (businesses.js BANK_BUSINESS_FIELDS, sync.js, transfers.js) and matching the
+// mobile gate on ForeignAccountsScreen. An IBAN and a SWIFT code are the same
+// class of secret as a NUBAN: they let someone receive in the merchant name.
+// Staff the owner DID trust with the account keep this for invoicing; opening an
+// account stays owner-only regardless (see the POST below).
+router.get("/:businessId/foreign-accounts", authMiddleware, requirePermission("canViewBalance"), async (req, res) => {
   try {
     const biz = await ownedBusiness(req, req.params.businessId);
     if (!biz) return res.status(404).json({ error: "Business not found" });
