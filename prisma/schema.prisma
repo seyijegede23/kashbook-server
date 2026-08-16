@@ -71,6 +71,11 @@ model User {
   recurringExpenses RecurringExpense[]
   recurringInvoices RecurringInvoice[]
   kycSubmissions    KycSubmission[]
+  // Back-reference only — the FK lives on StaffPermission, so this emits no SQL
+  // against User. `employerId` above stays a bare String? on purpose: adding a
+  // real FK to it would mean ALTER TABLE "User" on a database shared with
+  // another deployed app, and would fail outright on any orphaned row.
+  staffPermission   StaffPermission?
 }
 
 model AppNotification {
@@ -980,6 +985,48 @@ model AuditLog {
 
 // Open-review queue for the compliance team. Rules engine writes here; admins
 // transition status to cleared/escalated/frozen.
+// Per-staff capability grants, managed by the business owner.
+//
+// THE ROW'S EXISTENCE IS THE GRANT. No row means no permissions, so on the day
+// this ships every existing staff member has exactly zero new access and there
+// is no NULL-column path that could read as "allowed". Every flag additionally
+// defaults false, so even a half-written row cannot grant anything.
+//
+// A separate table rather than columns on User, deliberately:
+//   * it is the most additive change possible on a database shared with another
+//     deployed app — a brand-new table it has never heard of, no ALTER TABLE
+//     against anything it reads;
+//   * User is the hottest row in the system (atomic PIN-attempt increments,
+//     tokenVersion bumps on revoke), and permission writes should not contend
+//     with security-critical ones;
+//   * a JSON blob would be worse still: a PATCH that omits a key silently
+//     revokes it, and any defaulting written as `!== false` would fail OPEN on
+//     the money permission.
+model StaffPermission {
+  id         String @id @default(uuid())
+  userId     String @unique // the STAFF User.id
+  user       User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  employerId String // denormalised owner id — the tenant key, and cross-checked
+  //                   against User.employerId at read time so a stale grant from
+  //                   a previous employer can never be honoured.
+
+  canViewBalance    Boolean @default(false) // the account number AND the balance
+  canTransfer       Boolean @default(false) // send money, subject to dailyTransferCap
+  canViewReports    Boolean @default(false) // reports and insights
+  canManagePayables Boolean @default(false) // add suppliers, record payments
+
+  // Autonomous spend ceiling per calendar day. null or 0 means every transfer
+  // needs the owner's approval. There is deliberately NO "unlimited" value:
+  // uncapped staff spending is not a state this system should be able to express.
+  dailyTransferCap Float?
+
+  grantedById String // the owner who last changed this, for the audit trail
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([employerId])
+}
+
 model ComplianceFlag {
   id            String    @id @default(uuid())
   userId        String
