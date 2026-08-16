@@ -117,21 +117,64 @@ async function expireStaleRequests(prisma, { pushTo } = {}) {
     select: { id: true, requestedById: true, amount: true, currency: true },
     take: 500,
   });
-  if (!stale.length) return 0;
+  if (!stale.length) return await sweepStuckApprovals(prisma, now);
 
+  const ids = stale.map((r) => r.id);
   const { count } = await prisma.staffTransferRequest.updateMany({
-    where: { id: { in: stale.map((r) => r.id) }, status: "pending" },
+    where: { id: { in: ids }, status: "pending" },
     data: { status: "expired", reason: "Expired without a decision", decidedAt: now },
   });
 
-  if (pushTo) {
-    for (const r of stale) {
+  // Notify only the people whose request ACTUALLY expired. The read and the
+  // write are separate statements, so an owner approving in that gap leaves a
+  // row that was in `stale` but is now executing — telling that staff member
+  // their transfer expired, while the money is on its way, is worse than
+  // saying nothing.
+  if (pushTo && count > 0) {
+    const expired = await prisma.staffTransferRequest.findMany({
+      where: { id: { in: ids }, status: "expired" },
+      select: { requestedById: true },
+    });
+    for (const r of expired) {
       pushTo(
         r.requestedById,
         "Transfer request expired",
         "The business owner didn't action it in time. Send it again if it's still needed.",
       ).catch(() => {});
     }
+  }
+  return count + (await sweepStuckApprovals(prisma, now));
+}
+
+// How long a row may sit mid-approval before we treat the approval as
+// interrupted. Generous: a real approval is a couple of provider round-trips.
+const APPROVING_STUCK_MS = 15 * 60 * 1000;
+
+// A process killed between the atomic claim and the final status write leaves a
+// row in "approving" forever — no route will touch it (they all guard on
+// "pending"), and the owner sees a request stuck on "Sending…" they cannot
+// clear.
+//
+// These are parked as "failed", NOT returned to pending. We do not know whether
+// the provider moved the money: an instance dying immediately after a payout
+// request was accepted looks identical from here to one that died before it.
+// "failed" is terminal and visible, and a human can reconcile against the
+// provider. Offering it for approval again could pay the same beneficiary twice,
+// and that is not recoverable.
+async function sweepStuckApprovals(prisma, now = new Date()) {
+  const cutoff = new Date(now.getTime() - APPROVING_STUCK_MS);
+  const { count } = await prisma.staffTransferRequest.updateMany({
+    where: { status: "approving", decidedAt: { lte: cutoff } },
+    data: {
+      status: "failed",
+      failureReason:
+        "Approval was interrupted. Check with the bank whether this transfer went out before sending it again.",
+    },
+  });
+  if (count) {
+    console.error(
+      `[staffTransfer] ${count} approval(s) stranded mid-flight and were parked as failed — RECONCILE AGAINST THE PROVIDER before re-sending.`,
+    );
   }
   return count;
 }
@@ -140,6 +183,7 @@ module.exports = {
   staffSpendLast24h,
   decideStaffCap,
   expireStaleRequests,
+  sweepStuckApprovals,
   WINDOW_MS,
   APPROVAL_TTL_MS,
 };

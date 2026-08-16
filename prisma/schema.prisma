@@ -76,6 +76,15 @@ model User {
   // real FK to it would mean ALTER TABLE "User" on a database shared with
   // another deployed app, and would fail outright on any orphaned row.
   staffPermission   StaffPermission?
+
+  // DECLARED so schema and database agree. The staff-permissions migration
+  // creates this index (employerId had been queried unindexed since staff were
+  // introduced), but it was never written here — and Prisma treats the schema as
+  // the truth. The next `migrate diff` against production would therefore have
+  // emitted a DROP INDEX for it, quietly undoing the fix on a database SHARED
+  // with another live app. A missing @@index is not cosmetic drift; it is a
+  // pending destructive migration.
+  @@index([employerId])
 }
 
 model AppNotification {
@@ -1053,7 +1062,13 @@ model StaffTransferRequest {
   accountNumber String
   bankCode      String
   bankName      String?
+  // Resolved by NAME ENQUIRY at hold time, not copied from the staff member's
+  // request body. If the enquiry failed, this is their supplied name and
+  // nameVerified is false, which the owner's approval sheet must surface —
+  // approving a name nobody checked is the whole risk this queue exists to
+  // manage.
   accountName   String?
+  nameVerified  Boolean @default(false)
   amount        Float
   narration     String?
   currency      String  @default("NGN")

@@ -158,6 +158,43 @@ const claim = (id) =>
     assert.strictEqual(after.status, "approving", "expiring an in-flight send would strand real money");
   });
 
+  await test("an approval stranded mid-flight becomes FAILED, not pending", async () => {
+    // A killed process leaves "approving" with no catch to clean it up. It must
+    // become terminal: re-offering an ambiguous send could pay twice.
+    const { sweepStuckApprovals } = require("../src/utils/staffTransferCap");
+    const r = await makeRequest({ status: "approving", decidedAt: new Date(Date.now() - 60 * 60 * 1000) });
+    await sweepStuckApprovals(prisma);
+    const after = await prisma.staffTransferRequest.findUnique({ where: { id: r.id } });
+    assert.strictEqual(after.status, "failed");
+    assert.notStrictEqual(after.status, "pending");
+    // And a terminal row is not claimable, so it can never execute again.
+    assert.strictEqual((await claim(r.id)).count, 0);
+  });
+
+  await test("an approval in flight RIGHT NOW is not swept", async () => {
+    const { sweepStuckApprovals } = require("../src/utils/staffTransferCap");
+    const r = await makeRequest({ status: "approving", decidedAt: new Date() });
+    await sweepStuckApprovals(prisma);
+    const after = await prisma.staffTransferRequest.findUnique({ where: { id: r.id } });
+    assert.strictEqual(after.status, "approving", "killing a live approval would strand real money");
+  });
+
+  await test("the same client idempotency key cannot create two held requests", async () => {
+    // The retry path: one intent, one row. Two rows means the owner can approve
+    // the same transfer twice and pay the beneficiary twice.
+    const key = `kbsa_dup${Date.now()}`;
+    await makeRequest({ idempotencyKey: key });
+    await assert.rejects(() => makeRequest({ idempotencyKey: key }), (e) => e.code === "P2002");
+  });
+
+  await test("a held request records whether the payee name was bank-verified", async () => {
+    const unverified = await makeRequest({ accountName: "ACME Suppliers Ltd", nameVerified: false });
+    assert.strictEqual(unverified.nameVerified, false,
+      "an unchecked, staff-supplied name must be flagged so the owner is not misled");
+    const verified = await makeRequest({ accountName: "REAL NAME", nameVerified: true });
+    assert.strictEqual(verified.nameVerified, true);
+  });
+
   await test("the reaper leaves an unexpired request alone", async () => {
     const r = await makeRequest();
     await expireStaleRequests(prisma);

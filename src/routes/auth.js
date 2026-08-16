@@ -56,6 +56,28 @@ function resolvePermissions(user) {
   };
 }
 
+// Any endpoint that hands back a whole user object must hand back a COMPLETE
+// one. AppContext applies these with `setUser(updatedUser)` — a wholesale
+// replace, not a merge — so a payload missing `permissions` doesn't leave the
+// old value in place, it erases it. Saving a setting or editing a profile would
+// silently strip every granted capability from the running app until the
+// ten-minute /auth/me poll restored it.
+//
+// Also normalises accountType to lower case, because the raw column is "STAFF"
+// while every client comparison is against "staff".
+function safeUser(user) {
+  const { password: _p, transactionPin: _t, transactionPinFailedCount: _c,
+          transactionPinLockedUntil: _l, staffPermission: _s, ...safe } = user;
+  const { permissions, dailyTransferCap } = resolvePermissions(user);
+  return {
+    ...safe,
+    accountType: String(safe.accountType || "").toLowerCase(),
+    hasTransactionPin: !!user.transactionPin,
+    permissions,
+    dailyTransferCap,
+  };
+}
+
 // ── Helper: safe user response ────────────────────────────────────────────────
 function userResponse(user, token) {
   const { permissions, dailyTransferCap } = resolvePermissions(user);
@@ -799,9 +821,12 @@ router.patch("/profile", authMiddleware, async (req, res) => {
     // Business name is editable normally (individual KYC — the name is just the
     // virtual-account display label, not bound to a verified KYB identity).
 
-    const user = await prisma.user.update({ where: { id: req.user.id }, data });
-    const { password: _, ...safe } = user;
-    res.json({ user: safe });
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data,
+      include: { staffPermission: true },
+    });
+    res.json({ user: safeUser(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update profile" });
@@ -876,9 +901,12 @@ router.patch("/settings", authMiddleware, async (req, res) => {
     if (notificationsEnabled !== undefined) data.notificationsEnabled = notificationsEnabled;
     if (biometricEnabled     !== undefined) data.biometricEnabled     = biometricEnabled;
     if (autoDebitEnabled     !== undefined) data.autoDebitEnabled     = !!autoDebitEnabled;
-    const user = await prisma.user.update({ where: { id: req.user.id }, data });
-    const { password: _, ...safe } = user;
-    res.json({ user: safe });
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data,
+      include: { staffPermission: true },
+    });
+    res.json({ user: safeUser(user) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to save settings" });
@@ -1174,10 +1202,21 @@ router.post("/staff", authMiddleware, async (req, res) => {
 router.patch("/staff/:id/permissions", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Only the business owner can change staff permissions.", code: "OWNER_ONLY" });
-  if (req.user.plan !== "PREMIUM")
-    return res.status(403).json({ error: "Staff permissions require a Pro plan.", code: "PRO_REQUIRED" });
 
   const { pin, permissions = {}, dailyTransferCap } = req.body || {};
+
+  // Pro gates GRANTING, never REVOKING.
+  //
+  // A flat plan check here creates a trap: enforcement in authMiddleware does
+  // not care about the plan, so when a subscription lapses the staff member
+  // keeps every capability — including sending money — while the owner is
+  // locked out of the only screen that could take it away. Their own billing
+  // status must never be able to strand them with access they want removed.
+  const wantsAny =
+    permissions.canViewBalance === true || permissions.canTransfer === true ||
+    permissions.canViewReports === true || permissions.canManagePayables === true;
+  if (req.user.plan !== "PREMIUM" && wantsAny)
+    return res.status(403).json({ error: "Staff permissions require a Pro plan.", code: "PRO_REQUIRED" });
 
   try {
     const staff = await prisma.user.findUnique({

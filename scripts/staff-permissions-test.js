@@ -197,42 +197,73 @@ console.log("\nexpireStaleRequests");
 
 const { expireStaleRequests, APPROVAL_TTL_MS } = require("../src/utils/staffTransferCap");
 
-const stubRequests = (rows) => {
-  const calls = { findMany: null, updateMany: null };
+// expireStaleRequests now makes TWO passes: lapse stale pending rows, then
+// park approvals stranded mid-flight. The stub records every call so each pass
+// can be asserted separately.
+const stubRequests = (rows, expiredRows = null) => {
+  const calls = { findMany: [], updateMany: [] };
+  let findCount = 0;
   return {
     calls,
+    pendingWrite: () => calls.updateMany.find((c) => c.data.status === "expired"),
+    approvingWrite: () => calls.updateMany.find((c) => c.data.status === "failed"),
     prisma: {
       staffTransferRequest: {
-        findMany: async (a) => { calls.findMany = a; return rows; },
-        updateMany: async (a) => { calls.updateMany = a; return { count: rows.length }; },
+        findMany: async (a) => {
+          calls.findMany.push(a);
+          findCount++;
+          // 1st call = the stale-pending scan; 2nd = the confirmed-expired
+          // re-read used to decide who actually gets notified.
+          if (findCount === 1) return rows;
+          return expiredRows === null ? rows : expiredRows;
+        },
+        updateMany: async (a) => {
+          calls.updateMany.push(a);
+          return { count: a.data.status === "expired" ? rows.length : 0 };
+        },
       },
     },
   };
 };
 
-testAsync("sweeps only pending rows past their expiry", async () => {
+testAsync("lapses only pending rows past their expiry", async () => {
   const s = stubRequests([{ id: "r1", requestedById: "staff-1" }]);
   await expireStaleRequests(s.prisma);
-  assert.strictEqual(s.calls.findMany.where.status, "pending");
-  assert.ok(s.calls.findMany.where.expiresAt.lte instanceof Date);
+  assert.strictEqual(s.calls.findMany[0].where.status, "pending");
+  assert.ok(s.calls.findMany[0].where.expiresAt.lte instanceof Date);
 });
 
-testAsync("never sweeps a row that is mid-approval", async () => {
-  // "approving" means an execution is in flight. Expiring it would leave money
-  // moved against a request marked expired.
+testAsync("never LAPSES a row that is mid-approval", async () => {
+  // "approving" means an execution is in flight. Marking it expired would leave
+  // money moved against a request the system calls expired.
   const s = stubRequests([{ id: "r1", requestedById: "staff-1" }]);
   await expireStaleRequests(s.prisma);
-  assert.notStrictEqual(s.calls.findMany.where.status, "approving");
+  assert.notStrictEqual(s.calls.findMany[0].where.status, "approving");
   // The write re-asserts the guard, so a row that changed state between the
   // read and the write is left alone.
-  assert.strictEqual(s.calls.updateMany.where.status, "pending");
+  assert.strictEqual(s.pendingWrite().where.status, "pending");
 });
 
-testAsync("does nothing, and writes nothing, when the queue is clean", async () => {
+testAsync("a stranded approval is parked as FAILED, never returned to pending", async () => {
+  // A process killed mid-approval leaves "approving" forever, and no route
+  // touches it. It must become terminal — re-offering it could pay twice.
   const s = stubRequests([]);
-  const n = await expireStaleRequests(s.prisma);
-  assert.strictEqual(n, 0);
-  assert.strictEqual(s.calls.updateMany, null, "must not issue an unbounded updateMany");
+  await expireStaleRequests(s.prisma);
+  const w = s.approvingWrite();
+  assert.ok(w, "the stuck-approval sweep must run even when nothing lapsed");
+  assert.strictEqual(w.where.status, "approving");
+  assert.strictEqual(w.data.status, "failed");
+  assert.notStrictEqual(w.data.status, "pending", "re-approving an ambiguous send can double-pay");
+  assert.ok(w.where.decidedAt.lte instanceof Date, "must only touch rows stuck for a while");
+});
+
+testAsync("the stuck sweep is bounded, never a blanket write", async () => {
+  const s = stubRequests([]);
+  await expireStaleRequests(s.prisma);
+  const w = s.approvingWrite();
+  // Both conditions are required: without decidedAt it would kill approvals
+  // that are legitimately in flight right now.
+  assert.ok(w.where.status && w.where.decidedAt, "must filter on BOTH status and age");
 });
 
 testAsync("notifies each requester exactly once", async () => {
@@ -243,6 +274,19 @@ testAsync("notifies each requester exactly once", async () => {
   const pushed = [];
   await expireStaleRequests(s.prisma, { pushTo: async (id) => { pushed.push(id); } });
   assert.deepStrictEqual(pushed, ["staff-1", "staff-2"]);
+});
+
+testAsync("does NOT notify someone whose request was approved in the gap", async () => {
+  // The scan and the write are separate statements. A row read as stale but
+  // approved before the write is now executing — telling that staff member it
+  // expired, while the money is on its way, is worse than saying nothing.
+  const s = stubRequests(
+    [{ id: "r1", requestedById: "staff-1" }, { id: "r2", requestedById: "staff-2" }],
+    [{ requestedById: "staff-1" }], // only r1 actually reached "expired"
+  );
+  const pushed = [];
+  await expireStaleRequests(s.prisma, { pushTo: async (id) => { pushed.push(id); } });
+  assert.deepStrictEqual(pushed, ["staff-1"]);
 });
 
 testAsync("a failing push cannot break the sweep", async () => {

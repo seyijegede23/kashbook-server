@@ -458,7 +458,23 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
     // execution must be atomic, or two concurrent transfers could both pass the
     // limit/balance gate and overshoot. Different businesses still run in
     // parallel. Early-returns become outcome values handled after the lock.
-    const outcome = await prisma.withBusinessLock(biz.id, async () => {
+    // The business lock makes the balance/AML read-then-spend atomic PER
+    // BUSINESS. The staff cap is a per-STAFF quantity summed across every
+    // business they act for, so a business lock does not protect it: an owner
+    // with two banked businesses has a staff member who can fire one send at
+    // each, both read spent=0, both pass the cap, and 2x the authorised amount
+    // leaves. Reachable today for Fincra countries (GH/KE/TZ), whose
+    // provisioning has no one-account-per-owner constraint.
+    //
+    // So staff sends take a second lock keyed on the ACTOR, outermost. Order is
+    // always actor -> business and each request takes at most one of each, so no
+    // cycle and no deadlock. Owners are untouched and pay nothing.
+    const runLocked = (fn) =>
+      isStaff
+        ? prisma.withBusinessLock(`staffcap:${actorId}`, () => prisma.withBusinessLock(biz.id, fn))
+        : prisma.withBusinessLock(biz.id, fn);
+
+    const outcome = await runLocked(async () => {
       const amlCheck = await runPreTransferChecks({
         req,
         user: ownerFull,   // compliance subject: freeze, tier, velocity windows
@@ -542,14 +558,107 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
         // the StaffTransferRequest model comment for why parking it in the
         // ledger as complianceStatus "held" would corrupt the balance.
         if (!verdict.allowed) {
-          const held = await prisma.staffTransferRequest.create({
+          // RESOLVE THE PAYEE FROM THE BANK, not from the request body.
+          //
+          // The approval queue is the control that makes an over-cap staff
+          // transfer safe, and the only thing the owner has to decide on is the
+          // beneficiary. Storing the staff member's own `accountName` would let
+          // them type "ACME Suppliers Ltd" against their cousin's account
+          // number and have the owner approve exactly that — the queue would
+          // look like oversight while providing none. Worse, executeTransfer
+          // SKIPS its name enquiry whenever accountName is already set, so the
+          // spoofed name would also be what gets stamped on the counterparty.
+          //
+          // Falls back to the supplied name only if the enquiry itself fails,
+          // and says so, so the owner is never shown an unverified name as
+          // though it were confirmed.
+          let verifiedName = null;
+          let nameVerified = false;
+          try {
+            const internal = await prisma.business.findFirst({
+              where: {
+                virtualAccountNumber: accountNumber,
+                OR: [{ providerAccountId: { not: null } }, { anchorAccountId: { not: null } }],
+              },
+              select: { name: true, virtualAccountName: true },
+            });
+            if (internal) {
+              verifiedName = internal.virtualAccountName || internal.name;
+              nameVerified = true;
+            } else {
+              const ne = await provider.verifyRecipient({
+                accountNumber,
+                bankCode,
+                currency: getCountryConfig(biz.country || "NG").currency.code,
+              });
+              if (ne?.accountName) { verifiedName = ne.accountName; nameVerified = true; }
+            }
+          } catch (e) {
+            console.warn("[transfers] hold name enquiry failed:", e.message);
+          }
+
+          // HONOUR THE CLIENT'S IDEMPOTENCY KEY HERE TOO.
+          //
+          // The execute branch turns it into a stable payout reference so a
+          // retry after a lost response cannot double-send. This branch used to
+          // discard it and mint a fresh UUID, which meant the identical retried
+          // POST created a SECOND request. Both are approvable, both carry
+          // different references, and neither the executor's reference
+          // short-circuit nor the provider's idempotency header can collapse
+          // them — so an owner working through the queue pays the same
+          // beneficiary twice. And with the default cap of 0, EVERY staff
+          // transfer takes this branch.
+          //
+          // Safe inside the lock: lookup-then-create cannot race another send
+          // for the same actor.
+          const holdKey = idemSanitized ? `kbsa_${idemSanitized}` : `kbsa_${randomUUID().replace(/-/g, "")}`;
+          let held = idemSanitized
+            ? await prisma.staffTransferRequest.findUnique({ where: { idempotencyKey: holdKey } })
+            : null;
+          // Only reuse when it is genuinely the same intent. A client that
+          // reuses a key for a different transfer must get its own row rather
+          // than silently inherit this one, and a request already decided is
+          // not something to re-open.
+          if (
+            held &&
+            !(held.status === "pending" &&
+              held.requestedById === actorId &&
+              held.businessId === biz.id &&
+              Number(held.amount) === Number(amount) &&
+              held.accountNumber === accountNumber &&
+              held.bankCode === bankCode)
+          ) {
+            held = null;
+          }
+
+          if (held) {
+            // Same intent, already queued. Return the SAME 202 rather than
+            // adding a duplicate for the owner to approve, and skip the second
+            // audit row and push.
+            return {
+              status: 202,
+              body: {
+                status: "pending_approval",
+                code: "PENDING_APPROVAL",
+                requestId: held.id,
+                expiresAt: held.expiresAt,
+                message: "This is already waiting for the business owner to approve.",
+                cap: verdict.cap,
+                spent: verdict.spent,
+                remaining: verdict.remaining,
+              },
+            };
+          }
+
+          held = await prisma.staffTransferRequest.create({
             data: {
               businessId: biz.id,
               requestedById: actorId,
               ownerId,
               accountNumber, bankCode,
               bankName: bankName || null,
-              accountName: accountName || null,
+              accountName: verifiedName || accountName || null,
+              nameVerified,
               amount: Number(amount),
               narration: narration || null,
               currency: biz.baseCurrency || "NGN",
@@ -557,9 +666,11 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
               reason: verdict.cap === 0
                 ? "No daily limit set for this staff member"
                 : "Over the staff member's daily limit",
-              // Minted here and carried through to execution, so approving
-              // twice hits the executor's existing-reference short-circuit.
-              idempotencyKey: `kbsa_${randomUUID().replace(/-/g, "")}`,
+              // Carried through to execution, so approving twice hits the
+              // executor's existing-reference short-circuit. The kbsa_ prefix
+              // keeps this namespace distinct from the execute branch's kbtf_,
+              // so one client key cannot collide across the two paths.
+              idempotencyKey: holdKey,
               capAtRequest: verdict.cap,
               spentAtRequest: verdict.spent,
               expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
@@ -743,6 +854,9 @@ const publicRequest = (r) => ({
   bankCode: r.bankCode,
   bankName: r.bankName,
   accountName: r.accountName,
+  // The owner's sheet MUST show this. An unverified name is one the staff
+  // member typed, and approving it is the exact risk this queue exists to stop.
+  nameVerified: r.nameVerified === true,
   amount: r.amount,
   narration: r.narration,
   currency: r.currency,
@@ -907,7 +1021,13 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
         amount: Number(request.amount),
         accountNumber: request.accountNumber,
         bankCode: request.bankCode,
-        accountName: request.accountName,
+        // Only pass a name the BANK confirmed. executeTransfer skips its own
+        // name enquiry whenever accountName is truthy, so handing it an
+        // unverified, staff-supplied string would both skip verification and
+        // stamp that string on the counterparty. Passing null makes the
+        // executor resolve it properly, and RECIPIENT_UNVERIFIED aborts before
+        // any money moves.
+        accountName: request.nameVerified ? request.accountName : null,
         bankName: request.bankName,
         narration: request.narration,
         reference: request.idempotencyKey,
@@ -962,12 +1082,46 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
       });
     }
   } catch (err) {
-    // The claim already moved this row to "approving". Leaving it there would
-    // strand the request in a state no route can act on, so put it back.
+    // The claim already moved this row to "approving", so it must not be left
+    // there — no route or reaper can act on that state. Where it goes depends
+    // entirely on whether the provider could possibly have moved money.
+    //
+    // These codes are all raised BEFORE the payout call, so nothing left the
+    // account and the owner can safely try again. Anything else — a timeout, a
+    // socket reset, a 5xx, a bookkeeping failure after a successful debit — is
+    // ambiguous, and ambiguity here must never resolve to "offer it again".
+    const SAFE_TO_RETRY = new Set([
+      "INSUFFICIENT_BALANCE", "RECIPIENT_UNVERIFIED", "UNKNOWN_BANK",
+      "NO_BANKING", "ANCHOR_NOT_CONFIGURED", "BANKING_NOT_AVAILABLE", "NOT_IMPLEMENTED",
+    ]);
+    const safeToRetry = SAFE_TO_RETRY.has(err.code);
+    const reason = (err.message || "Transfer failed").slice(0, 300);
+    if (!safeToRetry) {
+      console.error(
+        `[transfers/approve] AMBIGUOUS FAILURE on request ${req.params.id} — parked as failed, DO NOT re-approve without checking the provider:`,
+        err.code || err.message,
+      );
+      audit({
+        req, action: "STAFF_TRANSFER_APPROVAL_AMBIGUOUS", resourceType: "business",
+        resourceId: req.params.id, severity: "alert",
+        metadata: { requestId: req.params.id, code: err.code || null, error: reason },
+      }).catch(() => {});
+    }
+
     await prisma.staffTransferRequest
       .updateMany({
         where: { id: req.params.id, status: "approving" },
-        data: { status: "pending", decidedById: null, decidedAt: null, failureReason: err.message?.slice(0, 300) || "Transfer failed" },
+        data: safeToRetry
+          ? { status: "pending", decidedById: null, decidedAt: null, failureReason: reason }
+          // NOT back to pending. We do not know whether the provider moved the
+          // money — a socket that died after the payout request was accepted
+          // looks identical here to one that never reached them. Returning it
+          // to the queue invites the owner to approve again, and the executor's
+          // reference short-circuit only saves us if the Transaction row was
+          // written, which is exactly what did not happen on this path.
+          // "failed" is terminal and visible; a duplicate payout is not
+          // recoverable.
+          : { status: "failed", failureReason: reason },
       })
       .catch(() => {});
 

@@ -85,15 +85,36 @@ router.get("/", async (req, res) => {
         }),
       ]);
 
+    // THE BULK PULL IS A PERMISSION SURFACE, not just a cache warm-up.
+    //
+    // The app calls this once on every launch and drops the result straight
+    // into AppContext, so anything returned here is in the staff member's
+    // hands regardless of which screens are gated. Two payloads must not be:
+    //
+    //   transactions — every bank credit and debit with amounts. Handing these
+    //                  over makes canViewBalance decorative: the balance is
+    //                  hidden while the entire ledger that produces it is not.
+    //   recurring    — standing auto-debit instructions INCLUDING the payee
+    //                  account numbers. Those routes are owner-only for a
+    //                  reason (see recurringExpenses.js); leaking their
+    //                  contents through the sync is the same disclosure by
+    //                  another door.
+    //
+    // Sales, expenses, customers, inventory, debts and invoices are the
+    // bookkeeping a staff member is employed to do, and stay.
+    const canSeeBank = req.user.permissions?.canViewBalance === true;
     res.json({
       sales,
       expenses,
-      transactions,
+      transactions: canSeeBank ? transactions : [],
       customers,
       inventory,
       debts,
       invoices,
-      recurring,
+      recurring: canSeeBank ? recurring : [],
+      // Told, not silently emptied — the client can distinguish "no bank
+      // activity" from "not yours to see" instead of rendering a confident zero.
+      bankWithheld: !canSeeBank,
       syncedAt: new Date().toISOString(),
     });
   } catch (err) {
@@ -130,7 +151,19 @@ router.get("/pull", async (req, res) => {
       }),
     ]);
 
-    res.json({ transactions, customers, inventory, payables });
+    // Same rule as the main pull above. This variant scopes on req.user.id so
+    // only an owner reaches it today, but that is scoping, not a capability
+    // check, and it would stop holding the moment someone "consistency-fixes"
+    // it to ownerIdOf(req) — which is precisely the tidy-up this codebase
+    // invites. Gate it explicitly rather than rely on the accident.
+    const canSeeBank = req.user.permissions?.canViewBalance === true;
+    res.json({
+      transactions: canSeeBank ? transactions : [],
+      customers,
+      inventory,
+      payables,
+      bankWithheld: !canSeeBank,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Sync pull failed" });

@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS "StaffTransferRequest" (
   "bankCode"              TEXT NOT NULL,
   "bankName"              TEXT,
   "accountName"           TEXT,
+  "nameVerified"          BOOLEAN NOT NULL DEFAULT false,
   "amount"                DOUBLE PRECISION NOT NULL,
   "narration"             TEXT,
   "currency"              TEXT NOT NULL DEFAULT 'NGN',
