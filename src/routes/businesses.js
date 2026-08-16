@@ -56,6 +56,40 @@ const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
 
 // GET /businesses
+// `include` with no `select` returns the ENTIRE Business row to the client.
+// Two separate problems, so two separate lists.
+
+// 1. Secrets that must never leave the server AT ALL, for anyone. The schema
+//    already says so in as many words — instagramAccessToken is commented
+//    "never returned to the client" and waAccessToken "never returned to
+//    clients" — but nothing enforced it, so every owner's device has been
+//    receiving both. They are encrypted at rest and the app never reads them,
+//    so stripping is invisible to the client and strictly safer.
+const SECRET_BUSINESS_FIELDS = [
+  "instagramAccessToken", "waAccessToken",
+  "kycBvn", "kycBvnHash", "kycId", "kycCacNumber", "kycCacHash",
+];
+
+// 2. The bank account itself. Owners keep it; staff do not, because the money
+//    position is owner-only (businesses.js:/balance says exactly that) and no
+//    staff screen renders these. The per-staff `staffCanViewBank` grant is what
+//    will put them back for staff who should have them.
+const BANK_BUSINESS_FIELDS = [
+  "virtualAccountNumber", "virtualAccountName", "virtualAccountBank",
+  "anchorAccountId", "providerAccountId",
+];
+
+// Redacting a named list rather than selecting a positive one is deliberate: a
+// column added later is exposed to OWNERS by default and has to be considered
+// explicitly, which is the mistake that shows up in review. The trade is that a
+// new SECRET must be added here, so the list is named to make that obvious.
+function publicBusiness(biz, { isStaff = false } = {}) {
+  const out = { ...biz };
+  for (const f of SECRET_BUSINESS_FIELDS) delete out[f];
+  if (isStaff) for (const f of BANK_BUSINESS_FIELDS) delete out[f];
+  return out;
+}
+
 router.get("/", async (req, res) => {
   try {
     const list = await prisma.business.findMany({
@@ -63,7 +97,8 @@ router.get("/", async (req, res) => {
       include: { customCategories: true },
       orderBy: { createdAt: "asc" },
     });
-    res.json(list);
+    const isStaff = req.user.accountType === "staff";
+    res.json(list.map((b) => publicBusiness(b, { isStaff })));
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch businesses" });
   }
@@ -149,7 +184,7 @@ router.post("/", async (req, res) => {
       },
       include: { customCategories: true },
     });
-    res.status(201).json(biz);
+    res.status(201).json(publicBusiness(biz));
   } catch (err) {
     // DB unique-index backstop (race across devices/requests) → friendly dup error.
     if (err?.code === "P2002") {
@@ -252,7 +287,7 @@ router.patch("/:id", async (req, res) => {
       data,
       include: { customCategories: true },
     });
-    res.json(biz);
+    res.json(publicBusiness(biz));
   } catch (err) {
     if (err?.code === "P2002") {
       return res.status(409).json({
@@ -330,7 +365,7 @@ router.patch("/:id/branding", async (req, res) => {
       data,
       include: { customCategories: true },
     });
-    res.json(updatedBiz);
+    res.json(publicBusiness(updatedBiz));
   } catch (err) {
     console.error("Branding update failed:", err);
     res.status(500).json({ error: "Failed to update business branding" });
