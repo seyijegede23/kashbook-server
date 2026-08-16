@@ -41,6 +41,14 @@ async function executeTransfer({
   amlCheck = {}, // result of runPreTransferChecks; default empty = no flags
   req = null,    // for audit IP/user-agent; null in cron
   notify = true, // toggle the push notification
+  // WHO pressed send, when that isn't the account owner. `userId` above stays
+  // the owner so the ledger and compliance rows are owner-scoped; these two
+  // record the actual human. They are load-bearing, not decorative: the
+  // per-staff daily cap in transfers.js sums Transaction.recordedBy to work out
+  // what a staff member has already moved. Drop the stamp and the cap silently
+  // resets to zero-spent on every send.
+  recordedBy = null,
+  recordedByName = null,
 } = {}) {
   const bankingId = business?.providerAccountId || business?.anchorAccountId;
   if (!business || !bankingId) {
@@ -63,9 +71,9 @@ async function executeTransfer({
       select: { id: true, userId: true, name: true, virtualAccountName: true, country: true, baseCurrency: true },
     });
     if (dest && dest.id !== business.id) {
-      return executeFincraBookTransfer({ business, userId, amount, dest, narration, reference, amlCheck, req, notify, source: provider.key });
+      return executeFincraBookTransfer({ business, userId, amount, dest, narration, reference, amlCheck, req, notify, source: provider.key, recordedBy, recordedByName });
     }
-    const args = { provider, business, userId, amount, accountNumber, bankCode, accountName, bankName, narration, reference, amlCheck, req, notify };
+    const args = { provider, business, userId, amount, accountNumber, bankCode, accountName, bankName, narration, reference, amlCheck, req, notify, recordedBy, recordedByName };
     return executeFincraPayout(args);
   }
 
@@ -232,6 +240,7 @@ async function executeTransfer({
         source: "anchor",
         reference: ref, // idempotency key (unique per [businessId, reference])
         currency: business.baseCurrency || "NGN",
+        recordedBy, recordedByName,
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
         // Booked fee = our fee + the bank-debited stamp duty, so the ledger
@@ -317,6 +326,7 @@ async function executeTransfer({
 async function executeFincraPayout({
   provider, business, userId, amount, accountNumber, bankCode,
   accountName, bankName, narration, reference, amlCheck = {}, req = null, notify = true,
+  recordedBy = null, recordedByName = null,
 }) {
   // Encode the businessId in the customerReference (kb_tf_<bizId>_<suffix>) so the
   // payout reconcile can attribute an orphaned SUCCESSFUL payout (one that Fincra
@@ -403,6 +413,7 @@ async function executeFincraPayout({
         businessId: business.id, userId, type: "expense", amount: Number(amount),
         description, category: "transfer", paymentMethod: "bank", date: new Date(),
         source: "fincra", reference: ref, currency,
+        recordedBy, recordedByName,
         fee, feeBreakdown,
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
@@ -435,7 +446,7 @@ async function executeFincraPayout({
   }
   return { reference: ref, route: "nip", transactionId: txn.id, transaction: txn, fee };
 }
-async function executeFincraBookTransfer({ business, userId, amount, dest, narration, reference, amlCheck = {}, req = null, notify = true, source = "fincra" }) {
+async function executeFincraBookTransfer({ business, userId, amount, dest, narration, reference, amlCheck = {}, req = null, notify = true, source = "fincra", recordedBy = null, recordedByName = null }) {
   const ref = reference || `kb_bk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const currency = getCountryConfig(business.country)?.currency?.code || business.baseCurrency || "NGN";
 
@@ -486,6 +497,10 @@ async function executeFincraBookTransfer({ business, userId, amount, dest, narra
           businessId: business.id, userId, type: "expense", amount: Number(amount), currency,
           description: outDesc, category: "transfer", paymentMethod: "bank", date: new Date(),
           source, reference: ref,
+          // Debit side only. The recipient's credit row below must NOT carry
+          // our staff member — they didn't record anything in that business,
+          // and stamping them there would attribute the money to a stranger.
+          recordedBy, recordedByName,
           flagSeverity: amlCheck.maxSeverity || null,
           complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
         },

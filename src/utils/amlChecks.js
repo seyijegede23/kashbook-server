@@ -49,7 +49,14 @@ function maskIdentifier(id) {
   return id.length <= 4 ? id : `${"*".repeat(id.length - 4)}${id.slice(-4)}`;
 }
 
-async function runPreTransferChecks({ req, user, business, amount, otp, bypassOtp = false }) {
+/**
+ * `user` is the COMPLIANCE SUBJECT — whose money it is, whose freeze state, tier
+ * and velocity windows apply. `actor` is the human at the keyboard, who on a
+ * staff-initiated transfer is a different person; the step-up OTP is sent to and
+ * verified against them. Defaults to `user`, so every existing caller (including
+ * the recurring-expense cron) behaves exactly as before.
+ */
+async function runPreTransferChecks({ req, user, actor = user, business, amount, otp, bypassOtp = false }) {
   // 1. Frozen check ------------------------------------------------------
   if (user?.accountStatus && user.accountStatus !== "active") {
     await audit({
@@ -217,7 +224,9 @@ async function runPreTransferChecks({ req, user, business, amount, otp, bypassOt
   const thresholds = getThresholds(business);
   const otpBypassAllowed = bypassOtp && amount <= limits.singleMax;
   if (amount > thresholds.stepUpOtpAbove && !otpBypassAllowed) {
-    const identifier = pickOtpIdentifier(user);
+    // The ACTOR receives and answers the step-up challenge, not the account
+    // holder — on a staff transfer the code must reach the person standing there.
+    const identifier = pickOtpIdentifier(actor);
     if (!identifier) {
       await audit({
         req,
@@ -249,6 +258,14 @@ async function runPreTransferChecks({ req, user, business, amount, otp, bypassOt
         code: "OTP_REQUIRED",
         error: "We've sent a 6-digit code to confirm this transfer.",
         otpIdentifier: maskIdentifier(identifier),
+        // SERVER-ONLY. The caller dispatches the code, and it MUST dispatch to
+        // exactly the string verified below — the route used to pick its own
+        // target independently, which agreed only by luck while both resolved to
+        // the same person. Once actor and subject differ, an independently
+        // chosen target is undeliverable or unverifiable, and "try both" would
+        // make the OWNER's code redeemable by a staff member.
+        // transfers.js whitelists response fields, so this never reaches a client.
+        otpTarget: identifier,
       };
     }
     const valid = await verifyOtp(identifier, String(otp).trim(), TRANSFER_OTP_TYPE);

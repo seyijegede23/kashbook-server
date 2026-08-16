@@ -2,6 +2,7 @@ const router = require("express").Router();
 const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
 const { requirePermission } = require("../middleware/requirePermission");
+const { ownerIdOf } = require("../utils/scope");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
 const { getProvider } = require("../providers");
@@ -9,7 +10,9 @@ const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { runPreTransferChecks, MONEY_OUT_SOURCES } = require("../utils/amlChecks");
+const { staffSpendLast24h, decideStaffCap } = require("../utils/staffTransferCap");
 const { audit } = require("../utils/audit");
+const { pushTo } = require("../utils/pushNotification");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
 const { computeTransferFee, computeFincraTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
@@ -18,6 +21,7 @@ const {
   TRANSFER_OTP_TYPE,
   resolveBusinessLimits,
   getThresholds,
+  formatAmountForBusiness,
 } = require("../config/amlLimits");
 
 router.use(auth);
@@ -335,9 +339,19 @@ router.get("/fee-quote", requirePermission("canTransfer"), async (req, res) => {
 
 // POST /transfers/send
 // body: { businessId, accountNumber, bankCode, amount, narration, accountName, bankName }
-router.post("/send", async (req, res) => {
-  if (req.user.accountType === "staff")
-    return res.status(403).json({ error: "Staff cannot initiate transfers" });
+router.post("/send", requirePermission("canTransfer", { auditDenials: true }), async (req, res) => {
+  // Four different people can be meant by "the user" on a staff-initiated
+  // transfer, and conflating any two of them is a money or security bug:
+  //
+  //   actorId  who pressed send. Their PIN authorises it, their phone receives
+  //            the step-up OTP, and they are the audit actor.
+  //   ownerId  whose business and whose money. The compliance subject: the
+  //            freeze state, the AML tier and the ledger row all belong here.
+  //
+  // For an owner both are the same id and nothing below changes behaviour.
+  const isStaff = req.user.accountType === "staff";
+  const actorId = req.user.id;
+  const ownerId = ownerIdOf(req);
 
   const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin, otp, idempotencyKey } = req.body;
   // Client-supplied idempotency key → a STABLE payout reference so a retry after a
@@ -378,7 +392,11 @@ router.post("/send", async (req, res) => {
 
   try {
     const biz = await prisma.business.findFirst({
-      where: { id: businessId, userId: req.user.id },
+      // ownerId, not req.user.id: a staff member sends from their EMPLOYER's
+      // business, so this lookup returned nothing and every staff send 404'd.
+      // Never drop the userId filter to "fix" that — it is what stops any
+      // authenticated user sending from any business in the system.
+      where: { id: businessId, userId: ownerId },
     });
     if (!biz) return res.status(404).json({ error: "Business not found" });
 
@@ -400,13 +418,41 @@ router.post("/send", async (req, res) => {
     // ── AML pre-transfer pipeline ─────────────────────────────────────
     // Runs frozen + tier limit + single cap + step-up + rules engine in
     // order. Writes audit rows for each gate and returns early on block.
-    const userFull = await prisma.user.findUnique({
-      where: { id: req.user.id },
-      select: {
-        id: true, accountStatus: true, complianceFreezeReason: true,
-        email: true, phone: true,
-      },
-    });
+    // TWO rows, because one row was doing three incompatible jobs.
+    //
+    //   ownerFull  the COMPLIANCE SUBJECT: freeze state, AML tier, and the
+    //              address the debit notice goes to. It is the owner's money.
+    //   actorFull  who pressed send: their step-up OTP destination.
+    //
+    // Loading only the caller meant a staff send would have run the AML and
+    // freeze checks against the STAFF's row — so a compliance-frozen OWNER would
+    // not have stopped it, because requireUnfrozen only inspects the caller.
+    // For an owner these are the same row and nothing changes.
+    const [ownerFull, actorRow] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: ownerId },
+        select: {
+          id: true, accountStatus: true, complianceFreezeReason: true,
+          email: true, phone: true, firstName: true, lastName: true,
+        },
+      }),
+      isStaff
+        ? prisma.user.findUnique({
+            where: { id: actorId },
+            select: {
+              id: true, accountStatus: true, complianceFreezeReason: true,
+              email: true, phone: true, firstName: true, lastName: true,
+            },
+          })
+        : null,
+    ]);
+    if (!ownerFull) return res.status(404).json({ error: "Business owner not found" });
+    const actorFull = actorRow || ownerFull;
+
+    // Both subjects are checked for freeze: requireUnfrozen already refused a
+    // frozen ACTOR on this POST, and the AML pipeline refuses a frozen OWNER
+    // below. Neither alone is enough.
+
     // Serialize money-out per business: the AML cumulative-limit read and the
     // execution must be atomic, or two concurrent transfers could both pass the
     // limit/balance gate and overshoot. Different businesses still run in
@@ -414,7 +460,8 @@ router.post("/send", async (req, res) => {
     const outcome = await prisma.withBusinessLock(biz.id, async () => {
       const amlCheck = await runPreTransferChecks({
         req,
-        user: userFull,
+        user: ownerFull,   // compliance subject: freeze, tier, velocity windows
+        actor: actorFull,  // who gets and answers the step-up OTP
         business: biz,
         amount: Number(amount),
         otp,
@@ -425,7 +472,10 @@ router.post("/send", async (req, res) => {
         // the user can collect it from email/SMS, then surface the request
         // to the client with the masked identifier.
         if (amlCheck.code === "OTP_REQUIRED") {
-          const target = userFull.email || userFull.phone;
+          // Use the target the pipeline itself chose. Picking one here
+          // independently is how dispatch and verification drift apart the
+          // moment the actor is not the account holder.
+          const target = amlCheck.otpTarget;
           if (target) {
             try {
               await dispatchOtp(target, TRANSFER_OTP_TYPE, { country: biz.country });
@@ -435,6 +485,9 @@ router.post("/send", async (req, res) => {
             }
           }
         }
+        // WHITELIST, deliberately — do not replace with `...amlCheck`.
+        // amlCheck carries otpTarget, the UNMASKED destination for the step-up
+        // code. Only the masked otpIdentifier is safe to return.
         return {
           status: amlCheck.status || 400,
           body: {
@@ -445,10 +498,87 @@ router.post("/send", async (req, res) => {
         };
       }
 
+      // ── Per-staff daily cap ───────────────────────────────────────
+      // The owner's own AML limits above are the business's ceiling. This is a
+      // SECOND, tighter ceiling on how much any one staff member may move, and
+      // it is the whole reason granting canTransfer is not equivalent to handing
+      // over the account.
+      //
+      // Default is 0 (auth.js coalesces a null grant to 0), so a freshly granted
+      // staff member can send NOTHING until the owner names a number. That is
+      // deliberate: it is what makes this route safe to ship before the approval
+      // queue exists, because the fail-closed path is "refuse", not "send".
+      //
+      // Window is a rolling 24h, matching the AML pipeline rather than a
+      // calendar day — a calendar day resets at midnight and would let a staff
+      // member spend 2x the cap across a two-minute boundary.
+      //
+      // Attribution comes from Transaction.recordedBy, which the executor stamps
+      // below. Not the audit log: audit() is fire-and-forget and swallows its
+      // own failures, so a dropped audit row would silently raise the cap. The
+      // spend record has to be the same row as the money.
+      if (isStaff) {
+        // Worst-case fee, on purpose. The real fee isn't known until the
+        // executor has run (an internal KashBook->KashBook book transfer is
+        // free), and re-running that route detection here would mean a second
+        // lookup that can disagree with the executor's. Over-estimating only
+        // ever refuses slightly early; under-estimating would let a staff
+        // member cross the cap, so the rounding goes the safe way.
+        const worstFee = provider.unifiedProvisioning
+          ? computeFincraTransferFee(Number(amount), { internal: false }).total
+          : computeTransferFee(Number(amount), "nip").totalCost;
+
+        const spent = await staffSpendLast24h(prisma, actorId);
+        const verdict = decideStaffCap({
+          cap: req.user.dailyTransferCap,
+          spent,
+          amount,
+          fee: worstFee,
+        });
+
+        if (!verdict.allowed) {
+          await audit({
+            req,
+            action: "STAFF_TRANSFER_BLOCKED_CAP",
+            resourceType: "business",
+            resourceId: biz.id,
+            severity: "warn",
+            metadata: {
+              staffUserId: actorId, ownerUserId: ownerId,
+              cap: verdict.cap, spent: verdict.spent, attempted: verdict.cost,
+            },
+          }).catch(() => {});
+
+          return {
+            status: 403,
+            body: {
+              code: "ABOVE_DAILY_CAP",
+              error: verdict.cap === 0
+                ? "Your daily transfer limit hasn't been set yet. Ask the business owner to set one."
+                : `This is over your daily transfer limit. You have ${formatAmountForBusiness(biz, verdict.remaining)} left of ${formatAmountForBusiness(biz, verdict.cap)} in the last 24 hours.`,
+              cap: verdict.cap,
+              spent: verdict.spent,
+              remaining: verdict.remaining,
+            },
+          };
+        }
+      }
+
       // Hand off to the shared executor — same code path the cron uses.
       const exec = await executeTransfer({
         business: biz,
-        userId: req.user.id,
+        // The OWNER owns the ledger row, not whoever pressed send. Two reasons:
+        // Transaction.user is onDelete SetNull and staff are hard-deleted, so
+        // stamping the staff id would NULL the attribution on every transfer
+        // they ever made the day they leave; and ComplianceFlag.userId must stay
+        // on the KYC subject the compliance queue expects. Who pressed send is
+        // recorded in the audit log, where actorId is already the staff id.
+        userId: ownerId,
+        // ...and this is who actually pressed send. Always stamped, owner or
+        // staff, so the field means exactly one thing. The daily-cap query
+        // above reads it back, so this line is what makes the cap enforceable.
+        recordedBy: actorId,
+        recordedByName: `${actorFull.firstName || ""} ${actorFull.lastName || ""}`.trim() || null,
         amount: Number(amount),
         accountNumber,
         bankCode,
@@ -503,17 +633,45 @@ router.post("/send", async (req, res) => {
 
     res.json({ status: "success", reference, route, fee });
 
+    // A staff-initiated debit must never be silent to the owner. The executor is
+    // called with notify:false here, so without this the owner would learn
+    // nothing about money leaving their account until they opened the app.
+    if (isStaff) {
+      const who = `${actorFull.firstName || ""} ${actorFull.lastName || ""}`.trim() || "A staff member";
+      const to = accountName || accountNumber;
+      const amt = formatAmountForBusiness(biz, Number(amount));
+      pushTo(ownerId, "Staff sent money", `${who} sent ${amt} to ${to}`).catch(() => {});
+      pushTo(actorId, "Transfer sent", `${amt} to ${to}`).catch(() => {});
+      audit({
+        req,
+        action: "STAFF_TRANSFER_SENT",
+        resourceType: "business",
+        resourceId: biz.id,
+        severity: "warn",
+        metadata: {
+          staffUserId: actorId, ownerUserId: ownerId,
+          amount: Number(amount), fee, reference, route,
+          capAtTime: req.user.dailyTransferCap,
+        },
+      }).catch(() => {});
+    }
+
     // Detailed debit alert — fire-and-forget, never affects the transfer result.
-    if (userFull.email) {
+    // Goes to the OWNER: it is their money and their fraud tripwire.
+    if (ownerFull.email) {
       const counterparty =
         [accountName, bankName].filter(Boolean).join(" · ") || String(accountNumber);
       require("../utils/transactionEmail").sendTransactionEmail({
-        to: userFull.email,
+        to: ownerFull.email,
         direction: "debit",
         amount: Number(amount),
         currency: biz.currency || "NGN",
         counterparty,
-        narration,
+        // Says who pressed send, so an unexpected debit is immediately
+        // attributable rather than looking like fraud.
+        narration: isStaff
+          ? `${narration || ""} · Sent by ${actorFull.firstName || "staff"}`.trim()
+          : narration,
         fee,
         reference,
         businessName: biz.name,
