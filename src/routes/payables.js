@@ -2,7 +2,13 @@ const router = require("express").Router();
 const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 
+const { requirePermission } = require("../middleware/requirePermission");
+const { ownerIdOf } = require("../utils/scope");
+
 router.use(auth);
+// Viewing and managing payables are the same capability here: every route in
+// this file writes or reads supplier debt, which is money owed.
+router.use(requirePermission("canManagePayables"));
 
 async function ownsBusiness(userId, businessId) {
   const biz = await prisma.business.findFirst({ where: { id: businessId, userId } });
@@ -13,7 +19,7 @@ async function ownsBusiness(userId, businessId) {
 router.get("/", async (req, res) => {
   const { businessId } = req.query;
   if (!businessId) return res.status(400).json({ error: "businessId required" });
-  if (!(await ownsBusiness(req.user.id, businessId)))
+  if (!(await ownsBusiness(ownerIdOf(req), businessId)))
     return res.status(403).json({ error: "Forbidden" });
 
   try {
@@ -44,7 +50,7 @@ router.post("/", async (req, res) => {
       .status(400)
       .json({ error: "businessId, creditorName, amount required" });
   }
-  if (!(await ownsBusiness(req.user.id, businessId)))
+  if (!(await ownsBusiness(ownerIdOf(req), businessId)))
     return res.status(403).json({ error: "Forbidden" });
 
   try {
@@ -73,7 +79,7 @@ router.delete("/:id", async (req, res) => {
       where: { id: req.params.id },
     });
     if (!payable) return res.status(404).json({ error: "Payable not found" });
-    if (!(await ownsBusiness(req.user.id, payable.businessId)))
+    if (!(await ownsBusiness(ownerIdOf(req), payable.businessId)))
       return res.status(403).json({ error: "Forbidden" });
 
     await prisma.payable.delete({ where: { id: req.params.id } });
@@ -93,7 +99,7 @@ router.post("/:id/payments", async (req, res) => {
       where: { id: req.params.id },
     });
     if (!payable) return res.status(404).json({ error: "Payable not found" });
-    if (!(await ownsBusiness(req.user.id, payable.businessId)))
+    if (!(await ownsBusiness(ownerIdOf(req), payable.businessId)))
       return res.status(403).json({ error: "Forbidden" });
 
     const newPaid = Math.min(payable.paidAmount + Number(amount), payable.amount);

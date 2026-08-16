@@ -121,7 +121,10 @@ router.delete("/:id", async (req, res) => {
       where: { id: req.params.id },
     });
     if (!debt) return res.status(404).json({ error: "Debt not found" });
-    if (debt.userId !== req.user.id)
+    // getTargetUserId, not req.user.id — every sibling check in this file uses
+    // it, and this one drifted. Harmless while staff are blocked outright, but
+    // it would refuse a permitted staff member deleting their employer's debt.
+    if (debt.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
 
     await prisma.businessDebt.delete({ where: { id: req.params.id } });

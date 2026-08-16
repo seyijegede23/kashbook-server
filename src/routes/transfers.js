@@ -1,6 +1,7 @@
 const router = require("express").Router();
 const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
+const { requirePermission } = require("../middleware/requirePermission");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
 const { getProvider } = require("../providers");
@@ -22,34 +23,23 @@ const {
 router.use(auth);
 router.use(requireUnfrozen);
 
-// The money position is owner-only, and until now that was only half true.
+// Money endpoints are capability-gated, using TWO distinct capabilities:
 //
-// businesses.js:346 refuses staff on GET /businesses/:id/balance with
-// "Balances are visible to the business owner only", but the endpoints BELOW
-// resolved a staff member to their employer and answered freely — so a staff
-// account could read the live balance, the AML limits with spend-to-date, and
-// the beneficiary list simply by asking a different route. The policy was
-// enforced in the app's UI and nowhere else.
+//   canViewBalance  the money position itself — the balance, the AML limits,
+//                   and spend-to-date.
+//   canTransfer     the machinery for SENDING: the bank list, name enquiry,
+//                   saved beneficiaries, fee quotes. These are useless to
+//                   someone who cannot send, and verify-account in particular
+//                   is a name-enquiry oracle that should not be open to them.
 //
-// This closes that. It is deliberately a blanket block for now, matching the
-// stated policy exactly; the per-staff `staffCanViewBank` grant replaces it in
-// the next step, at which point this becomes requirePermission("staffCanViewBank")
-// and all of these endpoints open together rather than one by accident.
-function ownerOnlyMoneyView(req, res, next) {
-  if (req.user.accountType === "staff") {
-    return res.status(403).json({
-      code: "STAFF_FORBIDDEN",
-      error: "Balances are visible to the business owner only.",
-    });
-  }
-  next();
-}
+// Both default to false for staff (no grant row), so this is identical in
+// behaviour to the blanket block it replaces until an owner grants something.
 
 // GET /transfers/banks
 // Bank list for the sender's country/currency, via their payment provider
 // (Fincra bank `code` is the payout bankCode; Anchor returns CBN codes). Sending
 // is local, so the sender's country drives which banks + which code namespace.
-router.get("/banks", async (req, res) => {
+router.get("/banks", requirePermission("canTransfer"), async (req, res) => {
   try {
     const country = req.user.country || "NG";
     const provider = getProvider(country);
@@ -72,7 +62,7 @@ router.get("/banks", async (req, res) => {
 //      /payments/verify-account doesn't know about its own virtual NUBANs, so
 //      external-only enquiry returns "Account not found" for KashBook→KashBook.
 //   2. Fall back to Anchor's name enquiry for external banks.
-router.post("/verify-account", async (req, res) => {
+router.post("/verify-account", requirePermission("canTransfer"), async (req, res) => {
   const { accountNumber, bankCode } = req.body;
   if (!accountNumber || !bankCode)
     return res.status(400).json({ error: "accountNumber and bankCode are required" });
@@ -111,7 +101,7 @@ router.post("/verify-account", async (req, res) => {
 
 // GET /transfers/balance?businessId=
 // Live held-funds balance from Anchor for the business's deposit account.
-router.get("/balance", ownerOnlyMoneyView, async (req, res) => {
+router.get("/balance", requirePermission("canViewBalance"), async (req, res) => {
   try {
     const { businessId } = req.query;
     if (!businessId) return res.status(400).json({ error: "businessId required" });
@@ -162,7 +152,7 @@ router.get("/balance", ownerOnlyMoneyView, async (req, res) => {
 // Treats no-NUBAN businesses as the "unverified" tier (all zeros). The
 // client is also expected to gate access to this screen, but a hard-coded
 // zero here means even a bad client can't show stale limits.
-router.get("/limits", ownerOnlyMoneyView, async (req, res) => {
+router.get("/limits", requirePermission("canViewBalance"), async (req, res) => {
   try {
     // AML kill switch: no limits are enforced, so show none — the client's
     // LimitsCard hides itself on a null payload.
@@ -247,7 +237,7 @@ router.get("/limits", ownerOnlyMoneyView, async (req, res) => {
 
 // GET /transfers/beneficiaries?businessId=<id>
 // Top recent transfer recipients for the Send Money "Recents" chips.
-router.get("/beneficiaries", ownerOnlyMoneyView, async (req, res) => {
+router.get("/beneficiaries", requirePermission("canTransfer"), async (req, res) => {
   try {
     const { businessId } = req.query;
     if (!businessId) return res.status(400).json({ error: "businessId required" });
@@ -277,7 +267,7 @@ router.get("/beneficiaries", ownerOnlyMoneyView, async (req, res) => {
 // executeTransfer routes it: a KashBook-internal destination is a free book
 // transfer; anything else is NIP (₦51 / ₦101 above ₦10,000). Server is
 // authoritative — the client never computes fees itself.
-router.get("/fee-quote", ownerOnlyMoneyView, async (req, res) => {
+router.get("/fee-quote", requirePermission("canTransfer"), async (req, res) => {
   try {
     const amount = Number(req.query.amount);
     const accountNumber = String(req.query.accountNumber || "").trim();

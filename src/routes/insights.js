@@ -5,6 +5,8 @@ const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
 const { answerQuestion, generateInsightCards, SUGGESTIONS } = require("../utils/insightsEngine");
 
+const { requirePermission } = require("../middleware/requirePermission");
+
 router.use(auth);
 
 // Staff act on their employer's books (same convention as invoices/transfers).
@@ -43,7 +45,7 @@ async function resolveBusiness(req, res) {
 // POST /insights/ask { businessId, question, context? }
 // context = the previous answer's intent id (string) so "what about last week?"
 // style follow-ups work. Returns { intent, answer, data? }.
-router.post("/ask", async (req, res) => {
+router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
   try {
     if (!premiumGate(req, res)) return;
     const biz = await resolveBusiness(req, res);
@@ -62,7 +64,7 @@ router.post("/ask", async (req, res) => {
 });
 
 // GET /insights/cards?businessId= — auto-generated observation cards
-router.get("/cards", async (req, res) => {
+router.get("/cards", requirePermission("canViewReports"), async (req, res) => {
   try {
     if (!premiumGate(req, res)) return;
     const biz = await resolveBusiness(req, res);

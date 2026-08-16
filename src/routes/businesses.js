@@ -10,6 +10,7 @@ const { cleanBusinessName, normalizeBusinessName, isProtectedName } = require(".
 const { encrypt, hmacValue } = require("../utils/crypto");
 const { validateDataUri, IMAGE_TYPES, DOC_TYPES } = require("../utils/uploadGuard");
 const { audit } = require("../utils/audit");
+const { requirePermission } = require("../middleware/requirePermission");
 const { getBaseCurrency, DEFAULT_COUNTRY } = require("../config/countries");
 const { getRiskCategory } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
@@ -70,10 +71,8 @@ const SECRET_BUSINESS_FIELDS = [
   "kycBvn", "kycBvnHash", "kycId", "kycCacNumber", "kycCacHash",
 ];
 
-// 2. The bank account itself. Owners keep it; staff do not, because the money
-//    position is owner-only (businesses.js:/balance says exactly that) and no
-//    staff screen renders these. The per-staff `staffCanViewBank` grant is what
-//    will put them back for staff who should have them.
+// 2. The bank account itself, gated on the canViewBalance capability. Owners
+//    always hold it; a staff member holds it only if the owner granted it.
 const BANK_BUSINESS_FIELDS = [
   "virtualAccountNumber", "virtualAccountName", "virtualAccountBank",
   "anchorAccountId", "providerAccountId",
@@ -83,10 +82,10 @@ const BANK_BUSINESS_FIELDS = [
 // column added later is exposed to OWNERS by default and has to be considered
 // explicitly, which is the mistake that shows up in review. The trade is that a
 // new SECRET must be added here, so the list is named to make that obvious.
-function publicBusiness(biz, { isStaff = false } = {}) {
+function publicBusiness(biz, { hideBank = false } = {}) {
   const out = { ...biz };
   for (const f of SECRET_BUSINESS_FIELDS) delete out[f];
-  if (isStaff) for (const f of BANK_BUSINESS_FIELDS) delete out[f];
+  if (hideBank) for (const f of BANK_BUSINESS_FIELDS) delete out[f];
   return out;
 }
 
@@ -97,8 +96,11 @@ router.get("/", async (req, res) => {
       include: { customCategories: true },
       orderBy: { createdAt: "asc" },
     });
-    const isStaff = req.user.accountType === "staff";
-    res.json(list.map((b) => publicBusiness(b, { isStaff })));
+    // The bank fields follow the capability, not the account type: a staff
+    // member the owner has trusted with the account should see it here too,
+    // otherwise the Dashboard has a balance with no account number beside it.
+    const hideBank = !req.user.permissions?.canViewBalance;
+    res.json(list.map((b) => publicBusiness(b, { hideBank })));
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch businesses" });
   }
@@ -377,11 +379,10 @@ router.patch("/:id/branding", async (req, res) => {
 // and cache 60s (shared cache so a transfer can optimistically adjust it).
 // Falls back to local math if the call fails so the UI doesn't blank.
 const balanceCache = require("../utils/balanceCache");
-router.get("/:id/balance", async (req, res) => {
-  // Staff record transactions but never see the money position.
-  if (req.user.accountType === "staff") {
-    return res.status(403).json({ error: "Balances are visible to the business owner only.", code: "STAFF_FORBIDDEN" });
-  }
+// Gated on the same capability as GET /transfers/balance, which returns the same
+// number. They disagreed before: this route refused staff outright while that one
+// answered, so the policy held only in the app's UI.
+router.get("/:id/balance", requirePermission("canViewBalance"), async (req, res) => {
   try {
     const biz = await prisma.business.findFirst({
       where: { id: req.params.id, userId: getTargetUserId(req) },
