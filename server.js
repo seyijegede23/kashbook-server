@@ -339,7 +339,16 @@ app.get("/admin", adminSpaLimiter, (_req, res) =>
 app.get("/health", apiLimiter, async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ status: "ok", uptime: Math.round(process.uptime()) });
+    res.json({
+      status: "ok",
+      uptime: Math.round(process.uptime()),
+      // Which commit is actually serving. Render injects RENDER_GIT_COMMIT on
+      // every deploy. Without this, confirming a deploy landed means watching
+      // uptime reset, which proves a restart happened but says nothing about
+      // WHICH code came back — and "I pushed it" is not the same as "it is
+      // running". Short SHA only: it names a public commit and reveals nothing.
+      commit: (process.env.RENDER_GIT_COMMIT || "local").slice(0, 7),
+    });
   } catch {
     res.status(503).json({ status: "degraded" });
   }
