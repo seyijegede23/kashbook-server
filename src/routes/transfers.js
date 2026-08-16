@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const auth = require("../middleware/auth");
 const requireUnfrozen = require("../middleware/requireUnfrozen");
-const { requirePermission } = require("../middleware/requirePermission");
+const { requirePermission, ownerOnly } = require("../middleware/requirePermission");
 const { ownerIdOf } = require("../utils/scope");
 const prisma = require("../utils/db");
 const anchor = require("../utils/anchor");
@@ -10,7 +10,8 @@ const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { runPreTransferChecks, MONEY_OUT_SOURCES } = require("../utils/amlChecks");
-const { staffSpendLast24h, decideStaffCap } = require("../utils/staffTransferCap");
+const { staffSpendLast24h, decideStaffCap, APPROVAL_TTL_MS } = require("../utils/staffTransferCap");
+const { randomUUID } = require("crypto");
 const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
 const { dispatchOtp } = require("../utils/otp");
@@ -536,26 +537,62 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
           fee: worstFee,
         });
 
+        // Over the cap is a HOLD, not a refusal. The transfer is parked for the
+        // owner to approve or reject, and NO Transaction row is written — see
+        // the StaffTransferRequest model comment for why parking it in the
+        // ledger as complianceStatus "held" would corrupt the balance.
         if (!verdict.allowed) {
+          const held = await prisma.staffTransferRequest.create({
+            data: {
+              businessId: biz.id,
+              requestedById: actorId,
+              ownerId,
+              accountNumber, bankCode,
+              bankName: bankName || null,
+              accountName: accountName || null,
+              amount: Number(amount),
+              narration: narration || null,
+              currency: biz.baseCurrency || "NGN",
+              status: "pending",
+              reason: verdict.cap === 0
+                ? "No daily limit set for this staff member"
+                : "Over the staff member's daily limit",
+              // Minted here and carried through to execution, so approving
+              // twice hits the executor's existing-reference short-circuit.
+              idempotencyKey: `kbsa_${randomUUID().replace(/-/g, "")}`,
+              capAtRequest: verdict.cap,
+              spentAtRequest: verdict.spent,
+              expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
+            },
+          });
+
           await audit({
             req,
-            action: "STAFF_TRANSFER_BLOCKED_CAP",
+            action: "STAFF_TRANSFER_HELD",
             resourceType: "business",
             resourceId: biz.id,
             severity: "warn",
             metadata: {
-              staffUserId: actorId, ownerUserId: ownerId,
+              requestId: held.id, staffUserId: actorId, ownerUserId: ownerId,
               cap: verdict.cap, spent: verdict.spent, attempted: verdict.cost,
             },
           }).catch(() => {});
 
+          const who = `${actorFull.firstName || ""} ${actorFull.lastName || ""}`.trim() || "A staff member";
+          pushTo(ownerId, "Transfer needs your approval",
+            `${who} wants to send ${formatAmountForBusiness(biz, Number(amount))} to ${accountName || accountNumber}`,
+          ).catch(() => {});
+
           return {
-            status: 403,
+            status: 202,
             body: {
-              code: "ABOVE_DAILY_CAP",
-              error: verdict.cap === 0
-                ? "Your daily transfer limit hasn't been set yet. Ask the business owner to set one."
-                : `This is over your daily transfer limit. You have ${formatAmountForBusiness(biz, verdict.remaining)} left of ${formatAmountForBusiness(biz, verdict.cap)} in the last 24 hours.`,
+              status: "pending_approval",
+              code: "PENDING_APPROVAL",
+              requestId: held.id,
+              expiresAt: held.expiresAt,
+              message: verdict.cap === 0
+                ? "Sent to the business owner for approval. You don't have a daily transfer limit yet."
+                : `This is over your ${formatAmountForBusiness(biz, verdict.cap)} daily limit, so it's been sent to the business owner for approval.`,
               cap: verdict.cap,
               spent: verdict.spent,
               remaining: verdict.remaining,
@@ -687,6 +724,320 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
       return res.status(400).json({ error: err.message, code: err.code });
     console.error("Transfer error:", err);
     res.status(400).json({ error: "Transfer failed" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Approval queue for staff transfers over their daily cap.
+// ═══════════════════════════════════════════════════════════════════════
+
+// What the requester and the approver are each allowed to see. The staff member
+// asked for this transfer, so nothing here is news to them; the owner needs the
+// beneficiary to make a decision. Neither gets the raw row.
+const publicRequest = (r) => ({
+  id: r.id,
+  businessId: r.businessId,
+  requestedById: r.requestedById,
+  requestedByName: r.requestedByName ?? undefined,
+  accountNumber: r.accountNumber,
+  bankCode: r.bankCode,
+  bankName: r.bankName,
+  accountName: r.accountName,
+  amount: r.amount,
+  narration: r.narration,
+  currency: r.currency,
+  status: r.status,
+  reason: r.reason,
+  failureReason: r.failureReason,
+  expiresAt: r.expiresAt,
+  decidedAt: r.decidedAt,
+  createdAt: r.createdAt,
+});
+
+// A request that has sat past its expiry is treated as expired on read, even if
+// the reaper has not swept it yet. Without this an owner could open a stale list
+// and approve something the system already considers dead.
+const isLapsed = (r) => r.status === "pending" && r.expiresAt <= new Date();
+
+// GET /transfers/approvals
+// Owner: everything waiting on them. Staff: their own requests, so they can see
+// what happened to a transfer they were told was "sent for approval".
+router.get("/approvals", async (req, res) => {
+  try {
+    const isStaff = req.user.accountType === "staff";
+    const status = String(req.query.status || "pending");
+
+    const rows = await prisma.staffTransferRequest.findMany({
+      where: isStaff
+        ? { requestedById: req.user.id, ...(status === "all" ? {} : { status }) }
+        : { ownerId: req.user.id, ...(status === "all" ? {} : { status }) },
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    });
+
+    // Attach the requester's name for the owner's list — an amount and an
+    // account number is not enough to decide on.
+    let names = {};
+    if (!isStaff && rows.length) {
+      const ids = [...new Set(rows.map((r) => r.requestedById))];
+      const users = await prisma.user.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, firstName: true, lastName: true },
+      });
+      names = Object.fromEntries(
+        users.map((u) => [u.id, `${u.firstName || ""} ${u.lastName || ""}`.trim()]),
+      );
+    }
+
+    res.json(
+      rows.map((r) =>
+        publicRequest({
+          ...r,
+          status: isLapsed(r) ? "expired" : r.status,
+          requestedByName: names[r.requestedById],
+        }),
+      ),
+    );
+  } catch (err) {
+    console.error("[transfers/approvals]", err);
+    res.status(500).json({ error: "Failed to load approvals" });
+  }
+});
+
+// POST /transfers/approvals/:id/approve
+// Owner-only, PIN-confirmed. Runs the full AML pipeline again at execution time
+// rather than trusting the checks from when the request was made: the balance,
+// the tier limits and the freeze state can all have changed since.
+router.post("/approvals/:id/approve", ownerOnly("Only the business owner can approve transfers."), async (req, res) => {
+  try {
+    const { pin } = req.body;
+
+    const pinCheck = await verifyTransactionPin(req.user.id, pin);
+    if (!pinCheck.ok) {
+      await audit({
+        req, action: "PIN_FAILED", resourceType: "user", resourceId: req.user.id,
+        severity: "warn", metadata: { code: pinCheck.code, context: "approve_staff_transfer" },
+      }).catch(() => {});
+      return res.status(pinCheck.status || 401).json({ error: pinCheck.error, code: pinCheck.code });
+    }
+
+    const request = await prisma.staffTransferRequest.findFirst({
+      where: { id: req.params.id, ownerId: req.user.id },
+    });
+    if (!request) return res.status(404).json({ error: "Request not found" });
+    if (request.status !== "pending")
+      return res.status(409).json({ error: `This request was already ${request.status}.`, code: "NOT_PENDING", status: request.status });
+    if (isLapsed(request))
+      return res.status(409).json({ error: "This request expired. Ask your staff member to send it again.", code: "EXPIRED" });
+
+    const biz = await prisma.business.findFirst({
+      where: { id: request.businessId, userId: req.user.id },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const provider = getProvider(biz);
+    if (!provider.supportsBanking)
+      return res.status(400).json({ error: "Banking isn't available in your country yet.", code: "BANKING_NOT_AVAILABLE" });
+
+    const [ownerFull, staffFull] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: request.ownerId },
+        select: { id: true, accountStatus: true, complianceFreezeReason: true, email: true, phone: true, firstName: true, lastName: true },
+      }),
+      prisma.user.findUnique({
+        where: { id: request.requestedById },
+        select: { id: true, firstName: true, lastName: true, employerId: true },
+      }),
+    ]);
+    if (!ownerFull) return res.status(404).json({ error: "Owner not found" });
+
+    // The staff member may have been removed, or moved to another employer,
+    // while the request sat in the queue. Approving then would send money on
+    // behalf of someone who no longer works here.
+    if (!staffFull || staffFull.employerId !== request.ownerId) {
+      await prisma.staffTransferRequest.updateMany({
+        where: { id: request.id, status: "pending" },
+        data: { status: "rejected", reason: "The staff member no longer works for this business.", decidedById: req.user.id, decidedAt: new Date() },
+      });
+      return res.status(409).json({ error: "That staff member is no longer on your team, so this request was cancelled.", code: "STAFF_GONE" });
+    }
+
+    const outcome = await prisma.withBusinessLock(biz.id, async () => {
+      // ATOMIC CLAIM. This single statement is what makes a double-tap safe:
+      // exactly one caller can move the row out of "pending", and only that
+      // caller proceeds to spend money. Everything before this point is a read
+      // and can legitimately race; nothing after it can run twice.
+      const claim = await prisma.staffTransferRequest.updateMany({
+        where: { id: request.id, status: "pending" },
+        data: { status: "approving", decidedById: req.user.id, decidedAt: new Date() },
+      });
+      if (claim.count !== 1) {
+        return { status: 409, body: { error: "This request is already being processed.", code: "NOT_PENDING" } };
+      }
+
+      const amlCheck = await runPreTransferChecks({
+        req,
+        user: ownerFull,   // compliance subject
+        actor: ownerFull,  // the OWNER is approving, so any step-up is theirs
+        business: biz,
+        amount: Number(request.amount),
+        // The owner has just entered their transaction PIN against this specific
+        // request, which is the same standing the recurring-expense cron relies
+        // on. Requiring a second OTP on top would mean the owner authenticates
+        // twice to approve one transfer they are already looking at.
+        bypassOtp: true,
+      });
+      if (!amlCheck.ok) {
+        // Put it back so the owner can retry once the blocker clears, rather
+        // than silently consuming their approval.
+        await prisma.staffTransferRequest.update({
+          where: { id: request.id },
+          data: { status: "pending", decidedById: null, decidedAt: null, failureReason: amlCheck.error },
+        });
+        return { status: amlCheck.status || 400, body: { error: amlCheck.error, code: amlCheck.code } };
+      }
+
+      const exec = await executeTransfer({
+        business: biz,
+        userId: request.ownerId,
+        // Attribution stays with the staff member who asked. The owner
+        // authorised it; they did not record it.
+        recordedBy: request.requestedById,
+        recordedByName: `${staffFull.firstName || ""} ${staffFull.lastName || ""}`.trim() || null,
+        amount: Number(request.amount),
+        accountNumber: request.accountNumber,
+        bankCode: request.bankCode,
+        accountName: request.accountName,
+        bankName: request.bankName,
+        narration: request.narration,
+        reference: request.idempotencyKey,
+        amlCheck,
+        req,
+        notify: false,
+      });
+
+      await prisma.staffTransferRequest.update({
+        where: { id: request.id },
+        data: {
+          status: "executed",
+          executedTransactionId: exec.transactionId || null,
+          executedReference: exec.reference || null,
+        },
+      });
+
+      return { exec };
+    });
+
+    if (outcome.status) return res.status(outcome.status).json(outcome.body);
+    const { reference, route, fee } = outcome.exec;
+
+    try {
+      require("../utils/balanceCache").adjustBalance(biz.id, -(Number(request.amount) + Number(fee || 0)));
+    } catch { /* noop */ }
+
+    res.json({ status: "success", reference, route, fee, requestId: request.id });
+
+    const who = `${staffFull.firstName || ""} ${staffFull.lastName || ""}`.trim() || "your staff member";
+    const amt = formatAmountForBusiness(biz, Number(request.amount));
+    const to = request.accountName || request.accountNumber;
+    pushTo(request.requestedById, "Transfer approved", `${amt} to ${to} has been sent.`).catch(() => {});
+    audit({
+      req, action: "STAFF_TRANSFER_APPROVED", resourceType: "business", resourceId: biz.id,
+      severity: "warn",
+      metadata: { requestId: request.id, staffUserId: request.requestedById, amount: Number(request.amount), fee, reference, route },
+    }).catch(() => {});
+
+    if (ownerFull.email) {
+      require("../utils/transactionEmail").sendTransactionEmail({
+        to: ownerFull.email,
+        direction: "debit",
+        amount: Number(request.amount),
+        currency: biz.currency || "NGN",
+        counterparty: [request.accountName, request.bankName].filter(Boolean).join(" · ") || String(request.accountNumber),
+        narration: `${request.narration || ""} · Approved for ${who}`.trim(),
+        fee,
+        reference,
+        businessName: biz.name,
+        dateLabel: new Date().toLocaleString("en-NG", { dateStyle: "medium", timeStyle: "short" }),
+      });
+    }
+  } catch (err) {
+    // The claim already moved this row to "approving". Leaving it there would
+    // strand the request in a state no route can act on, so put it back.
+    await prisma.staffTransferRequest
+      .updateMany({
+        where: { id: req.params.id, status: "approving" },
+        data: { status: "pending", decidedById: null, decidedAt: null, failureReason: err.message?.slice(0, 300) || "Transfer failed" },
+      })
+      .catch(() => {});
+
+    if (err.code === "INSUFFICIENT_BALANCE" || err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
+      return res.status(400).json({ error: err.message, code: err.code });
+    console.error("[transfers/approve]", err);
+    res.status(400).json({ error: "Transfer failed" });
+  }
+});
+
+// POST /transfers/approvals/:id/reject
+router.post("/approvals/:id/reject", ownerOnly("Only the business owner can reject transfers."), async (req, res) => {
+  try {
+    const reason = String(req.body?.reason || "").trim().slice(0, 300);
+
+    // Guarded on "pending" so a reject cannot race an in-flight approval and
+    // mark an executed transfer as rejected.
+    const claim = await prisma.staffTransferRequest.updateMany({
+      where: { id: req.params.id, ownerId: req.user.id, status: "pending" },
+      data: {
+        status: "rejected",
+        reason: reason || "Not approved by the business owner",
+        decidedById: req.user.id,
+        decidedAt: new Date(),
+      },
+    });
+    if (claim.count !== 1) {
+      const existing = await prisma.staffTransferRequest.findFirst({
+        where: { id: req.params.id, ownerId: req.user.id },
+        select: { status: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Request not found" });
+      return res.status(409).json({ error: `This request was already ${existing.status}.`, code: "NOT_PENDING", status: existing.status });
+    }
+
+    const request = await prisma.staffTransferRequest.findUnique({ where: { id: req.params.id } });
+    res.json({ status: "rejected", request: publicRequest(request) });
+
+    pushTo(request.requestedById, "Transfer not approved",
+      reason || "The business owner didn't approve this transfer.",
+    ).catch(() => {});
+    audit({
+      req, action: "STAFF_TRANSFER_REJECTED", resourceType: "business", resourceId: request.businessId,
+      severity: "warn",
+      metadata: { requestId: request.id, staffUserId: request.requestedById, amount: request.amount, reason },
+    }).catch(() => {});
+  } catch (err) {
+    console.error("[transfers/reject]", err);
+    res.status(500).json({ error: "Failed to reject the request" });
+  }
+});
+
+// POST /transfers/approvals/:id/cancel
+// The staff member withdrawing their own request — a typo'd amount shouldn't
+// need the owner to formally reject it. Scoped to requestedById so one staff
+// member cannot cancel another's.
+router.post("/approvals/:id/cancel", async (req, res) => {
+  try {
+    const claim = await prisma.staffTransferRequest.updateMany({
+      where: { id: req.params.id, requestedById: req.user.id, status: "pending" },
+      data: { status: "cancelled", reason: "Withdrawn by the requester", decidedAt: new Date() },
+    });
+    if (claim.count !== 1)
+      return res.status(409).json({ error: "This request can no longer be cancelled.", code: "NOT_PENDING" });
+
+    const request = await prisma.staffTransferRequest.findUnique({ where: { id: req.params.id } });
+    res.json({ status: "cancelled", request: publicRequest(request) });
+  } catch (err) {
+    console.error("[transfers/cancel]", err);
+    res.status(500).json({ error: "Failed to cancel the request" });
   }
 });
 

@@ -18,9 +18,22 @@ function dbConnectionString() {
   }
 }
 
+// A local Postgres is not built with SSL support, so forcing it there fails the
+// connection outright ("The server does not support SSL connections") — which
+// blocked running the money-path tests against a scratch database. Only
+// localhost is exempted; every hosted database keeps SSL exactly as before.
+function isLocalDb() {
+  try {
+    const h = new URL(process.env.DATABASE_URL || "").hostname;
+    return h === "localhost" || h === "127.0.0.1" || h === "::1";
+  } catch {
+    return false;
+  }
+}
+
 const pool = new Pool({
   connectionString: dbConnectionString(),
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+  ssl: process.env.DATABASE_URL && !isLocalDb() ? { rejectUnauthorized: false } : undefined,
   keepAlive: true,                // TCP keepalive — stop NAT/idle drops on Render
   idleTimeoutMillis: 30000,       // recycle idle clients before the DB/network kills the socket
   connectionTimeoutMillis: 10000, // fail fast instead of hanging on a bad connect

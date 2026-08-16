@@ -11,6 +11,13 @@
 const assert = require("assert");
 
 let passed = 0, failed = 0;
+
+// Fire-and-forget calls in this code (pushes, audit writes) MUST have a .catch.
+// Without one, a single failed push becomes an unhandled rejection, which on
+// Node 22 terminates the process — turning a notification hiccup into a server
+// restart mid-sweep. A synchronous assertion can't see that, so watch for it.
+const unhandled = [];
+process.on("unhandledRejection", (e) => unhandled.push(e));
 function test(name, fn) {
   try { fn(); console.log(`  PASS  ${name}`); passed++; }
   catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); failed++; }
@@ -90,9 +97,14 @@ test("a non-numeric amount cannot bypass the cap", () => {
 // ── 2. spend query ───────────────────────────────────────────────────
 console.log("\nstaffSpendLast24h");
 
-const stubPrisma = (rows, capture) => ({
+// Capture is per-stub, not a shared module-level variable: these tests are
+// async and interleave, so a global would record whichever call landed last.
+const stubPrisma = (rows, capture, approvedRows = [], captureApproval) => ({
   transaction: {
     findMany: async (args) => { if (capture) capture(args); return rows; },
+  },
+  staffTransferRequest: {
+    findMany: async (args) => { if (captureApproval) captureApproval(args); return approvedRows; },
   },
 });
 
@@ -130,6 +142,47 @@ testAsync("filters on recordedBy, transfer expenses only, within 24h", async () 
   assert.strictEqual(args.where.date.gte.getTime(), 1_000_000_000 - WINDOW_MS);
 });
 
+testAsync("owner-approved transfers are excluded from the cap", async () => {
+  // The cap measures UNSUPERVISED spend. An owner who personally approved a
+  // large payment did not thereby lock their staff out of routine small ones.
+  let args = null;
+  await staffSpendLast24h(
+    stubPrisma([], (a) => { args = a; }, [{ executedTransactionId: "txn-1" }, { executedTransactionId: "txn-2" }]),
+    "staff-1",
+  );
+  assert.deepStrictEqual(args.where.id, { notIn: ["txn-1", "txn-2"] });
+});
+
+testAsync("only EXECUTED approvals are excluded, and only this staff member's", async () => {
+  // A pending or rejected request must never reduce the measured spend — only
+  // money the owner actually let through. Scoped to the requester so one staff
+  // member's approval cannot raise another's ceiling.
+  let q = null;
+  await staffSpendLast24h(stubPrisma([], null, [], (a) => { q = a; }), "staff-1");
+  assert.strictEqual(q.where.status, "executed");
+  assert.strictEqual(q.where.requestedById, "staff-1");
+  assert.deepStrictEqual(q.where.executedTransactionId, { not: null });
+});
+
+testAsync("no approvals means no notIn clause at all", async () => {
+  // `notIn: []` is a legal but pointless filter; more importantly, a bug that
+  // produced `notIn: [undefined]` would silently drop rows.
+  let args = null;
+  await staffSpendLast24h(stubPrisma([], (a) => { args = a; }, []), "staff-1");
+  assert.strictEqual(args.where.id, undefined);
+});
+
+testAsync("an approval with a null transaction id does not corrupt the filter", async () => {
+  // If the post-execution update failed, executedTransactionId is null. That
+  // transfer must simply COUNT (refuse earlier), never become `notIn: [null]`.
+  let args = null;
+  await staffSpendLast24h(
+    stubPrisma([], (a) => { args = a; }, [{ executedTransactionId: null }]),
+    "staff-1",
+  );
+  assert.strictEqual(args.where.id, undefined);
+});
+
 testAsync("the window is rolling 24h, not a calendar day", async () => {
   // A calendar-day window would let a staff member spend the cap at 23:59 and
   // again at 00:01. Assert the boundary moves with `now`.
@@ -137,6 +190,74 @@ testAsync("the window is rolling 24h, not a calendar day", async () => {
   await staffSpendLast24h(stubPrisma([], (a) => { a1 = a; }), "s", 1000 * 60 * 60 * 24);
   await staffSpendLast24h(stubPrisma([], (a) => { a2 = a; }), "s", 1000 * 60 * 60 * 25);
   assert.notStrictEqual(a1.where.date.gte.getTime(), a2.where.date.gte.getTime());
+});
+
+// ── 2b. the expiry reaper ────────────────────────────────────────────
+console.log("\nexpireStaleRequests");
+
+const { expireStaleRequests, APPROVAL_TTL_MS } = require("../src/utils/staffTransferCap");
+
+const stubRequests = (rows) => {
+  const calls = { findMany: null, updateMany: null };
+  return {
+    calls,
+    prisma: {
+      staffTransferRequest: {
+        findMany: async (a) => { calls.findMany = a; return rows; },
+        updateMany: async (a) => { calls.updateMany = a; return { count: rows.length }; },
+      },
+    },
+  };
+};
+
+testAsync("sweeps only pending rows past their expiry", async () => {
+  const s = stubRequests([{ id: "r1", requestedById: "staff-1" }]);
+  await expireStaleRequests(s.prisma);
+  assert.strictEqual(s.calls.findMany.where.status, "pending");
+  assert.ok(s.calls.findMany.where.expiresAt.lte instanceof Date);
+});
+
+testAsync("never sweeps a row that is mid-approval", async () => {
+  // "approving" means an execution is in flight. Expiring it would leave money
+  // moved against a request marked expired.
+  const s = stubRequests([{ id: "r1", requestedById: "staff-1" }]);
+  await expireStaleRequests(s.prisma);
+  assert.notStrictEqual(s.calls.findMany.where.status, "approving");
+  // The write re-asserts the guard, so a row that changed state between the
+  // read and the write is left alone.
+  assert.strictEqual(s.calls.updateMany.where.status, "pending");
+});
+
+testAsync("does nothing, and writes nothing, when the queue is clean", async () => {
+  const s = stubRequests([]);
+  const n = await expireStaleRequests(s.prisma);
+  assert.strictEqual(n, 0);
+  assert.strictEqual(s.calls.updateMany, null, "must not issue an unbounded updateMany");
+});
+
+testAsync("notifies each requester exactly once", async () => {
+  const s = stubRequests([
+    { id: "r1", requestedById: "staff-1" },
+    { id: "r2", requestedById: "staff-2" },
+  ]);
+  const pushed = [];
+  await expireStaleRequests(s.prisma, { pushTo: async (id) => { pushed.push(id); } });
+  assert.deepStrictEqual(pushed, ["staff-1", "staff-2"]);
+});
+
+testAsync("a failing push cannot break the sweep", async () => {
+  const s = stubRequests([{ id: "r1", requestedById: "staff-1" }]);
+  const n = await expireStaleRequests(s.prisma, {
+    pushTo: async () => { throw new Error("expo down"); },
+  });
+  assert.strictEqual(n, 1);
+});
+
+test("the approval TTL is a day, not a week", () => {
+  // A stale approval executing days later, at a price the owner no longer
+  // intends, is worse than one that lapsed.
+  assert.ok(APPROVAL_TTL_MS <= 48 * 60 * 60 * 1000, "TTL must stay short");
+  assert.ok(APPROVAL_TTL_MS >= 60 * 60 * 1000, "TTL must give the owner a real chance to act");
 });
 
 // ── 3. the permission gate ───────────────────────────────────────────
@@ -226,6 +347,13 @@ test("a staff row with no employer resolves to itself, never to someone else", (
 
 // ── summary ──────────────────────────────────────────────────────────
 setTimeout(() => {
+  if (unhandled.length) {
+    console.log(`  FAIL  no unhandled promise rejections\n        ${unhandled.length}: ${unhandled[0]?.message}`);
+    failed++;
+  } else {
+    console.log("  PASS  no unhandled promise rejections");
+    passed++;
+  }
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exitCode = failed ? 1 : 0;
-}, 100);
+}, 200);

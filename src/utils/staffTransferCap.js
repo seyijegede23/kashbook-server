@@ -32,18 +32,49 @@ const { MONEY_OUT_SOURCES } = require("./amlChecks");
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// How long an owner has to act on a held transfer before it lapses. An approval
+// granted days later, at a price and for a reason the owner no longer holds in
+// mind, is worse than one that expired and had to be asked for again.
+const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+
 // How much this staff member has moved out in the trailing 24h, across every
 // business they act for. Employer-scoped for free: a staff account belongs to
 // exactly one employer, so every row bearing their recordedBy is that employer's.
+//
+// Transfers the OWNER personally approved are excluded. The cap measures
+// UNSUPERVISED spend — that is the whole thing it is for — and counting an
+// approved transfer against it would mean a single owner-authorised large
+// payment locks the staff member out of routine small ones for a day, which is
+// not what the owner agreed to when they tapped approve.
+//
+// Excluded by transaction id rather than by sniffing the reference string: the
+// Fincra path wraps the caller's reference (kb_tf_<biz>_<ref>) while the Anchor
+// path uses it verbatim, so any prefix test would silently stop matching for one
+// provider. If the id is ever missing the transfer simply counts, which refuses
+// earlier — the safe direction.
 async function staffSpendLast24h(prisma, actorId, now = Date.now()) {
   if (!actorId) return 0;
+  const since = new Date(now - WINDOW_MS);
+
+  const approved = await prisma.staffTransferRequest.findMany({
+    where: {
+      requestedById: actorId,
+      status: "executed",
+      executedTransactionId: { not: null },
+      decidedAt: { gte: since },
+    },
+    select: { executedTransactionId: true },
+  });
+  const approvedIds = approved.map((r) => r.executedTransactionId).filter(Boolean);
+
   const rows = await prisma.transaction.findMany({
     where: {
       recordedBy: actorId,
       type: "expense",
       category: "transfer",
       source: { in: MONEY_OUT_SOURCES },
-      date: { gte: new Date(now - WINDOW_MS) },
+      date: { gte: since },
+      ...(approvedIds.length ? { id: { notIn: approvedIds } } : {}),
     },
     select: { amount: true, fee: true },
   });
@@ -68,4 +99,47 @@ function decideStaffCap({ cap, spent, amount, fee = 0 }) {
   return { allowed, cap: capN, spent: spentN, cost, remaining };
 }
 
-module.exports = { staffSpendLast24h, decideStaffCap, WINDOW_MS };
+// Lapse held transfers the owner never acted on.
+//
+// The read paths already treat a past-expiry pending request as expired, so this
+// is bookkeeping rather than the enforcement itself — which is the right way
+// round: if the reaper stops running, nothing becomes approvable that shouldn't
+// be. It exists so the queue doesn't grow without bound and so the staff member
+// gets told, rather than watching a request sit "pending" forever.
+//
+// Only "pending" is swept. A row mid-approval is "approving", and expiring one
+// out from under an in-flight execution would leave money moved against a
+// request marked expired.
+async function expireStaleRequests(prisma, { pushTo } = {}) {
+  const now = new Date();
+  const stale = await prisma.staffTransferRequest.findMany({
+    where: { status: "pending", expiresAt: { lte: now } },
+    select: { id: true, requestedById: true, amount: true, currency: true },
+    take: 500,
+  });
+  if (!stale.length) return 0;
+
+  const { count } = await prisma.staffTransferRequest.updateMany({
+    where: { id: { in: stale.map((r) => r.id) }, status: "pending" },
+    data: { status: "expired", reason: "Expired without a decision", decidedAt: now },
+  });
+
+  if (pushTo) {
+    for (const r of stale) {
+      pushTo(
+        r.requestedById,
+        "Transfer request expired",
+        "The business owner didn't action it in time. Send it again if it's still needed.",
+      ).catch(() => {});
+    }
+  }
+  return count;
+}
+
+module.exports = {
+  staffSpendLast24h,
+  decideStaffCap,
+  expireStaleRequests,
+  WINDOW_MS,
+  APPROVAL_TTL_MS,
+};

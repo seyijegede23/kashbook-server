@@ -524,6 +524,24 @@ cron.schedule("*/10 * * * *", async () => {
   }
 });
 
+// ── Staff transfer approvals: lapse ones the owner never actioned (every 15m) ─
+// Enforcement does NOT depend on this: the approve route rejects a past-expiry
+// request on its own. This only stops the queue growing and tells the staff
+// member their request died, so a reaper outage can never make something
+// approvable that shouldn't be.
+cron.schedule("*/15 * * * *", async () => {
+  try {
+    await prisma.withCronLock(4012, async () => {
+      const { expireStaleRequests } = require("./src/utils/staffTransferCap");
+      const { pushTo } = require("./src/utils/pushNotification");
+      const n = await expireStaleRequests(prisma, { pushTo });
+      if (n) console.log(`[Cron] expired ${n} stale staff transfer request(s)`);
+    });
+  } catch (err) {
+    console.error("[Cron] staff transfer expiry error:", err);
+  }
+});
+
 // ── Observability: retention purge (daily 01:10) ─────────────────────────────
 cron.schedule("10 1 * * *", async () => {
   try {

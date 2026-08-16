@@ -209,6 +209,9 @@ model Business {
   waConversations   WaConversation[]
   kycSubmissions    KycSubmission[]
   foreignAccounts   ForeignAccount[]
+  // Virtual field only — no column is added to Business. The foreign key lives
+  // on StaffTransferRequest.
+  staffTransferRequests StaffTransferRequest[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -1015,7 +1018,9 @@ model StaffPermission {
   canViewReports    Boolean @default(false) // reports and insights
   canManagePayables Boolean @default(false) // add suppliers, record payments
 
-  // Autonomous spend ceiling per calendar day. null or 0 means every transfer
+  // Autonomous spend ceiling over a ROLLING 24 hours (not a calendar day — a
+  // midnight reset would let a staff member spend the cap twice inside two
+  // minutes; see utils/staffTransferCap.js). null or 0 means every transfer
   // needs the owner's approval. There is deliberately NO "unlimited" value:
   // uncapped staff spending is not a state this system should be able to express.
   dailyTransferCap Float?
@@ -1025,6 +1030,71 @@ model StaffPermission {
   updatedAt   DateTime @updatedAt
 
   @@index([employerId])
+}
+
+// A staff transfer that exceeded the staff member's daily cap and is waiting on
+// the owner. This is deliberately NOT a Transaction row with complianceStatus
+// "held": computeRawLedger (utils/ledgerBalance.js) sums Transaction filtered on
+// businessId/paymentMethod/currency/source/type/category and does NOT filter on
+// complianceStatus, so a pending transfer parked there would immediately reduce
+// the spendable balance for money that never left, and could trip the
+// pooled-wallet coverage alarm in alerts.js. Money that has not moved does not
+// belong in the ledger.
+model StaffTransferRequest {
+  id            String   @id @default(uuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  requestedById String // the STAFF User.id
+  ownerId       String // denormalised, so the owner's pending list is one indexed read
+
+  // Frozen copy of the transfer as requested. Deliberately a snapshot, not a
+  // reference: what the owner approves must be exactly what was asked for, even
+  // if the beneficiary record is edited in between.
+  accountNumber String
+  bankCode      String
+  bankName      String?
+  accountName   String?
+  amount        Float
+  narration     String?
+  currency      String  @default("NGN")
+
+  // pending → approved → executed, or pending → rejected | cancelled | expired,
+  // or approved → failed (the provider refused after the owner said yes).
+  // Terminal states are never revisited. Claimed atomically with an updateMany
+  // guarded on the previous status, so a double-tap cannot execute twice.
+  status String @default("pending")
+  reason String? // why it was held, or the rejection reason the staff member sees
+
+  // Minted at request time and carried through to execution, so approving twice
+  // hits the executor's existing-reference short-circuit rather than sending
+  // twice. Unique across the table as a second line of defence.
+  idempotencyKey String @unique
+
+  // The cap this was measured against, kept for the audit trail: the owner may
+  // change the cap after the fact and the record should still explain itself.
+  capAtRequest   Float?
+  spentAtRequest Float?
+
+  decidedById           String? // the owner who approved or rejected
+  decidedAt             DateTime?
+  executedTransactionId String? // set on success; the daily-cap query excludes
+  //                               these, because money the owner personally
+  //                               approved was not unsupervised spend
+  executedReference     String?
+  failureReason         String?
+
+  // Approvals go stale. A transfer the owner authorises days later, at a price
+  // and for a reason they no longer hold in mind, is worse than one that lapsed
+  // and had to be asked for again.
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId, status])
+  @@index([businessId, status])
+  @@index([requestedById, status])
+  @@index([status, expiresAt])
 }
 
 model ComplianceFlag {
