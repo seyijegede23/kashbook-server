@@ -455,6 +455,16 @@ model DebtPayment {
   amount Float
   note   String   @default("")
   date   DateTime @default(now())
+  // The bank credit that created this payment, when it came from matching an
+  // incoming transfer to the customer's debt; null for manually recorded
+  // payments. This is what lets UNMATCH reverse exactly the payments one credit
+  // created and nothing else — without it, unmatching had to either leave the
+  // money applied (the old bug) or guess by note text. Deliberately a bare
+  // scalar, no @relation: a Transaction can be deleted with its business while
+  // the payment history survives, and an FK would forbid that.
+  transactionId String?
+
+  @@index([transactionId])
 }
 
 model Payable {
