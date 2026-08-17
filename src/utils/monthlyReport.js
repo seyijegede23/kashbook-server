@@ -76,7 +76,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "income", matchedSaleId: null, date: dateThis },
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: dateThis },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -93,7 +93,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "income", matchedSaleId: null, date: datePrev },
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: datePrev },
       _sum: { amount: true },
     }),
     prisma.expense.groupBy({

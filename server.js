@@ -293,6 +293,7 @@ app.use("/recurring-expenses", apiLimiter);
 app.use("/recurring-invoices", apiLimiter);
 app.use("/insights", apiLimiter);
 app.use("/sync", apiLimiter);
+app.use("/transactions", apiLimiter);
 app.use("/instagram", apiLimiter);
 app.use("/whatsapp", apiLimiter);
 app.use("/admin-api", authLimiter);
@@ -318,6 +319,9 @@ app.use("/recurring-expenses", recurringExpenseRoutes);
 app.use("/recurring-invoices", recurringInvoiceRoutes);
 app.use("/insights", insightsRoutes);
 app.use("/sync", syncRoutes);
+// Bank-ledger reads + credit matching (match / create-sale / match-debt / unmatch).
+// Unmounted for months while the app called it — matching silently 404ed.
+app.use("/transactions", require("./src/routes/transactions"));
 app.use("/instagram", instagramRoutes);
 app.use("/whatsapp", whatsappRoutes);
 

@@ -13,7 +13,8 @@
  * DATA MODEL NOTE: manual bookkeeping lives in Sales (income) and Expense
  * (money out); the Transaction table holds bank/NUBAN movement only. Totals
  * therefore merge both sides, excluding bank credits already matched to a
- * recorded sale (Transaction.matchedSaleId) so a paid sale isn't counted twice.
+ * recorded sale (matchedSaleId) OR applied to a customer's debt (matchedCustomerId)
+ * so repaid credit isn't counted twice either.
  * This mirrors the Dashboard's Sales+Expense+Transaction merge.
  *
  * Exports: answerQuestion(), generateInsightCards(), SUGGESTIONS, and the pure
@@ -654,7 +655,7 @@ function parseQuestion(question, context = null, now = new Date()) {
 
 // ── Query layer ──────────────────────────────────────────────────────────────
 // Manual bookkeeping lives in Sales/Expense; Transaction holds bank movement.
-// Income = all Sales + bank credits NOT matched to a sale (matchedSaleId null,
+// Income = all Sales + bank credits NOT matched to a sale or a debt (both ids null,
 // so a recorded sale that was paid by transfer isn't double-counted).
 async function sumIncome(businessId, range, channel) {
   const date = { gte: range.start, lt: range.end };
@@ -665,7 +666,7 @@ async function sumIncome(businessId, range, channel) {
       _count: { _all: true },
     }),
     prisma.transaction.aggregate({
-      where: { businessId, type: "income", date, matchedSaleId: null, ...(channel ? { channel } : {}) },
+      where: { businessId, type: "income", date, matchedSaleId: null, matchedCustomerId: null, ...(channel ? { channel } : {}) },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -890,7 +891,7 @@ const HANDLERS = {
       }),
       prisma.transaction.groupBy({
         by: ["channel"],
-        where: { businessId: business.id, type: "income", matchedSaleId: null, date },
+        where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, date },
         _sum: { amount: true },
       }),
     ]);
@@ -991,7 +992,7 @@ const HANDLERS = {
         UNION ALL
         SELECT "date", amount FROM "Transaction"
         WHERE "businessId" = ${business.id} AND type = 'income'
-          AND "matchedSaleId" IS NULL AND "date" >= ${r.start} AND "date" < ${r.end}
+          AND "matchedSaleId" IS NULL AND "matchedCustomerId" IS NULL AND "date" >= ${r.start} AND "date" < ${r.end}
       ) t
       GROUP BY 1
     `;
@@ -1302,7 +1303,7 @@ async function generateInsightCards(business) {
     }),
     prisma.transaction.groupBy({
       by: ["channel"],
-      where: { businessId: business.id, type: "income", matchedSaleId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end } },
+      where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end } },
       _sum: { amount: true },
     }),
   ]);
@@ -1378,4 +1379,7 @@ module.exports = {
   findInventoryCandidates,
   parseUpdateCommand,
   parseCreateCommand,
+  // the income aggregate itself, so the match e2e can assert the exclusion
+  // rule (a matched credit counts ONCE) against the real query, not a copy
+  sumIncome,
 };
