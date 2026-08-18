@@ -269,16 +269,48 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
   }
 });
 
-// POST /transactions/:id/create-sale  { description?, channel?, customerId? }
+// Resolve the amount a record created FROM a transfer may carry.
+//
+// The transfer is the ceiling, never the floor: the owner composes the sale or
+// expense in the full Add form (items, quantities, category) and the total may
+// come out BELOW the transfer — a ₦5,000 credit paying for ₦4,500 of goods is
+// real life. It may never come out above, because the record is matched to this
+// transfer and the excess would be income/expense that no money ever backed.
+// Omitted → the whole transfer amount (what old clients send). The half-kobo
+// epsilon absorbs float noise from a client computing price × quantity.
+function resolveCappedAmount(body, tx) {
+  const cap = Number(tx.amount);
+  if (body.amount === undefined || body.amount === null || body.amount === "") {
+    return { amount: cap, remainder: 0 };
+  }
+  const n = Number(body.amount);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw matchError(400, "INVALID_AMOUNT", "Enter a valid amount.");
+  }
+  if (n > cap + 0.005) {
+    throw matchError(400, "AMOUNT_EXCEEDS_TRANSFER",
+      `The amount can't be more than the transfer (${cap}).`);
+  }
+  const amount = Math.round(Math.min(n, cap) * 100) / 100;
+  return { amount, remainder: Math.round((cap - amount) * 100) / 100 };
+}
+
+// Free-text length caps. These routes bypass the validateSale/validateExpense
+// chains, so without this the description field is unbounded.
+const clampText = (s, max) => (typeof s === "string" ? s.trim().slice(0, max) : "");
+
+// POST /transactions/:id/create-sale  { amount?, description?, channel?, customerId? }
 // The transfer IS the sale — record it in one step, already matched, so the
-// income is counted exactly once. Amount and date come from the credit, never
-// the client: a sale representing this transfer at a different amount would
-// re-open the double-count this feature exists to close.
+// income is counted exactly once. The DATE always comes from the credit (same
+// reporting period as the money); the AMOUNT may be composed in the full Add
+// form but is capped at the transfer (see resolveCappedAmount).
 router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req, res) => {
-  const { description, channel, customerId } = req.body || {};
+  const { channel, customerId } = req.body || {};
+  const description = clampText((req.body || {}).description, 500);
   try {
     const pre = await loadMatchableCredit(req, res);
     if (!pre) return;
+    const { amount, remainder } = resolveCappedAmount(req.body || {}, pre);
 
     if (customerId) {
       const customer = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -297,10 +329,10 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
             userId: getTargetUserId(req),
             businessId: tx.businessId,
             customerId: customerId || null,
-            amount: Number(tx.amount),
+            amount,
             paymentMethod: "transfer",
             isCredit: false,
-            notes: (description || "").trim() || tx.description || "Bank transfer",
+            notes: description || tx.description || "Bank transfer",
             channel: normalizeChannel(channel),
             // The transfer's date, so the sale lands in the same reporting
             // period as the money.
@@ -319,11 +351,85 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
 
     audit({
       req, action: "TX_MATCH_CREATE_SALE", resourceType: "transaction", resourceId: pre.id,
-      metadata: { saleId: result.sale.id, amount: Number(pre.amount) },
+      metadata: { saleId: result.sale.id, amount, remainder },
     }).catch(() => {});
-    res.status(201).json(result);
+    res.status(201).json({ ...result, remainder });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to create sale from transfer");
+  }
+});
+
+// Gate for the EXPENSE mirror: the debit being recorded must exist, be owned,
+// be OUTGOING, and not already carry an expense.
+async function loadMatchableDebit(req, res) {
+  const tx = await prisma.transaction.findUnique({ where: { id: req.params.id } });
+  if (!tx) {
+    res.status(404).json({ error: "Transaction not found" });
+    return null;
+  }
+  if (!(await ownsBusiness(req, tx.businessId))) {
+    res.status(403).json({ error: "Forbidden" });
+    return null;
+  }
+  if (tx.type !== "expense") {
+    res.status(400).json({ error: "Recording an expense is only for outgoing transfers.", code: "NOT_OUTGOING" });
+    return null;
+  }
+  if (tx.matchedExpenseId) {
+    res.status(409).json({ error: "This transfer is already recorded as an expense. Unmatch it first.", code: "ALREADY_MATCHED" });
+    return null;
+  }
+  return tx;
+}
+
+// POST /transactions/:id/create-expense  { amount?, description?, category? }
+// The outbound mirror: tap a transfer you SENT and record what it paid for.
+// Same cap rule, same lock + in-lock re-check, same exclusion consequence —
+// the bank debit stops counting in expense aggregates because the categorised
+// Expense row now carries that money.
+router.post("/:id/create-expense", requirePermission("canViewBalance"), async (req, res) => {
+  const description = clampText((req.body || {}).description, 500);
+  const category = clampText((req.body || {}).category, 40).toLowerCase() || "other";
+  try {
+    const pre = await loadMatchableDebit(req, res);
+    if (!pre) return;
+    const { amount, remainder } = resolveCappedAmount(req.body || {}, pre);
+
+    const result = await prisma.withBusinessLock(pre.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        if (tx.matchedExpenseId)
+          throw matchError(409, "ALREADY_MATCHED", "This transfer is already recorded as an expense.");
+
+        const expense = await px.expense.create({
+          data: {
+            userId: getTargetUserId(req),
+            businessId: tx.businessId,
+            category,
+            amount,
+            // "transfer", NOT "bank": paymentMethod "bank" + category "transfer"
+            // is the isBankLedgerRow signature, and a bookkeeping Expense must
+            // never read as a bank movement.
+            paymentMethod: "transfer",
+            notes: description || tx.description || "Bank transfer",
+            date: tx.date,
+            matchedTransactionId: tx.id,
+          },
+        });
+        const updatedTx = await px.transaction.update({
+          where: { id: tx.id }, data: { matchedExpenseId: expense.id },
+        });
+        return { expense, transaction: updatedTx };
+      }),
+    );
+
+    audit({
+      req, action: "TX_MATCH_CREATE_EXPENSE", resourceType: "transaction", resourceId: pre.id,
+      metadata: { expenseId: result.expense.id, amount, remainder, category },
+    }).catch(() => {});
+    res.status(201).json({ ...result, remainder });
+  } catch (err) {
+    respondMatchFailure(res, err, "Failed to record expense from transfer");
   }
 });
 
@@ -416,18 +522,33 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
 // re-introduces the double count.
 router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res) => {
   const deleteSale = req.query.deleteSale === "true";
+  const deleteExpense = req.query.deleteExpense === "true";
   try {
     const tx0 = await prisma.transaction.findUnique({ where: { id: req.params.id } });
     if (!tx0) return res.status(404).json({ error: "Transaction not found" });
     if (!(await ownsBusiness(req, tx0.businessId)))
       return res.status(403).json({ error: "Forbidden" });
-    if (!tx0.matchedSaleId && !tx0.matchedCustomerId)
+    if (!tx0.matchedSaleId && !tx0.matchedCustomerId && !tx0.matchedExpenseId)
       return res.json({ matched: false }); // idempotent no-op
 
     const result = await prisma.withBusinessLock(tx0.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
-        const out = { saleDeleted: false, customer: null };
+        const out = { saleDeleted: false, expenseDeleted: false, customer: null };
+
+        // Expense mirror of the sale branch below: unlink keeps the Expense as
+        // its own record (it goes back to counting, and so does the bank debit
+        // — the user asked to separate them); deleteExpense removes it, the
+        // undo for create-expense.
+        if (tx.matchedExpenseId) {
+          const expense = await px.expense.findUnique({ where: { id: tx.matchedExpenseId } });
+          if (expense && deleteExpense) {
+            await px.expense.delete({ where: { id: expense.id } });
+            out.expenseDeleted = true;
+          } else if (expense) {
+            await px.expense.update({ where: { id: expense.id }, data: { matchedTransactionId: null } });
+          }
+        }
 
         if (tx.matchedSaleId) {
           const sale = await px.sales.findUnique({ where: { id: tx.matchedSaleId } });
@@ -463,7 +584,8 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
         }
 
         out.transaction = await px.transaction.update({
-          where: { id: tx.id }, data: { matchedSaleId: null, matchedCustomerId: null },
+          where: { id: tx.id },
+          data: { matchedSaleId: null, matchedCustomerId: null, matchedExpenseId: null },
         });
         return out;
       }),
@@ -471,7 +593,11 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
 
     audit({
       req, action: "TX_UNMATCH", resourceType: "transaction", resourceId: tx0.id,
-      metadata: { hadSale: !!tx0.matchedSaleId, hadCustomer: !!tx0.matchedCustomerId, saleDeleted: result.saleDeleted },
+      metadata: {
+        hadSale: !!tx0.matchedSaleId, hadCustomer: !!tx0.matchedCustomerId,
+        hadExpense: !!tx0.matchedExpenseId,
+        saleDeleted: result.saleDeleted, expenseDeleted: result.expenseDeleted,
+      },
     }).catch(() => {});
     res.json({ matched: false, ...result });
   } catch (err) {

@@ -13,8 +13,9 @@
  * DATA MODEL NOTE: manual bookkeeping lives in Sales (income) and Expense
  * (money out); the Transaction table holds bank/NUBAN movement only. Totals
  * therefore merge both sides, excluding bank credits already matched to a
- * recorded sale (matchedSaleId) OR applied to a customer's debt (matchedCustomerId)
- * so repaid credit isn't counted twice either.
+ * recorded sale (matchedSaleId) OR applied to a customer's debt (matchedCustomerId),
+ * and bank debits already recorded as an Expense (matchedExpenseId) — each sum
+ * counts every unit of money exactly once.
  * This mirrors the Dashboard's Sales+Expense+Transaction merge.
  *
  * Exports: answerQuestion(), generateInsightCards(), SUGGESTIONS, and the pure
@@ -683,7 +684,7 @@ async function sumExpenses(businessId, range) {
   const [exp, bank] = await Promise.all([
     prisma.expense.aggregate({ where: { businessId, date }, _sum: { amount: true }, _count: { _all: true } }),
     prisma.transaction.aggregate({
-      where: { businessId, type: "expense", date },
+      where: { businessId, type: "expense", matchedExpenseId: null, date },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -755,7 +756,7 @@ const HANDLERS = {
       }),
       prisma.transaction.groupBy({
         by: ["category"],
-        where: { businessId: business.id, type: "expense", date },
+        where: { businessId: business.id, type: "expense", matchedExpenseId: null, date },
         _sum: { amount: true },
       }),
     ]);
@@ -1283,7 +1284,7 @@ async function generateInsightCards(business) {
     }),
     prisma.transaction.groupBy({
       by: ["category"],
-      where: { businessId: business.id, type: "expense", date: { gte: thisMonth.start, lt: thisMonth.end } },
+      where: { businessId: business.id, type: "expense", matchedExpenseId: null, date: { gte: thisMonth.start, lt: thisMonth.end } },
       _sum: { amount: true },
     }),
     prisma.$queryRaw`
@@ -1379,7 +1380,8 @@ module.exports = {
   findInventoryCandidates,
   parseUpdateCommand,
   parseCreateCommand,
-  // the income aggregate itself, so the match e2e can assert the exclusion
-  // rule (a matched credit counts ONCE) against the real query, not a copy
+  // the aggregates themselves, so the match e2e asserts the exclusion rules
+  // (a matched credit or debit counts ONCE) against the real query, not a copy
   sumIncome,
+  sumExpenses,
 };
