@@ -33,7 +33,7 @@ const bcrypt = require("@node-rs/bcrypt");
 
 const prisma = require("../src/utils/db");
 const { signToken } = require("../src/utils/jwt");
-const { sumIncome } = require("../src/utils/insightsEngine");
+const { sumIncome, sumExpenses } = require("../src/utils/insightsEngine");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -103,6 +103,7 @@ async function wipe() {
   await prisma.debt.deleteMany({ where: { customer: { userId: "me2e_owner" } } }).catch(() => {});
   await prisma.customer.deleteMany({ where: { userId: "me2e_owner" } }).catch(() => {});
   await prisma.sales.deleteMany({ where: { businessId: "me2e_biz" } }).catch(() => {});
+  await prisma.expense.deleteMany({ where: { businessId: "me2e_biz" } }).catch(() => {});
   await prisma.transaction.deleteMany({ where: { businessId: "me2e_biz" } }).catch(() => {});
   await prisma.auditLog.deleteMany({ where: { actorId: { in: ids } } }).catch(() => {});
   await prisma.staffPermission.deleteMany({ where: { userId: { in: ids } } }).catch(() => {});
@@ -363,6 +364,120 @@ async function wipe() {
     const r = await DEL(`/transactions/${c7.id}/match`, tOwner);
     assert.strictEqual(r.status, 200);
     assert.strictEqual(r.body.matched, false);
+  });
+
+  // ══ 6b. COMPOSED AMOUNTS — the transfer is a CEILING ═══════════════════
+  section("6b. capped amounts");
+  const expenses = async () => (await sumExpenses(biz.id, RANGE)).total;
+  const debit = (amount, over = {}) =>
+    credit(amount, { type: "expense", description: `Transfer to TEST PAYEE · Ref: y${seq}`, ...over });
+
+  await test("create-sale BELOW the transfer is allowed and reports the remainder", async () => {
+    const c9 = await credit(5000);
+    const before = await income();
+    const r = await POST(`/transactions/${c9.id}/create-sale`, tOwner, { amount: 4500, description: "goods" });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.body));
+    assert.strictEqual(Number(r.body.sale.amount), 4500);
+    assert.strictEqual(r.body.remainder, 500);
+    // Sale (4500) in, credit (5000) out: totals move DOWN by the remainder —
+    // the honest direction; the 500 was never backed by a recorded sale.
+    assert.strictEqual(before - (await income()), 500);
+    await DEL(`/transactions/${c9.id}/match?deleteSale=true`, tOwner);
+  });
+  await test("create-sale ABOVE the transfer: 400, nothing written", async () => {
+    const c10 = await credit(3000);
+    const salesBefore = await prisma.sales.count({ where: { businessId: biz.id } });
+    const r = await POST(`/transactions/${c10.id}/create-sale`, tOwner, { amount: 3000.01 });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.body.code, "AMOUNT_EXCEEDS_TRANSFER");
+    assert.strictEqual(await prisma.sales.count({ where: { businessId: biz.id } }), salesBefore);
+    const tx = await prisma.transaction.findUnique({ where: { id: c10.id } });
+    assert.strictEqual(tx.matchedSaleId, null, "a refused create must not leave a half-match");
+  });
+  await test("float noise from price × quantity does not trip the cap", async () => {
+    // 3 × 1666.67 = 5000.009999... in IEEE754; the epsilon must absorb it.
+    const c11 = await credit(5000.01);
+    const r = await POST(`/transactions/${c11.id}/create-sale`, tOwner, { amount: 3 * 1666.67 });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.body));
+    await DEL(`/transactions/${c11.id}/match?deleteSale=true`, tOwner);
+  });
+
+  // ══ 6c. THE EXPENSE MIRROR ═════════════════════════════════════════════
+  section("6c. record an outbound transfer as an expense");
+
+  await test("create-expense on an INCOME row: 400 NOT_OUTGOING", async () => {
+    const cI = await credit(700);
+    const r = await POST(`/transactions/${cI.id}/create-expense`, tOwner, {});
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(r.body.code, "NOT_OUTGOING");
+  });
+  await test("staff without canViewBalance: 403 on create-expense", async () => {
+    const d0 = await debit(700);
+    assert.strictEqual((await POST(`/transactions/${d0.id}/create-expense`, tStaffNo, {})).status, 403);
+  });
+
+  let dMain, expMain;
+  await test("recording the debit counts the expense ONCE (bank leg excluded)", async () => {
+    dMain = await debit(6000);
+    const before = await expenses(); // includes the 6000 bank debit
+    const r = await POST(`/transactions/${dMain.id}/create-expense`, tOwner, {
+      amount: 6000, description: "shop rent", category: "Rent",
+    });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.body));
+    expMain = r.body.expense;
+    assert.strictEqual(expMain.category, "rent", "category is lowercased");
+    assert.strictEqual(expMain.paymentMethod, "transfer", "'bank' would read as a bank movement");
+    assert.strictEqual(r.body.transaction.matchedExpenseId, expMain.id);
+    // Expense row (+6000) in, bank debit (−6000 excluded): total unchanged.
+    assert.strictEqual(await expenses(), before,
+      "recording a transfer as an expense must not change the expense total");
+  });
+  await test("recording it AGAIN: 409, sequentially and in a race", async () => {
+    assert.strictEqual((await POST(`/transactions/${dMain.id}/create-expense`, tOwner, {})).status, 409);
+    const dR = await debit(800);
+    const [a, b] = await Promise.all([
+      POST(`/transactions/${dR.id}/create-expense`, tOwner, {}),
+      POST(`/transactions/${dR.id}/create-expense`, tOwner, {}),
+    ]);
+    assert.deepStrictEqual([a.status, b.status].sort(), [201, 409], "exactly one may land");
+    assert.strictEqual(
+      await prisma.expense.count({ where: { matchedTransactionId: dR.id } }), 1,
+      "the race must produce exactly ONE expense row",
+    );
+    await DEL(`/transactions/${dR.id}/match?deleteExpense=true`, tOwner);
+  });
+  await test("create-expense below the cap allowed; above refused", async () => {
+    const d2 = await debit(2000);
+    const over = await POST(`/transactions/${d2.id}/create-expense`, tOwner, { amount: 2500 });
+    assert.strictEqual(over.status, 400);
+    assert.strictEqual(over.body.code, "AMOUNT_EXCEEDS_TRANSFER");
+    const under = await POST(`/transactions/${d2.id}/create-expense`, tOwner, { amount: 1500 });
+    assert.strictEqual(under.status, 201);
+    assert.strictEqual(under.body.remainder, 500);
+    await DEL(`/transactions/${d2.id}/match?deleteExpense=true`, tOwner);
+  });
+  await test("unmatch with deleteExpense removes the record (the undo)", async () => {
+    const before = await expenses();
+    const r = await DEL(`/transactions/${dMain.id}/match?deleteExpense=true`, tOwner);
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.expenseDeleted, true);
+    assert.strictEqual(await prisma.expense.findUnique({ where: { id: expMain.id } }), null);
+    assert.strictEqual(await expenses(), before,
+      "expense gone, bank debit back in: total must be unchanged");
+  });
+  await test("plain unmatch keeps the expense as its own record", async () => {
+    const d3 = await debit(900);
+    const r = await POST(`/transactions/${d3.id}/create-expense`, tOwner, { category: "supplies" });
+    assert.strictEqual(r.status, 201);
+    const u = await DEL(`/transactions/${d3.id}/match`, tOwner);
+    assert.strictEqual(u.status, 200);
+    assert.strictEqual(u.body.expenseDeleted, false);
+    const exp = await prisma.expense.findUnique({ where: { id: r.body.expense.id } });
+    assert.ok(exp, "the expense must survive a plain unlink");
+    assert.strictEqual(exp.matchedTransactionId, null);
+    const tx = await prisma.transaction.findUnique({ where: { id: d3.id } });
+    assert.strictEqual(tx.matchedExpenseId, null);
+    await prisma.expense.delete({ where: { id: exp.id } }); // tidy for later sums
   });
 
   // ══ 7. TENANCY ═════════════════════════════════════════════════════════
