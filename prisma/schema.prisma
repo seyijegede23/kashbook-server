@@ -556,6 +556,11 @@ model Expense {
   paymentMethod String    @default("cash")
   date          DateTime  @default(now())
   notes         String?
+  // The outbound bank transfer this expense records, when it was created from
+  // one ("tap a transfer you sent → record it as an expense"). Mirrors
+  // Sales.matchedTransactionId: bare scalar, no FK, no unique — the code guards
+  // one-expense-per-transfer under the business lock.
+  matchedTransactionId String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -578,6 +583,10 @@ model Transaction {
   paymentMethod     String    @default("cash")
   matchedSaleId     String?
   matchedCustomerId String?
+  // Expense mirror of matchedSaleId, for OUTBOUND transfers: the Expense row
+  // recorded from this debit. Expense aggregates exclude debits carrying this,
+  // exactly as income aggregates exclude matched credits.
+  matchedExpenseId  String?
   recordedBy        String?
   recordedByName    String?
   userId            String?
