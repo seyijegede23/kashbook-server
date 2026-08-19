@@ -56,6 +56,23 @@ function resolvePermissions(user) {
   };
 }
 
+// Staff feature access follows the EMPLOYER's subscription — their own row
+// stays FREE forever. Every payload that hands the client a user must carry
+// the plan the app should gate with, or staff paywalls never unlock
+// (authMiddleware resolves the same value for API-side gates as
+// req.user.effectivePlan).
+async function attachEffectivePlan(user) {
+  user.effectivePlan = user.plan ?? "FREE";
+  if (String(user.accountType).toUpperCase() === "STAFF" && user.employerId) {
+    const employer = await prisma.user.findUnique({
+      where: { id: user.employerId },
+      select: { plan: true },
+    });
+    user.effectivePlan = employer?.plan ?? "FREE";
+  }
+  return user;
+}
+
 // Any endpoint that hands back a whole user object must hand back a COMPLETE
 // one. AppContext applies these with `setUser(updatedUser)` — a wholesale
 // replace, not a merge — so a payload missing `permissions` doesn't leave the
@@ -101,6 +118,7 @@ function userResponse(user, token) {
       email:        user.email,
       phone:        user.phone,
       plan:         user.plan,
+      effectivePlan: user.effectivePlan ?? user.plan,
       role:         user.role,
       accountType:  user.accountType.toLowerCase(),
       employerId:   user.employerId ?? null,
@@ -375,6 +393,7 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
     });
 
     const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion ?? 0 });
+    await attachEffectivePlan(user);
     res.json(userResponse(user, token));
   } catch (err) {
     console.error(err);
@@ -460,6 +479,7 @@ router.post("/verify-otp", async (req, res) => {
     }
     await ensurePrimaryBusiness(user.id, user.businessName || "My Business");
     const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion ?? 0 });
+    await attachEffectivePlan(user);
     res.json(userResponse(user, token));
   } catch (err) {
     console.error(err);
@@ -538,6 +558,8 @@ router.get("/me", authMiddleware, async (req, res) => {
         ...safe,
         permissions,
         dailyTransferCap,
+        // Already resolved by authMiddleware for this request — no extra query.
+        effectivePlan: req.user.effectivePlan ?? user.plan,
         hasTransactionPin: !!user.transactionPin,
         accountType: safe.accountType.toLowerCase(),
         settings: {
@@ -826,6 +848,7 @@ router.patch("/profile", authMiddleware, async (req, res) => {
       data,
       include: { staffPermission: true },
     });
+    await attachEffectivePlan(user);
     res.json({ user: safeUser(user) });
   } catch (err) {
     console.error(err);
@@ -906,6 +929,7 @@ router.patch("/settings", authMiddleware, async (req, res) => {
       data,
       include: { staffPermission: true },
     });
+    await attachEffectivePlan(user);
     res.json({ user: safeUser(user) });
   } catch (err) {
     console.error(err);
@@ -986,6 +1010,7 @@ router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
     const user = await prisma.user.update({
       where: { id: req.user.id },
       data: { email, tokenVersion: { increment: 1 } },
+      include: { staffPermission: true },
     });
     // Tell the OLD address, so an unauthorised change is visible to the real owner.
     if (before?.email && before.email !== email) {
@@ -997,8 +1022,11 @@ router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
       ).catch((e) => console.warn("[email-change] old-address notice failed:", e.message));
     }
     const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion });
-    const { password: _, ...safe } = user;
-    res.json({ user: safe, token });
+    // safeUser, not a raw spread: the client replaces its user wholesale, so a
+    // payload without permissions/effectivePlan would strip a staff member's
+    // grants and Pro access until the next /auth/me poll.
+    await attachEffectivePlan(user);
+    res.json({ user: safeUser(user), token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update email" });
@@ -1064,10 +1092,12 @@ router.patch("/confirm-phone-change", authMiddleware, async (req, res) => {
     const user = await prisma.user.update({
       where: { id: req.user.id },
       data: { phone, tokenVersion: { increment: 1 } }, // revoke sessions on identifier change
+      include: { staffPermission: true },
     });
     const token = signToken({ userId: user.id, tokenVersion: user.tokenVersion });
-    const { password: _, ...safe } = user;
-    res.json({ user: safe, token });
+    // Same rule as the email change above: complete payload or grants collapse.
+    await attachEffectivePlan(user);
+    res.json({ user: safeUser(user), token });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update phone number" });
