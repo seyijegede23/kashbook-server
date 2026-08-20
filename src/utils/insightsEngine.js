@@ -660,7 +660,7 @@ function parseQuestion(question, context = null, now = new Date()) {
 // so a recorded sale that was paid by transfer isn't double-counted).
 async function sumIncome(businessId, range, channel) {
   const date = { gte: range.start, lt: range.end };
-  const [sales, bank] = await Promise.all([
+  const [sales, bank, remainder] = await Promise.all([
     prisma.sales.aggregate({
       where: { businessId, date, ...(channel ? { channel } : {}) },
       _sum: { amount: true },
@@ -671,9 +671,10 @@ async function sumIncome(businessId, range, channel) {
       _sum: { amount: true },
       _count: { _all: true },
     }),
+    sumMatchedRemainder(businessId, "income", date, channel),
   ]);
   return {
-    total: Number(sales._sum.amount || 0) + Number(bank._sum.amount || 0),
+    total: Number(sales._sum.amount || 0) + Number(bank._sum.amount || 0) + remainder,
     count: sales._count._all + bank._count._all,
   };
 }
@@ -681,18 +682,41 @@ async function sumIncome(businessId, range, channel) {
 // Expenses = recorded Expense rows + bank money-out (transfers, bills).
 async function sumExpenses(businessId, range) {
   const date = { gte: range.start, lt: range.end };
-  const [exp, bank] = await Promise.all([
+  const [exp, bank, remainder] = await Promise.all([
     prisma.expense.aggregate({ where: { businessId, date }, _sum: { amount: true }, _count: { _all: true } }),
     prisma.transaction.aggregate({
       where: { businessId, type: "expense", matchedExpenseId: null, date },
       _sum: { amount: true },
       _count: { _all: true },
     }),
+    sumMatchedRemainder(businessId, "expense", date),
   ]);
   return {
-    total: Number(exp._sum.amount || 0) + Number(bank._sum.amount || 0),
+    total: Number(exp._sum.amount || 0) + Number(bank._sum.amount || 0) + remainder,
     count: exp._count._all + bank._count._all,
   };
+}
+
+// Partial matches: a matched bank row is excluded from the sums above because
+// the Sales/Expense/DebtPayment rows carry that money — but when the match
+// accounted for LESS than the row (a ₦5,000 credit that paid a ₦3,000 debt),
+// the unmatched remainder is still real money and must stay in the totals.
+// Rows matched before matchedAmount existed carry NULL = treated as fully
+// matched, which is exactly the old behavior.
+async function sumMatchedRemainder(businessId, type, date, channel) {
+  const agg = await prisma.transaction.aggregate({
+    where: {
+      businessId, type, date,
+      matchedAmount: { not: null },
+      ...(type === "income"
+        ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }] }
+        : { matchedExpenseId: { not: null } }),
+      ...(channel ? { channel } : {}),
+    },
+    _sum: { amount: true, matchedAmount: true },
+  });
+  const rem = Number(agg._sum.amount || 0) - Number(agg._sum.matchedAmount || 0);
+  return rem > 0 ? Math.round(rem * 100) / 100 : 0;
 }
 
 // Merge {key → amount} maps from several groupBy sweeps.

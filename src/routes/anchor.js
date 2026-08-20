@@ -721,6 +721,9 @@ router.post("/", async (req, res) => {
             where: { id: twin.id },
             data: {
               description,
+              senderName: sender?.name || null,
+              senderBank: sender?.bank || null,
+              senderAccount: sender?.accountNumber || null,
               ...(reference ? { reference } : {}),
               // Keep the provider id the poller saw; fall back to the payment id.
               providerTxnId:
@@ -764,6 +767,11 @@ router.post("/", async (req, res) => {
               : new Date(),
             source: "anchor",
             currency: biz.baseCurrency || "NGN",
+            // Structured counterparty — what match ranking and sender-recall
+            // key on (the description only carries it as flattened text).
+            senderName: sender?.name || null,
+            senderBank: sender?.bank || null,
+            senderAccount: sender?.accountNumber || null,
             ...(reference ? { reference } : {}),
             ...(paymentKey ? { providerTxnId: paymentKey } : {}),
           },
@@ -786,9 +794,14 @@ router.post("/", async (req, res) => {
       });
       await pushTo(biz.userId, title, body);
 
-      // Auto-confirm a matching Instagram/WhatsApp payment request (fire-and-forget).
+      // Auto-confirm a matching Instagram/WhatsApp payment request, and an
+      // open invoice whose remaining balance equals the credit (all
+      // fire-and-forget). The invoice matcher used to run only on
+      // poller-booked credits — which the webhook beats almost every time —
+      // so it never actually fired.
       require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
       require("../utils/waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
+      require("../utils/invoiceMatch").tryMatchInvoice(biz, amount, sessionId || reference || "").catch(() => {});
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
@@ -895,6 +908,9 @@ router.post("/", async (req, res) => {
             date: new Date(),
             source: "anchor",
             currency: destBiz.baseCurrency || "NGN",
+            senderName: sender.name || null,
+            senderBank: sender.bank || null,
+            senderAccount: null,
             reference: dbReference, // unique per business — the real dedup gate
             providerTxnId: bookTransferId,
           },
@@ -915,9 +931,11 @@ router.post("/", async (req, res) => {
       });
       await pushTo(destBiz.userId, title, body);
 
-      // Auto-confirm a matching Instagram/WhatsApp payment request (fire-and-forget).
+      // Auto-confirm a matching Instagram/WhatsApp payment request or open
+      // invoice (fire-and-forget).
       require("../utils/igPaymentMatch").tryMatchIgPayment(destBiz, amount).catch(() => {});
       require("../utils/waPaymentMatch").tryMatchWaPayment(destBiz, amount).catch(() => {});
+      require("../utils/invoiceMatch").tryMatchInvoice(destBiz, amount, dbReference).catch(() => {});
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(destBiz.id, Number(amount) || 0); } catch { /* noop */ }

@@ -108,6 +108,24 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
   ]);
 
+  // Partial matches: matched bank rows are excluded above, but where the match
+  // accounted for less than the row (matchedAmount < amount) the remainder is
+  // still real money. NULL matchedAmount (pre-column matches) = fully matched.
+  const remainderWhere = (type, date) => ({
+    ...bizScope, type, date,
+    matchedAmount: { not: null },
+    ...(type === "income"
+      ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }] }
+      : { matchedExpenseId: { not: null } }),
+  });
+  const [remIncomeG, remExpenseG, remPrevIncomeG] = await Promise.all([
+    prisma.transaction.groupBy({ by: ["businessId"], where: remainderWhere("income", dateThis), _sum: { amount: true, matchedAmount: true } }),
+    prisma.transaction.groupBy({ by: ["businessId"], where: remainderWhere("expense", dateThis), _sum: { amount: true, matchedAmount: true } }),
+    prisma.transaction.groupBy({ by: ["businessId"], where: remainderWhere("income", datePrev), _sum: { amount: true, matchedAmount: true } }),
+  ]);
+  const remainderOf = (g) =>
+    Math.max(0, Number(g._sum.amount || 0) - Number(g._sum.matchedAmount || 0));
+
   const stats = new Map(); // businessId -> { income, expense, count, prevIncome, cats: [] }
   const get = (id) => {
     if (!stats.has(id)) stats.set(id, { income: 0, expense: 0, count: 0, prevIncome: 0, cats: [] });
@@ -126,6 +144,9 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   for (const g of [...prevSalesG, ...prevTxIncomeG]) {
     get(g.businessId).prevIncome += Number(g._sum.amount || 0);
   }
+  for (const g of remIncomeG) get(g.businessId).income += remainderOf(g);
+  for (const g of remExpenseG) get(g.businessId).expense += remainderOf(g);
+  for (const g of remPrevIncomeG) get(g.businessId).prevIncome += remainderOf(g);
   // Expense categories from both sources, merged per (business, category).
   const catTotals = new Map(); // "bizId|category" → amount
   for (const g of [...expCats, ...txExpCats]) {
@@ -143,7 +164,10 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   const byUser = new Map();
   for (const b of businesses) {
     const s = stats.get(b.id);
-    if (!s || s.count === 0) continue; // silent months don't get a section
+    // Silent months don't get a section — but a month whose only activity is
+    // a partial-match remainder has real income with count 0, so gate on
+    // money too, not rows alone.
+    if (!s || (s.count === 0 && s.income === 0 && s.expense === 0)) continue;
     if (!byUser.has(b.userId)) byUser.set(b.userId, []);
     byUser.get(b.userId).push({ business: b, stats: s });
   }

@@ -22,11 +22,7 @@ const { pushTo } = require("./pushNotification");
 
 const WINDOW_MS = 48 * 60 * 60 * 1000; // how long an armed "Request ₦X" stays matchable
 
-// Exact-to-the-kobo comparison — robust against IEEE-754 float representation
-// (e.g. 500001 kobo / 100 = 5000.01, where `Math.abs(x - 5000) < 0.01` fails).
-function sameMoney(a, b) {
-  return Math.round((Number(a) || 0) * 100) === Math.round((Number(b) || 0) * 100);
-}
+const { sameMoney } = require("./money");
 
 async function tryMatchIgPayment(biz, amount) {
   if (!biz?.id || !ig.isConfigured()) return;

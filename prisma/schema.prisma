@@ -587,6 +587,19 @@ model Transaction {
   // recorded from this debit. Expense aggregates exclude debits carrying this,
   // exactly as income aggregates exclude matched credits.
   matchedExpenseId  String?
+  // How much of this bank row the match actually accounted for (sale amount,
+  // debt applied, expense recorded) — always ≤ amount. Scalar totals add the
+  // unmatched remainder (amount − matchedAmount) back in, so a ₦5,000 credit
+  // that paid a ₦3,000 debt doesn't silently drop ₦2,000 from income. NULL on
+  // matches made before this column existed = treated as fully matched.
+  matchedAmount     Float?
+  // Structured counterparty for INBOUND credits, captured at booking time
+  // (the same values that get flattened into description). These are what
+  // match ranking and sender-recall key on; never render account numbers
+  // unmasked in UI.
+  senderName        String?
+  senderBank        String?
+  senderAccount     String?
   recordedBy        String?
   recordedByName    String?
   userId            String?

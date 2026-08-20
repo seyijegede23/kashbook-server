@@ -264,15 +264,28 @@ async function wipe() {
     const stamped = await prisma.debtPayment.count({ where: { transactionId: c4.id } });
     assert.strictEqual(stamped, 2, "every payment must carry the credit's id or unmatch can't find it");
   });
-  await test("debt-matched credit is EXCLUDED from income", async () => {
-    // The other half of the exclusion rule: matchedCustomerId, not only
-    // matchedSaleId. Before this fix a debt-matched credit still counted.
+  await test("debt-matched credit: applied slice leaves income, remainder STAYS", async () => {
+    // Two rules in one flow. (a) matchedCustomerId excludes like matchedSaleId
+    // does — before that fix a debt-matched credit still counted. (b) only the
+    // APPLIED slice is excluded: a credit bigger than the debt leaves a
+    // remainder of real money, which used to vanish from income entirely
+    // (matchedAmount is what puts it back).
     const before = await income();
     const cX = await credit(123456);
     assert.strictEqual(await income(), before + 123456);
-    await POST(`/transactions/${cX.id}/match-debt`, tOwner, { customerId: customer.id });
-    assert.strictEqual(await income(), before, "matchedCustomerId must exclude like matchedSaleId does");
-    await DEL(`/transactions/${cX.id}/match`, tOwner);
+    const r = await POST(`/transactions/${cX.id}/match-debt`, tOwner, { customerId: customer.id });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    const applied = r.body.amountApplied;
+    assert.ok(applied > 0 && applied < 123456, "scenario needs a partial application");
+    const tx = await prisma.transaction.findUnique({ where: { id: cX.id } });
+    assert.strictEqual(Number(tx.matchedAmount), applied, "matchedAmount must record the applied slice");
+    assert.strictEqual(await income(), before + 123456 - applied,
+      "only the applied slice may leave income — the remainder is real money");
+    const u = await DEL(`/transactions/${cX.id}/match`, tOwner);
+    assert.strictEqual(u.status, 200);
+    const txAfter = await prisma.transaction.findUnique({ where: { id: cX.id } });
+    assert.strictEqual(txAfter.matchedAmount, null, "unmatch must clear matchedAmount");
+    assert.strictEqual(await income(), before + 123456, "unmatch restores the full credit to income");
   });
   await test("matching the same credit to debt AGAIN: 409, and nothing moves", async () => {
     const owedBefore = (await prisma.customer.findUnique({ where: { id: customer.id } })).totalOwed;
@@ -379,9 +392,13 @@ async function wipe() {
     assert.strictEqual(r.status, 201, JSON.stringify(r.body));
     assert.strictEqual(Number(r.body.sale.amount), 4500);
     assert.strictEqual(r.body.remainder, 500);
-    // Sale (4500) in, credit (5000) out: totals move DOWN by the remainder —
-    // the honest direction; the 500 was never backed by a recorded sale.
-    assert.strictEqual(before - (await income()), 500);
+    // Sale (4500) in, credit excluded, but the 500 remainder is REAL money
+    // that arrived — matchedAmount keeps it in income, so the total is
+    // unchanged: 4500 recorded + 500 unrecorded remainder = the 5000 credit.
+    assert.strictEqual(before - (await income()), 0,
+      "the remainder must stay in income, not silently vanish");
+    const txC9 = await prisma.transaction.findUnique({ where: { id: c9.id } });
+    assert.strictEqual(Number(txC9.matchedAmount), 4500);
     await DEL(`/transactions/${c9.id}/match?deleteSale=true`, tOwner);
   });
   await test("create-sale ABOVE the transfer: 400, nothing written", async () => {

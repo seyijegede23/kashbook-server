@@ -129,6 +129,17 @@ router.patch("/:id", async (req, res) => {
       await audit({ req, action: "TXN_EDIT_BANK_BLOCKED", resourceType: "transaction", resourceId: tx.id, severity: "warning", metadata: { source: tx.source, paymentMethod: tx.paymentMethod, category: tx.category } }).catch(() => {});
       return res.status(403).json({ error: "Bank transactions can't be edited.", code: "BANK_ROW_IMMUTABLE" });
     }
+    // A matched row's amount is load-bearing: matchedAmount ≤ amount is the
+    // invariant every remainder aggregate rests on, and shrinking the amount
+    // under an existing match would make the remainder go negative and cancel
+    // other rows' legitimate remainders inside summed aggregates. Unmatch
+    // first, then edit.
+    if (amount !== undefined && (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedExpenseId)) {
+      return res.status(409).json({
+        error: "This transaction is matched to a record. Unmatch it before changing the amount.",
+        code: "MATCHED_ROW_AMOUNT_LOCKED",
+      });
+    }
     const updated = await prisma.transaction.update({
       where: { id: req.params.id },
       data: {
@@ -250,7 +261,14 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
           throw matchError(409, "SALE_ALREADY_MATCHED", "That sale is already matched to another transfer.");
 
         const updatedTx = await px.transaction.update({
-          where: { id: tx.id }, data: { matchedSaleId: saleId },
+          where: { id: tx.id },
+          data: {
+            matchedSaleId: saleId,
+            // How much of the credit the sale accounts for. A sale below the
+            // credit leaves a remainder that scalar income totals add back;
+            // a sale ABOVE the credit still only accounts for the credit.
+            matchedAmount: Math.min(Number(sale.amount) || 0, Number(tx.amount) || 0),
+          },
         });
         const updatedSale = await px.sales.update({
           where: { id: saleId }, data: { matchedTransactionId: tx.id },
@@ -259,9 +277,18 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
       }),
     );
 
+    // provenance: which suggestion the user actually took (rank in the list,
+    // whether it was the exact-amount candidate). Pure telemetry for judging
+    // and tuning the ranking — clamped, never trusted for anything else.
+    const prov = req.body.provenance || {};
     audit({
       req, action: "TX_MATCH_SALE", resourceType: "transaction", resourceId: pre.id,
-      metadata: { saleId, amount: Number(pre.amount) },
+      metadata: {
+        saleId, amount: Number(pre.amount),
+        pickedRank: Number.isFinite(Number(prov.rank)) ? Math.max(0, Math.min(999, Number(prov.rank))) : undefined,
+        pickedExact: typeof prov.exact === "boolean" ? prov.exact : undefined,
+        candidates: Number.isFinite(Number(prov.total)) ? Math.max(0, Math.min(9999, Number(prov.total))) : undefined,
+      },
     }).catch(() => {});
     res.json({ matched: true, ...result });
   } catch (err) {
@@ -343,7 +370,8 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
           },
         });
         const updatedTx = await px.transaction.update({
-          where: { id: tx.id }, data: { matchedSaleId: sale.id },
+          where: { id: tx.id },
+          data: { matchedSaleId: sale.id, matchedAmount: amount },
         });
         return { sale, transaction: updatedTx };
       }),
@@ -417,7 +445,8 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
           },
         });
         const updatedTx = await px.transaction.update({
-          where: { id: tx.id }, data: { matchedExpenseId: expense.id },
+          where: { id: tx.id },
+          data: { matchedExpenseId: expense.id, matchedAmount: amount },
         });
         return { expense, transaction: updatedTx };
       }),
@@ -493,7 +522,14 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
           include: { debts: { include: { payments: true } } },
         });
         const updatedTx = await px.transaction.update({
-          where: { id: tx.id }, data: { matchedCustomerId: customerId },
+          where: { id: tx.id },
+          data: {
+            matchedCustomerId: customerId,
+            // Only what was actually applied to debts — the remainder stays
+            // countable as income (scalar totals add amount − matchedAmount
+            // back), instead of silently vanishing from reports.
+            matchedAmount: Number(tx.amount) - remaining,
+          },
         });
         return {
           amountApplied: Number(tx.amount) - remaining,
@@ -585,7 +621,7 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
 
         out.transaction = await px.transaction.update({
           where: { id: tx.id },
-          data: { matchedSaleId: null, matchedCustomerId: null, matchedExpenseId: null },
+          data: { matchedSaleId: null, matchedCustomerId: null, matchedExpenseId: null, matchedAmount: null },
         });
         return out;
       }),

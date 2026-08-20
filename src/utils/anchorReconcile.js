@@ -12,7 +12,7 @@
 
 const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
-const { recalcInvoiceStatus } = require("./invoiceStatus");
+const { tryMatchInvoice } = require("./invoiceMatch");
 const { SINGLE_FLAG_ABOVE } = require("../config/amlLimits");
 const {
   resolveInboundSender,
@@ -175,6 +175,9 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
           date: a.createdAt ? new Date(a.createdAt) : new Date(),
           source: "anchor",
           currency: biz.baseCurrency || "NGN",
+          senderName: sender?.name || null,
+          senderBank: sender?.bank || null,
+          senderAccount: sender?.accountNumber || null,
           reference: dbReference,
           // The provider-side id this row came from — survives a later webhook
           // repair that re-keys `reference`, so the row stays traceable.
@@ -240,56 +243,8 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
   return created;
 }
 
-async function tryMatchInvoice(biz, amount, reference) {
-  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
-    .toISOString().slice(0, 10);
-
-  const candidates = await prisma.invoice.findMany({
-    where: {
-      businessId: biz.id,
-      status: { in: ["SENT", "PARTIAL", "OVERDUE"] },
-      issueDate: { gte: ninetyDaysAgo },
-    },
-    select: {
-      id: true, invoiceNumber: true, total: true, amountPaid: true, dueDate: true, status: true,
-    },
-  });
-
-  // Match candidates whose remaining balance equals the credited amount.
-  const matches = candidates.filter(
-    (c) => Math.abs((c.total - c.amountPaid) - amount) < 0.01,
-  );
-  if (matches.length !== 1) return; // 0 = no match; >1 = ambiguous, defer to user
-
-  const inv = matches[0];
-  await prisma.invoicePayment.create({
-    data: {
-      invoiceId: inv.id,
-      amount,
-      method: "bank",
-      note: `NUBAN transfer · ${reference}`,
-    },
-  });
-
-  const newAmountPaid = inv.amountPaid + amount;
-  const newStatus = recalcInvoiceStatus({
-    amountPaid: newAmountPaid,
-    total: inv.total,
-    dueDate: inv.dueDate,
-    status: inv.status,
-  });
-
-  await prisma.invoice.update({
-    where: { id: inv.id },
-    data: { amountPaid: newAmountPaid, status: newStatus },
-  });
-
-  await pushTo(
-    biz.userId,
-    "Invoice Paid ✅",
-    `${inv.invoiceNumber} marked ${newStatus.toLowerCase()} via NUBAN`,
-  );
-}
+// tryMatchInvoice moved to ./invoiceMatch (shared with the webhook and Fincra
+// paths, kobo-exact compare, claim under the per-business lock).
 
 async function reconcileAll({ onCreate, logger, throttleMs = 1500 } = {}) {
   const bizs = await prisma.business.findMany({

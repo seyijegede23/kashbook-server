@@ -18,9 +18,7 @@ const { pushTo } = require("./pushNotification");
 
 const WINDOW_MS = 48 * 60 * 60 * 1000;
 
-function sameMoney(a, b) {
-  return Math.round((Number(a) || 0) * 100) === Math.round((Number(b) || 0) * 100);
-}
+const { sameMoney } = require("./money");
 
 async function tryMatchWaPayment(biz, amount) {
   if (!biz?.id || !wa.isConfigured()) return;

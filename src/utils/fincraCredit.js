@@ -102,6 +102,9 @@ async function recordFincraInboundCredit(d, source = "fincra") {
         paymentMethod: "bank",
         date: new Date(),
         source,
+        senderName: sender?.name || null,
+        senderBank: sender?.bank || null,
+        senderAccount: sender?.accountNumber || null,
         reference,
       },
     });
@@ -147,6 +150,11 @@ async function recordFincraInboundCredit(d, source = "fincra") {
   }
   require("./igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
   require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
+  // Currency passed so an FCY inflow can never settle an NGN invoice on
+  // numeric equality. Known limitation: `amount` here is fee-NET, invoices
+  // are gross — Fincra credits with a fee won't auto-match (acceptable while
+  // Fincra is dormant; revisit with amount+fee if it wakes).
+  require("./invoiceMatch").tryMatchInvoice(biz, amount, reference, { currency }).catch(() => {});
   return { recorded: true, businessId: biz.id, amount, currency };
 }
 
