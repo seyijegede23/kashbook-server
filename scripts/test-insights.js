@@ -3,7 +3,7 @@
 const {
   normalize, parseTimeRange, parseQuestion, matchIntent, previousPeriod,
   extractQuantity, matchInventoryItem, findInventoryCandidates, parseUpdateCommand,
-  parseCreateCommand,
+  parseCreateCommand, parseContext, buildNextContext, extractPersonName, nearestIntent,
 } = require("../src/utils/insightsEngine");
 
 // Fixed "now": Friday 2026-07-03 12:00 Lagos (11:00 UTC).
@@ -373,6 +373,92 @@ eq(extractQuantity("i sold 2 shirts for 4000", 4000), 2, "qty: leading quantity"
   eq(u1.data?.action, { kind: "create_product", name: "Garri", price: 0, stock: 10 }, "update: unknown → create offer with stock");
   const u2 = await answerQuestion("set garri price to 500", fakeBiz);
   eq(u2.data?.action, { kind: "create_product", name: "Garri", price: 500, priceText: "₦500", stock: 0 }, "update: unknown price-set → create offer with price");
+
+  // ── Month + year, quarters ─────────────────────────────────────────────────
+  // NOW = 2026-07-03 (Q3). Explicit years pin exactly; bare quarters resolve
+  // to the current year (or last year when in the future).
+  {
+    const r = parseTimeRange("sales in june 2024", NOW);
+    eq(r?.label, "june 2024", "month+year: label");
+    eq(r?.start.toISOString().slice(0, 10), "2024-05-31", "month+year: start (June 1 Lagos = May 31 23:00 UTC)");
+    const q1 = parseTimeRange("q1", NOW);
+    eq(q1?.label, "Q1 2026", "bare q1 → this year");
+    const q3 = parseTimeRange("how is q3 going", NOW);
+    eq(q3?.label, "Q3 2026", "current quarter label");
+    eq(Math.abs(q3.end.getTime() - NOW.getTime()) < 1000, true, "current quarter ends now (to-date)");
+    const q4 = parseTimeRange("q4", NOW);
+    eq(q4?.label, "Q4 2025", "future quarter → last year");
+    const lq = parseTimeRange("last quarter", NOW);
+    eq(lq?.label, "last quarter", "last quarter label");
+    eq(lq.start.toISOString().slice(0, 10), "2026-03-31", "last quarter = Q2 (Apr 1 Lagos)");
+    const q2y = parseTimeRange("q2 2025", NOW);
+    eq(q2y?.label, "Q2 2025", "quarter+year pins exactly");
+  }
+
+  // ── Two-period comparison ──────────────────────────────────────────────────
+  {
+    const p = parseQuestion("sales in june vs march", null, NOW);
+    eq(p.intent, "income", "compare: intent from vocab");
+    eq(p.range.label, "june 2026", "compare: left range");
+    eq(p.rangeB?.label, "march 2026", "compare: right range");
+    const bare = parseQuestion("june vs march", null, NOW);
+    eq(bare.intent, "income", "bare period-vs-period defaults to income");
+    eq(bare.rangeB?.label, "march 2026", "bare compare: right range");
+    const exp = parseQuestion("expenses this week versus last month", null, NOW);
+    eq(exp.intent, "expenses", "compare: expenses intent");
+    eq(exp.rangeB?.label, "last month", "compare: mixed range kinds");
+    const ch = parseQuestion("instagram vs whatsapp sales", null, NOW);
+    eq(ch.intent, "channels", "channel-vs-channel stays channels");
+    eq(ch.rangeB, null, "channel-vs-channel has no rangeB");
+  }
+
+  // ── Person entity extraction (pure) ────────────────────────────────────────
+  {
+    eq(extractPersonName(normalize("how much does chioma owe")), "chioma", "person: does X owe");
+    eq(extractPersonName(normalize("does ada g still owe me")), "ada g", "person: multi-token + still");
+    eq(extractPersonName(normalize("chioma's debt")), "chioma", "person: possessive (apostrophe stripped)");
+    eq(extractPersonName(normalize("sales to blessing")), "blessing", "person: sales to X");
+    eq(extractPersonName(normalize("does anyone owe me")), null, "person: pronouns are not names");
+    eq(extractPersonName(normalize("what is my debt")), null, "person: my debt is not a name");
+    eq(extractPersonName(normalize("who owes me money")), null, "person: who-questions stay generic");
+  }
+
+  // ── Rich follow-up context ─────────────────────────────────────────────────
+  {
+    // legacy shape still accepted
+    eq(parseContext("income"), { intent: "income", channel: null, range: null }, "context: legacy intent id");
+    eq(parseContext("{broken"), null, "context: malformed JSON rejected");
+    const ctx = buildNextContext("income", { start: new Date("2026-06-22T23:00:00Z"), end: new Date("2026-06-28T23:00:00Z"), label: "last week", kind: "week" }, "instagram");
+    eq(typeof ctx, "string", "nextContext is a string");
+    const back = parseContext(ctx);
+    eq(back.intent, "income", "context roundtrip: intent");
+    eq(back.channel, "instagram", "context roundtrip: channel");
+    eq(back.range?.label, "last week", "context roundtrip: range label");
+    // "and on instagram?" after "income last week" keeps last week
+    const f1 = parseQuestion("what about instagram", ctx, NOW);
+    eq(f1.intent, "income", "follow-up: intent inherited");
+    eq(f1.channel, "instagram", "follow-up: channel from the question");
+    eq(f1.range.label, "last week", "follow-up: RANGE inherited from context");
+    // "what about june?" after instagram income keeps the channel
+    const f2 = parseQuestion("what about june", ctx, NOW);
+    eq(f2.range.label, "june 2026", "follow-up: range from the question");
+    eq(f2.channel, "instagram", "follow-up: CHANNEL inherited from context");
+    // smalltalk and record intents never become carry-over context
+    eq(buildNextContext("greeting", { start: NOW, end: NOW, label: "today" }, null), null, "no context from smalltalk");
+    eq(buildNextContext("record_sale", { start: NOW, end: NOW, label: "today" }, null), null, "no context from record commands");
+    // legacy behavior preserved: intent-only context gives no range inheritance
+    const legacy = parseQuestion("what about instagram", "income", NOW);
+    eq(legacy.intent, "income", "legacy context: intent works");
+    eq(legacy.range.label, "this month", "legacy context: range still defaults");
+  }
+
+  // ── Did you mean ───────────────────────────────────────────────────────────
+  {
+    eq(nearestIntent(normalize("outstanding"))?.id, "debts", "near-miss: weak keyword surfaces its intent");
+    const p = parseQuestion("outstanding", null, NOW);
+    eq(p.intent, null, "near-miss: still below threshold");
+    eq(p.nearMiss, "debts", "near-miss exposed on the parse");
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

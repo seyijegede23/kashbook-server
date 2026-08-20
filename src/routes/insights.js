@@ -43,8 +43,10 @@ async function resolveBusiness(req, res) {
 }
 
 // POST /insights/ask { businessId, question, context? }
-// context = the previous answer's intent id (string) so "what about last week?"
-// style follow-ups work. Returns { intent, answer, data? }.
+// context = the previous answer's `nextContext` (JSON with intent + channel +
+// range) or, from older clients, the bare intent id — either makes "what
+// about last week?" style follow-ups work. Returns { intent, answer, data?,
+// nextContext? }.
 router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
   try {
     if (!premiumGate(req, res)) return;
@@ -53,7 +55,9 @@ router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
 
     const question = String(req.body.question || "").trim().slice(0, 300);
     if (!question) return res.status(400).json({ error: "Ask a question first." });
-    const context = typeof req.body.context === "string" ? req.body.context.slice(0, 40) : null;
+    // 400 fits the rich JSON context (intent + channel + two ISO dates +
+    // label); parseContext rejects anything malformed regardless of length.
+    const context = typeof req.body.context === "string" ? req.body.context.slice(0, 400) : null;
 
     // "What is my balance" is a BALANCE question wearing a reports costume.
     // The route gate is canViewReports; the engine must still refuse the one

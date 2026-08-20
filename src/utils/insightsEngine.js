@@ -261,6 +261,42 @@ function parseTimeRange(text, now = new Date()) {
     return { start: fromLagos(y, m, d - back), end: now, label: `since ${since[1]}`, kind: "days", days: back || 7 };
   }
 
+  // Quarters — "this quarter", "last quarter", "q1", "q3 2025".
+  const qStart = Math.floor(m / 3) * 3;
+  if (/\bthis quarter\b/.test(t)) {
+    return { start: fromLagos(y, qStart, 1), end: now, label: "this quarter", kind: "days" };
+  }
+  if (/\blast quarter\b/.test(t)) {
+    return { start: fromLagos(y, qStart - 3, 1), end: fromLagos(y, qStart, 1), label: "last quarter", kind: "days" };
+  }
+  const q = t.match(/\bq([1-4])(?:\s+(\d{4}))?\b/);
+  if (q) {
+    const qi = (parseInt(q[1], 10) - 1) * 3;
+    const yr = q[2] ? parseInt(q[2], 10) : qi > m ? y - 1 : y;
+    const isCurrent = yr === y && m >= qi && m < qi + 3;
+    return {
+      start: fromLagos(yr, qi, 1),
+      end: isCurrent ? now : fromLagos(yr, qi + 3, 1),
+      label: `Q${q[1]} ${yr}`,
+      kind: "days",
+    };
+  }
+
+  // Month + explicit year ("june 2024") — pins the exact month, any year.
+  // Must run before the bare-month loop, which only knows this-or-last year.
+  const my = t.match(new RegExp(`\\b(${MONTHS.join("|")})\\s+(\\d{4})\\b`));
+  if (my) {
+    const i = MONTHS.indexOf(my[1]);
+    const yr = parseInt(my[2], 10);
+    const isCurrent = yr === y && i === m;
+    return {
+      start: fromLagos(yr, i, 1),
+      end: isCurrent ? now : fromLagos(yr, i + 1, 1),
+      label: `${MONTHS[i]} ${yr}`,
+      kind: "month",
+    };
+  }
+
   // Month names ("in june", "june") — this year, or last year if in the future.
   // "may" is also a modal verb ("how much may i make"), so it only counts as a
   // month with an anchor: a preceding preposition or a trailing 4-digit year.
@@ -573,14 +609,122 @@ function matchIntent(text) {
 
 const COMPARE_RE = /\b(compare|compared|vs|versus|than last|change)\b/;
 
+// ── Follow-up context ────────────────────────────────────────────────────────
+// Two shapes, both accepted forever:
+//   legacy: the bare intent id ("income") — older clients round-trip this
+//   rich:   JSON {"i":intent,"c":channel,"r":{"s":ISO,"e":ISO,"l":label,"k":kind}}
+// The rich shape is what makes BOTH directions of follow-up work: "and on
+// instagram?" after "income last week" keeps last week, and "what about
+// june?" after "instagram sales" keeps the channel. The old shape kept only
+// the intent, so every follow-up silently reset to this-month.
+function parseContext(context) {
+  if (!context || typeof context !== "string") return null;
+  if (context[0] !== "{") return { intent: context, channel: null, range: null };
+  try {
+    const j = JSON.parse(context);
+    let range = null;
+    if (j.r && j.r.s && j.r.e) {
+      const s = new Date(j.r.s);
+      const e = new Date(j.r.e);
+      if (!Number.isNaN(s.getTime()) && !Number.isNaN(e.getTime()) && s < e) {
+        range = {
+          start: s, end: e,
+          label: String(j.r.l || "that period").slice(0, 60),
+          kind: typeof j.r.k === "string" ? j.r.k : "days",
+        };
+      }
+    }
+    return {
+      intent: typeof j.i === "string" ? j.i : null,
+      channel: typeof j.c === "string" && Object.values(CHANNELS).includes(j.c) ? j.c : null,
+      range,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// The context string an answer hands back for the NEXT question. Only real
+// query intents carry over — small talk and record commands must not.
+function buildNextContext(intent, range, channel) {
+  if (!intent || !INTENTS.some((i) => i.id === intent)) return null;
+  if (SMALLTALK.has(intent) || ACTION_INTENTS.has(intent)) return null;
+  return JSON.stringify({
+    i: intent,
+    ...(channel ? { c: channel } : {}),
+    r: {
+      s: range.start.toISOString(),
+      e: range.end.toISOString(),
+      l: range.label,
+      k: range.kind || "days",
+    },
+  });
+}
+
+// ── Person entity (customer names) ──────────────────────────────────────────
+// Anchored patterns only — free NER over normalized text would eat vocab
+// words. Runs on POST-normalization text (lowercase, apostrophes stripped, so
+// "Chioma's debt" arrives as "chiomas debt"; the within-1 customer matcher
+// absorbs the trailing s).
+const NAME_STOPWORDS = new Set([
+  "i", "we", "me", "us", "my", "our", "you", "who", "he", "she", "they", "them",
+  "it", "anyone", "anybody", "someone", "somebody", "people", "customer",
+  "customers", "everyone", "the", "that", "this", "a", "much", "money", "still",
+  "total", "any", "all", "do", "does", "did", "how", "what", "which",
+]);
+function extractPersonName(text) {
+  const t = ` ${text} `;
+  const pats = [
+    // "how much does chioma owe" / "does ada g still owe"
+    /\b(?:does|do)\s+([a-z][a-z ]{1,28}?)\s+(?:still\s+)?owes?\b/,
+    // "chioma's debt" — normalize strips the apostrophe AND maps debt→owe, so
+    // the surviving shape is "chiomas owe": one word with a possessive s.
+    /\b([a-z]{3,20})s\s+owe\b/,
+    // "chioma balance" (balance survives normalization)
+    /\b([a-z][a-z ]{1,28}?)s?\s+balance\b/,
+    // "sales to chioma" / "income from ada"
+    /\b(?:sales|income)\s+(?:to|from)\s+([a-z][a-z ]{1,28}?)\s*$/,
+  ];
+  for (const re of pats) {
+    const m = re.exec(t);
+    if (!m) continue;
+    const candidate = m[1].trim();
+    if (!candidate) continue;
+    const words = candidate.split(" ");
+    // Every word a stopword → not a name ("does anyone owe", "my debt").
+    if (words.every((w) => NAME_STOPWORDS.has(w))) continue;
+    // A leading stopword run before the name ("does the customer chioma owe")
+    // gets trimmed; anything left is the candidate.
+    while (words.length && NAME_STOPWORDS.has(words[0])) words.shift();
+    if (!words.length || words.length > 3) continue;
+    return words.join(" ");
+  }
+  return null;
+}
+
 // Full parse (pure, testable): question (+ optional follow-up context) →
 // { intent, range, channel, compare, usedContext }
 function parseQuestion(question, context = null, now = new Date()) {
   const text = normalize(question);
-  const range = parseTimeRange(text, now);
+  const ctx = parseContext(context);
+  let range = parseTimeRange(text, now);
   const channelList = parseChannels(text);
-  const channel = channelList.length === 1 ? channelList[0] : null;
+  let channel = channelList.length === 1 ? channelList[0] : null;
   const compare = COMPARE_RE.test(` ${text} `);
+
+  // Two-period comparison: "june vs march", "this week vs last month". Both
+  // sides must parse as time ranges; a channel-vs-channel question ("ig vs
+  // whatsapp") has no range on either side and stays with the channels intent.
+  let rangeB = null;
+  const vsParts = ` ${text} `.split(/\b(?:vs|versus|compared to|compared with|against)\b/);
+  if (vsParts.length === 2) {
+    const rA = parseTimeRange(vsParts[0], now);
+    const rB = parseTimeRange(vsParts[1], now);
+    if (rA && rB) {
+      range = rA;
+      rangeB = rB;
+    }
+  }
 
   let match;
   // Record commands ("record a sale of 5000", "i sold 3 bags of rice for
@@ -611,8 +755,8 @@ function parseQuestion(question, context = null, now = new Date()) {
     }
   }
   // Bare-amount reply after "record a sale" → "5000" / "5k" / "5,000"
-  if (!match && context && ACTION_INTENTS.has(context) && /^\d[\d\s.]*[km]?$/.test(text)) {
-    match = { id: context, score: THRESHOLD };
+  if (!match && ctx?.intent && ACTION_INTENTS.has(ctx.intent) && /^\d[\d\s.]*[km]?$/.test(text)) {
+    match = { id: ctx.intent, score: THRESHOLD };
   }
   // Direction check: "do i owe / i owe" is the merchant's OWN payables — the
   // opposite of the debts intent — unless they said "owe me/us" ("who owes me"
@@ -630,28 +774,68 @@ function parseQuestion(question, context = null, now = new Date()) {
     match = { id: "channels", score: 5 };
   }
   if (!match) match = matchIntent(text);
+  // A bare period-vs-period question ("june vs march") names no money word —
+  // sales is the default thing merchants compare.
+  if (!match && rangeB) match = { id: "income", score: THRESHOLD };
   let usedContext = false;
 
   // Follow-up: "what about last week?" / "what about instagram?" — a time or
   // channel expression with no clear intent reuses the previous question's
-  // intent (passed back by the client).
-  if (!match && (range || channel) && context && typeof context === "string") {
-    if (INTENTS.some((i) => i.id === context) && !SMALLTALK.has(context) && !ACTION_INTENTS.has(context)) {
-      match = { id: context, score: THRESHOLD };
+  // intent, AND inherits whichever dimension the follow-up did NOT restate:
+  // "and on instagram?" after "income last week" keeps last week; "what about
+  // june?" after "instagram sales" keeps the channel. (Legacy intent-id
+  // contexts have no range/channel to inherit and behave as before.)
+  if (!match && (range || channel) && ctx?.intent) {
+    if (INTENTS.some((i) => i.id === ctx.intent) && !SMALLTALK.has(ctx.intent) && !ACTION_INTENTS.has(ctx.intent)) {
+      match = { id: ctx.intent, score: THRESHOLD };
       usedContext = true;
+      if (!range && ctx.range) range = ctx.range;
+      if (!channel && channelList.length === 0 && ctx.channel) channel = ctx.channel;
     }
+  }
+
+  // Nothing cleared the bar — surface the closest sub-threshold intent so the
+  // fallback can offer "did you mean…?" instead of a dead end.
+  let nearMiss = null;
+  if (!match) {
+    const near = nearestIntent(text);
+    if (near) nearMiss = near.id;
   }
 
   return {
     intent: match ? match.id : null,
     range: range || defaultRange(now),
     hadExplicitRange: !!range,
+    rangeB,
     channel,
     compare,
     usedContext,
+    personName: extractPersonName(text),
+    nearMiss,
     text,
     raw: String(question || ""),
   };
+}
+
+// The best intent that DIDN'T clear the threshold — fuel for "did you mean".
+function nearestIntent(text) {
+  const tokens = text.split(" ");
+  let best = null;
+  for (const intent of INTENTS) {
+    if (SMALLTALK.has(intent.id) || ACTION_INTENTS.has(intent.id)) continue;
+    let score = 0;
+    for (const p of intent.phrases) if (text.includes(p)) score += 5;
+    for (const k of intent.strong) {
+      if (tokens.includes(k)) score += 3;
+      else if (
+        k.length >= 5 &&
+        tokens.some((tk) => tk.length >= 4 && !TYPO_STOPLIST.has(tk) && within1(tk, k))
+      ) score += 3;
+    }
+    for (const k of intent.weak) if (tokens.includes(k)) score += 1;
+    if (score > 0 && score < THRESHOLD && (!best || score > best.score)) best = { id: intent.id, score };
+  }
+  return best;
 }
 
 // ── Query layer ──────────────────────────────────────────────────────────────
@@ -1273,12 +1457,177 @@ const FALLBACK =
 // `canViewBalance` defaults TRUE so the cron-driven monthly P&L email and every
 // existing owner-side caller behave exactly as before. Only the HTTP route,
 // which knows who is asking, passes it as false.
+// Fuzzy customer lookup for person-entity questions. Token-based (bank/legal
+// vs informal names never whole-string match): exact full-name equality wins,
+// then all-query-tokens-present, then within-1 token matches. Exactly one
+// best → match; several tie → choices for the user to tap.
+const INTENT_EXAMPLES = {
+  income: "How much did I make this month?",
+  expenses: "How much did I spend this month?",
+  profit: "What's my profit this month?",
+  debts: "Who owes me money?",
+  payables: "Who do I owe?",
+  channels: "Which channel sells the most?",
+  best_day: "What's my best day?",
+  expense_breakdown: "Where is my money going?",
+  top_customers: "Who are my top customers?",
+  top_products: "What's my best-selling product?",
+  stock: "What's low in stock?",
+  invoices: "Any unpaid invoices?",
+  balance: "What's my bank balance?",
+  count: "How many sales this month?",
+};
+
+async function resolveCustomerByName(businessId, name) {
+  const customers = await prisma.customer.findMany({
+    where: { businessId },
+    select: { id: true, name: true, totalOwed: true },
+  });
+  const qTokens = name.toLowerCase().split(" ").filter(Boolean);
+  const scored = customers
+    .map((c) => {
+      const cTokens = (c.name || "").toLowerCase().split(/\s+/).filter(Boolean);
+      if (cTokens.join(" ") === qTokens.join(" ")) return { c, score: 3 };
+      const hits = qTokens.filter((q) =>
+        cTokens.some((ct) => ct === q || (q.length >= 4 && within1(ct, q))),
+      ).length;
+      if (hits === qTokens.length) return { c, score: 2 };
+      if (hits > 0) return { c, score: 1 };
+      return null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+  if (!scored.length) return { match: null, choices: [] };
+  const top = scored.filter((s) => s.score === scored[0].score);
+  if (top.length === 1) return { match: top[0].c, choices: [] };
+  return { match: null, choices: top.slice(0, 4).map((s) => s.c) };
+}
+
+// Person-entity answers — "how much does chioma owe", "sales to chioma".
+async function answerForCustomer(parsed, business, cust) {
+  if (parsed.intent === "debts") {
+    if (!(cust.totalOwed > 0)) {
+      return { answer: `${cust.name} doesn't owe you anything right now. ✅`, data: { customer: cust.name, owed: 0 } };
+    }
+    const unpaid = await prisma.debt.findMany({
+      where: { customerId: cust.id, paid: false },
+      orderBy: { date: "asc" },
+      select: { date: true },
+    });
+    const oldest = unpaid[0] ? ` The oldest debt is from ${new Date(unpaid[0].date).toLocaleDateString("en-NG", { day: "numeric", month: "short", year: "numeric" })}.` : "";
+    return {
+      answer: `${cust.name} owes you ${money(cust.totalOwed, business.baseCurrency)} across ${unpaid.length} unpaid debt${unpaid.length === 1 ? "" : "s"}.${oldest}`,
+      data: { customer: cust.name, owed: cust.totalOwed, unpaidCount: unpaid.length },
+    };
+  }
+  // income / count scoped to this customer's sales
+  const agg = await prisma.sales.aggregate({
+    where: { businessId: business.id, customerId: cust.id, date: { gte: parsed.range.start, lt: parsed.range.end } },
+    _sum: { amount: true },
+    _count: { _all: true },
+  });
+  const total = Number(agg._sum.amount || 0);
+  if (agg._count._all === 0) {
+    return { answer: `No sales to ${cust.name} recorded ${parsed.range.label}.`, data: { customer: cust.name, total: 0, count: 0 } };
+  }
+  return {
+    answer: `Sales to ${cust.name} ${parsed.range.label}: ${money(total, business.baseCurrency)} (${agg._count._all} record${agg._count._all === 1 ? "" : "s"}).`,
+    data: { customer: cust.name, total, count: agg._count._all },
+  };
+}
+
+// Two-period comparison — "june vs march", "this week vs last month".
+async function answerComparison(parsed, business) {
+  const { intent, range, rangeB, channel } = parsed;
+  const fetch = async (r) => {
+    if (intent === "expenses") return (await sumExpenses(business.id, r)).total;
+    if (intent === "profit") {
+      const [i, e] = await Promise.all([sumIncome(business.id, r, channel), sumExpenses(business.id, r)]);
+      return i.total - e.total;
+    }
+    return (await sumIncome(business.id, r, channel)).total;
+  };
+  const [a, b] = await Promise.all([fetch(range), fetch(rangeB)]);
+  const noun = intent === "expenses" ? "Spending" : intent === "profit" ? "Profit" : "Income";
+  const delta = pctDelta(a, b);
+  const capA = range.label[0].toUpperCase() + range.label.slice(1);
+  const tail =
+    delta == null
+      ? b === 0 && a === 0
+        ? "Nothing recorded in either period."
+        : `${capA} is new — nothing recorded ${rangeB.label}.`
+      : `${capA} is ${delta >= 0 ? "up" : "down"} ${Math.abs(delta).toFixed(0)}% on ${rangeB.label}.`;
+  return {
+    answer: `${noun} ${range.label}: ${money(a, business.baseCurrency)} · ${rangeB.label}: ${money(b, business.baseCurrency)}. ${tail}`,
+    data: {
+      compare: {
+        a: { label: range.label, total: a },
+        b: { label: rangeB.label, total: b },
+        deltaPct: delta,
+      },
+    },
+  };
+}
+
 async function answerQuestion(question, business, context = null, { canViewBalance = true } = {}) {
   const parsed = parseQuestion(question, context);
-  if (!parsed.intent) return { intent: null, answer: FALLBACK };
+
+  if (!parsed.intent) {
+    // Closest sub-threshold intent → a tappable "did you mean", instead of
+    // the dead-end static fallback.
+    const example = parsed.nearMiss && INTENT_EXAMPLES[parsed.nearMiss];
+    if (example) {
+      return {
+        intent: null,
+        answer: `I didn't quite get that — did you mean "${example}"?`,
+        data: { suggest: example },
+      };
+    }
+    return { intent: null, answer: FALLBACK };
+  }
+
+  // Person entity: "how much does chioma owe", "sales to ada". Resolved here
+  // (parseQuestion stays pure); an ambiguous name becomes tappable choices,
+  // an unknown one falls through to the generic handler.
+  if (parsed.personName && ["debts", "income", "count", "top_customers"].includes(parsed.intent)) {
+    const { match: cust, choices } = await resolveCustomerByName(business.id, parsed.personName);
+    if (cust) {
+      const result = await answerForCustomer(parsed, business, cust);
+      return {
+        intent: parsed.intent,
+        answer: result.answer,
+        data: result.data,
+        nextContext: buildNextContext(parsed.intent, parsed.range, parsed.channel),
+      };
+    }
+    if (choices.length > 1) {
+      return {
+        intent: parsed.intent,
+        answer: `Which ${parsed.intent === "debts" ? "customer" : "one"}? I found ${choices.map((c) => c.name).join(", ")}.`,
+        data: { choices: choices.map((c) => ({ name: c.name, ask: parsed.intent === "debts" ? `How much does ${c.name} owe?` : `Sales to ${c.name}` })) },
+      };
+    }
+  }
+
+  // Two explicit periods → a comparison, for the money intents.
+  if (parsed.rangeB && ["income", "expenses", "profit", "count"].includes(parsed.intent)) {
+    const result = await answerComparison(parsed, business);
+    return {
+      intent: parsed.intent,
+      answer: result.answer,
+      data: result.data,
+      nextContext: buildNextContext(parsed.intent, parsed.range, parsed.channel),
+    };
+  }
+
   const handler = HANDLERS[parsed.intent];
   const result = await handler({ business, canViewBalance, ...parsed });
-  return { intent: parsed.intent, answer: result.answer, data: result.data };
+  return {
+    intent: parsed.intent,
+    answer: result.answer,
+    data: result.data,
+    nextContext: buildNextContext(parsed.intent, parsed.range, parsed.channel),
+  };
 }
 
 // Auto-generated observation cards for the Insights screen. All deterministic.
@@ -1404,6 +1753,10 @@ module.exports = {
   findInventoryCandidates,
   parseUpdateCommand,
   parseCreateCommand,
+  parseContext,
+  buildNextContext,
+  extractPersonName,
+  nearestIntent,
   // the aggregates themselves, so the match e2e asserts the exclusion rules
   // (a matched credit or debit counts ONCE) against the real query, not a copy
   sumIncome,
