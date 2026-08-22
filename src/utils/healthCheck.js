@@ -20,6 +20,9 @@ const CRON_INTERVAL_MIN = {
   // error at least alerts. Registering it here means the existing cron_stale
   // rule catches the silence too.
   dbBackup: 24 * 60,
+  // Same reasoning, and sharper: a payroll cron that stops means staff quietly
+  // don't get asked to be paid, and nobody finds out until someone complains.
+  salaryPayments: 24 * 60,
 };
 
 async function pingDb() {

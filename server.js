@@ -64,6 +64,7 @@ const instagramWebhookRoute = require("./src/routes/instagramWebhook");
 const whatsappRoutes = require("./src/routes/whatsapp");
 const whatsappWebhookRoute = require("./src/routes/whatsappWebhook");
 const transferRoutes = require("./src/routes/transfers");
+const payrollRoutes = require("./src/routes/payroll");
 const syncRoutes = require("./src/routes/sync");
 const recurringExpenseRoutes = require("./src/routes/recurringExpenses").router;
 const recurringInvoiceRoutes = require("./src/routes/recurringInvoices");
@@ -290,6 +291,7 @@ app.use("/invoices", apiLimiter);
 app.use("/notifications", apiLimiter);
 app.use("/transfers", apiLimiter);
 app.use("/recurring-expenses", apiLimiter);
+app.use("/payroll", apiLimiter);
 app.use("/recurring-invoices", apiLimiter);
 app.use("/insights", apiLimiter);
 app.use("/sync", apiLimiter);
@@ -316,6 +318,7 @@ app.use("/admin-api", adminRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/transfers", transferRoutes);
 app.use("/recurring-expenses", recurringExpenseRoutes);
+app.use("/payroll", payrollRoutes);
 app.use("/recurring-invoices", recurringInvoiceRoutes);
 app.use("/insights", insightsRoutes);
 app.use("/sync", syncRoutes);
@@ -506,6 +509,33 @@ cron.schedule("5 0 * * *", async () => {
     console.error("[Cron] Recurring expenses error:", err);
   }
 });
+
+// ── Background cron: queue due staff payments (daily at 07:00 Lagos) ─────────
+// Mints approval rows and notifies the owner. It moves NO money: every payment
+// is sent only from the PIN-gated approve route.
+//
+// 07:00 rather than a midnight tick because these need a human: an approval
+// queued at 00:10 just sits unseen for eight hours. It also runs after the
+// recurring-expense cron, so the balance warning reflects the day's auto-debits
+// instead of racing them.
+//
+// The timezone is NOT optional. A contractual pay date must be computed on the
+// Lagos civil day: without it, "pay on the 25th" fires at 23:00 on the 24th WAT
+// on a UTC host and the period key lands in the wrong month at a boundary.
+// (The recurring cron above omits this — a separate, pre-existing issue; it is
+// deliberately not changed here, since altering a live feature's firing time is
+// not this change's business.)
+cron.schedule("0 7 * * *", async () => {
+  try {
+    await prisma.withCronLock(4013, async () => {
+      await require("./src/utils/snapshots").recordHeartbeat("salaryPayments");
+      const n = await require("./src/utils/salaryRunner").processSalaryPayments();
+      if (n) console.log(`[Cron] queued ${n} staff payment(s) for approval`);
+    });
+  } catch (err) {
+    console.error("[Cron] Staff payments error:", err);
+  }
+}, { timezone: "Africa/Lagos" });
 
 // ── Background cron: process due recurring invoices (daily at 00:15) ─────────
 // For each due PREMIUM rule: creates the SENT invoice + share link and pushes

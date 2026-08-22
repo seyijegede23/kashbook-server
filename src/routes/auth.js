@@ -1355,6 +1355,20 @@ router.delete("/staff/:id", authMiddleware, async (req, res) => {
       data: { status: "cancelled", reason: "The staff member was removed from the business.", decidedAt: new Date() },
     }).catch(() => {});
 
+    // Same reasoning for a scheduled salary, and one step further: the schedule
+    // itself goes, so nothing can re-queue next month. Paid history survives —
+    // SalaryPayment carries its own name and amount snapshots and has no
+    // foreign key to either the schedule or the User row.
+    await prisma.salaryPayment.updateMany({
+      where: { staffUserId: staff.id, status: "pending" },
+      data: {
+        status: "rejected", owed: false,
+        reason: "The staff member was removed from the business.",
+        decidedAt: new Date(),
+      },
+    }).catch(() => {});
+    await prisma.salarySchedule.deleteMany({ where: { staffUserId: staff.id } }).catch(() => {});
+
     await prisma.user.delete({ where: { id: req.params.id } });
 
     // Staff removal wrote no audit row at all until now — the one event most

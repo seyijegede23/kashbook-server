@@ -221,6 +221,8 @@ model Business {
   // Virtual field only — no column is added to Business. The foreign key lives
   // on StaffTransferRequest.
   staffTransferRequests StaffTransferRequest[]
+  salarySchedules       SalarySchedule[]
+  salaryPayments        SalaryPayment[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -1189,4 +1191,173 @@ model AlertState {
   key         String   @id // alert rule key
   lastFiredAt DateTime
   lastValue   String?
+}
+
+// ─── Staff Payments ──────────────────────────────────────────────────────────
+// Scheduled salary. NOT a payroll system: it sends the amount the owner typed
+// and handles no PAYE, pension or payslips — the UI says so, because a product
+// that merely IMPLIES it remits statutory deductions is worse than one that
+// doesn't offer them.
+//
+// Deliberately NOT modelled as a RecurringExpense + staffUserId, for three
+// reasons that are each load-bearing:
+//   1. `GET /recurring-expenses` is scoped by ownerIdOf(req), which resolves a
+//      STAFF caller to their employer — every salary row would be listed to any
+//      staff member who reached that screen. A table no existing route selects
+//      from is invisible by construction, rather than by a negative filter that
+//      fails open the day someone forgets it.
+//   2. RecurringExpense.autoSend is UNATTENDED (recurringExpenseRunner.js calls
+//      executeTransfer directly). Salary is attended: the owner approves each
+//      payment. Bolting that branch into the live auto-debit runner would widen
+//      the blast radius on a money path that currently works.
+//   3. Its consent model is the bug we must not inherit: `authorizedAt` is
+//      written and never read, and its PIN triggers cover a payee change but NOT
+//      an amount change.
+
+// The standing arrangement. The payout bank details live HERE and never on
+// User: User has no money identity, and it lives in a database shared with
+// another deployed app (see the comment on User.employerId).
+model SalarySchedule {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  ownerId    String // denormalised tenant key; the owner's list is one indexed read
+
+  // Bare String, NO foreign key. Staff are HARD deleted (auth.js DELETE
+  // /staff/:id), so a Cascade would vaporise payment history and a Restrict
+  // would break the delete route. The name snapshot keeps history readable
+  // after the User row is gone.
+  staffUserId       String
+  staffNameSnapshot String
+
+  // ── Where the money goes ──
+  // `payoutKind` is the Phase 2 seam: "external_bank" today, "kashbook_internal"
+  // once staff have their own accounts. executeTransfer already detects an
+  // internal KashBook NUBAN and books a free instant transfer, and
+  // computeTransferFee(amount, "book") already returns 0 — so the rail swap is
+  // one branch, not a migration.
+  payoutKind    String  @default("external_bank")
+  accountNumber String
+  bankCode      String
+  bankName      String?
+  // Resolved by BANK NAME ENQUIRY server-side, never copied from a request
+  // body. A client-supplied payee name makes an approval queue look like
+  // oversight while providing none.
+  accountName   String
+  nameVerified  Boolean @default(false)
+
+  amount   Float
+  currency String @default("NGN")
+
+  // ── Schedule. An ANCHOR, not a cursor. ──
+  // Nothing is computed from the last payment, so nothing can drift: a 31st
+  // anchor pays 28 Feb and then 31 Mar again. computeNextDue() in
+  // recurringSchedule.js is naive interval addition and drifts permanently
+  // (Jan 31 → Mar 2/3 forever); it is deliberately not used here.
+  frequency       String   @default("monthly") // monthly | weekly
+  anchorDay       Int // 1..31 for monthly, 0..6 for weekly
+  businessDayRule String   @default("before") // weekend payday pays EARLY, never late
+  nextRunDate     DateTime
+
+  // ── Consent, bound to BOTH the amount and the payee ──
+  // Written only by a PIN-verified write, and READ by the runner: a schedule
+  // whose amount no longer matches what was authorised mints nothing. That puts
+  // the consent check at the point of money, not just on the edit route, so a
+  // future code path that writes `amount` without a PIN still cannot pay anyone.
+  authorizedAt     DateTime
+  authorizedAmount Float
+  authorizedPayee  String // `${accountNumber}:${bankCode}` at PIN time
+
+  status                   String  @default("active") // active | paused | suspended
+  pausedReason             String?
+  consecutiveUnpaidPeriods Int     @default(0)
+  lastRunAt                DateTime?
+  lastRunStatus            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // One salary per person, enforced by the database. Scoped to the OWNER rather
+  // than the business: a staff member has exactly one employer, so a two-
+  // business owner must not be able to schedule the same person twice.
+  @@unique([ownerId, staffUserId])
+  @@index([status, nextRunDate])
+  @@index([ownerId, status])
+  @@index([businessId, status])
+}
+
+// One row per staff member per pay PERIOD — the object the owner approves.
+model SalaryPayment {
+  id String @id @default(uuid())
+
+  // Bare String, no FK: payment history must outlive the instruction that
+  // created it. The row is self-describing.
+  scheduleId String
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  ownerId    String
+
+  staffUserId       String
+  staffNameSnapshot String
+
+  // Frozen snapshot of the terms AND the destination. What the owner approves
+  // must be exactly what was presented, even if the schedule is edited in
+  // between.
+  amount        Float
+  currency      String  @default("NGN")
+  payoutKind    String  @default("external_bank")
+  accountNumber String
+  bankCode      String
+  bankName      String?
+  accountName   String?
+  nameVerified  Boolean @default(false)
+
+  periodKey    String // "2026-09" | "2026-W38", computed in Africa/Lagos
+  scheduledFor DateTime
+
+  // pending → approving → paid | failed, or pending → rejected | expired | skipped.
+  // `failed` is TERMINAL and AMBIGUOUS: it means a human must check with the
+  // bank before sending again. It is never re-offered automatically.
+  status        String  @default("pending")
+  reason        String?
+  failureReason String?
+
+  // Is this period still OWED? Expiry and rejection leave it true so an unpaid
+  // period stays visible; only an explicit skip clears it. The recurring engine
+  // silently advanced its cursor past a skipped period and that money simply
+  // vanished from the record.
+  owed Boolean @default(true)
+
+  // Deterministic and derived from data alone, so it is stable across every
+  // retry and distinct across every period. Handed to executeTransfer as
+  // `reference`, landing under Transaction @@unique([businessId, reference]).
+  reference String
+
+  // Set by one approve call, identifying exactly the rows THAT call claimed, so
+  // a single guarded updateMany can claim a batch atomically and still give
+  // per-row ownership.
+  claimToken String?
+
+  expiresAt   DateTime
+  decidedById String?
+  decidedAt   DateTime?
+  paidAt      DateTime?
+
+  executedTransactionId String?
+  executedReference     String?
+  feeCharged            Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // THE anti-double-pay constraint, enforced by Postgres rather than by
+  // application logic: one payment per person per period, forever. A schedule
+  // paused for three months and resumed can only ever produce named periods —
+  // never one payment per daily cron tick, which is exactly how the recurring
+  // engine's backlog catch-up can double-pay today.
+  @@unique([scheduleId, periodKey])
+  @@unique([businessId, reference])
+  @@index([ownerId, status])
+  @@index([status, expiresAt])
+  @@index([businessId, status])
 }
