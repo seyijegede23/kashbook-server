@@ -108,7 +108,20 @@ function getThresholds(business) {
     velocity: {
       rapidFireCount:    5,
       rapidFireWindowMs: 10 * 60 * 1000,
-      spikeMultiplier:   5,
+      // VELOCITY_SPIKE is OFF (0 disables it in amlRules.js).
+      //
+      // It compared today's outbound against the merchant's own rolling 30-day
+      // daily average and raised a high-severity flag past 5×. For a small
+      // business that average is the problem: a quiet fortnight drags it down,
+      // so one ordinary large payment — a supplier settled, rent, restocking —
+      // reads as a 5× spike and lands on the compliance queue. It measured
+      // "unusual for you" rather than "suspicious", and for lumpy real-world
+      // trading those are not the same thing.
+      //
+      // Nothing about money movement changes: this rule only ever wrote a
+      // ComplianceFlag row, it never blocked, delayed or froze a transfer.
+      // Set back to 5 (or higher) to re-enable.
+      spikeMultiplier:   0,
       spikeMinHistoryDays: 7,
       structuringCount:        4,
       structuringWindowMs:     24 * 60 * 60 * 1000,

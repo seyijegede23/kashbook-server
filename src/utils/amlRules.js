@@ -63,6 +63,10 @@ function ruleRapidFire({ history24h, business }) {
 function ruleVelocitySpike({ amount, history30d, businessAgeDays, business }) {
   const t = getThresholds(business);
   const w = t.velocity;
+  // spikeMultiplier 0/null disables the rule outright — see amlLimits.js for
+  // why it is currently off. Kept as a config switch rather than deleted code
+  // so re-enabling is one number.
+  if (!w.spikeMultiplier) return null;
   if (businessAgeDays < w.spikeMinHistoryDays) return null;
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
