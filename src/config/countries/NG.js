@@ -48,7 +48,19 @@ module.exports = {
   amlLimits: {
     soleProp: { daily: 2_000_000,  weekly: 10_000_000, monthly: 30_000_000,  singleMax: 1_000_000 },
     limited:  { daily: 8_000_000,  weekly: 40_000_000, monthly: 120_000_000, singleMax: 4_000_000 },
-    stepUpOtpAbove:          500_000,   // OTP step-up on larger transfers
+    // OTP step-up on larger transfers.
+    //
+    // Was 500_000 — HALF the sole-proprietor single-transfer cap, so an OTP was
+    // demanded on the entire top half of every transfer such a merchant was
+    // even allowed to make. Paying a supplier ₦600k is routine, and it was
+    // being treated as exceptional.
+    //
+    // At 1_000_000 a sole proprietor (singleMax 1_000_000) never meets it, and
+    // a limited company (singleMax 4_000_000) meets it above ₦1m rather than
+    // ₦500k. Nothing that MONITORS changes: the caps, the ₦5m CTR-style review
+    // flag, the structuring window and the velocity rules are all untouched —
+    // this only moves where the extra authentication prompt starts.
+    stepUpOtpAbove:        1_000_000,
     singleFlagAbove:         5_000_000, // CTR-style review flag
     structuringSubThreshold: 4_500_000,
     offHoursMinAmount:         500_000,
