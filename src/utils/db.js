@@ -1,39 +1,19 @@
 const { PrismaClient } = require("@prisma/client");
 const { PrismaPg } = require("@prisma/adapter-pg");
 const { Pool } = require("pg");
+// Render's INTERNAL Postgres serves a SELF-SIGNED cert, and pg lets a `sslmode`
+// in the URL override any explicit ssl option — see src/utils/pgSsl.js for the
+// full explanation. That logic used to live only here; the nightly backup grew
+// its own half-copy and failed every night on "self-signed certificate", so it
+// is now shared and both callers use it.
+const { pgConnectionConfig } = require("./pgSsl");
 
-// Render's INTERNAL Postgres serves a SELF-SIGNED cert over its private network,
-// which `sslmode=verify-full` rejects ("self-signed certificate"). Drop any
-// sslmode from the URL and connect with SSL but WITHOUT CA verification — safe
-// because the internal link is Render's private network (and the external/local
-// connection tolerates it too). The traffic is still encrypted.
-function dbConnectionString() {
-  const raw = process.env.DATABASE_URL || "";
-  try {
-    const u = new URL(raw);
-    u.searchParams.delete("sslmode");
-    return u.toString();
-  } catch {
-    return raw;
-  }
-}
-
-// A local Postgres is not built with SSL support, so forcing it there fails the
-// connection outright ("The server does not support SSL connections") — which
-// blocked running the money-path tests against a scratch database. Only
-// localhost is exempted; every hosted database keeps SSL exactly as before.
-function isLocalDb() {
-  try {
-    const h = new URL(process.env.DATABASE_URL || "").hostname;
-    return h === "localhost" || h === "127.0.0.1" || h === "::1";
-  } catch {
-    return false;
-  }
-}
-
+// connectionString has sslmode stripped; ssl is undefined for localhost (a local
+// Postgres is usually built without SSL support and forcing it fails outright,
+// which blocked the money-path tests against a scratch database) and
+// rejectUnauthorized:false for every hosted database — exactly as before.
 const pool = new Pool({
-  connectionString: dbConnectionString(),
-  ssl: process.env.DATABASE_URL && !isLocalDb() ? { rejectUnauthorized: false } : undefined,
+  ...pgConnectionConfig(process.env.DATABASE_URL),
   keepAlive: true,                // TCP keepalive — stop NAT/idle drops on Render
   idleTimeoutMillis: 30000,       // recycle idle clients before the DB/network kills the socket
   connectionTimeoutMillis: 10000, // fail fast instead of hanging on a bad connect

@@ -58,6 +58,7 @@ const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
 const { Client } = require("pg");
+const { pgConnectionConfig } = require("../src/utils/pgSsl");
 
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
@@ -82,16 +83,16 @@ function fail(msg) { throw new Error(msg); }
 
 async function connect(url, label) {
   if (!url) fail(`${label} connection string is not set.`);
-  // Render requires SSL; a local rehearsal target usually doesn't offer it.
-  let local = false;
-  try {
-    const h = new URL(url).hostname;
-    local = h === "localhost" || h === "127.0.0.1" || h === "::1";
-  } catch { /* non-URL DSN — assume remote */ }
-  const c = new Client({
-    connectionString: url,
-    ...(local ? {} : { ssl: { rejectUnauthorized: false } }),
-  });
+  // Render requires SSL and serves a SELF-SIGNED cert; a local rehearsal target
+  // usually offers no SSL at all. pgConnectionConfig handles both.
+  //
+  // This used to set `ssl: { rejectUnauthorized: false }` while passing the URL
+  // through untouched — and pg lets a `sslmode` in the URL override and discard
+  // that option, so DATABASE_URL's `sslmode=verify-full` meant the backup
+  // verified the cert after all and died nightly on "self-signed certificate".
+  // The API never hit it because db.js stripped sslmode. Same helper now, so
+  // the two cannot diverge again.
+  const c = new Client(pgConnectionConfig(url));
   await c.connect();
   return c;
 }
