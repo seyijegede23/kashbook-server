@@ -75,7 +75,15 @@ async function uploadFcyDocs(docs = {}) {
 const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
 
-const SUPPORTED = ["USD", "EUR", "GBP"];
+// EUR only. Fincra approved KashBook for EUR virtual accounts in August 2026;
+// USD and GBP were not granted. Requesting an un-granted currency gets as far
+// as a `pending` row that the provider then never issues, which shows the user
+// a request that waits forever — so the currency is gated here rather than
+// discovered at the provider.
+//
+// Re-add "USD" / "GBP" here and in utils/fcyKyc.js the day Fincra grants them.
+// Everything downstream is already currency-parameterised.
+const SUPPORTED = ["EUR"];
 
 // Gated OFF by default until the full KYC payload is implemented.
 //

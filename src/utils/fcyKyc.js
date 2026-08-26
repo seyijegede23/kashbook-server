@@ -21,7 +21,10 @@
 // first, and signing then throws "Must supply api_key" at request time.
 const cloudinary = require("../config/cloudinary");
 
-const SUPPORTED = ["USD", "EUR", "GBP"];
+// EUR only — Fincra granted EUR virtual accounts and not USD or GBP.
+// Kept as a list, and the taxCountry === "US" rule below is left intact, so
+// re-adding a currency is a one-line change if Fincra widens the grant.
+const SUPPORTED = ["EUR"];
 
 // Fincra's documented enums. Anything outside these is rejected by them, so we
 // reject first with a message the user can act on.

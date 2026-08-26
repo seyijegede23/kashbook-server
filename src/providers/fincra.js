@@ -216,9 +216,13 @@ class FincraProvider extends PaymentProvider {
   // monthlyTransactionVolume alongside KYCInformation, and an earlier version
   // that named only a few fields silently dropped the rest.
   async provisionForeignAccount(body = {}) {
+    // `body` (from utils/fcyKyc.js) always carries an explicit currency and
+    // spreads last, so these are fallbacks only. The default is EUR because
+    // that is the single currency Fincra granted; a stale "USD" default here
+    // would silently open the wrong account type if a caller ever omitted it.
     const res = await fincra.createVirtualAccount({
       accountType: "individual",
-      currency: "USD",
+      currency: "EUR",
       ...body,
     });
     const a = readAccount(res);
