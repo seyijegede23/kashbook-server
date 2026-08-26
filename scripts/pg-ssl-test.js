@@ -22,8 +22,8 @@ function section(t) { console.log(`\n── ${t} ${"─".repeat(Math.max(0, 56 -
 // What pg will really use once it has parsed the connection string.
 const resolved = (url) => new Client(pgConnectionConfig(url)).connectionParameters.ssl;
 
-const RENDER = "postgresql://u:p@dpg-abc123-a.oregon-postgres.render.com/kashbook";
-const INTERNAL = "postgresql://u:p@dpg-abc123-a/kashbook";
+const RENDER = "postgresql://placeholder:placeholder@dpg-abc123-a.oregon-postgres.render.com/kashbook";
+const INTERNAL = "postgresql://placeholder:placeholder@dpg-abc123-a/kashbook";
 
 // ══ 1. THE REGRESSION ══════════════════════════════════════════════════════
 section("1. the bug that broke the nightly backup");
@@ -79,7 +79,7 @@ test("stripping sslmode leaves the rest of the URL intact", () => {
 
 test("credentials survive the rewrite", () => {
   const out = stripSslMode(`${RENDER}?sslmode=verify-full`);
-  assert.ok(out.includes("u:p@"), "user/password lost: " + out);
+  assert.ok(out.includes("placeholder:placeholder@"), "user/password lost: " + out);
 });
 
 // ══ 3. LOCAL ═══════════════════════════════════════════════════════════════
@@ -87,11 +87,11 @@ section("3. localhost gets no SSL (it is not built with it)");
 
 for (const host of ["localhost", "127.0.0.1"]) {
   test(`${host} → ssl undefined`, () => {
-    const cfg = pgConnectionConfig(`postgresql://postgres:x@${host}:5432/scratch`);
+    const cfg = pgConnectionConfig(`postgresql://placeholder:placeholder@${host}:5432/scratch`);
     assert.strictEqual(cfg.ssl, undefined);
   });
   test(`${host} is detected as local`, () => {
-    assert.strictEqual(isLocalHost(`postgresql://postgres:x@${host}:5432/scratch`), true);
+    assert.strictEqual(isLocalHost(`postgresql://placeholder:placeholder@${host}:5432/scratch`), true);
   });
 }
 
