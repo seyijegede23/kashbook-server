@@ -16,7 +16,7 @@ const { audit } = require("../utils/audit");
 const { pushTo } = require("../utils/pushNotification");
 const { dispatchOtp } = require("../utils/otp");
 const { executeTransfer } = require("../utils/executeTransfer");
-const { computeTransferFee, computeFincraTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
+const { computeTransferFee, NIP_FEE, STAMP_DUTY, STAMP_DUTY_THRESHOLD, PLATFORM_MARGIN } = require("../config/fees");
 const {
   STEP_UP_OTP_ABOVE,
   TRANSFER_OTP_TYPE,
@@ -300,22 +300,6 @@ router.get("/fee-quote", requirePermission("canTransfer"), async (req, res) => {
       return !!dest;
     };
 
-
-    // Fincra: external pay-out fee is 1.5% (1% Fincra + 0.5% margin); internal
-    // KashBook→KashBook book transfers are free. Match executeFincraPayout.
-    if (provider.unifiedProvisioning) {
-      let internal = false;
-      if (/^\d{10}$/.test(accountNumber)) {
-        const dest = await prisma.business.findFirst({
-          where: { virtualAccountNumber: accountNumber, providerAccountId: { not: null } },
-          select: { id: true },
-        });
-        if (dest) internal = true;
-      }
-      const { total, breakdown } = computeFincraTransferFee(amount, { internal });
-      return res.json({ fee: total, breakdown, route: internal ? "book" : "payout", total: amount + total });
-    }
-
     let route = "nip";
     if (/^\d{10}$/.test(accountNumber)) {
       const internalDest = await prisma.business.findFirst({
@@ -540,9 +524,7 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
         // lookup that can disagree with the executor's. Over-estimating only
         // ever refuses slightly early; under-estimating would let a staff
         // member cross the cap, so the rounding goes the safe way.
-        const worstFee = provider.unifiedProvisioning
-          ? computeFincraTransferFee(Number(amount), { internal: false }).total
-          : computeTransferFee(Number(amount), "nip").totalCost;
+        const worstFee = computeTransferFee(Number(amount), "nip").totalCost;
 
         const spent = await staffSpendLast24h(prisma, actorId);
         const verdict = decideStaffCap({

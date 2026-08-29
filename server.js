@@ -58,7 +58,6 @@ const invoiceRoutes = require("./src/routes/invoices");
 const adminRoutes = require("./src/routes/admin");
 const notificationRoutes = require("./src/routes/notifications");
 const anchorWebhookRoute = require("./src/routes/anchor");
-const fincraWebhookRoute = require("./src/routes/fincra");
 const instagramRoutes = require("./src/routes/instagram");
 const instagramWebhookRoute = require("./src/routes/instagramWebhook");
 const whatsappRoutes = require("./src/routes/whatsapp");
@@ -201,14 +200,6 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   anchorWebhookRoute,
 );
-// Fincra webhook — same raw-body-before-json requirement so the HMAC-SHA512
-// signature verifies against the exact bytes Fincra signed (header `signature`).
-app.use(
-  "/webhooks/fincra",
-  webhookLimiter,
-  express.raw({ type: "application/json", limit: "1mb" }),
-  fincraWebhookRoute,
-);
 // Instagram messaging webhook — same raw-body-before-json requirement so the
 // X-Hub-Signature-256 HMAC verifies against the exact bytes Meta sent. The GET
 // handshake carries no body, so express.raw is a no-op for it.
@@ -301,10 +292,6 @@ app.use("/whatsapp", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
-// FCY (USD/EUR/GBP) accounts hang off /businesses/:id/foreign-accounts. Mounted
-// BEFORE businessRoutes so its :businessId paths resolve first; it inherits the
-// same apiLimiter applied to /businesses above.
-app.use("/businesses", require("./src/routes/foreignAccounts"));
 app.use("/businesses", businessRoutes);
 app.use("/customers", customerRoutes);
 app.use("/inventory", inventoryRoutes);
@@ -387,20 +374,6 @@ app.listen(PORT, () => {
 // + push notifications even when Anchor's webhook delivery drops.
 // /webhooks/anchor is mounted above.
 require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
-
-// ── Background loop: reconcile Fincra collections + payouts every 5 min ──────
-// NOT optional, and no longer dormant. Ghana, Kenya and Tanzania route to Fincra,
-// and webhooks are ack-then-process: we return 200 and then do the work, so an
-// event lost between the ack and the write is gone. Fincra publishes NO webhook
-// retry policy anywhere in its documentation, which makes this poll the ONLY
-// guarantee that a merchant's inbound money is ever booked.
-//
-// It re-reads Fincra's own collection and payout records and books anything the
-// webhook missed, sharing recordFincraInboundCredit with the webhook path so the
-// Transaction @@unique([businessId, reference]) gate makes double-crediting
-// impossible. Leader-elected via withCronLock, and it no-ops when Fincra is
-// unconfigured, so it is safe on every instance.
-require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────
 // Summary of today's money in/out per user, or a nudge if nothing was

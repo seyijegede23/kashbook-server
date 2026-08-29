@@ -33,7 +33,7 @@ module.exports = {
   // NOTE: Fincra states KES merchant onboarding "typically takes up to 120 hours",
   // so the first account in a new Fincra environment is not instant. Collections
   // above KES 999,999 may trigger a Request For Information.
-  paymentProvider: "fincra",
+  paymentProvider: null, // Fincra removed 2026-08-27 (zero accounts). No local rail here.
 
   regionLabel: "County",
   regions: require("./regions/KE"),

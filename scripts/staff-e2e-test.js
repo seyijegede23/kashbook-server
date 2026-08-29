@@ -103,7 +103,6 @@ const { expireStaleRequests } = require("../src/utils/staffTransferCap");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 app.use("/auth", require("../src/routes/auth"));
-app.use("/businesses", require("../src/routes/foreignAccounts"));
 app.use("/businesses", require("../src/routes/businesses"));
 app.use("/transfers", require("../src/routes/transfers"));
 app.use("/recurring-expenses", require("../src/routes/recurringExpenses").router);
@@ -314,10 +313,6 @@ const send = (amount, over = {}) =>
   // serves the same field is the failure mode this whole section exists for.
   section("1b. side doors into the same data");
 
-  await test("foreign account IBAN/SWIFT is refused", async () => {
-    const r = await GET(`/businesses/${biz.id}/foreign-accounts`, tStaff);
-    assert.strictEqual(r.status, 403, "an IBAN is the same class of secret as a NUBAN");
-  });
   await test("business debts are refused", async () => {
     const r = await GET(`/business-debts?businessId=${biz.id}`, tStaff);
     assert.strictEqual(r.status, 403);

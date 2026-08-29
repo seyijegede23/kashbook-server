@@ -32,7 +32,7 @@ module.exports = {
   // Fincra TZS instant virtual account. Create-KYC is name only (no email, same
   // as KES) — see buildLocalKyc. Rails: TIPS instant with no cutoff, TISS same
   // day with a 5pm cutoff, mobile money instant. Account opening fee is 0.
-  paymentProvider: "fincra",
+  paymentProvider: null, // Fincra removed 2026-08-27 (zero accounts). No local rail here.
 
   regionLabel: "Region",
   regions: require("./regions/TZ"),

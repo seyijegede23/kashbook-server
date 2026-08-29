@@ -25,7 +25,7 @@ module.exports = {
     { code: "limited_company",     label: "Limited Liability Company", regCode: "Private_Incorporated" },
   ],
 
-  paymentProvider: "fincra", // Fincra GHS instant VA (First Bank Ghana). Create-KYC: name + email.
+  paymentProvider: null, // Fincra removed 2026-08-27 (zero accounts). No local rail here.
 
   regionLabel: "Region",
   regions: require("./regions/GH"),
