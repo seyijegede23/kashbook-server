@@ -3,6 +3,14 @@ const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { validateInventoryItem, validateIdParam } = require("../middleware/validate");
 
+// A barcode is unique per business. Without this, scanning a code that is
+// already on another product returns a blank 500 and the shopkeeper has no idea
+// why the save failed or which product already owns it.
+function isDuplicateBarcode(err) {
+  return err?.code === "P2002" &&
+    (err?.meta?.target || []).some?.((f) => String(f).includes("barcode"));
+}
+
 router.use(auth);
 
 // Helper to resolve the correct business owner ID
@@ -84,6 +92,12 @@ router.post("/", validateInventoryItem, async (req, res) => {
     });
     res.status(201).json(item);
   } catch (err) {
+    if (isDuplicateBarcode(err)) {
+      return res.status(409).json({
+        code: "BARCODE_TAKEN",
+        error: "Another product already uses that barcode.",
+      });
+    }
     console.error("POST /inventory error:", err.message);
     res.status(500).json({ error: "Failed to create item" });
   }
@@ -138,6 +152,12 @@ router.patch("/:id", async (req, res) => {
     });
     res.json(updated);
   } catch (err) {
+    if (isDuplicateBarcode(err)) {
+      return res.status(409).json({
+        code: "BARCODE_TAKEN",
+        error: "Another product already uses that barcode.",
+      });
+    }
     console.error("PATCH /inventory error:", err.message);
     res.status(500).json({ error: "Failed to update item" });
   }

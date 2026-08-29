@@ -798,6 +798,13 @@ model InventoryItem {
 
   @@index([userId, businessId])
   @@index([businessId, updatedAt])
+  // A barcode identifies ONE product within a business. Scoped per business,
+  // not globally, because two shops legitimately stock the same product and a
+  // global constraint would stop the second one recording it.
+  //
+  // Postgres permits many NULLs in a unique index, so products without a
+  // barcode — today that is all of them — are unaffected.
+  @@unique([businessId, barcode])
 }
 
 // Recurring invoices — PREMIUM. A rule auto-creates a SENT invoice (+ share
