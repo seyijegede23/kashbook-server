@@ -1,16 +1,17 @@
 // Country registry. Adding a country = adding a file + one line below.
+//
+// Nigeria only since 2026-08-27 — Ghana, Kenya, Tanzania, Uganda, South Africa
+// and Egypt were removed because KashBook services Nigeria alone. Every user and
+// business was already NG (16/16 and 12/12), so nothing had to migrate.
+//
+// The registry, the `country` column and everything that reads config by code
+// are all KEPT. Re-adding a market is a file plus one line here, not a rebuild.
 // `getCountryConfig` always returns NG as a safe fallback so existing code
 // never sees `undefined` — but `enabled` should be checked at the route
 // level to decide whether to surface the country in pickers.
 
 const COUNTRIES = {
   NG: require("./NG"),
-  GH: require("./GH"),
-  KE: require("./KE"),
-  TZ: require("./TZ"),
-  ZA: require("./ZA"),
-  EG: require("./EG"),
-  UG: require("./UG"),
 };
 
 const DEFAULT_COUNTRY = "NG";
