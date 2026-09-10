@@ -298,6 +298,9 @@ class FincraProvider extends PaymentProvider {
       "payout.reversed": "payout_failed",
       "payout.declined": "payout_failed",
       "disbursement.failed": "payout_failed",
+      // Euro → naira conversion (utils/fcyConversion.js). The initiate call is
+      // synchronous, so this is confirmation, not the trigger.
+      "conversion.successful": "conversion_success",
     };
     // `reference` first: it is the stable, documented unique identifier.
     // `id` is a small INTEGER on payouts (14380) and on RFI collections

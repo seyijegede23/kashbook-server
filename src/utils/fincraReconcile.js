@@ -83,11 +83,19 @@ function startFincraReconcileLoop(intervalMs = 5 * 60 * 1000) {
       const total = await prisma.withCronLock(FINCRA_RECONCILE_LOCK, async () => {
         await require("./snapshots").recordHeartbeat("fincra-reconcile").catch(() => {});
         const credits = await reconcileFincraCollections();
-        return { credits };
+        // Euro conversions whose naira payout did not complete (a crash or a
+        // Fincra error between "converted" and "paid"). The merchant's euros are
+        // already gone from their balance at that point, so this is the net that
+        // guarantees the naira still arrives. Idempotent by customerReference.
+        const conversions = await require("./fcyConversion").retryStuckConversions();
+        return { credits, conversions };
       });
-      const c = total?.credits;
-      if (c?.backfilled) {
-        console.log(`[fincra-reconcile] credits backfilled=${c.backfilled}`);
+      const c = total?.credits, v = total?.conversions;
+      if (c?.backfilled || v?.retried || v?.flagged) {
+        console.log(
+          `[fincra-reconcile] credits backfilled=${c?.backfilled || 0}; ` +
+          `conversions retried=${v?.retried || 0} completed=${v?.completed || 0} flagged=${v?.flagged || 0}`,
+        );
       }
     } catch (e) {
       console.error("[fincra-reconcile] tick error:", e.message);

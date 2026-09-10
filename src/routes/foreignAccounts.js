@@ -29,6 +29,9 @@ const crypto = require("crypto");
 const cloudinary = require("../config/cloudinary");
 const { getForeignAccountProvider } = require("../providers");
 const fincraService = require("../services/fincra");
+const fcy = require("../utils/fcyConversion");
+const { computeLedgerBalance } = require("../utils/ledgerBalance");
+const { verifyTransactionPin } = require("../utils/transactionPin");
 const { audit } = require("../utils/audit");
 const { buildFcyRequest, FcyKycError } = require("../utils/fcyKyc");
 const { isFcyRestricted } = require("../config/fcyRestrictedCountries");
@@ -166,10 +169,33 @@ router.get("/:businessId/foreign-accounts", authMiddleware, requirePermission("c
     // is in our own country list), so advertise nothing there rather than
     // letting a merchant complete a full KYC form only to be declined.
     const restricted = isFcyRestricted(biz.country);
+
+    // Balance per issued currency, from OUR ledger. Fincra pools every merchant's
+    // euros into one KashBook wallet, so the ledger is the only place that knows
+    // whose euros are whose. Currency-scoped, so this can never read naira rows.
+    const balances = {};
+    for (const fa of rows) {
+      if (fa.status === "issued") balances[fa.currency] = await computeLedgerBalance(biz.id, fa.currency);
+    }
+    // Conversion history the merchant should see. Abandoned quotes and
+    // conversions that failed before any money moved are noise to them.
+    const conversions = await prisma.fcyConversion.findMany({
+      where: { businessId: biz.id, status: { notIn: ["quoted", "failed"] } },
+      orderBy: { createdAt: "desc" },
+      take: 10,
+    });
+
     res.json({
       supported: FCY_ENABLED && LIVE_OK() && getForeignAccountProvider() && !restricted ? SUPPORTED : [],
       restricted,
       accounts: rows.map(publicView),
+      balances,
+      // Where converted naira goes. Conversion needs a naira NUBAN to land in.
+      canConvert: !!biz.virtualAccountNumber,
+      payoutTo: biz.virtualAccountNumber
+        ? { bankName: biz.virtualAccountBank || null, accountNumber: `••••${String(biz.virtualAccountNumber).slice(-4)}`, accountName: biz.virtualAccountName || null }
+        : null,
+      conversions: conversions.map(fcy.publicView),
     });
   } catch (err) {
     console.error("[foreign-accounts] list:", err.message);
@@ -344,6 +370,93 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
   } catch (err) {
     console.error("[foreign-accounts] create:", err.message);
     res.status(500).json({ error: "Couldn't request that account. Please try again." });
+  }
+});
+
+// ── Conversions: euro → naira ────────────────────────────────────────────────
+// The only way euros leave a balance. Two steps, both owner-only, both behind
+// the same feature gate as issuing: quote locks a rate (~30s), confirm needs the
+// transaction PIN and runs the money path in utils/fcyConversion.js.
+
+function sendConversionError(res, err) {
+  if (err instanceof fcy.ConversionError) {
+    const body = { error: err.message, code: err.code };
+    if (err.quote) body.quote = err.quote;       // QUOTE_CHANGED carries the fresh figures
+    if (err.available !== undefined) body.available = err.available;
+    return res.status(err.status || 400).json(body);
+  }
+  console.error("[foreign-accounts] conversion:", err.message);
+  return res.status(500).json({ error: "Couldn't complete that right now. Please try again." });
+}
+
+// Shared preamble for both conversion routes. Returns the business or sends
+// the refusal and returns null.
+async function conversionPreamble(req, res) {
+  if (req.user.accountType === "staff") {
+    res.status(403).json({ code: "OWNER_ONLY", error: "Only the business owner can convert foreign currency." });
+    return null;
+  }
+  const biz = await ownedBusiness(req, req.params.businessId);
+  if (!biz) { res.status(404).json({ error: "Business not found" }); return null; }
+  if (!(FCY_ENABLED && LIVE_OK() && getForeignAccountProvider())) {
+    res.status(503).json({ code: "FCY_UNAVAILABLE", error: "Foreign currency isn't available right now." });
+    return null;
+  }
+  return biz;
+}
+
+router.post("/:businessId/foreign-accounts/conversions/quote", authMiddleware, async (req, res) => {
+  try {
+    const biz = await conversionPreamble(req, res);
+    if (!biz) return;
+    const currency = String(req.body?.currency || "").toUpperCase();
+    if (!SUPPORTED.includes(currency)) {
+      return res.status(400).json({ error: `Choose one of ${SUPPORTED.join(", ")}.` });
+    }
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "Enter an amount to convert." });
+    }
+    // Must actually hold an issued account in that currency; a balance without
+    // one would mean a credit landed somewhere we do not track.
+    const fa = await prisma.foreignAccount.findUnique({
+      where: { businessId_currency: { businessId: biz.id, currency } },
+    });
+    if (!fa || fa.status !== "issued") {
+      return res.status(409).json({ code: "NO_FCY_ACCOUNT", error: `You don't have a ${currency} account yet.` });
+    }
+    const quote = await fcy.quoteConversion({ biz, userId: req.user.id, currency, amount });
+    res.json({ quote });
+  } catch (err) {
+    sendConversionError(res, err);
+  }
+});
+
+router.post("/:businessId/foreign-accounts/conversions/:conversionId/confirm", authMiddleware, async (req, res) => {
+  try {
+    const biz = await conversionPreamble(req, res);
+    if (!biz) return;
+
+    // Same PIN gate as sending money. Moving euros to naira is irreversible
+    // once Fincra has converted, so it deserves the same proof of presence.
+    const pinCheck = await verifyTransactionPin(req.user.id, req.body?.pin);
+    if (!pinCheck.ok) {
+      await audit({
+        req, action: "PIN_FAILED", resourceType: "user", resourceId: req.user.id,
+        severity: "warn", metadata: { context: "fcy_conversion", conversionId: req.params.conversionId },
+      });
+      const { ok, status, ...rest } = pinCheck;
+      return res.status(status || 401).json({ code: "PIN_INVALID", ...rest });
+    }
+
+    const result = await fcy.executeConversion({
+      biz, userId: req.user.id, conversionId: req.params.conversionId, req,
+    });
+    // 202 when the euros converted but the naira payout is being retried: the
+    // merchant's money is safe and on its way, but not yet landed.
+    res.status(result.payout === "payout_failed" ? 202 : 200).json(result);
+  } catch (err) {
+    sendConversionError(res, err);
   }
 });
 

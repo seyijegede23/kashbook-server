@@ -15,6 +15,7 @@ const prisma = require("../utils/db");
 const FincraProvider = require("../providers/fincra");
 const { pushTo } = require("../utils/pushNotification");
 const { recordFincraInboundCredit } = require("../utils/fincraCredit");
+const { recordConversionPayoutOutcome } = require("../utils/fcyConversion");
 
 const fincra = new FincraProvider();
 
@@ -296,19 +297,28 @@ async function handleEvent(evt) {
     case "inbound_credit":
       await recordFincraInboundCredit(d);
       break;
-    // Fincra is RECEIVE-ONLY for us: it issues EUR virtual accounts and we never
-    // push money through it (providers/index.js explains how that is enforced).
-    // So a payout event cannot be ours. It is logged rather than handled, because
-    // silently ignoring one would hide a genuine problem — either money leaving
-    // an account we believed could not send, or Fincra addressing us with another
-    // merchant's event. Both warrant a look.
+    // The ONLY payouts we make through Fincra are the naira leg of a euro
+    // conversion (customerReference kb_cvp_…, utils/fcyConversion.js). Those are
+    // recorded. Anything else is not ours and is logged rather than ignored: it
+    // would mean money leaving a wallet we believed could not send, or Fincra
+    // addressing us with another merchant's event. Both warrant a look.
     case "payout_success":
-    case "payout_failed":
-      console.warn(
-        `[fincra-webhook] UNEXPECTED payout event "${evt.kind}" — Fincra is receive-only. ` +
-        `reference=${d?.customerReference || d?.reference || "?"} ` +
-        `amount=${d?.amount ?? "?"} ${d?.sourceCurrency || ""}`,
-      );
+    case "payout_failed": {
+      const outcome = evt.kind === "payout_success" ? "success" : "failed";
+      const r = await recordConversionPayoutOutcome(d, outcome);
+      if (!r.handled) {
+        console.warn(
+          `[fincra-webhook] UNEXPECTED payout event "${evt.kind}" — not a conversion payout. ` +
+          `reference=${d?.customerReference || d?.reference || "?"} ` +
+          `amount=${d?.amount ?? "?"} ${d?.sourceCurrency || ""}`,
+        );
+      }
+      break;
+    }
+    // Conversion outcome arrives synchronously on the initiate call; the webhook
+    // is confirmation only. Logged so the trail exists if a dispute ever needs it.
+    case "conversion_success":
+      console.log(`[fincra-webhook] conversion.successful ref=${d?.customerReference || d?.reference || "?"}`);
       break;
     default:
       break;

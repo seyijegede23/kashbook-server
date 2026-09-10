@@ -185,6 +185,9 @@ router.get("/limits", requirePermission("canViewBalance"), async (req, res) => {
         businessId: biz.id,
         type: "expense",
         category: "transfer",
+        // Same currency scoping as runPreTransferChecks: a euro conversion is a
+        // "fincra" expense transfer and must not eat the naira allowance shown here.
+        currency: biz.baseCurrency || getCountryConfig(biz.country)?.currency?.code || "NGN",
         source: { in: MONEY_OUT_SOURCES }, // must match runPreTransferChecks (amlChecks.js)
         date: { gte: since30d },
       },

@@ -264,6 +264,34 @@ function createPayout(payload) {
   return fincraFetch("/disbursements/payouts", { method: "POST", body: payload });
 }
 
+// ── Conversions (EUR wallet → NGN wallet, both ours) ─────────────────────────
+// Two-step, per docs.fincra.com/reference/generate-quote and
+// /reference/initiate-currency-conversion (checked 2026-09-10):
+//
+//   POST /quotes/generate      { business, sourceCurrency, destinationCurrency,
+//                                amount, action:"send", transactionType:"conversion",
+//                                paymentDestination:"fliqpay_wallet", feeBearer }
+//     → data { rate, fee, sourceAmount, destinationAmount, amountToCharge,
+//              amountToReceive, reference, expireAt }
+//   POST /conversions/initiate { business, quoteReference, customerReference }
+//     → data { reference, customerReference }   (synchronous)
+//
+// ⚠️ A quote is valid for 30 SECONDS. Callers must expect expiry between quote
+// and confirm and re-quote rather than retry the same reference.
+function generateQuote(payload) {
+  return fincraFetch("/quotes/generate", {
+    method: "POST",
+    body: { business: process.env.FINCRA_BUSINESS_ID, ...payload },
+  });
+}
+
+function initiateConversion({ quoteReference, customerReference }) {
+  return fincraFetch("/conversions/initiate", {
+    method: "POST",
+    body: { business: process.env.FINCRA_BUSINESS_ID, quoteReference, customerReference },
+  });
+}
+
 // ── Webhook verification (fail-closed) ──────────────────────────────────────
 // Fincra signs webhooks with HMAC-SHA512 over the raw request body using the
 // webhook secret, delivered in the `signature` header. Timing-safe compare.
@@ -286,6 +314,8 @@ module.exports = {
   isConfigured,
   isLive,
   fincraFetch,
+  generateQuote,
+  initiateConversion,
   createVirtualAccount,
   createNgnAccount,
   getVirtualAccount,

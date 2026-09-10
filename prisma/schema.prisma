@@ -218,6 +218,7 @@ model Business {
   waConversations   WaConversation[]
   kycSubmissions    KycSubmission[]
   foreignAccounts   ForeignAccount[]
+  fcyConversions    FcyConversion[]
   // Virtual field only — no column is added to Business. The foreign key lives
   // on StaffTransferRequest.
   staffTransferRequests StaffTransferRequest[]
@@ -399,6 +400,49 @@ model ForeignAccount {
   @@unique([businessId, currency])
   @@index([fincraRequestId])
   @@index([accountNumber])
+}
+
+// One euro → naira conversion attempt, quote through to the naira landing.
+// Exists because the ledger alone cannot describe the failure that matters: the
+// euros have left the merchant's balance (converted at Fincra) but the naira
+// payout to their NUBAN failed. "converted" / "payout_failed" is money we owe
+// until the payout succeeds; utils/fcyConversion.retryStuckConversions drives
+// rows out of those states. Both references are unique so a retry can never pay
+// twice. Money-path detail in utils/fcyConversion.js.
+model FcyConversion {
+  id                      String    @id @default(uuid())
+  businessId              String
+  business                Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId                  String?
+  sourceCurrency          String
+  destinationCurrency     String    @default("NGN")
+  sourceAmount            Float     // debited from the merchant's FCY ledger balance
+  fee                     Float     @default(0) // any source-side charge beyond sourceAmount
+  rate                    Float
+  grossDestinationAmount  Float     // what Fincra delivers to our naira wallet
+  destinationAmount       Float     // what the merchant gets, after marginBps
+  marginBps               Int       @default(0)
+  // quoted | converting | converted | paying_out | paid | payout_failed | failed | needs_review
+  status                  String    @default("quoted")
+  quoteReference          String
+  quoteExpiresAt          DateTime
+  customerReference       String    @unique // kb_cv_…  (the conversion)
+  conversionReference     String?
+  payoutCustomerReference String    @unique // kb_cvp_… (the naira payout)
+  payoutReference         String?
+  // Snapshot of the destination, name-verified at quote time.
+  payoutAccountNumber     String
+  payoutBankCode          String
+  payoutBankName          String?
+  payoutAccountName       String?
+  error                   String?
+  convertedAt             DateTime?
+  paidAt                  DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@index([businessId, createdAt])
+  @@index([status])
 }
 
 model CustomCategory {

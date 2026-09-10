@@ -145,11 +145,18 @@ async function runPreTransferChecks({ req, user, actor = user, business, amount,
   const since7d  = new Date(now - 7  * 24 * 60 * 60 * 1000);
   const since30d = new Date(now - 30 * 24 * 60 * 60 * 1000);
 
+  // Currency-scoped. Since 2026-09-10 a merchant can hold euros (Fincra) and
+  // convert them, which writes a EUR expense row with source "fincra" and
+  // category "transfer". Without this filter €100 would be summed here as ₦100
+  // against the naira velocity limits. The limits themselves are in the
+  // business's own currency, so only rows in that currency belong in the window.
+  const windowCurrency = limits.currencyCode || business.baseCurrency || "NGN";
   const recent30 = await prisma.transaction.findMany({
     where: {
       businessId: business.id,
       type: "expense",
       category: "transfer",
+      currency: windowCurrency,
       source: { in: MONEY_OUT_SOURCES },
       date: { gte: since30d },
     },
