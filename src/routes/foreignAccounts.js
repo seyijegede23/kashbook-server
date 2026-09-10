@@ -28,6 +28,7 @@ const { requirePermission } = require("../middleware/requirePermission");
 const crypto = require("crypto");
 const cloudinary = require("../config/cloudinary");
 const { getForeignAccountProvider } = require("../providers");
+const fincraService = require("../services/fincra");
 const { audit } = require("../utils/audit");
 const { buildFcyRequest, FcyKycError } = require("../utils/fcyKyc");
 const { isFcyRestricted } = require("../config/fcyRestrictedCountries");
@@ -101,6 +102,24 @@ const SUPPORTED = ["EUR"];
 // UI shows "not available yet" instead of a button that always fails.
 const FCY_ENABLED = process.env.FCY_ENABLED === "true";
 
+// A euro account is only real if it came from Fincra's LIVE API. services/fincra
+// falls back to the SANDBOX host when FINCRA_BASE_URL is unset, so a production
+// deploy that turns FCY_ENABLED on and forgets the base URL would hand merchants
+// sandbox account details, which they would give to real customers. Money sent
+// to those never arrives and nothing in the app would say why.
+//
+// So production requires the live host explicitly. Off in production, the feature
+// simply advertises no currencies, which is the same "not available yet" state
+// the UI already knows how to show.
+const LIVE_OK = () => process.env.NODE_ENV !== "production" || fincraService.isLive();
+if (FCY_ENABLED && process.env.NODE_ENV === "production" && !fincraService.isLive()) {
+  console.error(
+    "[fcy] DISABLED: FCY_ENABLED=true in production but FINCRA_BASE_URL is not the live API " +
+    `(${process.env.FINCRA_BASE_URL || "unset, defaulting to sandbox"}). ` +
+    "Set FINCRA_BASE_URL=https://api.fincra.com with LIVE keys, or unset FCY_ENABLED.",
+  );
+}
+
 // Never leak provider ids or the raw decline text to the client.
 function publicView(fa) {
   return {
@@ -148,7 +167,7 @@ router.get("/:businessId/foreign-accounts", authMiddleware, requirePermission("c
     // letting a merchant complete a full KYC form only to be declined.
     const restricted = isFcyRestricted(biz.country);
     res.json({
-      supported: FCY_ENABLED && getForeignAccountProvider() && !restricted ? SUPPORTED : [],
+      supported: FCY_ENABLED && LIVE_OK() && getForeignAccountProvider() && !restricted ? SUPPORTED : [],
       restricted,
       accounts: rows.map(publicView),
     });
@@ -182,7 +201,7 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
 
     // FCY is independent of whoever holds the local account: a Nigerian merchant
     // keeps their NGN NUBAN at Anchor and holds USD/EUR/GBP at Fincra.
-    const provider = FCY_ENABLED ? getForeignAccountProvider() : null;
+    const provider = FCY_ENABLED && LIVE_OK() ? getForeignAccountProvider() : null;
     if (!provider) {
       return res.status(503).json({
         code: "NOT_SUPPORTED",

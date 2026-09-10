@@ -329,5 +329,41 @@ test("the mobile picker offers exactly what the server accepts", () => {
   }
 });
 
+// ══ 7. SANDBOX CANNOT MASQUERADE AS LIVE ═══════════════════════════════════
+section("7. a production deploy cannot issue sandbox accounts");
+
+const fincraService = require("../src/services/fincra");
+const withBase = (url, fn) => {
+  const prev = process.env.FINCRA_BASE_URL;
+  if (url === undefined) delete process.env.FINCRA_BASE_URL;
+  else process.env.FINCRA_BASE_URL = url;
+  try { return fn(); } finally {
+    if (prev === undefined) delete process.env.FINCRA_BASE_URL;
+    else process.env.FINCRA_BASE_URL = prev;
+  }
+};
+
+test("the live host reads as live", () => {
+  assert.strictEqual(withBase("https://api.fincra.com", () => fincraService.isLive()), true);
+});
+
+for (const [label, url] of [
+  ["the sandbox host", "https://sandboxapi.fincra.com"],
+  ["an unset base url (defaults to sandbox)", undefined],
+  ["a lookalike host", "https://api.fincra.com.evil.example"],
+  ["a subdomain of the live host", "https://sandbox.api.fincra.com"],
+  ["junk", "not-a-url"],
+  ["empty", ""],
+]) {
+  test(`${label} does NOT read as live`, () => {
+    assert.strictEqual(withBase(url, () => fincraService.isLive()), false,
+      `${url} was treated as live — merchants could be issued sandbox accounts`);
+  });
+}
+
+test("the live check is case-insensitive on the host", () => {
+  assert.strictEqual(withBase("https://API.Fincra.COM", () => fincraService.isLive()), true);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

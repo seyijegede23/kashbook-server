@@ -22,6 +22,23 @@ function isConfigured() {
   return !!SECRET();
 }
 
+// Are we pointed at Fincra's LIVE API, or the sandbox?
+//
+// BASE() defaults to the SANDBOX, which is the right default for a machine with
+// no config but the wrong one to fail silently on. A production server with
+// FCY_ENABLED=true and no FINCRA_BASE_URL would issue sandbox EUR accounts to
+// real merchants, who would pass those details to real customers, and the money
+// would go nowhere with nothing in the app to say so. Callers use this to refuse
+// rather than to warn. Matched on the exact live host, so an unrecognised or
+// misspelled URL reads as "not live" and fails closed.
+function isLive() {
+  try {
+    return new URL(BASE()).hostname.toLowerCase() === "api.fincra.com";
+  } catch {
+    return false;
+  }
+}
+
 // Is this failure worth another attempt?
 //
 // undici intermittently throws a bare, code-less "fetch failed" against
@@ -267,6 +284,7 @@ function verifyWebhookSignature(rawBody, signatureHeader) {
 
 module.exports = {
   isConfigured,
+  isLive,
   fincraFetch,
   createVirtualAccount,
   createNgnAccount,
