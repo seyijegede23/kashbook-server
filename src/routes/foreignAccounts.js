@@ -32,6 +32,11 @@ const fincraService = require("../services/fincra");
 const fcy = require("../utils/fcyConversion");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { verifyTransactionPin } = require("../utils/transactionPin");
+const { fireAlert } = require("../utils/alerts");
+
+const fincraHost = () => {
+  try { return new URL(process.env.FINCRA_BASE_URL || "https://sandboxapi.fincra.com").hostname; } catch { return "?"; }
+};
 const { audit } = require("../utils/audit");
 const { buildFcyRequest, FcyKycError } = require("../utils/fcyKyc");
 const { isFcyRestricted } = require("../config/fcyRestrictedCountries");
@@ -67,12 +72,42 @@ async function uploadFcyDocs(docs = {}) {
     out.bankStatementType = r.type;
   }
   // Passport is one page; other IDs need front and back, hence an array.
+  out.meansOfIdTypes = [];
   for (const [i, uri] of [].concat(docs.meansOfId || []).filter(Boolean).entries()) {
     if (i >= 2) break; // Fincra takes at most front + back
     const r = await put(uri, "id");
     out.meansOfIdIds.push(r.id);
+    out.meansOfIdTypes.push(r.type);
   }
   return out;
+}
+
+// Best-effort removal of documents stored for an attempt that never reached
+// Fincra. A private passport scan with nothing pointing at it is the worst kind
+// of leftover: invisible, personal, and ours to answer for.
+async function destroyUploaded(uploaded = {}) {
+  const jobs = [];
+  const gone = (id, type) => cloudinary.uploader.destroy(id, { type: "private", resource_type: type || "image" });
+  if (uploaded.utilityBillId) jobs.push(gone(uploaded.utilityBillId, uploaded.utilityBillType));
+  if (uploaded.bankStatementId) jobs.push(gone(uploaded.bankStatementId, uploaded.bankStatementType));
+  (uploaded.meansOfIdIds || []).forEach((id, i) => jobs.push(gone(id, (uploaded.meansOfIdTypes || [])[i])));
+  await Promise.allSettled(jobs);
+}
+
+// Keep the address the merchant confirmed on the FCY form. Only the fields they
+// supplied, only where they differ, so this can never blank anything. The
+// postcode in particular was never collected anywhere else.
+async function persistAddress(biz, address) {
+  if (!address || typeof address !== "object") return;
+  const map = { street: "addressLine1", city: "addressCity", state: "addressState", postalCode: "addressPostalCode" };
+  const data = {};
+  for (const [k, col] of Object.entries(map)) {
+    const v = typeof address[k] === "string" ? address[k].trim().slice(0, 120) : "";
+    if (v && v !== biz[col]) data[col] = v;
+  }
+  if (!Object.keys(data).length) return;
+  await prisma.business.update({ where: { id: biz.id }, data })
+    .catch((e) => console.warn("[foreign-accounts] address persist failed:", e.message));
 }
 
 // Staff act on their employer's data — same convention as the other routes.
@@ -264,34 +299,26 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
       }
     }
 
-    // One per (business, currency). Return the existing row rather than erroring
+    // One per (business, currency). A row that actually reached Fincra (it has
+    // a fincraRequestId, or has since been approved/issued) is returned as-is,
     // so a double-tap is harmless and the client just keeps polling.
+    //
+    // A "pending" row with NO fincraRequestId never reached Fincra: it is the
+    // leftover of an attempt that failed validation. It must not block a retry.
+    // On 2026-09-10 exactly that leftover made every resubmission return 200
+    // "existing" without re-validating, and the app announced an account
+    // request that had never been sent.
     const existing = await prisma.foreignAccount.findUnique({
       where: { businessId_currency: { businessId: biz.id, currency } },
     });
-    if (existing && existing.status !== "declined") {
+    const reachedFincra = !!existing && existing.status !== "declined" &&
+      (!!existing.fincraRequestId || ["approved", "issued"].includes(existing.status));
+    if (reachedFincra) {
       return res.status(200).json({ account: publicView(existing), existing: true });
     }
 
     const owner = await prisma.user.findUnique({ where: { id: biz.userId } });
     if (!owner) return res.status(404).json({ error: "Business owner not found" });
-
-    // Create the row BEFORE calling Fincra. The issued webhook matches on
-    // fincraRequestId/accountNumber, and it can arrive before our HTTP response
-    // does — with no row to match, that credit would have nowhere to land.
-    const row = existing
-      ? await prisma.foreignAccount.update({
-          where: { id: existing.id },
-          data: { status: "pending", declineReason: null },
-        })
-      : await prisma.foreignAccount.create({
-          data: {
-            businessId: biz.id,
-            currency,
-            accountType: biz.businessKyb ? "corporate" : "individual",
-            status: "pending",
-          },
-        });
 
     // Upload the KYC documents PRIVATELY (never public: these are passports and
     // utility bills). buildFcyRequest signs them into expiring URLs for Fincra
@@ -322,12 +349,38 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
       });
     } catch (err) {
       if (err instanceof FcyKycError) {
-        // Not a provider failure — nothing was sent, so the row stays pending
-        // and the user can correct and resubmit.
+        // Nothing was sent. Drop the documents we just stored so a rejected
+        // attempt leaves no private assets behind, and point at the field.
+        destroyUploaded(uploaded).catch(() => {});
         return res.status(err.httpStatus || 400).json({ error: err.message, code: err.code, field: err.field });
       }
       throw err;
     }
+
+    // The address the merchant just confirmed IS the business address; keep it
+    // so the next thing that needs it (invoices, the NUBAN) has it too.
+    await persistAddress(biz, req.body?.kyc?.address);
+
+    // Create the row only NOW, immediately before Fincra is called. It has to
+    // exist before the call, because the issued webhook matches on
+    // fincraRequestId/accountNumber and can arrive before our HTTP response,
+    // and not a moment earlier, because a row created before validation is the
+    // leftover described above.
+    const row = existing
+      ? await prisma.foreignAccount.update({
+          where: { id: existing.id },
+          data: { status: "pending", declineReason: null },
+        })
+      : await prisma.foreignAccount.create({
+          data: {
+            businessId: biz.id,
+            currency,
+            // Always individual: Fincra's FCY accounts are individual-only
+            // (see utils/fcyKyc.js accountType).
+            accountType: "individual",
+            status: "pending",
+          },
+        });
 
     let result;
     try {
@@ -336,16 +389,30 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
         merchantReference: `fa_${row.id}`,
       });
     } catch (err) {
-      // Leave no half-open request: mark it declined with the reason so the user
-      // can retry, and surface a safe message.
+      // Leave no half-open request: mark it declined so the user can retry.
+      // The merchant sees a safe reason; the raw provider message goes to the
+      // log. A 401/403 means OUR credentials were rejected, not their KYC, so
+      // say that plainly and page the admin (fireAlert dedups for an hour).
+      const authProblem = err.status === 401 || err.status === 403;
+      const reason = authProblem
+        ? "Our banking partner couldn't process the request. Support has been notified; please try again later."
+        : String(err.message || "").slice(0, 500);
       await prisma.foreignAccount.update({
         where: { id: row.id },
-        data: { status: "declined", declineReason: String(err.message || "").slice(0, 500) },
+        data: { status: "declined", declineReason: reason },
       });
-      console.error(`[foreign-accounts] ${currency} provisioning failed:`, err.message);
+      console.error(
+        `[foreign-accounts] ${currency} provisioning failed: HTTP ${err.status ?? "n/a"} ${err.errorType || ""} ${err.message}`,
+      );
+      if (authProblem) {
+        fireAlert("fincra-auth", "Fincra credentials rejected",
+          `EUR account request for business ${biz.id} got HTTP ${err.status} (${err.message}) from ${fincraHost()}. ` +
+          "Check FINCRA_SECRET_KEY / FINCRA_PUBLIC_KEY / FINCRA_BUSINESS_ID on Render are the LIVE values for api.fincra.com.",
+        ).catch(() => {});
+      }
       return res.status(502).json({
-        code: "PROVIDER_ERROR",
-        error: "We couldn't set up that account right now. Please try again shortly.",
+        code: authProblem ? "PROVIDER_AUTH" : "PROVIDER_ERROR",
+        error: authProblem ? reason : "We couldn't set up that account right now. Please try again shortly.",
       });
     }
 

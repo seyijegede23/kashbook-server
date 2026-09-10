@@ -267,6 +267,43 @@ test("a complete input builds a body", () => {
   assert.ok(body.KYCInformation, "KYCInformation missing");
 });
 
+// The NUBAN onboarding never collected a postcode, so every app-onboarded
+// business had addressPostalCode = null and every FCY request was rejected
+// (2026-09-10). The form now supplies the address itself.
+test("the postcode can come from the form when the business row has none", () => {
+  const inp = OK();
+  inp.business.addressPostalCode = null;
+  inp.extra.address = { postalCode: "101233" };
+  assert.doesNotThrow(() => buildFcyRequest(inp), "postcode from extra.address was not accepted");
+});
+
+test("what the merchant typed wins over the business row", () => {
+  const inp = OK();
+  inp.extra.address = { street: "5 New Road", city: "Abuja", state: "FCT", postalCode: "900001" };
+  const json = JSON.stringify(buildFcyRequest(inp));
+  for (const v of ["5 New Road", "Abuja", "FCT", "900001"]) {
+    assert.ok(json.includes(v), `form address value "${v}" did not reach the payload`);
+  }
+  assert.ok(!json.includes("Awolowo"), "the business row's street leaked through despite a form value");
+});
+
+test("no postcode anywhere is FCY_ADDRESS_INCOMPLETE tagged 'address'", () => {
+  const inp = OK();
+  inp.business.addressPostalCode = null;
+  inp.extra.address = { street: "12 Awolowo Road", city: "Lagos", state: "Lagos", postalCode: "" };
+  assert.throws(() => buildFcyRequest(inp), (e) => e.code === "FCY_ADDRESS_INCOMPLETE" && e.field === "address");
+});
+
+test("the address error is tagged with a field the app now renders", () => {
+  // The app's FIELD_TO_KEY must know every field tag the server can emit for
+  // the address, or the error lands under a key nothing displays again.
+  const screen = path.join(__dirname, "..", "..", "src", "screens", "ForeignAccountKycScreen.js");
+  if (!fs.existsSync(screen)) return;
+  const src = fs.readFileSync(screen, "utf8");
+  assert.ok(/address:\s*"address"/.test(src), "FIELD_TO_KEY has no entry for the server's 'address' field");
+  assert.ok(/errors\.address/.test(src), "nothing in the screen renders errors.address");
+});
+
 test("accountType is ALWAYS individual, even for a registered company", () => {
   // Fincra's FCY accounts are individual-only. This previously sent "corporate"
   // whenever business.businessKyb was true, declining exactly the merchants most

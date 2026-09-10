@@ -155,13 +155,21 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
     }
   }
 
-  const street = business.addressLine1;
-  const city = business.addressCity;
-  const state = business.addressState;
-  const zip = business.addressPostalCode;
+  // Address: what the merchant typed on the FCY form wins, then what the
+  // business row holds. The form has an address section because the NUBAN
+  // onboarding never collected a postcode (VirtualAccountScreen sends street,
+  // city and state only), so addressPostalCode was null for every app-onboarded
+  // business and this check rejected every single request, 2026-09-10, with a
+  // message the app then failed to display. Fincra requires all four.
+  const addr = extra.address && typeof extra.address === "object" ? extra.address : {};
+  const pick = (v, fallback) => (req(v) ? String(v).trim() : fallback);
+  const street = pick(addr.street, business.addressLine1);
+  const city = pick(addr.city, business.addressCity);
+  const state = pick(addr.state, business.addressState);
+  const zip = pick(addr.postalCode, business.addressPostalCode);
   if (!req(street) || !req(city) || !req(state) || !req(zip)) {
     throw new FcyKycError(
-      "Add your full business address, including postcode, before opening a foreign currency account.",
+      "Enter your full business address, including a postal code.",
       "FCY_ADDRESS_INCOMPLETE", "address",
     );
   }

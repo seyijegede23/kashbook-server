@@ -453,7 +453,11 @@ async function findExistingPayout(customerReference, { maxPages = 3 } = {}) {
   let cursor;
   for (let page = 0; page < maxPages; page++) {
     let res;
-    try { res = await fincra.listPayouts({ perPage: 100, cursor }); } catch { return null; }
+    // "Could not ask" is NOT "does not exist". Returning null here would let a
+    // retry send a second payout during any Fincra outage or credential
+    // failure; the caller must treat unknown as "leave it for the next tick".
+    try { res = await fincra.listPayouts({ perPage: 100, cursor }); }
+    catch (e) { return { unknown: true, error: e.message }; }
     const items = res?.data?.results || (Array.isArray(res?.data) ? res.data : []);
     const hit = items.find((p) => String(p.customerReference || "") === customerReference);
     if (hit) return hit;
@@ -479,6 +483,10 @@ async function retryStuckConversions({ logger = console } = {}) {
   });
   for (const row of owed) {
     const existing = await findExistingPayout(row.payoutCustomerReference);
+    if (existing && existing.unknown) {
+      logger.warn?.(`[fcy-conversion] cannot check Fincra payouts (${existing.error}); leaving ${row.id} for the next tick`);
+      continue;
+    }
     if (existing) {
       const st = String(existing.status || "").toLowerCase();
       if (["successful", "success", "completed", "paid"].includes(st)) {

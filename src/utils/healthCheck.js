@@ -23,6 +23,11 @@ const CRON_INTERVAL_MIN = {
   // Same reasoning, and sharper: a payroll cron that stops means staff quietly
   // don't get asked to be paid, and nobody finds out until someone complains.
   salaryPayments: 24 * 60,
+  // The Fincra loop only writes an "ok" beat after a SUCCESSFUL list, so a
+  // dead credential shows up here as stale within ~10 minutes. Before
+  // 2026-09-10 the beat was written before the call and the loop 401'd for
+  // hours behind a green health page.
+  "fincra-reconcile": 5,
 };
 
 async function pingDb() {
@@ -42,6 +47,9 @@ function depsConfigured() {
     smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER),
     whatsapp: !!(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN),
     cloudinary: !!process.env.CLOUDINARY_CLOUD_NAME,
+    fincra: !!process.env.FINCRA_SECRET_KEY,
+    // Configured is not the same as live: the client defaults to the sandbox.
+    fincraLive: require("../services/fincra").isLive(),
   };
 }
 
@@ -65,8 +73,8 @@ async function collectHealth() {
   // row stays behind, is not in CRON_INTERVAL_MIN, falls back to the 60-minute
   // default, and is therefore permanently "stale" — alerting forever about a
   // cron that no longer exists. korapay-reconcile did exactly that for 18 days
-  // after Korapay was removed, and fincra-reconcile is doing it while that loop
-  // is commented out.
+  // after Korapay was removed. (fincra-reconcile is live again since Sep 2026
+  // and registered above.)
   //
   // A name absent from CRON_INTERVAL_MIN means the code no longer schedules it,
   // so it is reported as `retired` and never counted as stale. Registering a new
@@ -80,6 +88,7 @@ async function collectHealth() {
       lastRunAt: h.lastRunAt,
       ageMin: Math.round(ageMin),
       status: h.lastStatus,
+      error: h.lastError || null,
       retired,
       stale: !retired && ageMin > expected * 2,
     };

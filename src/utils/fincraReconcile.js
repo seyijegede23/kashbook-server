@@ -16,6 +16,7 @@
 const prisma = require("./db");
 const fincra = require("../services/fincra");
 const { recordFincraInboundCredit } = require("./fincraCredit");
+const { fireAlert } = require("./alerts");
 
 const SUCCESS = new Set(["successful", "success", "completed", "paid", "received"]);
 // "approved" is DELIBERATELY absent. Fincra uses it to mean "accepted for
@@ -40,8 +41,26 @@ async function reconcileFincraCollections({ perPage = 50, logger = console } = {
   try {
     res = await fincra.listCollections({ perPage });
   } catch (e) {
-    logger.warn?.(`[fincra-reconcile] list failed: ${e.message}`);
-    return { scanned, backfilled };
+    // Say WHAT failed, not just Fincra's one-word message. "Unauthorized" on its
+    // own cost an afternoon on 2026-09-10: it is the API gateway rejecting the
+    // api-key itself, which a sandbox key against the live host produces
+    // byte-for-byte, and nothing in the old line said status, host or cause.
+    let host = "?";
+    try { host = new URL(process.env.FINCRA_BASE_URL || "https://sandboxapi.fincra.com").hostname; } catch { /* keep ? */ }
+    const auth = e.status === 401 || e.status === 403;
+    logger.warn?.(
+      `[fincra-reconcile] list failed: HTTP ${e.status ?? "n/a"} ${e.errorType || ""} "${e.message}" host=${host}` +
+      (auth
+        ? " — the api-key was rejected by this host. Check FINCRA_SECRET_KEY / FINCRA_PUBLIC_KEY / FINCRA_BUSINESS_ID on Render are the LIVE values for api.fincra.com (a sandbox key returns exactly this; an IP block would say ACCESS_DENIED instead)."
+        : ""),
+    );
+    if (auth) {
+      // fireAlert dedups per key for an hour, so this pages once, not every 5 min.
+      fireAlert("fincra-auth", "Fincra credentials rejected",
+        `GET /collections on ${host} returned HTTP ${e.status} (${e.message}). EUR inbound reconcile is dead and every EUR account request will fail until the keys are fixed.`,
+      ).catch(() => {});
+    }
+    return { scanned, backfilled, error: `HTTP ${e.status ?? "n/a"} ${e.message}`.trim() };
   }
   const items = res?.data?.results || (Array.isArray(res?.data) ? res.data : []);
   for (const item of items) {
@@ -81,8 +100,19 @@ function startFincraReconcileLoop(intervalMs = 5 * 60 * 1000) {
     running = true;
     try {
       const total = await prisma.withCronLock(FINCRA_RECONCILE_LOCK, async () => {
-        await require("./snapshots").recordHeartbeat("fincra-reconcile").catch(() => {});
         const credits = await reconcileFincraCollections();
+        const { recordHeartbeat } = require("./snapshots");
+        if (credits.error) {
+          // The heartbeat records the FAILURE. It used to be written "ok" before
+          // the call, so the health page showed a healthy cron through hours of
+          // 401s. With no "ok" beat the existing cron_stale rule fires in ~10
+          // minutes, and lastError carries the reason.
+          await recordHeartbeat("fincra-reconcile", "error", credits.error).catch(() => {});
+          // Nothing else runs on a dead credential. Retrying payouts now would
+          // read "cannot list payouts" as "no payout exists" and pay again.
+          return { credits, conversions: null };
+        }
+        await recordHeartbeat("fincra-reconcile", "ok").catch(() => {});
         // Euro conversions whose naira payout did not complete (a crash or a
         // Fincra error between "converted" and "paid"). The merchant's euros are
         // already gone from their balance at that point, so this is the net that
