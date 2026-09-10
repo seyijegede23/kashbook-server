@@ -8,12 +8,24 @@
 // a real payout. This single list keeps the ledger math and the AML windowing in
 // lockstep (they were separate before and could disagree).
 //
-// "fincra" was removed on 2026-08-27 with the foreign-currency feature. It is
-// safe to drop from this list ONLY because the ledger held zero fincra-sourced
-// rows at the time (verified: all 52 rows were "anchor"). Removing a source
-// that HAD money against it would silently make that money unspendable, so
-// re-verify before ever pruning this list again.
-const PROVIDER_SOURCES = ["anchor"];
+// "fincra" was removed on 2026-08-27 and RESTORED on 2026-09-09 when Fincra
+// approved EUR virtual accounts. It must be here: a EUR credit is real provider
+// money, and a source missing from this list is money the ledger cannot see —
+// it would be unspendable AND unprotected, because isBankLedgerRow below is what
+// makes a bank row append-only against the client-reachable write surfaces.
+//
+// This does NOT let euros inflate a naira balance. This list answers "is the row
+// real money"; the CURRENCY filter answers "whose balance". computeRawLedger
+// (utils/ledgerBalance.js) queries `{ source: { in: PROVIDER_SOURCES }, currency }`
+// — both conditions, so a EUR row only ever sums into a EUR balance. The two
+// guards are independent and both are required; dropping the currency filter
+// would add €1 to the naira balance as ₦1.
+//
+// Fincra is receive-only (see providers/index.js), so no outbound EUR row can
+// exist. If a EUR payout path is ever added, re-check the AML money-out windows
+// in amlChecks.js — they read this same list via MONEY_OUT_SOURCES and are
+// NOT currency-scoped, so a EUR payout would be summed against naira thresholds.
+const PROVIDER_SOURCES = ["anchor", "fincra"];
 
 // A "bank-ledger row" is real, provider-owned money that feeds the spendable
 // balance — it must be append-only and never user-editable/deletable. True when
