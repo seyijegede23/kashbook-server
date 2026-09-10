@@ -266,6 +266,11 @@ router.post("/register", body("password").custom((v) => {
   // SECURITY: the OTP purpose is pinned server-side. Letting the caller choose
   // (req.body.type) meant any code issued for ANY purpose — a password-reset
   // code, a transfer step-up code — counted as proof of registration.
+  //
+  // "phone_register" is a historical name. Since 2026-09-10 the app sends the
+  // sign-up code to the EMAIL, and `iden` here is whichever identifier the code
+  // went to; this route stores both channels regardless. Not renamed because
+  // the type is a key in the OTP store and older app builds still send it.
   const otpValid = await verifyOtp(iden, otpCode, "phone_register");
   if (!otpValid) return res.status(400).json({ error: "Invalid or expired verification code" });
 
