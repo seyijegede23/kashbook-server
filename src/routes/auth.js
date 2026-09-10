@@ -10,6 +10,7 @@ const { validateDataUri, IMAGE_TYPES } = require("../utils/uploadGuard");
 const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
 const { verifyTransactionPin } = require("../utils/transactionPin");
+const { isValidEmail, normalizeEmail } = require("../utils/email");
 
 // Hard ceiling on what an owner can delegate in a rolling 24h, in the business's
 // own currency. Not a security boundary — the owner's AML tier limits are still
@@ -147,6 +148,25 @@ function normalizePhone(phone = "", callingCode = "234") {
   return p;
 }
 
+const INVALID_EMAIL = "Enter a valid email address";
+
+// Every auth entry point takes "an email or a phone number" in one field. An
+// identifier containing "@" is meant as an email, and must then BE one; a phone
+// number never contains "@", so the branch is unambiguous. Until 2026-09-10 the
+// email side was `includes("@")` and nothing else, which let emoji through at
+// sign-up and had /send-otp mailing them.
+//
+// Returns { iden, isEmail } with iden normalised for lookup, or { error } for a
+// malformed email so the caller can 400 before it touches the OTP store or the
+// mailer. An empty input resolves to an empty iden, which each route already
+// rejects with its own "required" message.
+function resolveIdentifier(raw = "", callingCode) {
+  const s = String(raw ?? "");
+  if (!s.includes("@")) return { iden: normalizePhone(s, callingCode), isEmail: false };
+  const email = normalizeEmail(s);
+  return email ? { iden: email, isEmail: true } : { iden: null, isEmail: true, error: INVALID_EMAIL };
+}
+
 function splitName(fullName = "") {
   const parts = fullName.trim().split(/\s+/);
   return { firstName: parts[0] || "", lastName: parts.slice(1).join(" ") || parts[0] || "" };
@@ -210,8 +230,9 @@ router.post("/register", body("password").custom((v) => {
   const ln  = lastName?.trim()  || splitName(name).lastName;
   const biz = businessName?.trim() || "My Business";
   const rawIdentifier = identifier || email || phone || "";
-  const isEmail = rawIdentifier.includes("@");
-  const iden = isEmail ? rawIdentifier.trim().toLowerCase() : normalizePhone(rawIdentifier, callingCode);
+  const resolved = resolveIdentifier(rawIdentifier, callingCode);
+  if (resolved.error) return res.status(400).json({ error: resolved.error, field: "email" });
+  const { iden, isEmail } = resolved;
   // Country is the source of truth for currency + language + KYC scheme.
   // Every country we hold config for can register and keep books; whether we can
   // also issue them a LOCAL receiving account is a separate question answered by
@@ -234,6 +255,13 @@ router.post("/register", body("password").custom((v) => {
   if (!fn)      return res.status(400).json({ error: "First name is required" });
   if (!iden)    return res.status(400).json({ error: "Email or phone number is required" });
   if (!otpCode) return res.status(400).json({ error: "Verification code is required" });
+  // The separate `email` field, when sent, must be a real address. Checked
+  // BEFORE the OTP below is consumed, so a typo does not cost the user their
+  // code. Previously anything without "@" was silently dropped and anything
+  // with one was stored as-is.
+  if (typeof email === "string" && email.trim() && !isValidEmail(email)) {
+    return res.status(400).json({ error: INVALID_EMAIL, field: "email" });
+  }
 
   // SECURITY: the OTP purpose is pinned server-side. Letting the caller choose
   // (req.body.type) meant any code issued for ANY purpose — a password-reset
@@ -250,7 +278,8 @@ router.post("/register", body("password").custom((v) => {
     // became a generic "account already exists" — after the user had already
     // spent their verification code, and without saying which field was the
     // problem. P2002 is still handled below as the race backstop.
-    const cleanEmail = email?.includes("@") ? email.trim().toLowerCase() : (isEmail ? iden : null);
+    // Validated above, so normalizeEmail cannot return null here.
+    const cleanEmail = (typeof email === "string" && email.trim()) ? normalizeEmail(email) : (isEmail ? iden : null);
     const cleanPhone = phone ? normalizePhone(phone, callingCode || countryCfg.callingCode) : (isEmail ? null : iden);
 
     const clash = await prisma.user.findFirst({
@@ -330,9 +359,12 @@ router.post("/login", body("identifier").notEmpty(), body("password").notEmpty()
 
   const { identifier, password } = req.body;
   try {
-    const isEmailLike = identifier.includes("@");
+    const { iden, isEmail: isEmailLike, error } = resolveIdentifier(identifier);
+    // A malformed email is a format error, not an existence probe: it says
+    // nothing about which addresses are registered, so a 400 here is safe.
+    if (error) return res.status(400).json({ error });
     const user = await prisma.user.findFirst({
-      where: isEmailLike ? { email: identifier.trim().toLowerCase() } : { phone: normalizePhone(identifier) },
+      where: isEmailLike ? { email: iden } : { phone: iden },
       // Staff log in here too, and userResponse reports what they may do. Without
       // this the app would open with every capability hidden until the 10-minute
       // /auth/me poll corrected it.
@@ -419,7 +451,10 @@ router.post("/send-otp", async (req, res) => {
   if (!rawIden) return res.status(400).json({ error: "Identifier required" });
   if (!SENDABLE_OTP_TYPES.has(type))
     return res.status(400).json({ error: "Unsupported verification type" });
-  const iden = rawIden.includes("@") ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
+  const { iden, error } = resolveIdentifier(rawIden);
+  // The one that matters most: this endpoint SENDS. An unvalidated address
+  // meant a real email to 😀@😀.😀, or to whatever else was typed.
+  if (error) return res.status(400).json({ error });
   try {
     await dispatchOtp(iden, type);
     res.json({ message: "OTP sent" });
@@ -448,7 +483,8 @@ router.post("/check-otp", async (req, res) => {
   if (!rawIden || !code) return res.status(400).json({ error: "Identifier and code required" });
   if (!CHECKABLE_OTP_TYPES.has(type))
     return res.status(400).json({ error: "Invalid or expired code" });
-  const iden = rawIden.includes("@") ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
+  const { iden, error } = resolveIdentifier(rawIden);
+  if (error) return res.status(400).json({ error });
   const valid = await peekOtp(iden, code, type);
   if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
   res.json({ valid: true });
@@ -461,8 +497,8 @@ router.post("/verify-otp", async (req, res) => {
   const { phone, email, identifier, code, name, businessName } = req.body;
   const rawIden = identifier || email || phone || "";
   if (!rawIden || !code) return res.status(400).json({ error: "Identifier and code required" });
-  const isEmail = rawIden.includes("@");
-  const iden = isEmail ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
+  const { iden, isEmail, error } = resolveIdentifier(rawIden);
+  if (error) return res.status(400).json({ error });
   try {
     const valid = await verifyOtp(iden, code, "phone_register");
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
@@ -494,8 +530,10 @@ router.post("/forgot-password", async (req, res) => {
   const { phone, email, identifier } = req.body;
   const rawIden = identifier || email || phone || "";
   if (!rawIden) return res.status(400).json({ error: "Identifier required" });
-  const isEmail = rawIden.includes("@");
-  const iden = isEmail ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
+  const { iden, isEmail, error } = resolveIdentifier(rawIden);
+  // Format, not existence: the uniform "if that account exists" reply below is
+  // about registered-or-not, and a malformed address is neither.
+  if (error) return res.status(400).json({ error });
   try {
     const user = await prisma.user.findFirst({ where: isEmail ? { email: iden } : { phone: iden } });
     // Respond identically and immediately whether or not the account exists, then
@@ -521,8 +559,8 @@ router.post("/reset-password", async (req, res) => {
   const rawIden = identifier || email || phone || "";
   if (!rawIden || !code || !newPassword) return res.status(400).json({ error: "Identifier, code and newPassword required" });
   if (newPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
-  const isEmail = rawIden.includes("@");
-  const iden = isEmail ? rawIden.trim().toLowerCase() : normalizePhone(rawIden);
+  const { iden, isEmail, error } = resolveIdentifier(rawIden);
+  if (error) return res.status(400).json({ error });
   try {
     const valid = await verifyOtp(iden, code, "phone_reset");
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
@@ -963,8 +1001,8 @@ router.post("/request-email-change", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
   const { newEmail, currentPassword } = req.body;
-  if (!newEmail?.includes("@")) return res.status(400).json({ error: "Valid email required" });
-  const email = newEmail.trim().toLowerCase();
+  const email = normalizeEmail(newEmail);
+  if (!email) return res.status(400).json({ error: INVALID_EMAIL });
   try {
     // Re-authenticate: the OTP only proves control of the NEW address (which an
     // attacker holding a stolen token owns). The password proves it's the owner.
@@ -998,9 +1036,9 @@ router.patch("/confirm-email-change", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff")
     return res.status(403).json({ error: "Only the business owner can change account details.", code: "STAFF_FORBIDDEN" });
   const { newEmail, otpCode } = req.body;
-  if (!newEmail?.includes("@") || !otpCode)
+  const email = normalizeEmail(newEmail);
+  if (!email || !otpCode)
     return res.status(400).json({ error: "Email and verification code required" });
-  const email = newEmail.trim().toLowerCase();
   try {
     const valid = await verifyOtp(email, otpCode, "email_change");
     if (!valid) return res.status(400).json({ error: "Invalid or expired code" });
@@ -1166,10 +1204,8 @@ router.post("/staff", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "Password must be at least 8 characters" });
   }
   const ph = phone ? normalizePhone(phone) : null;
-  const em = email ? String(email).trim().toLowerCase() : null;
-  if (em && !/\S+@\S+\.\S+/.test(em)) {
-    return res.status(400).json({ error: "Enter a valid email address" });
-  }
+  const em = email ? normalizeEmail(email) : null;
+  if (email && !em) return res.status(400).json({ error: INVALID_EMAIL });
   try {
     if (ph) {
       const exists = await prisma.user.findUnique({ where: { phone: ph } });
