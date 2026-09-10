@@ -357,6 +357,14 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
         // Nothing was sent. Drop the documents we just stored so a rejected
         // attempt leaves no private assets behind, and point at the field.
         destroyUploaded(uploaded).catch(() => {});
+        // Log WHICH check failed and whether the app sent an address at all.
+        // An old app build sends none, which looks identical to a merchant
+        // who left the postcode blank unless this line says so.
+        const addr = req.body?.kyc?.address;
+        console.warn(
+          `[foreign-accounts] ${currency} KYC rejected: ${err.code} field=${err.field} ` +
+          `addressSupplied=${addr && typeof addr === "object" ? "yes" : "no"} business=${biz.id}`,
+        );
         return res.status(err.httpStatus || 400).json({ error: err.message, code: err.code, field: err.field });
       }
       throw err;
