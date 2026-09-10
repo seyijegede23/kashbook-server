@@ -33,6 +33,7 @@ const fcy = require("../utils/fcyConversion");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { fireAlert } = require("../utils/alerts");
+const { reachedFincra, neverSent } = require("../utils/foreignAccountState");
 
 const fincraHost = () => {
   try { return new URL(process.env.FINCRA_BASE_URL || "https://sandboxapi.fincra.com").hostname; } catch { return "?"; }
@@ -200,6 +201,12 @@ router.get("/:businessId/foreign-accounts", authMiddleware, requirePermission("c
       where: { businessId: biz.id },
       orderBy: { createdAt: "asc" },
     });
+    // A "pending" row that never reached Fincra is not an account in progress;
+    // it is the leftover of an attempt that failed before the provider call.
+    // Listing it showed an "In progress" badge and hid the request button
+    // behind it. The POST path treats such a row as retryable; the list must
+    // agree, or the merchant can never get back to the form.
+    const visible = rows.filter((fa) => !neverSent(fa));
     // Fincra refuses FCY accounts for a list of countries (Uganda is on it and
     // is in our own country list), so advertise nothing there rather than
     // letting a merchant complete a full KYC form only to be declined.
@@ -209,7 +216,7 @@ router.get("/:businessId/foreign-accounts", authMiddleware, requirePermission("c
     // euros into one KashBook wallet, so the ledger is the only place that knows
     // whose euros are whose. Currency-scoped, so this can never read naira rows.
     const balances = {};
-    for (const fa of rows) {
+    for (const fa of visible) {
       if (fa.status === "issued") balances[fa.currency] = await computeLedgerBalance(biz.id, fa.currency);
     }
     // Conversion history the merchant should see. Abandoned quotes and
@@ -223,7 +230,7 @@ router.get("/:businessId/foreign-accounts", authMiddleware, requirePermission("c
     res.json({
       supported: FCY_ENABLED && LIVE_OK() && getForeignAccountProvider() && !restricted ? SUPPORTED : [],
       restricted,
-      accounts: rows.map(publicView),
+      accounts: visible.map(publicView),
       balances,
       // Where converted naira goes. Conversion needs a naira NUBAN to land in.
       canConvert: !!biz.virtualAccountNumber,
@@ -311,9 +318,7 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
     const existing = await prisma.foreignAccount.findUnique({
       where: { businessId_currency: { businessId: biz.id, currency } },
     });
-    const reachedFincra = !!existing && existing.status !== "declined" &&
-      (!!existing.fincraRequestId || ["approved", "issued"].includes(existing.status));
-    if (reachedFincra) {
+    if (reachedFincra(existing)) {
       return res.status(200).json({ account: publicView(existing), existing: true });
     }
 

@@ -402,5 +402,49 @@ test("the live check is case-insensitive on the host", () => {
   assert.strictEqual(withBase("https://API.Fincra.COM", () => fincraService.isLive()), true);
 });
 
+// ══ 8. WHICH ROWS COUNT AS A REQUEST ═══════════════════════════════════════
+section("8. a row that never reached Fincra is neither listed nor blocking");
+
+const { reachedFincra, neverSent } = require("../src/utils/foreignAccountState");
+
+const ROWS = {
+  leftover:      { status: "pending",  fincraRequestId: null,  consentUrl: null },
+  sentWithRef:   { status: "pending",  fincraRequestId: "abc", consentUrl: null },
+  sentWithLink:  { status: "pending",  fincraRequestId: null,  consentUrl: "https://x" },
+  approved:      { status: "approved", fincraRequestId: null,  consentUrl: null },
+  issued:        { status: "issued",   fincraRequestId: null,  consentUrl: null },
+  declined:      { status: "declined", fincraRequestId: "abc", consentUrl: null },
+};
+
+test("a pending row with no request id and no consent link never reached Fincra", () => {
+  assert.strictEqual(neverSent(ROWS.leftover), true);
+  assert.strictEqual(reachedFincra(ROWS.leftover), false, "it must not block a retry");
+});
+
+for (const k of ["sentWithRef", "sentWithLink", "approved", "issued"]) {
+  test(`${k} DID reach Fincra: listed, and a retry short-circuits`, () => {
+    assert.strictEqual(neverSent(ROWS[k]), false);
+    assert.strictEqual(reachedFincra(ROWS[k]), true);
+  });
+}
+
+test("a declined row is shown (with its reason) AND retryable", () => {
+  assert.strictEqual(neverSent(ROWS.declined), false, "declined must stay visible");
+  assert.strictEqual(reachedFincra(ROWS.declined), false, "declined must not block a retry");
+});
+
+test("no row at all is neither", () => {
+  assert.strictEqual(neverSent(null), false);
+  assert.strictEqual(reachedFincra(null), false);
+  assert.strictEqual(reachedFincra(undefined), false);
+});
+
+test("both call sites use the shared helper (they can never disagree)", () => {
+  const src = read("routes/foreignAccounts.js");
+  assert.ok(/reachedFincra\(existing\)/.test(src), "POST short-circuit does not use reachedFincra()");
+  assert.ok(/rows\.filter\(\(fa\) => !neverSent\(fa\)\)/.test(src), "GET list does not filter with neverSent()");
+  assert.ok(!/existing\.status !== "declined" &&/.test(src), "an inline copy of the rule survives in the route");
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
