@@ -280,11 +280,14 @@ test("the postcode can come from the form when the business row has none", () =>
 test("what the merchant typed wins over the business row", () => {
   const inp = OK();
   inp.extra.address = { street: "5 New Road", city: "Abuja", state: "FCT", postalCode: "900001" };
-  const json = JSON.stringify(buildFcyRequest(inp));
-  for (const v of ["5 New Road", "Abuja", "FCT", "900001"]) {
-    assert.ok(json.includes(v), `form address value "${v}" did not reach the payload`);
-  }
-  assert.ok(!json.includes("Awolowo"), "the business row's street leaked through despite a form value");
+  const a = buildFcyRequest(inp).KYCInformation.address;
+  // "5 New Road" is split: the 5 becomes the house number Fincra requires
+  // separately, and the street carries the rest.
+  assert.deepStrictEqual(
+    { number: a.number, street: a.street, city: a.city, state: a.state, zip: a.zip },
+    { number: "5", street: "New Road", city: "Abuja", state: "FCT", zip: "900001" },
+  );
+  assert.ok(!JSON.stringify(a).includes("Awolowo"), "the business row's street leaked through despite a form value");
 });
 
 test("no postcode anywhere is FCY_ADDRESS_INCOMPLETE tagged 'address'", () => {
@@ -324,13 +327,77 @@ for (const type of ["nationalId", "driverLicense", "idCard"]) {
   });
 }
 
-test("passport sends a SINGLE url string, not an array", () => {
+test("passport sends a ONE-element array (the shape in Fincra's own example)", () => {
   const inp = OK();
   inp.extra.document.type = "passport";
   inp.documents.meansOfIdIds = ["kb/passport_page"];
   const body = buildFcyRequest(inp);
-  assert.strictEqual(typeof body.meansOfId, "string",
-    "passport must send one url string; an array is a validation decline");
+  assert.ok(Array.isArray(body.meansOfId) && body.meansOfId.length === 1,
+    "passport must send [url]; Fincra's example does, and a bare string is unproven");
+});
+
+test("monthlyTransactionCount/Volume live INSIDE KYCInformation, not top level", () => {
+  // The live validator declined the top-level form on 2026-09-10:
+  // "monthlyTransactionCount is not allowed".
+  const body = buildFcyRequest(OK());
+  assert.strictEqual(body.monthlyTransactionCount, undefined, "still at top level");
+  assert.strictEqual(body.monthlyTransactionVolume, undefined, "still at top level");
+  assert.strictEqual(body.KYCInformation.monthlyTransactionCount, "20");
+  assert.strictEqual(body.KYCInformation.monthlyTransactionVolume, "4000");
+});
+
+test("the top level carries exactly the keys Fincra's example does", () => {
+  const keys = Object.keys(buildFcyRequest(OK())).sort();
+  assert.deepStrictEqual(keys, ["KYCInformation", "accountType", "currency", "meansOfId", "utilityBill"],
+    "an unexpected top-level key is a strict-schema decline");
+});
+
+test("savings is no longer an accepted source of income", () => {
+  const inp = OK();
+  inp.extra.sourceOfIncome = "savings";
+  assert.throws(() => buildFcyRequest(inp), (e) => e.code === "FCY_INCOME_SOURCE");
+});
+
+for (const v of ["gift", "real_estate", "loan", "pension", "grant", "trust", "crypto", "other"]) {
+  test(`sourceOfIncome ${v} (documented) is accepted`, () => {
+    const inp = OK();
+    inp.extra.sourceOfIncome = v;
+    assert.doesNotThrow(() => buildFcyRequest(inp));
+  });
+}
+
+test("house number: lifted off a street that starts with one", () => {
+  const inp = OK(); // street "12 Awolowo Road", no explicit number
+  const a = buildFcyRequest(inp).KYCInformation.address;
+  assert.strictEqual(a.number, "12");
+  assert.strictEqual(a.street, "Awolowo Road", "the number must not also lead the street");
+});
+
+test("house number: the form's own field wins", () => {
+  const inp = OK();
+  inp.extra.address = { number: "7B", street: "Adeola Odeku Street" };
+  const a = buildFcyRequest(inp).KYCInformation.address;
+  assert.strictEqual(a.number, "7B");
+  assert.strictEqual(a.street, "Adeola Odeku Street");
+});
+
+test("house number: 'No. 5' and '#5' are understood", () => {
+  for (const s of ["No. 5 Marina", "No 5 Marina", "#5 Marina"]) {
+    const inp = OK();
+    inp.extra.address = { street: s };
+    const a = buildFcyRequest(inp).KYCInformation.address;
+    assert.strictEqual(a.number, "5", `from "${s}"`);
+    assert.strictEqual(a.street, "Marina", `from "${s}"`);
+  }
+});
+
+test("house number: never invented", () => {
+  // This used to send a literal "1", which passes validation and fails the
+  // utility-bill review days later with no visible reason.
+  const inp = OK();
+  inp.extra.address = { street: "Awolowo Road" };
+  inp.business.addressLine2 = "Suite 4";
+  assert.throws(() => buildFcyRequest(inp), (e) => e.code === "FCY_HOUSE_NUMBER");
 });
 
 for (const bad of ["driversLicense", "votersCard", "drivers_license", "nin", ""]) {

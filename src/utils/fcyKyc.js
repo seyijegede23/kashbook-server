@@ -28,8 +28,21 @@ const SUPPORTED = ["EUR"];
 
 // Fincra's documented enums. Anything outside these is rejected by them, so we
 // reject first with a message the user can act on.
-const EMPLOYMENT_STATUS = ["employed", "self_employed", "unemployed", "student", "retired"];
-const SOURCE_OF_INCOME = ["salary", "business_income", "investment", "inheritance", "savings", "other"];
+// Both lists are Fincra's, verbatim from the "Collect Customer Details" table
+// on docs.fincra.com/docs/request-fcy-virtual-account (checked 2026-09-11).
+// Their validator is strict and case-sensitive, so a value outside these is a
+// decline AFTER the merchant has filled the whole form.
+//
+// "savings" used to be in SOURCE_OF_INCOME. It is not a value Fincra accepts,
+// so it was removed on 2026-09-11 before any merchant hit it; the app's picker
+// no longer offers it.
+const EMPLOYMENT_STATUS = [
+  "employed", "self_employed", "unemployed", "student", "retired", "homemaker", "freelancer", "other",
+];
+const SOURCE_OF_INCOME = [
+  "salary", "business_income", "investment", "gift", "inheritance", "real_estate",
+  "loan", "pension", "grant", "trust", "crypto", "other",
+];
 // Fincra's EUR document enum, verified against docs.fincra.com/docs/request-fcy-virtual-account
 // on 2026-09-09. Corrected on that date after the restore: this list previously
 // read ["passport", "nationalId", "driversLicense", "votersCard"], which had two
@@ -85,6 +98,15 @@ function signedDocUrl(publicId, { resourceType = "image", ttlDays = 14 } = {}) {
 
 // ISO-2 country for tax/nationality. Fincra wants the code, not the name.
 const iso2 = (c) => String(c || "").trim().toUpperCase().slice(0, 2);
+
+// "12 Awolowo Road" → { number: "12", street: "Awolowo Road" }.
+// Accepts the local habits "No. 12", "No 12", "#12" and a letter suffix ("12B").
+// A street with no leading number comes back with number: null, untouched.
+function splitHouseNumber(street) {
+  const s = String(street || "").trim();
+  const m = s.match(/^(?:no\.?|#)?\s*(\d+[a-z]?)\s*[,\-]?\s+(.+)$/i);
+  return m ? { number: m[1].toUpperCase(), street: m[2].trim() } : { number: null, street: s };
+}
 
 function assertDocument(doc = {}) {
   if (!DOCUMENT_TYPES.includes(doc.type)) {
@@ -174,6 +196,26 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
     );
   }
 
+  // Fincra wants the house number SEPARATE from the street, and compliance
+  // checks the utility bill against it, so it must be real. Order: the form's
+  // house-number field, else a leading number on the street line ("12 Awolowo
+  // Road" → 12 + "Awolowo Road"), else a purely numeric addressLine2. Nothing
+  // is invented: this used to fall back to a literal "1", which passes
+  // validation and then fails the document review, days later, with no way to
+  // see why. A merchant with no number anywhere is asked for one instead.
+  const parsed = splitHouseNumber(street);
+  const line2 = String(business.addressLine2 || "").trim();
+  const houseNumber = pick(addr.number, parsed.number || (/^\d+[a-z]?$/i.test(line2) ? line2 : null));
+  if (!req(houseNumber)) {
+    throw new FcyKycError(
+      "Enter your house number, or start the street with it (for example 12 Awolowo Road).",
+      "FCY_HOUSE_NUMBER", "address",
+    );
+  }
+  // Once the number has its own field, it must not also lead the street line,
+  // or the address reads "12, 12 Awolowo Road" on Fincra's side.
+  const streetName = parsed.number ? parsed.street : street;
+
   // ── things only the user can tell us ─────────────────────────────────────
   if (!EMPLOYMENT_STATUS.includes(extra.employmentStatus)) {
     throw new FcyKycError("Select your employment status.", "FCY_EMPLOYMENT", "employmentStatus");
@@ -229,10 +271,11 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
     // below is entirely personal identity), not to the registered company.
     accountType: "individual",
     utilityBill: signedDocUrl(documents.utilityBillId, { resourceType: documents.utilityBillType }),
-    // Single url for a passport, [front, back] for everything else.
-    meansOfId: singlePage ? signedIds[0] : signedIds.slice(0, 2),
-    monthlyTransactionCount: String(monthlyCount),
-    monthlyTransactionVolume: String(monthlyVolume),
+    // ALWAYS an array: one url for a passport, [front, back] for everything
+    // else. Fincra's own request example sends a one-element array for a
+    // passport, so that is the shape known to pass their validator; a bare
+    // string is documented as accepted but has never been seen to be.
+    meansOfId: signedIds.slice(0, singlePage ? 1 : 2),
     KYCInformation: {
       firstName,
       lastName,
@@ -245,12 +288,18 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
       sourceOfIncome: extra.sourceOfIncome,
       accountDesignation: business.businessKyb ? "Business use" : "Personal use",
       employmentStatus: extra.employmentStatus,
+      // INSIDE KYCInformation, not at the top level. Fincra's field table puts
+      // these two at the top level; their JSON example nests them here; and on
+      // 2026-09-10 the LIVE validator declined the top-level form with
+      // "monthlyTransactionCount is not allowed". The example is the truth.
+      monthlyTransactionCount: String(monthlyCount),
+      monthlyTransactionVolume: String(monthlyVolume),
       address: {
         countryOfResidence,
         state,
         city,
-        street,
-        number: String(business.addressLine2 || "").trim() || "1",
+        street: streetName,
+        number: String(houseNumber),
         zip: String(zip),
       },
       incomeBand: { lower: String(lower), upper: String(upper) },
