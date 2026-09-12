@@ -578,6 +578,40 @@ test("the request body carries per-document links with the right extensions", ()
   for (const u of [body.utilityBill, ...body.meansOfId]) assert.ok(!/cloudinary/i.test(u), u);
 });
 
+// ══ 7b. DATE OF BIRTH IS A CALENDAR DATE ═══════════════════════════════════
+section("7b. birthDate is the Lagos calendar date, not a slice of the ISO string");
+
+test("the exact stored value Fincra declined (2 May at Lagos midnight) sends 2 May", () => {
+  const inp = OK();
+  inp.user.dateOfBirth = new Date("2004-05-01T23:00:00.000Z");
+  assert.strictEqual(buildFcyRequest(inp).KYCInformation.birthDate, "2004-05-02",
+    "still sending the previous day: Fincra will decline again with a DOB mismatch");
+});
+
+test("a UTC-midnight value (from a YYYY-MM-DD string) is unchanged", () => {
+  const inp = OK();
+  inp.user.dateOfBirth = new Date("2004-05-02T00:00:00.000Z");
+  assert.strictEqual(buildFcyRequest(inp).KYCInformation.birthDate, "2004-05-02");
+});
+
+test("a bare YYYY-MM-DD string passes through", () => {
+  const inp = OK();
+  inp.user.dateOfBirth = "1990-04-02";
+  assert.strictEqual(buildFcyRequest(inp).KYCInformation.birthDate, "1990-04-02");
+});
+
+test("year boundary: 31 Dec at Lagos midnight stays 31 Dec", () => {
+  const inp = OK();
+  inp.user.dateOfBirth = new Date("1999-12-30T23:00:00.000Z");
+  assert.strictEqual(buildFcyRequest(inp).KYCInformation.birthDate, "1999-12-31");
+});
+
+test("no date of birth is still FCY_PROFILE_INCOMPLETE", () => {
+  const inp = OK();
+  inp.user.dateOfBirth = null;
+  assert.throws(() => buildFcyRequest(inp), (e) => e.code === "FCY_PROFILE_INCOMPLETE" && e.field === "birthDate");
+});
+
 // ══ 8. ACCOUNT LIFECYCLE WITHOUT THE WEBHOOK ═══════════════════════════════
 section("8. polled account status maps to the same events the webhook uses");
 

@@ -101,6 +101,17 @@ function signedDocUrl(publicId, { resourceType = "image", mime, ttlDays = 14 } =
 // ISO-2 country for tax/nationality. Fincra wants the code, not the name.
 const iso2 = (c) => String(c || "").trim().toUpperCase().slice(0, 2);
 
+// A stored DateTime → the YYYY-MM-DD it means in Lagos. Same rule as
+// toLagosDateString in utils/anchor.js (kept local so this module does not
+// load the Anchor client). A bare "YYYY-MM-DD" string passes through.
+function lagosCalendarDate(d) {
+  if (!d) return null;
+  if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  const dt = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lagos" }).format(dt);
+}
+
 // "12 Awolowo Road" → { number: "12", street: "Awolowo Road" }.
 // Accepts the local habits "No. 12", "No 12", "#12" and a letter suffix ("12B").
 // A street with no leading number comes back with number: null, untouched.
@@ -164,7 +175,14 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
   const lastName = user.lastName;
   const email = user.email;
   const phone = user.phone;
-  const birthDate = user.dateOfBirth ? new Date(user.dateOfBirth).toISOString().slice(0, 10) : null;
+  // The CALENDAR date in Lagos, never a slice of the ISO string. The app's date
+  // picker yields local midnight, which is stored as the previous day at 23:00Z
+  // (2 May 2004 → "2004-05-01T23:00:00.000Z"). Slicing that sent "2004-05-01",
+  // and Fincra declined the first live request on 2026-09-12: "Date of Birth on
+  // the document does not match with the provided one." Anchor's KYC passed on
+  // the same stored value because utils/anchor.js converts it the same way
+  // (toLagosDateString); the two providers must see the same date.
+  const birthDate = lagosCalendarDate(user.dateOfBirth);
   const countryOfResidence = iso2(business.country || user.country || "NG");
 
   for (const [label, v, field] of [
