@@ -58,7 +58,10 @@ async function uploadFcyDocs(docs = {}) {
       type: "private",
       access_mode: "authenticated",
     });
-    return { id: up.public_id, type: meta.resourceType };
+    // The validated mime travels with the id: it decides the extension and the
+    // Content-Type of the link Fincra fetches (utils/fcyDocLink.js). Cloudinary
+    // cannot supply it for a `raw` PDF, which is exactly the case that failed.
+    return { id: up.public_id, type: meta.resourceType, mime: meta.mime };
   };
 
   const out = { meansOfIdIds: [] };
@@ -66,19 +69,23 @@ async function uploadFcyDocs(docs = {}) {
     const r = await put(docs.utilityBill, "ub");
     out.utilityBillId = r.id;
     out.utilityBillType = r.type;
+    out.utilityBillMime = r.mime;
   }
   if (docs.bankStatement) {
     const r = await put(docs.bankStatement, "bs");
     out.bankStatementId = r.id;
     out.bankStatementType = r.type;
+    out.bankStatementMime = r.mime;
   }
   // Passport is one page; other IDs need front and back, hence an array.
   out.meansOfIdTypes = [];
+  out.meansOfIdMimes = [];
   for (const [i, uri] of [].concat(docs.meansOfId || []).filter(Boolean).entries()) {
     if (i >= 2) break; // Fincra takes at most front + back
     const r = await put(uri, "id");
     out.meansOfIdIds.push(r.id);
     out.meansOfIdTypes.push(r.type);
+    out.meansOfIdMimes.push(r.mime);
   }
   return out;
 }

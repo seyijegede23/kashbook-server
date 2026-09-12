@@ -513,5 +513,144 @@ test("both call sites use the shared helper (they can never disagree)", () => {
   assert.ok(!/existing\.status !== "declined" &&/.test(src), "an inline copy of the rule survives in the route");
 });
 
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed ? 1 : 0);
+// ══ 7. THE LINKS FINCRA FETCHES ════════════════════════════════════════════
+section("7. document links: ours, signed, expiring, and shaped like a real file");
+
+const { signDocLink, verifyDocLink, publicBase } = require("../src/utils/fcyDocLink");
+const createFcyDocsRouter = require("../src/routes/fcyDocs");
+
+test("a link points at OUR server, not Cloudinary, and ends in the right extension", () => {
+  const pdf = signDocLink({ publicId: "kashbook/fcy/ub_1", resourceType: "raw", mime: "application/pdf" });
+  const jpg = signDocLink({ publicId: "kashbook/fcy/id_1", resourceType: "image", mime: "image/jpeg" });
+  assert.ok(pdf.startsWith(publicBase() + "/fcy-docs/"), pdf);
+  assert.ok(pdf.endsWith(".pdf"), pdf);
+  assert.ok(jpg.endsWith(".jpg"), jpg);
+  assert.ok(!/cloudinary/i.test(pdf + jpg), "a Cloudinary host leaked into a link handed to a third party");
+});
+
+test("sign → verify round-trips the exact asset", () => {
+  const url = signDocLink({ publicId: "kashbook/fcy/ub_2", resourceType: "raw", mime: "application/pdf" });
+  const file = url.slice(url.lastIndexOf("/") + 1);
+  const token = file.slice(0, file.lastIndexOf("."));
+  const v = verifyDocLink(token);
+  assert.deepStrictEqual({ p: v.publicId, r: v.resourceType, m: v.mime }, { p: "kashbook/fcy/ub_2", r: "raw", m: "application/pdf" });
+});
+
+test("a tampered signature is refused", () => {
+  const url = signDocLink({ publicId: "kashbook/fcy/ub_3", resourceType: "raw", mime: "application/pdf" });
+  const token = url.slice(url.lastIndexOf("/") + 1).replace(/\.pdf$/, "");
+  const flipped = token.slice(0, -1) + (token.endsWith("A") ? "B" : "A");
+  assert.strictEqual(verifyDocLink(flipped), null);
+});
+
+test("a re-pointed payload (same signature, different asset) is refused", () => {
+  const url = signDocLink({ publicId: "kashbook/fcy/ub_4", resourceType: "raw", mime: "application/pdf" });
+  const token = url.slice(url.lastIndexOf("/") + 1).replace(/\.pdf$/, "");
+  const [body, sig] = [token.slice(0, token.lastIndexOf(".")), token.slice(token.lastIndexOf(".") + 1)];
+  const other = Buffer.from(JSON.stringify({ p: "kashbook/fcy/SOMEONE_ELSES_PASSPORT", r: "image", m: "image/jpeg", e: 9999999999 })).toString("base64url");
+  assert.strictEqual(verifyDocLink(`${other}.${sig}`), null);
+  assert.ok(verifyDocLink(`${body}.${sig}`), "the untouched token must still verify");
+});
+
+test("an expired link is refused; a live one is not", () => {
+  const url = signDocLink({ publicId: "kashbook/fcy/ub_5", resourceType: "raw", mime: "application/pdf", ttlDays: 14 });
+  const token = url.slice(url.lastIndexOf("/") + 1).replace(/\.pdf$/, "");
+  assert.ok(verifyDocLink(token, { now: Date.now() + 13 * 86400 * 1000 }), "still valid on day 13");
+  assert.strictEqual(verifyDocLink(token, { now: Date.now() + 15 * 86400 * 1000 }), null, "must be dead on day 15");
+});
+
+test("garbage never throws", () => {
+  for (const junk of ["", ".", "a.", ".b", "x", null, undefined, 42, "a".repeat(5000), "notbase64.notasig"]) {
+    assert.strictEqual(verifyDocLink(junk), null, `verifyDocLink(${JSON.stringify(junk)})`);
+  }
+});
+
+test("the request body carries per-document links with the right extensions", () => {
+  const inp = OK();
+  inp.documents = {
+    utilityBillId: "kb/ub", utilityBillType: "raw", utilityBillMime: "application/pdf",
+    meansOfIdIds: ["kb/front", "kb/back"], meansOfIdTypes: ["raw", "image"], meansOfIdMimes: ["application/pdf", "image/png"],
+  };
+  const body = buildFcyRequest(inp);
+  assert.ok(body.utilityBill.endsWith(".pdf"), body.utilityBill);
+  assert.ok(body.meansOfId[0].endsWith(".pdf"), "a PDF ID page was labelled as an image: " + body.meansOfId[0]);
+  assert.ok(body.meansOfId[1].endsWith(".png"), body.meansOfId[1]);
+  for (const u of [body.utilityBill, ...body.meansOfId]) assert.ok(!/cloudinary/i.test(u), u);
+});
+
+// The route itself, on a real listening socket with Cloudinary stubbed out.
+const http = require("http");
+const express = require("express");
+
+async function atest(name, fn) {
+  try { await fn(); console.log(`  PASS  ${name}`); passed++; }
+  catch (e) { console.log(`  FAIL  ${name}\n        ${e.message}`); failed++; }
+}
+
+(async () => {
+  const served = [];
+  const app = express();
+  app.use("/fcy-docs", createFcyDocsRouter({
+    fetchAsset: async (link, method) => {
+      served.push({ link, method });
+      if (link.publicId === "kb/missing") return null;
+      const body = Buffer.from("%PDF-1.1 stub");
+      return { length: body.length, body: method === "HEAD" ? null : body };
+    },
+  }));
+  const server = http.createServer(app);
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  const at = (path, method = "GET") => fetch(`http://127.0.0.1:${port}${path}`, { method });
+  const pathOf = (url) => url.slice(url.indexOf("/fcy-docs/"));
+
+  await atest("GET a valid link: 200, real Content-Type, inline, the bytes", async () => {
+    const url = signDocLink({ publicId: "kb/ub_ok", resourceType: "raw", mime: "application/pdf" });
+    const r = await at(pathOf(url));
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.headers.get("content-type"), "application/pdf");
+    assert.ok(/^inline; filename="document\.pdf"$/.test(r.headers.get("content-disposition")), r.headers.get("content-disposition"));
+    assert.strictEqual(r.headers.get("content-length"), String(Buffer.byteLength("%PDF-1.1 stub")));
+    assert.strictEqual(await r.text(), "%PDF-1.1 stub");
+  });
+
+  await atest("HEAD a valid link: 200 with headers and no body", async () => {
+    const url = signDocLink({ publicId: "kb/ub_ok", resourceType: "raw", mime: "application/pdf" });
+    const r = await at(pathOf(url), "HEAD");
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.headers.get("content-type"), "application/pdf");
+    assert.strictEqual((await r.text()).length, 0);
+  });
+
+  await atest("an image link serves image/jpeg as .jpg", async () => {
+    const url = signDocLink({ publicId: "kb/id_ok", resourceType: "image", mime: "image/jpeg" });
+    const r = await at(pathOf(url));
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.headers.get("content-type"), "image/jpeg");
+    assert.ok(url.endsWith(".jpg"));
+  });
+
+  await atest("a bad token is a 404, and Cloudinary is never asked", async () => {
+    const before = served.length;
+    const r = await at("/fcy-docs/not.a.real.token.pdf");
+    assert.strictEqual(r.status, 404);
+    assert.strictEqual(served.length, before, "the stub was called for a token that failed verification");
+  });
+
+  await atest("a valid token with a swapped extension is a 404", async () => {
+    const url = signDocLink({ publicId: "kb/ub_ok", resourceType: "raw", mime: "application/pdf" });
+    const r = await at(pathOf(url).replace(/\.pdf$/, ".jpg"));
+    assert.strictEqual(r.status, 404);
+  });
+
+  await atest("a signed link to an asset that no longer exists is a 404, not a 500", async () => {
+    const url = signDocLink({ publicId: "kb/missing", resourceType: "raw", mime: "application/pdf" });
+    const r = await at(pathOf(url));
+    assert.strictEqual(r.status, 404);
+  });
+
+  await new Promise((r) => server.close(r));
+
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
+})();

@@ -10,16 +10,20 @@
 //
 // DOCUMENT URLS
 //   Fincra FETCHES `utilityBill` and `meansOfId`, so they must be reachable by
-//   their servers. Our KYC uploads are deliberately private (type "private",
-//   access_mode "authenticated"), which is why we mint SIGNED, EXPIRING URLs
-//   rather than making the assets public. See signedDocUrl().
+//   their servers, and they validate what they get back. Our KYC uploads are
+//   deliberately private on Cloudinary, and Cloudinary's own download links
+//   serve a PDF as application/octet-stream with no extension, which Fincra
+//   declined on 2026-09-12 ("Unable to retrieve one or more documents from
+//   url"). So the links point at OUR server (routes/fcyDocs.js), signed and
+//   expiring, ending in .pdf/.jpg with the real Content-Type. See
+//   utils/fcyDocLink.js and signedDocUrl() below.
 //
 // Reference: docs/FINCRA_INTEGRATION_REFERENCE.md §4.
 
 // The configured instance, not the bare SDK: requiring "cloudinary" directly
 // yields an unconfigured client unless some other module happened to be loaded
 // first, and signing then throws "Must supply api_key" at request time.
-const cloudinary = require("../config/cloudinary");
+const { signDocLink } = require("./fcyDocLink");
 
 // EUR only — Fincra granted EUR virtual accounts and not USD or GBP.
 // Kept as a list, and the taxCountry === "US" rule below is left intact, so
@@ -87,13 +91,11 @@ const req = (v) => v !== undefined && v !== null && String(v).trim() !== "";
  * we did upload correctly, which is worse than the exposure of a URL that is
  * already unguessable (random public_id) and time-boxed.
  */
-function signedDocUrl(publicId, { resourceType = "image", ttlDays = 14 } = {}) {
+function signedDocUrl(publicId, { resourceType = "image", mime, ttlDays = 14 } = {}) {
   if (!publicId) return null;
-  return cloudinary.utils.private_download_url(publicId, null, {
-    resource_type: resourceType,
-    type: "private",
-    expires_at: Math.floor(Date.now() / 1000) + ttlDays * 24 * 60 * 60,
-  });
+  // Not a Cloudinary URL any more: a link to our own fcy-docs route, which
+  // fetches the private asset server-side and serves it as a normal file.
+  return signDocLink({ publicId, resourceType, mime, ttlDays });
 }
 
 // ISO-2 country for tax/nationality. Fincra wants the code, not the name.
@@ -257,7 +259,13 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
     );
   }
 
-  const signedIds = meansOfIdIds.map((id) => signedDocUrl(id));
+  // Each ID page carries its own type and mime: a PDF scan of a licence is a
+  // `raw` asset and needs a .pdf link, a photographed one is an image. The old
+  // form assumed "image" for every page, which 404s for a PDF.
+  const signedIds = meansOfIdIds.map((id, i) => signedDocUrl(id, {
+    resourceType: (documents.meansOfIdTypes || [])[i] || "image",
+    mime: (documents.meansOfIdMimes || [])[i],
+  }));
 
   const body = {
     currency,
@@ -270,7 +278,7 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
     // would have been declined. The account belongs to the PERSON (the KYC block
     // below is entirely personal identity), not to the registered company.
     accountType: "individual",
-    utilityBill: signedDocUrl(documents.utilityBillId, { resourceType: documents.utilityBillType }),
+    utilityBill: signedDocUrl(documents.utilityBillId, { resourceType: documents.utilityBillType, mime: documents.utilityBillMime }),
     // ALWAYS an array: one url for a passport, [front, back] for everything
     // else. Fincra's own request example sends a one-element array for a
     // passport, so that is the shape known to pass their validator; a bare
@@ -322,7 +330,7 @@ function buildFcyRequest({ user = {}, business = {}, currency, extra = {}, docum
     body.KYCInformation.taxNumber = String(extra.taxNumber).trim();
   }
   if (documents.bankStatementId) {
-    body.bankStatement = signedDocUrl(documents.bankStatementId, { resourceType: documents.bankStatementType });
+    body.bankStatement = signedDocUrl(documents.bankStatementId, { resourceType: documents.bankStatementType, mime: documents.bankStatementMime });
   }
   return body;
 }

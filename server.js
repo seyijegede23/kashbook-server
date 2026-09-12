@@ -211,6 +211,11 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   fincraWebhookRoute,
 );
+// KYC documents for Fincra to fetch: /fcy-docs/<signed token>.<ext>. Public
+// by necessity (their fetcher carries no credentials); guarded by the HMAC in
+// the token, and served from our own host so the document arrives with a real
+// Content-Type and extension. Why that matters is in utils/fcyDocLink.js.
+app.use("/fcy-docs", webhookLimiter, require("./src/routes/fcyDocs")());
 // Instagram messaging webhook — same raw-body-before-json requirement so the
 // X-Hub-Signature-256 HMAC verifies against the exact bytes Meta sent. The GET
 // handshake carries no body, so express.raw is a no-op for it.
