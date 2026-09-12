@@ -578,6 +578,65 @@ test("the request body carries per-document links with the right extensions", ()
   for (const u of [body.utilityBill, ...body.meansOfId]) assert.ok(!/cloudinary/i.test(u), u);
 });
 
+// ══ 8. ACCOUNT LIFECYCLE WITHOUT THE WEBHOOK ═══════════════════════════════
+section("8. polled account status maps to the same events the webhook uses");
+
+const { decideAccountTransition, declineReasonOf } = require("../src/utils/fincraReconcile");
+const D = (fa, d) => decideAccountTransition(fa, d);
+
+test("pending + Fincra says declined → account_declined (the 2026-09-12 case)", () => {
+  assert.strictEqual(D({ status: "pending" }, { status: "declined", reason: "x" }), "account_declined");
+  assert.strictEqual(D({ status: "pending" }, { status: "DECLINED" }), "account_declined", "case-insensitive");
+  assert.strictEqual(D({ status: "pending" }, { status: "rejected" }), "account_declined");
+});
+
+test("already declined + still declined → nothing (no second push)", () => {
+  assert.strictEqual(D({ status: "declined" }, { status: "declined" }), null);
+});
+
+test("pending + approved (no details yet) → account_approved", () => {
+  assert.strictEqual(D({ status: "pending" }, { status: "approved" }), "account_approved");
+});
+
+test("approved + isActive with account details → account_issued", () => {
+  const d = { status: "approved", isActive: true, accountInformation: { otherInfo: { iban: "DE00" } } };
+  assert.strictEqual(D({ status: "approved" }, d), "account_issued");
+  assert.strictEqual(D({ status: "pending" }, d), "account_issued", "pending can go straight to issued");
+});
+
+test("approved with details but not yet active is still issued (details are what matter)", () => {
+  assert.strictEqual(D({ status: "pending" }, { status: "approved", accountInformation: { accountNumber: "123" } }), "account_issued");
+});
+
+test("already issued + still active → nothing", () => {
+  assert.strictEqual(D({ status: "issued" }, { status: "approved", isActive: true, accountInformation: { accountNumber: "1" } }), null);
+});
+
+test("pending + still pending → nothing; unknown status → nothing", () => {
+  assert.strictEqual(D({ status: "pending" }, { status: "pending" }), null);
+  assert.strictEqual(D({ status: "pending" }, { status: "processing" }), null);
+  assert.strictEqual(D({ status: "pending" }, {}), null);
+});
+
+test("closed → account_closed once", () => {
+  assert.strictEqual(D({ status: "issued" }, { status: "closed" }), "account_closed");
+  assert.strictEqual(D({ status: "closed" }, { status: "closed" }), null);
+});
+
+test("the decline reason is found under any spelling Fincra has used", () => {
+  assert.strictEqual(declineReasonOf({ reason: "Document type is different" }), "Document type is different");
+  assert.strictEqual(declineReasonOf({ declineReason: " addr mismatch " }), "addr mismatch");
+  assert.strictEqual(declineReasonOf({ rejectionReason: "r" }), "r");
+  assert.strictEqual(declineReasonOf({ reason: "", comment: "c" }), "c");
+  assert.strictEqual(declineReasonOf({}), "");
+  assert.strictEqual(declineReasonOf({ reason: 42 }), "");
+});
+
+test("the webhook route exports handleEvent for the poller to reuse", () => {
+  const mod = require("../src/routes/fincra");
+  assert.strictEqual(typeof mod.handleEvent, "function", "routes/fincra must export handleEvent");
+});
+
 // The route itself, on a real listening socket with Cloudinary stubbed out.
 const http = require("http");
 const express = require("express");

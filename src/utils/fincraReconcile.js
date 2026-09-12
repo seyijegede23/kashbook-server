@@ -88,6 +88,76 @@ async function reconcileFincraCollections({ perPage = 50, logger = console } = {
 // branch backup/fincra-2026-08-27 if a send path is ever added, and restore
 // computeFincraTransferFee alongside it.
 
+// ── Account-request lifecycle ────────────────────────────────────────────────
+// The webhook is the primary channel for virtualaccount.approved / issued /
+// declined, and it is not enough on its own: on 2026-09-12 Fincra's dashboard
+// showed the first live EUR request DECLINED while our row still read
+// "pending", because no webhook ever arrived (none has, ever, as of that day).
+// A merchant would have waited on "In progress" forever with no reason shown.
+//
+// So every tick also asks Fincra directly for each request we still consider
+// open and applies whatever it says, through the SAME handleEvent the webhook
+// uses, so the two paths cannot drift. It only acts on a real change, so a
+// webhook that does arrive later is a harmless no-op, and nobody gets pushed
+// twice.
+
+// Pure: given our row and Fincra's GET /profile/virtual-accounts/:id record,
+// which lifecycle event (if any) should be applied. Exported for tests.
+function decideAccountTransition(fa, d = {}) {
+  const status = String(d.status || "").toLowerCase();
+  const info = d.accountInformation || {};
+  const hasDetails = !!(info.accountNumber || info.otherInfo?.accountNumber || info.otherInfo?.iban || d.accountNumber);
+  const issued = d.isActive === true || (status === "approved" && hasDetails);
+  if (["declined", "rejected"].includes(status)) return fa.status === "declined" ? null : "account_declined";
+  if (status === "closed") return fa.status === "closed" ? null : "account_closed";
+  if (issued) return fa.status === "issued" ? null : "account_issued";
+  if (status === "approved") return fa.status === "pending" ? "account_approved" : null;
+  return null;
+}
+
+// Fincra spells the decline reason inconsistently across payloads; take the
+// first non-empty of the spellings seen or documented.
+function declineReasonOf(d = {}) {
+  for (const k of ["reason", "declineReason", "rejectionReason", "declinedReason", "comment", "note", "message"]) {
+    const v = d[k];
+    if (v && typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+async function reconcileFincraAccountRequests({ logger = console } = {}) {
+  const { handleEvent } = require("../routes/fincra");
+  const rows = await prisma.foreignAccount.findMany({
+    where: { status: { in: ["pending", "approved"] }, fincraRequestId: { not: null } },
+    select: { id: true, status: true, currency: true, fincraRequestId: true, fincraAccountId: true },
+    take: 50,
+  });
+  let checked = 0, changed = 0;
+  for (const fa of rows) {
+    let res;
+    try {
+      res = await fincra.getVirtualAccount(fa.fincraAccountId || fa.fincraRequestId);
+    } catch (e) {
+      logger.warn?.(`[fincra-reconcile] account ${fa.currency} ${fa.id.slice(0, 8)}: status fetch failed HTTP ${e.status ?? "n/a"} ${e.message}`);
+      continue;
+    }
+    checked++;
+    const d = (res && res.data) || res || {};
+    const kind = decideAccountTransition(fa, d);
+    if (!kind) continue;
+    // Guarantee findForeignAccount lands on OUR row whatever id Fincra echoes.
+    const data = { ...d, _id: d._id || d.id || fa.fincraRequestId, reference: fa.fincraRequestId, reason: declineReasonOf(d) };
+    if (kind === "account_declined" && !data.reason) {
+      // Learn the shape rather than guess at it: keys only, no values.
+      logger.warn?.(`[fincra-reconcile] declined with no reason field; keys=${Object.keys(d).join(",")}`);
+    }
+    await handleEvent({ kind, event: `poll:${kind}`, data });
+    changed++;
+    logger.log?.(`[fincra-reconcile] account ${fa.currency} ${fa.id.slice(0, 8)}: ${fa.status} → ${kind.replace("account_", "")} (polled; no webhook)` + (data.reason ? ` reason="${data.reason.slice(0, 160)}"` : ""));
+  }
+  return { checked, changed };
+}
+
 // Start the periodic reconcile. Returns a stopper. No-op if Fincra isn't configured.
 function startFincraReconcileLoop(intervalMs = 5 * 60 * 1000) {
   if (!fincra.isConfigured()) {
@@ -118,13 +188,21 @@ function startFincraReconcileLoop(intervalMs = 5 * 60 * 1000) {
         // already gone from their balance at that point, so this is the net that
         // guarantees the naira still arrives. Idempotent by customerReference.
         const conversions = await require("./fcyConversion").retryStuckConversions();
-        return { credits, conversions };
+        // Open account requests, checked against Fincra directly. The webhook
+        // has never delivered a lifecycle event to us; this is what moves a row
+        // off "pending" when Fincra decides.
+        const accounts = await reconcileFincraAccountRequests().catch((e) => {
+          console.error("[fincra-reconcile] account requests:", e.message);
+          return { checked: 0, changed: 0 };
+        });
+        return { credits, conversions, accounts };
       });
-      const c = total?.credits, v = total?.conversions;
-      if (c?.backfilled || v?.retried || v?.flagged) {
+      const c = total?.credits, v = total?.conversions, a = total?.accounts;
+      if (c?.backfilled || v?.retried || v?.flagged || a?.changed) {
         console.log(
           `[fincra-reconcile] credits backfilled=${c?.backfilled || 0}; ` +
-          `conversions retried=${v?.retried || 0} completed=${v?.completed || 0} flagged=${v?.flagged || 0}`,
+          `conversions retried=${v?.retried || 0} completed=${v?.completed || 0} flagged=${v?.flagged || 0}; ` +
+          `account requests changed=${a?.changed || 0} of ${a?.checked || 0}`,
         );
       }
     } catch (e) {
@@ -138,4 +216,10 @@ function startFincraReconcileLoop(intervalMs = 5 * 60 * 1000) {
   return () => clearInterval(id);
 }
 
-module.exports = { reconcileFincraCollections, startFincraReconcileLoop };
+module.exports = {
+  reconcileFincraCollections,
+  reconcileFincraAccountRequests,
+  decideAccountTransition,
+  declineReasonOf,
+  startFincraReconcileLoop,
+};

@@ -357,3 +357,7 @@ function logWebhookFormatProbe(headers, raw) {
 }
 
 module.exports = router;
+// The reconcile poller (utils/fincraReconcile.js) applies a polled account
+// status through this same function, so a webhook and a poll can never
+// disagree about what a given Fincra status means for our row.
+module.exports.handleEvent = handleEvent;
