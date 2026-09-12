@@ -612,6 +612,26 @@ test("no date of birth is still FCY_PROFILE_INCOMPLETE", () => {
   assert.throws(() => buildFcyRequest(inp), (e) => e.code === "FCY_PROFILE_INCOMPLETE" && e.field === "birthDate");
 });
 
+// ══ 7c. A RETRY IS A NEW REQUEST TO FINCRA ═════════════════════════════════
+section("7c. every attempt carries its own merchantReference");
+
+test("two attempts on the same row never share a reference (409 DUPLICATE_REFERENCE)", () => {
+  const { attemptReference } = require("../src/routes/foreignAccounts");
+  assert.strictEqual(typeof attemptReference, "function", "routes/foreignAccounts must expose attemptReference");
+  const seen = new Set();
+  for (let i = 0; i < 500; i++) {
+    const ref = attemptReference("4f1b8f89-0000-0000-0000-000000000000");
+    assert.ok(ref.startsWith("fa_4f1b8f89-"), ref);
+    assert.ok(!seen.has(ref), `duplicate reference on attempt ${i}: ${ref}`);
+    seen.add(ref);
+  }
+});
+
+test("a reference still carries the row id for tracing in Fincra's dashboard", () => {
+  const { attemptReference } = require("../src/routes/foreignAccounts");
+  assert.ok(attemptReference("abc-123").includes("abc-123"));
+});
+
 // ══ 8. ACCOUNT LIFECYCLE WITHOUT THE WEBHOOK ═══════════════════════════════
 section("8. polled account status maps to the same events the webhook uses");
 

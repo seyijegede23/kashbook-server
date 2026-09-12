@@ -90,6 +90,17 @@ async function uploadFcyDocs(docs = {}) {
   return out;
 }
 
+// The merchantReference for ONE attempt at a request. Row id for traceability,
+// then a time + sequence suffix so two attempts on the same row, even within
+// the same millisecond, never share a reference. Exported on the router for
+// the test that guards the uniqueness.
+let attemptSeq = 0;
+function attemptReference(rowId) {
+  attemptSeq = (attemptSeq + 1) % 1296; // two base-36 digits
+  return `fa_${rowId}_${Date.now().toString(36)}${attemptSeq.toString(36).padStart(2, "0")}`;
+}
+router.attemptReference = attemptReference;
+
 // Best-effort removal of documents stored for an attempt that never reached
 // Fincra. A private passport scan with nothing pointing at it is the worst kind
 // of leftover: invisible, personal, and ours to answer for.
@@ -386,12 +397,28 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
     // fincraRequestId/accountNumber and can arrive before our HTTP response,
     // and not a moment earlier, because a row created before validation is the
     // leftover described above.
-    const row = existing
-      ? await prisma.foreignAccount.update({
-          where: { id: existing.id },
-          data: { status: "pending", declineReason: null },
-        })
-      : await prisma.foreignAccount.create({
+    // On a retry the OLD Fincra ids must go. The reconcile poller polls every
+    // pending row that has a fincraRequestId; left in place, the id of the
+    // declined attempt would be polled while this new attempt is in flight and
+    // the old decline re-applied on top of it. They are set again from the new
+    // response below.
+    //
+    // updateMany with the status in the WHERE makes the claim atomic: two
+    // simultaneous retries cannot both flip the same declined row.
+    let row;
+    if (existing) {
+      const claimed = await prisma.foreignAccount.updateMany({
+        where: { id: existing.id, status: existing.status },
+        data: { status: "pending", declineReason: null, fincraRequestId: null, fincraAccountId: null, consentUrl: null },
+      });
+      if (claimed.count !== 1) {
+        destroyUploaded(uploaded).catch(() => {});
+        return res.status(409).json({ error: "This request is already being submitted.", code: "ALREADY_SUBMITTED" });
+      }
+      row = await prisma.foreignAccount.findUnique({ where: { id: existing.id } });
+    } else {
+      try {
+        row = await prisma.foreignAccount.create({
           data: {
             businessId: biz.id,
             currency,
@@ -401,12 +428,27 @@ router.post("/:businessId/foreign-accounts", authMiddleware, async (req, res) =>
             status: "pending",
           },
         });
+      } catch (err) {
+        // @@unique([businessId, currency]): a concurrent first request won the
+        // race. Nothing to repair; the other request is doing the work.
+        if (err.code === "P2002") {
+          destroyUploaded(uploaded).catch(() => {});
+          return res.status(409).json({ error: "This request is already being submitted.", code: "ALREADY_SUBMITTED" });
+        }
+        throw err;
+      }
+    }
 
     let result;
     try {
       result = await provider.provisionForeignAccount({
         ...fincraBody,
-        merchantReference: `fa_${row.id}`,
+        // Unique PER ATTEMPT, not per row. Fincra keeps the merchantReference
+        // on a declined record forever, so re-sending `fa_<row id>` on a retry
+        // returned 409 DUPLICATE_REFERENCE (2026-09-12 23:08) and the merchant
+        // could never try again. Nothing of ours parses this value: webhook and
+        // poll matching use the ids Fincra returns, which we store.
+        merchantReference: attemptReference(row.id),
       });
     } catch (err) {
       // Leave no half-open request: mark it declined so the user can retry.
