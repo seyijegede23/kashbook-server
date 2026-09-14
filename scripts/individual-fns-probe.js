@@ -18,7 +18,7 @@ const anchor = require("../src/utils/anchor");
 
   console.log("1) createIndividualCustomer()…");
   const c = await anchor.createIndividualCustomer({
-    user: { firstName: "Test", lastName: "Owner", email: `kbfn+${stamp}@kashbook.app`, phone: "08000000000" },
+    user: { firstName: "Test", lastName: "Owner", email: `kbfn+${stamp}@relianttechnology.com.ng`, phone: "08000000000" },
     address: { state: "Lagos", addressLine_1: "1 Marina Street", city: "Lagos Island", postalCode: "100001" },
   });
   console.log("   ✓ customerId:", c.customerId, "(suffix-detect:", /-anc_ind_cst$/.test(c.customerId) ? "individual ✓)" : "NOT individual ✗)");

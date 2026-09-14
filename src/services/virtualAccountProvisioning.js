@@ -352,7 +352,7 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
           user: {
             firstName: user.firstName,
             lastName: user.lastName || user.firstName,
-            email: user.email || `${user.id}@kashbook.app`,
+            email: user.email || `${user.id}@relianttechnology.com.ng`,
             phone: user.phone || "+2348000000000",
             dateOfBirth: dob,
             bvn,
@@ -366,7 +366,7 @@ async function executeVirtualAccountProvisioning({ biz, user, body, req }) {
           user: {
             firstName: user.firstName,
             lastName: user.lastName || user.firstName,
-            email: user.email || `${user.id}@kashbook.app`,
+            email: user.email || `${user.id}@relianttechnology.com.ng`,
             phone: user.phone || "+2348000000000",
           },
           address: businessAddress?.addressLine1

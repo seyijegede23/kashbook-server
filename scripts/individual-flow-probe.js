@@ -46,7 +46,7 @@ function detail(j) { return j?.errors?.[0]?.detail || j?.errors?.[0]?.title || J
   let r = await call("/customers", { method: "POST", body: {
     data: { type: "IndividualCustomer", attributes: {
       fullName: { firstName: "Test", lastName: "Owner" },
-      email: `kbprobe+${stamp}@kashbook.app`,
+      email: `kbprobe+${stamp}@relianttechnology.com.ng`,
       phoneNumber: "08000000000",
       address: addr,
     } },
