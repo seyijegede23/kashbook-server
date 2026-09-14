@@ -13,7 +13,7 @@ function requireUnfrozen(req, res, next) {
     error: "Your account is under review. Contact support to resolve.",
     code: "FROZEN",
     reason: req.user?.complianceFreezeReason || null,
-    supportEmail: process.env.COMPLIANCE_SUPPORT_EMAIL || "compliance@kashbook.com",
+    supportEmail: process.env.COMPLIANCE_SUPPORT_EMAIL || "compliance@relianttechnology.com.ng",
   });
 }
 
