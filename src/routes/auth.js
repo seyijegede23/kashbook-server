@@ -604,6 +604,14 @@ router.get("/me", authMiddleware, async (req, res) => {
         // Already resolved by authMiddleware for this request — no extra query.
         effectivePlan: req.user.effectivePlan ?? user.plan,
         hasTransactionPin: !!user.transactionPin,
+        // Remote feature switches. The app hides a feature's entry points when
+        // its flag is false or missing, so a feature can be pulled or restored
+        // from Render's environment without shipping an app update. `fcy` is
+        // FCY_ENABLED, the same switch that gates the foreign-accounts routes,
+        // so the tile and the API can never disagree.
+        features: {
+          fcy: process.env.FCY_ENABLED === "true",
+        },
         accountType: safe.accountType.toLowerCase(),
         settings: {
           language: safe.language,
