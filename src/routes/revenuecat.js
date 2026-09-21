@@ -35,6 +35,17 @@ const GRANT = new Set([
 // the user keeps access until the period expires / grace period ends.
 const REVOKE = new Set(["EXPIRATION"]);
 
+// Accounts whose Pro is never taken away by RevenueCat: the store review
+// account. Apple and Google reviewers run sandbox purchases, and a sandbox
+// subscription expires within the hour, so without this the review account
+// would drop to Free in the middle of the review. Grants still apply; only
+// the revoke is ignored, and it is logged and audited so it stays visible.
+// Comma-separated KashBook user ids, set on the server environment.
+const PINNED = new Set(
+  String(process.env.REVENUECAT_PINNED_USER_IDS || "")
+    .split(",").map((s) => s.trim()).filter(Boolean),
+);
+
 router.post("/", async (req, res) => {
   // 1. Authenticate
   const expected = process.env.REVENUECAT_WEBHOOK_AUTH;
@@ -87,6 +98,18 @@ router.post("/", async (req, res) => {
     }
     if (user.plan === targetPlan) {
       console.log(`[RevenueCat webhook] ${type} — ${user.id} already ${targetPlan}`);
+      return;
+    }
+    if (targetPlan === "FREE" && PINNED.has(user.id)) {
+      console.log(`[RevenueCat webhook] ${type} — ${user.id} is pinned, Pro kept`);
+      await audit({
+        action: "SUBSCRIPTION_REVOKE_IGNORED",
+        resourceType: "user",
+        resourceId: user.id,
+        severity: "info",
+        actorOverride: { type: "system", id: "revenuecat" },
+        metadata: { eventType: type, productId: event.product_id || null, reason: "pinned" },
+      }).catch(() => {});
       return;
     }
 
