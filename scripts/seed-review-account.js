@@ -90,7 +90,12 @@ function generate() {
     // A provisions shop paying ₦150k rent turns over ₦1.5m to ₦2m a month;
     // the counts and basket sizes are tuned to land there, well above the
     // expenses below, so the month views read like a business that works.
-    const count = isToday ? 3 : dow === 0 ? between(0, 3) : dow === 6 ? between(5, 10) : between(3, 7);
+    // A gentle upward trend, about 8% a month, so the current month is the
+    // best one and "vs last month" reads as growth.
+    const monthIndex = (day.getFullYear() - START.getFullYear()) * 12 + day.getMonth() - START.getMonth();
+    const growth = 1 + 0.08 * monthIndex;
+    const base = isToday ? 3 : dow === 0 ? between(0, 3) : dow === 6 ? between(5, 10) : between(3, 7);
+    const count = Math.round(base * growth);
     for (let i = 0; i < count; i++) {
       const lines = between(1, 3);
       const chosen = new Map();
@@ -109,7 +114,9 @@ function generate() {
     if (dom === 3) expenses.push({ category: "utility", amount: between(9, 16) * 1000, paymentMethod: "transfer", date: at(day, 10), notes: "Electricity units" });
     if (dom === 27) expenses.push({ category: "salary", amount: 85000, paymentMethod: "transfer", date: at(day, 16), notes: "Shop assistant salary" });
     if (dom === 27) expenses.push({ category: "salary", amount: 60000, paymentMethod: "transfer", date: at(day, 16, 5), notes: "Storekeeper salary" });
-    if (dow === 1) expenses.push({ category: "supplies", amount: between(200, 300) * 1000, paymentMethod: "transfer", date: at(day, 10, 30), notes: `Restock: ${pick(["Indomie and Peak Milk", "Semovita and sugar", "Vegetable oil", "Milo and sugar", "Indomie cartons"])}` });
+    // Restock on Fridays: the week's sales come first, so the Week view is not
+    // a loss every Monday to Thursday.
+    if (dow === 5) expenses.push({ category: "supplies", amount: between(200, 300) * 1000, paymentMethod: "transfer", date: at(day, 10, 30), notes: `Restock: ${pick(["Indomie and Peak Milk", "Semovita and sugar", "Vegetable oil", "Milo and sugar", "Indomie cartons"])}` });
     if (dow === 2 || dow === 5) expenses.push({ category: "utility", amount: between(6, 14) * 1000, paymentMethod: "cash", date: at(day, 17), notes: "Generator diesel" });
     if (dow === 1 || dow === 3 || dow === 6) expenses.push({ category: "transport", amount: between(10, 40) * 100, paymentMethod: "cash", date: at(day, 14), notes: pick(["Okada delivery", "Delivery to Ikeja", "Keke to market", "Delivery to Yaba"]) });
     if (dom === 15 && rand() < 0.6) expenses.push({ category: "maintenance", amount: between(5, 25) * 1000, paymentMethod: "cash", date: at(day, 12), notes: pick(["Freezer repair", "Shelf and signage", "Generator service"]) });
