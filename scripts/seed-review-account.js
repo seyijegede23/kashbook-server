@@ -18,8 +18,24 @@
  * Pair it with REVENUECAT_PINNED_USER_IDS on the server (routes/revenuecat.js).
  */
 const prisma = require("../src/utils/db");
+const bcrypt = require("@node-rs/bcrypt");
 const { audit } = require("../src/utils/audit");
 const { normalizeChannel } = require("../src/utils/salesChannel");
+const { computeNextPayDate, periodKeyFor, referenceFor, SALARY_APPROVAL_TTL_MS } = require("../src/utils/salarySchedule");
+
+// Two staff logins with different grants, each on a monthly salary. The staff
+// sign in with the phone number and STAFF_PASSWORD. Bank details are
+// illustrative; see the salary section for why no money can ever go there.
+const STAFF_PASSWORD = "KashStaff2026";
+const STAFF = [
+  { firstName: "Chidi", lastName: "Nwosu", phone: "+2348011223344", salary: 85000,
+    perms: { canViewBalance: false, canTransfer: true, canViewReports: true, canManagePayables: false, dailyTransferCap: 50000 },
+    bank: { accountNumber: "0123456789", bankCode: "058", bankName: "Guaranty Trust Bank", accountName: "CHIDI NWOSU" } },
+  { firstName: "Amaka", lastName: "Obi", phone: "+2348022334455", salary: 60000,
+    perms: { canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: true, dailyTransferCap: null },
+    bank: { accountNumber: "3012345678", bankCode: "011", bankName: "First Bank of Nigeria", accountName: "AMAKA OBI" } },
+];
+const PAY_DAY = 27;
 
 const args = process.argv.slice(2);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
@@ -92,6 +108,7 @@ function generate() {
     if (dom === 1) expenses.push({ category: "rent", amount: 150000, paymentMethod: "transfer", date: at(day, 9), notes: `Shop rent, ${day.toLocaleString("en-GB", { month: "long" })}` });
     if (dom === 3) expenses.push({ category: "utility", amount: between(9, 16) * 1000, paymentMethod: "transfer", date: at(day, 10), notes: "Electricity units" });
     if (dom === 27) expenses.push({ category: "salary", amount: 85000, paymentMethod: "transfer", date: at(day, 16), notes: "Shop assistant salary" });
+    if (dom === 27) expenses.push({ category: "salary", amount: 60000, paymentMethod: "transfer", date: at(day, 16, 5), notes: "Storekeeper salary" });
     if (dow === 1) expenses.push({ category: "supplies", amount: between(200, 300) * 1000, paymentMethod: "transfer", date: at(day, 10, 30), notes: `Restock: ${pick(["Indomie and Peak Milk", "Semovita and sugar", "Vegetable oil", "Milo and sugar", "Indomie cartons"])}` });
     if (dow === 2 || dow === 5) expenses.push({ category: "utility", amount: between(6, 14) * 1000, paymentMethod: "cash", date: at(day, 17), notes: "Generator diesel" });
     if (dow === 1 || dow === 3 || dow === 6) expenses.push({ category: "transport", amount: between(10, 40) * 100, paymentMethod: "cash", date: at(day, 14), notes: pick(["Okada delivery", "Delivery to Ikeja", "Keke to market", "Delivery to Yaba"]) });
@@ -230,6 +247,73 @@ function generate() {
       for (const p of inv.payments) await prisma.invoicePayment.create({ data: { invoiceId: row.id, amount: p.amount, method: p.method, date: p.date } });
     } else counter++;
     done.push(`invoice INV-${String(counter).padStart(3, "0")} ${inv.status} ${ymd(inv.issue)} ${inv.customer} ₦${inv.total.toLocaleString("en-NG")}`);
+  }
+
+  // 6. Staff logins with their grants, the way POST /auth/staff and the
+  //    permissions route write them. Keyed by phone.
+  const owner = await prisma.user.findUnique({ where: { id: user.id }, select: { businessName: true } });
+  const staffByPhone = {};
+  for (const s of STAFF) {
+    let row = await prisma.user.findUnique({ where: { phone: s.phone }, select: { id: true, employerId: true, firstName: true, lastName: true } });
+    if (row && row.employerId !== user.id) throw new Error(`${s.phone} belongs to another account`);
+    if (!row) {
+      if (!DRY) {
+        row = await prisma.user.create({ data: {
+          firstName: s.firstName, lastName: s.lastName, businessName: owner.businessName, phone: s.phone, email: null,
+          password: await bcrypt.hash(STAFF_PASSWORD, 12), accountType: "STAFF", employerId: user.id, createdAt: START,
+        }, select: { id: true, employerId: true, firstName: true, lastName: true } });
+        await prisma.staffPermission.create({ data: { userId: row.id, employerId: user.id, ...s.perms, grantedById: user.id } });
+      }
+      done.push(`staff ${s.firstName} ${s.lastName} (${s.phone}) with grants`);
+    }
+    if (row) staffByPhone[s.phone] = row;
+  }
+
+  // 7. Salaries: one schedule per staff member, paid history for every month
+  //    of the window, next pay date after this one. Consent is bound to the
+  //    payee, and these schedules are written with a payee key that can never
+  //    match ("demo:never-authorized"), so the runner suspends them instead of
+  //    minting a payment: nothing on this account can send money to the
+  //    illustrative bank details above, even if someone approves with a PIN.
+  const nextRunDate = computeNextPayDate({ frequency: "monthly", anchorDay: PAY_DAY, businessDayRule: "before", from: new Date(TODAY.getTime() + 4 * DAY) });
+  for (const s of STAFF) {
+    const staff = staffByPhone[s.phone];
+    if (!staff) continue;
+    const staffNameSnapshot = `${staff.firstName} ${staff.lastName}`.trim();
+    let schedule = await prisma.salarySchedule.findUnique({ where: { ownerId_staffUserId: { ownerId: user.id, staffUserId: staff.id } } });
+    if (!schedule) {
+      if (!DRY) {
+        schedule = await prisma.salarySchedule.create({ data: {
+          businessId: biz.id, ownerId: user.id, staffUserId: staff.id, staffNameSnapshot,
+          payoutKind: "external_bank", accountNumber: s.bank.accountNumber, bankCode: s.bank.bankCode, bankName: s.bank.bankName, accountName: s.bank.accountName, nameVerified: true,
+          amount: s.salary, currency: "NGN", frequency: "monthly", anchorDay: PAY_DAY, businessDayRule: "before", nextRunDate,
+          authorizedAt: START, authorizedAmount: s.salary, authorizedPayee: "demo:never-authorized", status: "active", createdAt: START,
+          lastRunAt: at(TODAY, 9), lastRunStatus: "paid",
+        } });
+      }
+      done.push(`salary schedule ${staffNameSnapshot} ₦${s.salary.toLocaleString("en-NG")} monthly on the ${PAY_DAY}th, next ${ymd(nextRunDate)}`);
+    }
+    if (!schedule) continue;
+    // Paid history: one row per month from the window start to this month.
+    const rows = [];
+    for (let m = new Date(START.getFullYear(), START.getMonth(), 1, 12); m <= TODAY; m = new Date(m.getFullYear(), m.getMonth() + 1, 1, 12)) {
+      let scheduledFor = computeNextPayDate({ frequency: "monthly", anchorDay: PAY_DAY, businessDayRule: "before", from: m });
+      if (scheduledFor > TODAY) scheduledFor = at(TODAY, 9); // this month, paid early
+      const periodKey = periodKeyFor(scheduledFor, "monthly");
+      const paidAt = new Date(scheduledFor.getTime() + 9 * 3600e3);
+      rows.push({
+        scheduleId: schedule.id, businessId: biz.id, ownerId: user.id, staffUserId: staff.id, staffNameSnapshot,
+        amount: s.salary, currency: "NGN", payoutKind: "external_bank", accountNumber: s.bank.accountNumber, bankCode: s.bank.bankCode, bankName: s.bank.bankName, accountName: s.bank.accountName, nameVerified: true,
+        periodKey, scheduledFor, status: "paid", owed: false, reference: referenceFor(schedule.id, periodKey),
+        expiresAt: new Date(scheduledFor.getTime() + SALARY_APPROVAL_TTL_MS), decidedById: user.id, decidedAt: paidAt, paidAt,
+        executedReference: referenceFor(schedule.id, periodKey), feeCharged: 53.75, createdAt: scheduledFor, updatedAt: paidAt,
+      });
+    }
+    const existing = await prisma.salaryPayment.count({ where: { scheduleId: schedule.id } });
+    if (existing < rows.length) {
+      if (!DRY) await prisma.salaryPayment.createMany({ data: rows, skipDuplicates: true });
+      done.push(`${rows.length - existing} paid salary rows for ${staffNameSnapshot}`);
+    }
   }
 
   console.log(done.length ? done.map((d) => "  + " + d).join("\n") : "  nothing to add, already seeded");
