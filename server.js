@@ -37,6 +37,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const express = require("express");
+const compression = require("compression");
 const cors = require("cors");
 const path = require("path");
 const prisma = require("./src/utils/db");
@@ -233,6 +234,11 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   whatsappWebhookRoute,
 );
+// gzip every JSON response. The app's full sync on launch carries a
+// business's whole history (thousands of rows for an active shop) and
+// compresses about five to one; on mobile data that is the difference
+// between a launch that feels instant and one that does not.
+app.use(compression());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // RevenueCat webhook — header-token auth (no body signature), so it's fine

@@ -38,7 +38,12 @@ router.get("/", async (req, res) => {
     const businessScope = { businessId };
     const incremental = sinceDate ? { updatedAt: { gt: sinceDate } } : {};
     const orderBy = sinceDate ? { updatedAt: "asc" } : { date: "desc" };
-    const txCap = sinceDate ? undefined : 200;
+    // The full load is what the app's reports are built from, so it has to
+    // carry the business's history, not a page of it. At 200 a shop doing a
+    // few sales a day lost every month but the last one on reinstall, and
+    // the month views showed expenses with no income. 2,500 rows per table
+    // is about two years for a busy shop and a few hundred kB gzipped.
+    const txCap = sinceDate ? undefined : 2500;
 
     const [sales, expenses, transactions, customers, inventory, debts, invoices, recurring] =
       await Promise.all([
