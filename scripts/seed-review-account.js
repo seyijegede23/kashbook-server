@@ -46,12 +46,18 @@ const CUSTOMERS = [
   { name: "Blessing Eze", phone: "+2348134567802" },
 ];
 const EXPENSES = [
+  // Today's rows keep the dashboard's "today" tiles from reading zero in
+  // review screenshots. daysAgo(0) is today at the given hour, so a rerun on
+  // a later day adds nothing (same notes + amount) and the old rows age out.
+  { category: "transport", amount: 1500, paymentMethod: "cash", date: daysAgo(0, 8), notes: "Okada delivery" },
   { category: "rent", amount: 150000, paymentMethod: "transfer", date: daysAgo(12, 9), notes: "Shop rent, September" },
   { category: "supplies", amount: 84000, paymentMethod: "transfer", date: daysAgo(8, 10), notes: "Restock: Indomie and Peak Milk" },
   { category: "utility", amount: 18000, paymentMethod: "cash", date: daysAgo(5, 16), notes: "Generator diesel" },
   { category: "transport", amount: 6500, paymentMethod: "cash", date: daysAgo(2, 14), notes: "Delivery to Ikeja" },
 ];
 const SALES = [
+  { amount: 3900, paymentMethod: "cash", channel: "walk-in", date: daysAgo(0, 9), notes: "Peak Evaporated Milk 160g × 6" },
+  { amount: 6300, paymentMethod: "transfer", channel: "whatsapp", date: daysAgo(0, 10), notes: "Golden Penny Semovita 1kg × 3" },
   { amount: 4200, paymentMethod: "cash", channel: "walk-in", date: daysAgo(9, 10), notes: "Indomie Chicken 70g × 12" },
   { amount: 9750, paymentMethod: "transfer", channel: "whatsapp", date: daysAgo(7, 13), notes: "Peak Evaporated Milk 160g × 15" },
   { amount: 12600, paymentMethod: "transfer", channel: "instagram", date: daysAgo(6, 15), notes: "Golden Penny Semovita 1kg × 6" },
