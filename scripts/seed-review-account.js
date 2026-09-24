@@ -1,20 +1,21 @@
 /**
- * Seed the store-review account.
+ * Seed the store-review account with five months of trading.
  *
- * Apple and Google reviewers sign in with one account and expect to see a
- * business that is in use: stock with barcodes, customers, recent sales and
- * expenses, invoices in more than one state, and every Pro feature open. This
- * puts that account into that state, idempotently: run it twice and the second
- * run adds nothing.
+ * Apple and Google reviewers sign in with one account and expect a business
+ * that is in use: stock with barcodes, customers, daily sales, weekly and
+ * monthly expenses, invoices in every state, month views with real shapes.
+ * This writes that history, deterministically: the same rows every run, so
+ * a rerun adds nothing, and `--rebuild` wipes the rows an earlier run wrote
+ * and writes them again.
  *
- *   node -r dotenv/config scripts/seed-review-account.js --email dami@example.com [--dry]
+ *   node -r dotenv/config scripts/seed-review-account.js --email dami@example.com [--rebuild] [--dry]
  *
- * Rows are created the way the routes create them (same fields, same
- * invoice-number counter, same channel normalisation), so nothing here is
- * distinguishable from entries made in the app. The plan is set to PREMIUM
- * with the same audit action the admin panel writes. Pair it with
- * REVENUECAT_PINNED_USER_IDS on the server so a reviewer's sandbox purchase
- * expiring cannot knock the account back to Free (see routes/revenuecat.js).
+ * Rows are created the way the routes create them (same fields, the invoice
+ * counter, channel normalisation), so nothing is distinguishable from
+ * entries made in the app. Only rows this script wrote are ever removed:
+ * anything dated before the seed window or matched to a bank transaction is
+ * left alone. The plan is set to PREMIUM with the admin panel's audit action.
+ * Pair it with REVENUECAT_PINNED_USER_IDS on the server (routes/revenuecat.js).
  */
 const prisma = require("../src/utils/db");
 const { audit } = require("../src/utils/audit");
@@ -24,62 +25,104 @@ const args = process.argv.slice(2);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
 const EMAIL = opt("--email");
 const DRY = args.includes("--dry");
-if (!EMAIL) { console.error("usage: --email <account email> [--dry]"); process.exit(1); }
+const REBUILD = args.includes("--rebuild");
+if (!EMAIL) { console.error("usage: --email <account email> [--rebuild] [--dry]"); process.exit(1); }
 
+// ── Deterministic randomness ───────────────────────────────────────────────
+// mulberry32: the same seed gives the same ledger on every machine and run.
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+const rand = rng(20260924);
+const between = (lo, hi) => lo + Math.floor(rand() * (hi - lo + 1));
+const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+const weighted = (pairs) => { const r = rand() * pairs.reduce((s, [, w]) => s + w, 0); let acc = 0; for (const [v, w] of pairs) { acc += w; if (r < acc) return v; } return pairs[pairs.length - 1][0]; };
+
+// ── The window: 5 calendar months back from today, in Lagos time ───────────
 const DAY = 86400e3;
-const daysAgo = (n, hour = 11) => { const d = new Date(Date.now() - n * DAY); d.setHours(hour, 0, 0, 0); return d; };
-const ymd = (d) => d.toISOString().slice(0, 10);
-// EAN-13 from a 12-digit body: Nigeria's GS1 prefix is 615.
-const ean13 = (body12) => {
-  const s = String(body12).split("").map(Number);
-  const sum = s.reduce((acc, d, i) => acc + d * (i % 2 === 0 ? 1 : 3), 0);
-  return body12 + String((10 - (sum % 10)) % 10);
-};
+const TODAY = new Date(); TODAY.setHours(12, 0, 0, 0);
+const START = new Date(TODAY); START.setMonth(START.getMonth() - 5); START.setDate(1); START.setHours(12, 0, 0, 0);
+const at = (day, hour, minute = 0) => { const d = new Date(day); d.setHours(hour, minute, 0, 0); return d; };
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const ean13 = (body12) => { const s = String(body12).split("").map(Number); const sum = s.reduce((acc, d, i) => acc + d * (i % 2 === 0 ? 1 : 3), 0); return body12 + String((10 - (sum % 10)) % 10); };
 
 const PRODUCTS = [
-  { name: "Indomie Chicken 70g", price: 350, cost: 300, quantity: 240, category: "Food", barcode: ean13("615010000001") },
-  { name: "Peak Evaporated Milk 160g", price: 650, cost: 560, quantity: 120, category: "Food", barcode: ean13("615010000002") },
-  { name: "Golden Penny Semovita 1kg", price: 2100, cost: 1850, quantity: 60, category: "Food", barcode: ean13("615010000003") },
+  { name: "Indomie Chicken 70g", price: 350, cost: 300, quantity: 240, barcode: ean13("615010000001"), w: 5, maxQty: 24 },
+  { name: "Peak Evaporated Milk 160g", price: 650, cost: 560, quantity: 120, barcode: ean13("615010000002"), w: 4, maxQty: 12 },
+  { name: "Golden Penny Semovita 1kg", price: 2100, cost: 1850, quantity: 60, barcode: ean13("615010000003"), w: 3, maxQty: 6 },
+  { name: "Dangote Sugar 1kg", price: 1800, cost: 1600, quantity: 45, barcode: ean13("615010000004"), w: 3, maxQty: 5 },
+  { name: "Kings Vegetable Oil 1L", price: 2900, cost: 2600, quantity: 30, barcode: ean13("615010000005"), w: 2, maxQty: 4 },
+  { name: "Milo 400g", price: 3200, cost: 2850, quantity: 8, barcode: ean13("615010000006"), w: 2, maxQty: 3 }, // low stock on purpose
 ];
 const CUSTOMERS = [
   { name: "Chinedu Okafor", phone: "+2348023456701" },
   { name: "Blessing Eze", phone: "+2348134567802" },
+  { name: "Ngozi Umeh", phone: "+2347012345603" },
+  { name: "Tunde Bakare", phone: "+2348098765404" },
+  { name: "Amina Yusuf", phone: "+2349011223305" },
 ];
-const EXPENSES = [
-  // Today's rows keep the dashboard's "today" tiles from reading zero in
-  // review screenshots. daysAgo(0) is today at the given hour, so a rerun on
-  // a later day adds nothing (same notes + amount) and the old rows age out.
-  { category: "transport", amount: 1500, paymentMethod: "cash", date: daysAgo(0, 8), notes: "Okada delivery" },
-  { category: "rent", amount: 150000, paymentMethod: "transfer", date: daysAgo(12, 9), notes: "Shop rent, September" },
-  { category: "supplies", amount: 84000, paymentMethod: "transfer", date: daysAgo(8, 10), notes: "Restock: Indomie and Peak Milk" },
-  { category: "utility", amount: 18000, paymentMethod: "cash", date: daysAgo(5, 16), notes: "Generator diesel" },
-  { category: "transport", amount: 6500, paymentMethod: "cash", date: daysAgo(2, 14), notes: "Delivery to Ikeja" },
-];
-const SALES = [
-  { amount: 3900, paymentMethod: "cash", channel: "walk-in", date: daysAgo(0, 9), notes: "Peak Evaporated Milk 160g × 6" },
-  { amount: 6300, paymentMethod: "transfer", channel: "whatsapp", date: daysAgo(0, 10), notes: "Golden Penny Semovita 1kg × 3" },
-  { amount: 4200, paymentMethod: "cash", channel: "walk-in", date: daysAgo(9, 10), notes: "Indomie Chicken 70g × 12" },
-  { amount: 9750, paymentMethod: "transfer", channel: "whatsapp", date: daysAgo(7, 13), notes: "Peak Evaporated Milk 160g × 15" },
-  { amount: 12600, paymentMethod: "transfer", channel: "instagram", date: daysAgo(6, 15), notes: "Golden Penny Semovita 1kg × 6" },
-  { amount: 2650, paymentMethod: "cash", channel: "walk-in", date: daysAgo(4, 12), notes: "Indomie Chicken 70g × 5, Peak Evaporated Milk 160g × 1" },
-  { amount: 25200, paymentMethod: "transfer", channel: "whatsapp", date: daysAgo(2, 11), notes: "Golden Penny Semovita 1kg × 12", customer: "Chinedu Okafor" },
-  { amount: 7000, paymentMethod: "cash", channel: "walk-in", date: daysAgo(1, 17), notes: "Indomie Chicken 70g × 20" },
-];
-const INVOICES = [
-  {
-    status: "SENT", customer: "Chinedu Okafor", issue: daysAgo(3), due: new Date(Date.now() + 11 * DAY),
-    items: [
-      { name: "Golden Penny Semovita 1kg", quantity: 10, rate: 2100 },
-      { name: "Peak Evaporated Milk 160g", quantity: 24, rate: 650 },
-    ],
-    notes: "Thank you for your order.",
-  },
-  {
-    status: "PAID", customer: "Blessing Eze", issue: daysAgo(6), due: daysAgo(-8),
-    items: [{ name: "Indomie Chicken 70g", quantity: 48, rate: 350 }],
-    payment: { method: "transfer", date: daysAgo(5, 12) },
-  },
-];
+
+// ── Generate the ledger ────────────────────────────────────────────────────
+function generate() {
+  const sales = [], expenses = [], invoices = [];
+  const productPairs = PRODUCTS.map((p) => [p, p.w]);
+  for (let day = new Date(START); day <= TODAY; day = new Date(day.getTime() + DAY)) {
+    const dow = day.getDay(); // 0 Sunday
+    const isToday = ymd(day) === ymd(TODAY);
+    // Sales: Sundays quiet, Saturdays busy, today only up to the afternoon.
+    // A provisions shop paying ₦150k rent turns over ₦1.5m to ₦2m a month;
+    // the counts and basket sizes are tuned to land there, well above the
+    // expenses below, so the month views read like a business that works.
+    const count = isToday ? 3 : dow === 0 ? between(0, 3) : dow === 6 ? between(5, 10) : between(3, 7);
+    for (let i = 0; i < count; i++) {
+      const lines = between(1, 3);
+      const chosen = new Map();
+      for (let l = 0; l < lines; l++) { const p = weighted(productPairs); chosen.set(p.name, { p, qty: between(1, Math.ceil(p.maxQty * 1.4)) }); }
+      const items = [...chosen.values()];
+      const amount = items.reduce((s, { p, qty }) => s + p.price * qty, 0);
+      const notes = items.map(({ p, qty }) => `${p.name} × ${qty}`).join(", ");
+      const channel = weighted([["walk-in", 60], ["whatsapp", 25], ["instagram", 10], ["other", 5]]);
+      const paymentMethod = weighted([["cash", 55], ["transfer", 40], ["pos", 5]]);
+      const customer = rand() < 0.2 ? pick(CUSTOMERS).name : null;
+      sales.push({ amount, paymentMethod, channel, date: at(day, between(8, isToday ? 11 : 19), between(0, 59)), notes, customer });
+    }
+    // Expenses.
+    const dom = day.getDate();
+    if (dom === 1) expenses.push({ category: "rent", amount: 150000, paymentMethod: "transfer", date: at(day, 9), notes: `Shop rent, ${day.toLocaleString("en-GB", { month: "long" })}` });
+    if (dom === 3) expenses.push({ category: "utility", amount: between(9, 16) * 1000, paymentMethod: "transfer", date: at(day, 10), notes: "Electricity units" });
+    if (dom === 27) expenses.push({ category: "salary", amount: 85000, paymentMethod: "transfer", date: at(day, 16), notes: "Shop assistant salary" });
+    if (dow === 1) expenses.push({ category: "supplies", amount: between(200, 300) * 1000, paymentMethod: "transfer", date: at(day, 10, 30), notes: `Restock: ${pick(["Indomie and Peak Milk", "Semovita and sugar", "Vegetable oil", "Milo and sugar", "Indomie cartons"])}` });
+    if (dow === 2 || dow === 5) expenses.push({ category: "utility", amount: between(6, 14) * 1000, paymentMethod: "cash", date: at(day, 17), notes: "Generator diesel" });
+    if (dow === 1 || dow === 3 || dow === 6) expenses.push({ category: "transport", amount: between(10, 40) * 100, paymentMethod: "cash", date: at(day, 14), notes: pick(["Okada delivery", "Delivery to Ikeja", "Keke to market", "Delivery to Yaba"]) });
+    if (dom === 15 && rand() < 0.6) expenses.push({ category: "maintenance", amount: between(5, 25) * 1000, paymentMethod: "cash", date: at(day, 12), notes: pick(["Freezer repair", "Shelf and signage", "Generator service"]) });
+    if (dom === 20 && rand() < 0.5) expenses.push({ category: "marketing", amount: between(3, 10) * 1000, paymentMethod: "transfer", date: at(day, 11), notes: "Instagram promotion" });
+  }
+  // Invoices: two a month, older ones paid, the recent ones in every state.
+  const months = [];
+  for (let m = new Date(START); m <= TODAY; m = new Date(m.getFullYear(), m.getMonth() + 1, 1, 12)) months.push(new Date(m));
+  months.forEach((m, mi) => {
+    const last = mi === months.length - 1, prev = mi === months.length - 2;
+    for (let k = 0; k < 2; k++) {
+      const issue = new Date(m.getFullYear(), m.getMonth(), k === 0 ? between(3, 9) : between(14, 22), 12);
+      if (issue > TODAY) continue;
+      const due = new Date(issue.getTime() + 14 * DAY);
+      const lines = between(1, 3);
+      const chosen = new Map();
+      for (let l = 0; l < lines; l++) { const p = weighted(productPairs); chosen.set(p.name, { name: p.name, quantity: between(6, 40), rate: p.price }); }
+      const items = [...chosen.values()];
+      const total = items.reduce((s, it) => s + it.quantity * it.rate, 0);
+      let status = "PAID", payments = [{ amount: total, method: pick(["transfer", "cash"]), date: new Date(issue.getTime() + between(2, 9) * DAY) }];
+      if (last && k === 1) { status = "DRAFT"; payments = []; }
+      else if (last && k === 0) { status = "SENT"; payments = []; }
+      else if (prev && k === 1) { status = "SENT"; payments = []; } // past due date: the app shows it as overdue
+      else if (prev && k === 0) { const part = Math.round(total * 0.4 / 100) * 100; status = "PARTIAL"; payments = [{ amount: part, method: "transfer", date: new Date(issue.getTime() + 5 * DAY) }]; }
+      invoices.push({ customer: pick(CUSTOMERS).name, issue, due, items, total, status, payments, notes: k === 0 ? "Thank you for your order." : null });
+    }
+  });
+  invoices.sort((a, b) => a.issue - b.issue);
+  return { sales, expenses, invoices };
+}
 
 (async () => {
   const user = await prisma.user.findFirst({
@@ -90,8 +133,24 @@ const INVOICES = [
   const biz = user.businesses[0];
   if (!biz) throw new Error("that account has no business");
   const ownerName = [user.firstName, user.lastName].filter(Boolean).join(" ") || "Owner";
+  const { sales, expenses, invoices } = generate();
   console.log(`${DRY ? "[dry] " : ""}account ${user.id} (${user.plan}) business "${biz.name}" ${biz.id}`);
+  console.log(`window ${ymd(START)} → ${ymd(TODAY)}: ${sales.length} sales, ${expenses.length} expenses, ${invoices.length} invoices generated`);
   const done = [];
+
+  // 0. Rebuild: remove what earlier runs wrote, identified by creation time.
+  //    The first seed ran on 2026-09-21; the owner's own entries on this
+  //    account were all created before that, and anything matched to a bank
+  //    transaction is never touched.
+  if (REBUILD && !DRY) {
+    const SEED_EPOCH = new Date("2026-09-21T17:00:00Z");
+    const s = await prisma.sales.deleteMany({ where: { businessId: biz.id, createdAt: { gte: SEED_EPOCH }, matchedTransactionId: null } });
+    const e = await prisma.expense.deleteMany({ where: { businessId: biz.id, createdAt: { gte: SEED_EPOCH }, matchedTransactionId: null } });
+    const inv = await prisma.invoice.deleteMany({ where: { businessId: biz.id } });
+    await prisma.business.update({ where: { id: biz.id }, data: { invoiceCounter: 0 } });
+    biz.invoiceCounter = 0;
+    done.push(`rebuild: removed ${s.count} sales, ${e.count} expenses, ${inv.count} invoices; invoice counter reset`);
+  }
 
   // 1. Plan
   if (user.plan !== "PREMIUM") {
@@ -124,48 +183,53 @@ const INVOICES = [
     if (existingBarcodes.has(p.barcode)) continue;
     if (!DRY) await prisma.inventoryItem.create({ data: {
       userId: user.id, businessId: biz.id, name: p.name, unit: "piece", quantity: p.quantity, price: p.price, cost: p.cost,
-      lowStockAlert: 10, category: p.category, barcode: p.barcode, lastRestocked: daysAgo(8, 10), createdBy: user.id, createdByName: ownerName,
+      lowStockAlert: 10, category: "Food", barcode: p.barcode, lastRestocked: new Date(TODAY.getTime() - 8 * DAY), createdBy: user.id, createdByName: ownerName,
     } });
     done.push(`product ${p.name} [${p.barcode}]`);
   }
 
-  // 4. Expenses and sales, keyed by note + amount so a rerun adds nothing
-  const expenseKeys = new Set((await prisma.expense.findMany({ where: { businessId: biz.id }, select: { notes: true, amount: true } })).map((e) => `${e.notes}|${e.amount}`));
-  for (const e of EXPENSES) {
-    if (expenseKeys.has(`${e.notes}|${e.amount}`)) continue;
-    if (!DRY) await prisma.expense.create({ data: { userId: user.id, businessId: biz.id, category: e.category, amount: e.amount, paymentMethod: e.paymentMethod, date: e.date, notes: e.notes } });
-    done.push(`expense ${e.notes} ₦${e.amount}`);
-  }
-  const saleKeys = new Set((await prisma.sales.findMany({ where: { businessId: biz.id }, select: { notes: true, amount: true } })).map((s) => `${s.notes}|${s.amount}`));
-  for (const s of SALES) {
-    if (saleKeys.has(`${s.notes}|${s.amount}`)) continue;
-    if (!DRY) await prisma.sales.create({ data: {
+  // 4. Sales and expenses, keyed by date + amount + note so a rerun adds nothing
+  const key = (r) => `${new Date(r.date).toISOString()}|${r.amount}|${r.notes}`;
+  // Existing rows are read from a day before the window start: the first
+  // rent entry is dated 09:00 on the 1st, before START's noon, and without
+  // the margin a rerun would add it again.
+  const KEY_FROM = new Date(START.getTime() - DAY);
+  const saleKeys = new Set((await prisma.sales.findMany({ where: { businessId: biz.id, date: { gte: KEY_FROM } }, select: { date: true, amount: true, notes: true } })).map(key));
+  const newSales = sales.filter((s) => !saleKeys.has(key(s)));
+  if (!DRY && newSales.length) {
+    await prisma.sales.createMany({ data: newSales.map((s) => ({
       userId: user.id, businessId: biz.id, customerId: s.customer ? customerByName[s.customer]?.id || null : null,
       amount: s.amount, paymentMethod: s.paymentMethod, isCredit: false, notes: s.notes, channel: normalizeChannel(s.channel),
       date: s.date, recordedBy: user.id, recordedByName: ownerName,
-    } });
-    done.push(`sale ${s.notes} ₦${s.amount}`);
+    })) });
   }
+  if (newSales.length) done.push(`${newSales.length} sales, ₦${newSales.reduce((s, x) => s + x.amount, 0).toLocaleString("en-NG")} in total`);
+  const expenseKeys = new Set((await prisma.expense.findMany({ where: { businessId: biz.id, date: { gte: KEY_FROM } }, select: { date: true, amount: true, notes: true } })).map(key));
+  const newExpenses = expenses.filter((e) => !expenseKeys.has(key(e)));
+  if (!DRY && newExpenses.length) {
+    await prisma.expense.createMany({ data: newExpenses.map((e) => ({ userId: user.id, businessId: biz.id, category: e.category, amount: e.amount, paymentMethod: e.paymentMethod, date: e.date, notes: e.notes })) });
+  }
+  if (newExpenses.length) done.push(`${newExpenses.length} expenses, ₦${newExpenses.reduce((s, x) => s + x.amount, 0).toLocaleString("en-NG")} in total`);
 
-  // 5. Invoices, only if the business has none (the counter must stay in step)
-  const invoiceCount = await prisma.invoice.count({ where: { businessId: biz.id } });
-  if (invoiceCount === 0) {
-    for (const inv of INVOICES) {
-      const subtotal = inv.items.reduce((sum, it) => sum + it.quantity * it.rate, 0);
-      if (!DRY) {
-        const updated = await prisma.business.update({ where: { id: biz.id }, data: { invoiceCounter: { increment: 1 } } });
-        const invoiceNumber = `INV-${String(updated.invoiceCounter).padStart(3, "0")}`;
-        const row = await prisma.invoice.create({ data: {
-          businessId: biz.id, customerId: customerByName[inv.customer]?.id || null, userId: user.id, invoiceNumber, type: "invoice",
-          status: inv.status, issueDate: ymd(inv.issue), dueDate: ymd(inv.due), subtotal, taxRate: 0, taxAmount: 0,
-          discountValue: 0, discountAmount: 0, total: subtotal, amountPaid: inv.status === "PAID" ? subtotal : 0,
-          notes: inv.notes || null, template: "classic",
-          items: { create: inv.items.map((it) => ({ name: it.name, quantity: it.quantity, rate: it.rate, amount: it.quantity * it.rate })) },
-        } });
-        if (inv.payment) await prisma.invoicePayment.create({ data: { invoiceId: row.id, amount: subtotal, method: inv.payment.method, date: inv.payment.date } });
-      }
-      done.push(`invoice ${inv.status} to ${inv.customer} ₦${subtotal}`);
-    }
+  // 5. Invoices, in date order so the numbers run with the calendar
+  const existingInv = new Set((await prisma.invoice.findMany({ where: { businessId: biz.id }, select: { issueDate: true, total: true } })).map((i) => `${i.issueDate}|${i.total}`));
+  let counter = biz.invoiceCounter;
+  for (const inv of invoices) {
+    if (existingInv.has(`${ymd(inv.issue)}|${inv.total}`)) continue;
+    const paid = inv.payments.reduce((s, p) => s + p.amount, 0);
+    if (!DRY) {
+      const updated = await prisma.business.update({ where: { id: biz.id }, data: { invoiceCounter: { increment: 1 } } });
+      counter = updated.invoiceCounter;
+      const row = await prisma.invoice.create({ data: {
+        businessId: biz.id, customerId: customerByName[inv.customer]?.id || null, userId: user.id, invoiceNumber: `INV-${String(counter).padStart(3, "0")}`, type: "invoice",
+        status: inv.status, issueDate: ymd(inv.issue), dueDate: ymd(inv.due), subtotal: inv.total, taxRate: 0, taxAmount: 0,
+        discountValue: 0, discountAmount: 0, total: inv.total, amountPaid: paid, notes: inv.notes, template: "classic",
+        createdAt: inv.issue, updatedAt: inv.issue,
+        items: { create: inv.items.map((it) => ({ name: it.name, quantity: it.quantity, rate: it.rate, amount: it.quantity * it.rate })) },
+      } });
+      for (const p of inv.payments) await prisma.invoicePayment.create({ data: { invoiceId: row.id, amount: p.amount, method: p.method, date: p.date } });
+    } else counter++;
+    done.push(`invoice INV-${String(counter).padStart(3, "0")} ${inv.status} ${ymd(inv.issue)} ${inv.customer} ₦${inv.total.toLocaleString("en-NG")}`);
   }
 
   console.log(done.length ? done.map((d) => "  + " + d).join("\n") : "  nothing to add, already seeded");
