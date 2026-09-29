@@ -27,6 +27,7 @@ const { getProvider } = require("../providers");
 const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("./ledgerBalance");
 const balanceCache = require("./balanceCache");
+const { getReservedBalance, netSpendable } = require("./savingsReserve");
 
 async function executeTransfer({
   business,
@@ -49,12 +50,41 @@ async function executeTransfer({
   // resets to zero-spent on every send.
   recordedBy = null,
   recordedByName = null,
+  // Why this debit exists when it is NOT a payment to someone else. Only the
+  // savings service passes it ("savings_deposit": funding the business's own
+  // PiggyVest wallet). It is stamped on the Transaction row so reporting can
+  // leave the movement out, and it switches off the internal-route lookup
+  // below, because the destination is known to be external.
+  purpose = null,
 } = {}) {
   const bankingId = business?.providerAccountId || business?.anchorAccountId;
   if (!business || !bankingId) {
     const err = new Error("Business has no banking account configured.");
     err.code = "NO_BANKING";
     throw err;
+  }
+  if (purpose && purpose !== "savings_deposit") {
+    const err = new Error(`executeTransfer: unsupported purpose "${purpose}"`);
+    err.code = "BAD_PURPOSE";
+    throw err;
+  }
+
+  // A plain send (Send Money, an approval, payroll, a recurring expense) to one
+  // of this business's OWN savings pot accounts is refused: it would land in the
+  // pot with no movement row, so the pot balance and the merchant's reports
+  // would both be wrong. Savings deposits come through the savings route, which
+  // passes `purpose` and books the movement first.
+  if (!purpose && accountNumber) {
+    const potHit = await prisma.savingsPot.findFirst({
+      where: { businessId: business.id, pvAccountNumber: String(accountNumber), status: { not: "closed" } },
+      select: { id: true, name: true },
+    });
+    if (potHit) {
+      const err = new Error(`That account belongs to your savings pot "${potHit.name}". Use Savings → Put in to add money to it.`);
+      err.code = "SAVINGS_DEST_USE_DEPOSIT";
+      err.potId = potHit.id;
+      throw err;
+    }
   }
 
 
@@ -88,7 +118,10 @@ async function executeTransfer({
 
   // 2. Route detection — internal book transfer vs external NIP. Done before
   // the balance check because the fee depends on the route (internal = free).
-  const internalDest = await prisma.business.findFirst({
+  // A savings deposit skips it: the destination is a PiggyVest wallet account,
+  // known external, and matching on the 10-digit number alone could otherwise
+  // book-route the money to a KashBook business that happens to share it.
+  const internalDest = purpose === "savings_deposit" ? null : await prisma.business.findFirst({
     where: {
       virtualAccountNumber: accountNumber,
       anchorAccountId: { not: null },
@@ -108,64 +141,103 @@ async function executeTransfer({
   // not ours — but it's real money off this account, so gate and book it).
   const totalCost = fee + statutoryStamp;
 
-  // 3. Live balance check — must cover the transfer, our fee, AND the stamp duty.
-  const { balance } = await anchor.getAccountBalance(business.anchorAccountId);
+  // 3. Live balance check — must cover the transfer, our fee, AND the stamp duty,
+  // out of what is SPENDABLE: the bank's available figure minus whatever the
+  // merchant has set aside in ledger savings pots. Those pots move no money, so
+  // this subtraction is the only thing that makes them real. Every caller holds
+  // withBusinessLock(business.id) here, and ledger-pot deposits take the same
+  // lock, so the reserve cannot change between this read and the Anchor call.
+  const [{ balance: grossBalance }, reserved] = await Promise.all([
+    anchor.getAccountBalance(business.anchorAccountId),
+    getReservedBalance(business.id),
+  ]);
+  const balance = netSpendable(grossBalance, reserved);
   if (balance + MONEY_EPS < Number(amount) + totalCost) {
+    const savedNote = reserved > 0 ? ` (${formatAmountForBusiness(business, reserved)} is set aside in savings)` : "";
     const err = new Error(
       totalCost > 0
-        ? `Insufficient balance. This transfer needs ${formatAmountForBusiness(business, Number(amount) + totalCost)} (includes ${formatAmountForBusiness(business, fee)} fee${statutoryStamp ? ` + ${formatAmountForBusiness(business, statutoryStamp)} government stamp duty` : ""}). Available: ${formatAmountForBusiness(business, balance)}`
-        : `Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}`,
+        ? `Insufficient balance. This transfer needs ${formatAmountForBusiness(business, Number(amount) + totalCost)} (includes ${formatAmountForBusiness(business, fee)} fee${statutoryStamp ? ` + ${formatAmountForBusiness(business, statutoryStamp)} government stamp duty` : ""}). Available: ${formatAmountForBusiness(business, balance)}${savedNote}`
+        : `Insufficient balance. Available: ${formatAmountForBusiness(business, balance)}${savedNote}`,
     );
     err.code = "INSUFFICIENT_BALANCE";
     err.availableBalance = balance;
+    err.grossBalance = grossBalance;
+    err.reserved = reserved;
+    err.moneyMoved = false;
     throw err;
   }
 
   let resolvedName = accountName;
   let resolvedBank = bankName;
   let route;
+  // Anchor's own id for the movement. For a savings deposit it is how the
+  // reconcile loop ties an outflow at Anchor to an inflow at PiggyVest and how
+  // a failed/reversed NIP webhook finds the movement to fail.
+  let providerTransferId = null;
 
   if (internalDest) {
     resolvedName = resolvedName || internalDest.virtualAccountName || internalDest.name;
     resolvedBank = "KashBook (internal)";
     route = "book";
-    await anchor.createBookTransfer({
+    const book = await anchor.createBookTransfer({
       fromAccountId: business.anchorAccountId,
       toAccountId: internalDest.anchorAccountId,
       amount: Number(amount),
       reason: narration || `Transfer from ${business.name}`,
       reference: ref,
     });
+    providerTransferId = book?.transferId || book?.id || null;
   } else {
-    if (!resolvedName) {
-      const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
-      if (!ne.accountName) {
-        const err = new Error("Could not resolve recipient account");
-        err.code = "RECIPIENT_UNVERIFIED";
+    // Everything up to the transfer itself moves no money. Errors thrown here
+    // are stamped moneyMoved:false so a caller that books a movement row before
+    // calling (the savings service) can fail that row outright instead of
+    // parking it as "unknown" for the reconcile loop to resolve.
+    let cp;
+    try {
+      if (!resolvedName) {
+        const ne = await anchor.verifyCounterparty({ accountNumber, bankCode });
+        if (!ne.accountName) {
+          const err = new Error("Could not resolve recipient account");
+          err.code = "RECIPIENT_UNVERIFIED";
+          throw err;
+        }
+        resolvedName = ne.accountName;
+      }
+      const banks = await anchor.getBanks();
+      const matchedBank = banks.find((b) => b.code === bankCode);
+      if (!matchedBank?.id) {
+        const err = new Error("Unknown bank — refresh the bank list");
+        err.code = "UNKNOWN_BANK";
         throw err;
       }
-      resolvedName = ne.accountName;
+      cp = await anchor.createCounterparty({
+        accountNumber,
+        bankId: matchedBank.id,
+        accountName: resolvedName,
+      });
+    } catch (preErr) {
+      if (preErr && typeof preErr === "object") preErr.moneyMoved = false;
+      throw preErr;
     }
-    const banks = await anchor.getBanks();
-    const matchedBank = banks.find((b) => b.code === bankCode);
-    if (!matchedBank?.id) {
-      const err = new Error("Unknown bank — refresh the bank list");
-      err.code = "UNKNOWN_BANK";
-      throw err;
-    }
-    const cp = await anchor.createCounterparty({
-      accountNumber,
-      bankId: matchedBank.id,
-      accountName: resolvedName,
-    });
     route = "nip";
-    await anchor.createTransfer({
-      fromAccountId: business.anchorAccountId,
-      counterpartyId: cp.counterpartyId,
-      amount: Number(amount),
-      reason: narration || `Transfer from ${business.name}`,
-      reference: ref,
-    });
+    let nip;
+    try {
+      nip = await anchor.createTransfer({
+        fromAccountId: business.anchorAccountId,
+        counterpartyId: cp.counterpartyId,
+        amount: Number(amount),
+        reason: narration || `Transfer from ${business.name}`,
+        reference: ref,
+      });
+    } catch (txErr) {
+      // A definite rejection (validation, auth, not found) means Anchor did
+      // not act. A timeout, a 5xx, a 409 on the idempotency key or a
+      // code-less network error may have: leave moneyMoved undefined.
+      const s = Number(txErr?.httpStatus || txErr?.status || 0);
+      if ([400, 401, 403, 404, 422].includes(s) && txErr && typeof txErr === "object") txErr.moneyMoved = false;
+      throw txErr;
+    }
+    providerTransferId = nip?.transferId || nip?.id || null;
 
     // Collect the fee into KashBook's revenue account (free book transfer).
     // The user's transfer already succeeded — a failed collection must NOT
@@ -220,6 +292,8 @@ async function executeTransfer({
         date: new Date(),
         source: "anchor",
         reference: ref, // idempotency key (unique per [businessId, reference])
+        providerTxnId: providerTransferId || undefined,
+        purpose: purpose || undefined,
         currency: business.baseCurrency || "NGN",
         recordedBy, recordedByName,
         flagSeverity: amlCheck.maxSeverity || null,
@@ -250,7 +324,7 @@ async function executeTransfer({
         `${formatAmountForBusiness(business, amount)} → ${resolvedName} (Ref: ${ref.slice(-8)})`,
       ).catch(() => {});
     }
-    return { reference: ref, route, transactionId: null, transaction: null, fee, bookkeepingFailed: true };
+    return { reference: ref, route, transactionId: null, transaction: null, fee, providerTransferId, bookkeepingFailed: true };
   }
 
   // 5. ComplianceFlag rows (CTR auto-flag + any rule hits).
@@ -295,7 +369,7 @@ async function executeTransfer({
     );
   }
 
-  return { reference: ref, route, transactionId: txn.id, transaction: txn, fee };
+  return { reference: ref, route, transactionId: txn.id, transaction: txn, fee, providerTransferId };
 }
 
 module.exports = { executeTransfer };

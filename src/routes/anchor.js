@@ -668,6 +668,13 @@ router.post("/", async (req, res) => {
       const description = buildInboundDescription({ sender, narration, reference: sessionId });
       const paidAt = pay.paidAt ? new Date(pay.paidAt) : null;
 
+      // Savings: is this the merchant's own money coming home from a PiggyVest
+      // pot? Decided BEFORE the repair and the create, outside any lock, so a
+      // withdrawal landing is booked with purpose "savings_withdrawal" and is
+      // never pushed as a payment, matched to an invoice or emailed as a credit.
+      const savingsHit = await require("../utils/savingsCredit").classifyInboundCredit(biz, { amount, sender, narration });
+      const isSavings = savingsHit.purpose === "savings_withdrawal";
+
       // Cross-path repair. The reconcile poller reads Anchor's /transactions
       // list, which carries no Payment link, so it books credits it cannot
       // attribute as "Anonymous sender" under an anc_txn_ key. The webhook knows
@@ -717,6 +724,24 @@ router.post("/", async (req, res) => {
             return null;
           }
           const twin = candidates[0];
+          // Re-tagging as savings is safe only if the poller's row is still
+          // untouched. If a matcher (or a person) already paid an invoice or a
+          // debt with it, the purpose stays off and a human sorts it out.
+          let tagSavings = isSavings;
+          if (isSavings) {
+            const full = await prisma.transaction.findUnique({ where: { id: twin.id }, select: { matchedSaleId: true, matchedCustomerId: true, matchedExpenseId: true, purpose: true } });
+            // The invoice matcher records the bank reference in the payment's
+            // note ("NUBAN transfer · <ref>"); that is the only link back.
+            const rawRef = String(twin.reference || "").replace(/^anc_txn_/, "");
+            const invoicePaid = rawRef
+              ? await prisma.invoicePayment.findFirst({ where: { note: { contains: rawRef } }, select: { id: true } }).catch(() => null)
+              : null;
+            if (full?.matchedSaleId || full?.matchedCustomerId || full?.matchedExpenseId || invoicePaid) {
+              tagSavings = false;
+              await audit({ action: "SAVINGS_LANDING_CONFLICT", resourceType: "transaction", resourceId: twin.id, severity: "alert", metadata: { amount, movementId: savingsHit.movementId, matchedSaleId: full?.matchedSaleId, matchedCustomerId: full?.matchedCustomerId, invoicePaid: !!invoicePaid } }).catch(() => {});
+              require("../utils/alerts").fireAlert(`savings-landing-conflict-${twin.id}`, "Savings landing already used as a payment", `A ₦${amount} credit to ${biz.name} is a savings withdrawal landing, but the poller-booked row was already matched to a sale, debt or invoice. Unmatch it by hand, then tag it as savings.`).catch(() => {});
+            }
+          }
           await prisma.transaction.update({
             where: { id: twin.id },
             data: {
@@ -725,6 +750,7 @@ router.post("/", async (req, res) => {
               senderBank: sender?.bank || null,
               senderAccount: sender?.accountNumber || null,
               ...(reference ? { reference } : {}),
+              ...(tagSavings ? { purpose: "savings_withdrawal" } : {}),
               // Keep the provider id the poller saw; fall back to the payment id.
               providerTxnId:
                 twin.providerTxnId ||
@@ -736,6 +762,9 @@ router.post("/", async (req, res) => {
           return twin;
         });
         if (repaired) {
+          if (isSavings) {
+            await require("../utils/savingsCredit").markLanded({ movementId: savingsHit.movementId, transactionId: repaired.id, amount }).catch(() => {});
+          }
           console.log(
             `[Anchor webhook] credit ₦${amount} was reconcile-booked (${repaired.reference || "no ref"}) — attributed sender + re-keyed to ${reference || "same ref"}`,
           );
@@ -750,8 +779,9 @@ router.post("/", async (req, res) => {
         }
       }
 
+      let createdRow;
       try {
-        await prisma.transaction.create({
+        createdRow = await prisma.transaction.create({
           data: {
             businessId: biz.id,
             userId: biz.userId,
@@ -774,6 +804,7 @@ router.post("/", async (req, res) => {
             senderAccount: sender?.accountNumber || null,
             ...(reference ? { reference } : {}),
             ...(paymentKey ? { providerTxnId: paymentKey } : {}),
+            ...(isSavings ? { purpose: "savings_withdrawal" } : {}),
           },
         });
       } catch (createErr) {
@@ -784,6 +815,15 @@ router.post("/", async (req, res) => {
           return;
         }
         throw createErr;
+      }
+
+      if (isSavings) {
+        // The merchant's own savings landing: the balance moves, nothing else
+        // that a customer payment triggers should happen.
+        await require("../utils/savingsCredit").markLanded({ movementId: savingsHit.movementId, transactionId: createdRow.id, amount }).catch(() => {});
+        try { require("../utils/balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
+        await pushTo(biz.userId, "Savings arrived", `${require("../config/amlLimits").formatAmountForBusiness(biz, amount)} from your savings is now in your account.`).catch(() => {});
+        return;
       }
 
       const { title, body } = buildInboundNotification({
@@ -971,6 +1011,29 @@ router.post("/", async (req, res) => {
     ) {
       // Local Transaction was already written when /transfers/send ran.
       if (eventType !== "nip.transfer.successful") {
+        // A savings deposit that failed or was reversed never reached the pot.
+        // Fail the movement (from sent|unknown only) so the merchant sees it
+        // and can retry with a new reference. The reversal credit itself, when
+        // Anchor sends one, is booked by the ordinary inbound path.
+        try {
+          const transferId = root?.id || rels.transfer?.data?.id || attrs.transferId || null;
+          const ref = attrs.reference || attrs.customerReference || null;
+          const mv = await prisma.savingsMovement.findFirst({
+            where: {
+              type: "deposit",
+              status: { in: ["sent", "unknown", "initiated"] },
+              OR: [
+                ...(ref ? [{ reference: String(ref) }] : []),
+                ...(transferId ? [{ providerTransferId: String(transferId) }] : []),
+              ],
+            },
+          });
+          if (mv) {
+            await require("../utils/savings").failDepositAtBank(mv, { source: eventType.replace("nip.transfer.", ""), reason: attrs.reason });
+          }
+        } catch (svErr) {
+          console.error("[Anchor webhook] savings deposit outcome:", svErr.message);
+        }
         const accountId = rels.account?.data?.id;
         if (accountId) {
           const biz = await prisma.business.findFirst({

@@ -47,7 +47,7 @@ router.get("/stats", async (req, res) => {
         prisma.user.count({ where: { createdAt: { gte: today } } }),
         prisma.invoice.count(),
         prisma.transaction.aggregate({
-          where: { type: "income" },
+          where: { type: "income", ...require("../config/moneySources").NOT_SAVINGS },
           _sum: { amount: true },
         }),
       ]);
@@ -233,7 +233,7 @@ router.get("/revenue", async (req, res) => {
     since.setHours(0, 0, 0, 0);
 
     const transactions = await prisma.transaction.findMany({
-      where: { type: "income", date: { gte: since } },
+      where: { type: "income", date: { gte: since }, ...require("../config/moneySources").NOT_SAVINGS },
       select: { amount: true, date: true },
       orderBy: { date: "asc" },
     });

@@ -54,13 +54,10 @@ async function spentLast24h(businessId) {
 
 async function availableBalance(biz) {
   try {
-    const provider = getProvider(biz);
-    if (provider.pooledWallet) {
-      return await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN");
-    }
-    const anchor = require("./anchor");
-    const r = await anchor.getAccountBalance(biz.providerAccountId || biz.anchorAccountId);
-    return Number(r?.balance ?? r ?? 0);
+    // Spendable, not gross: money set aside in savings pots cannot pay staff,
+    // and the executor will refuse it, so the warning must count it out too.
+    const { getSpendableBalance } = require("./savingsReserve");
+    return (await getSpendableBalance(biz)).spendable;
   } catch (e) {
     console.warn("[salary] balance lookup failed:", e.message);
     return null; // unknown — warn about limits only

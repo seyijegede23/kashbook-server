@@ -3,7 +3,7 @@ const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
 const { requirePermission } = require("../middleware/requirePermission");
 const { normalizeChannel } = require("../utils/salesChannel");
-const { isBankLedgerRow } = require("../config/moneySources");
+const { isBankLedgerRow, isSavingsRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
@@ -219,6 +219,12 @@ async function loadMatchableCredit(req, res) {
     res.status(400).json({ error: "Matching is only for incoming transfers.", code: "NOT_INCOMING" });
     return null;
   }
+  // A savings withdrawal landing is the merchant's own money, not a payment:
+  // it can never be matched to a sale, a debt or an invoice.
+  if (isSavingsRow(tx)) {
+    res.status(409).json({ error: "This is money returning from your savings, not a customer payment.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
+    return null;
+  }
   if (tx.matchedSaleId || tx.matchedCustomerId) {
     res.status(409).json({ error: "This transfer is already matched. Unmatch it first.", code: "ALREADY_MATCHED" });
     return null;
@@ -401,6 +407,12 @@ async function loadMatchableDebit(req, res) {
   }
   if (tx.type !== "expense") {
     res.status(400).json({ error: "Recording an expense is only for outgoing transfers.", code: "NOT_OUTGOING" });
+    return null;
+  }
+  // A savings deposit is the merchant's own money moving into a pot, not an
+  // expense; recording one would double-count it against their profit.
+  if (isSavingsRow(tx)) {
+    res.status(409).json({ error: "This is a transfer into your savings, not an expense.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
     return null;
   }
   if (tx.matchedExpenseId) {

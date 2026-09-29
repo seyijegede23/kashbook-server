@@ -175,8 +175,9 @@ function startFincraReconcileLoop(intervalMs = 5 * 60 * 1000) {
         if (credits.error) {
           // The heartbeat records the FAILURE. It used to be written "ok" before
           // the call, so the health page showed a healthy cron through hours of
-          // 401s. With no "ok" beat the existing cron_stale rule fires in ~10
-          // minutes, and lastError carries the reason.
+          // 401s. healthCheck treats an "error" status as stale, so the
+          // cron_stale rule fires on the next health pass and lastError
+          // carries the reason.
           await recordHeartbeat("fincra-reconcile", "error", credits.error).catch(() => {});
           // Nothing else runs on a dead credential. Retrying payouts now would
           // read "cannot list payouts" as "no payout exists" and pay again.

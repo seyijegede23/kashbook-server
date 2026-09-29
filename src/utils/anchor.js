@@ -686,6 +686,21 @@ async function createBookTransfer({
   return { transferId: res.data?.id, raw: res.data };
 }
 
+// ─── Transfer status ─────────────────────────────────────────────────────────
+// GET /transfers/:id. Used by the savings reconcile loop to settle a deposit
+// whose nip.transfer.failed/reversed webhook never arrived. The status words
+// are normalised to three outcomes; anything unrecognised reads as pending,
+// never as failed, so a wording change at Anchor can only delay, not mis-fail.
+async function getTransfer(transferId) {
+  const res = await anchorFetch(`/transfers/${encodeURIComponent(transferId)}`);
+  const a = res.data?.attributes || {};
+  const raw = String(a.status || a.transferStatus || "").toUpperCase();
+  const status = /FAIL|REVERS|REJECT|DECLIN|CANCEL/.test(raw) ? "failed"
+    : /SUCCESS|COMPLET|SETTLED|PAID/.test(raw) ? "success"
+    : "pending";
+  return { status, rawStatus: raw, reason: a.failureReason || a.reason || null, reference: a.reference || null, raw: res.data };
+}
+
 // ─── Transfer (NIP — external, to any Nigerian bank) ────────────────────────
 async function createTransfer({
   fromAccountId,
@@ -920,6 +935,7 @@ module.exports = {
   verifyCounterparty,
   createCounterparty,
   createTransfer,
+  getTransfer,
   createBookTransfer,
   verifyWebhook,
   listCustomerDocuments,

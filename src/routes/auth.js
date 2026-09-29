@@ -611,6 +611,10 @@ router.get("/me", authMiddleware, async (req, res) => {
         // so the tile and the API can never disagree.
         features: {
           fcy: process.env.FCY_ENABLED === "true",
+          // Savings pots: SAVINGS_ENABLED opens creation and deposits; the
+          // interest (PiggyVest) option additionally needs the partner keys.
+          savings: process.env.SAVINGS_ENABLED === "true",
+          savingsInterest: process.env.SAVINGS_ENABLED === "true" && !!process.env.PVB_SECRET_KEY,
         },
         accountType: safe.accountType.toLowerCase(),
         settings: {
@@ -780,6 +784,25 @@ router.post("/delete-account", authMiddleware, async (req, res) => {
     const anchor = require("../utils/anchor");
     const { getProvider } = require("../providers");
     const { computeLedgerBalance } = require("../utils/ledgerBalance");
+    // Savings guard: a pot with money in it, or a movement still settling,
+    // is money the deletion would strand (a PiggyVest wallet nobody can
+    // reach; a reserve with no account behind it). Checked before the bank
+    // balance so the message names the right thing to do first.
+    const bizIds = businesses.map((b) => b.id);
+    if (bizIds.length) {
+      const [potWithMoney, inflight] = await Promise.all([
+        prisma.savingsPot.findFirst({ where: { businessId: { in: bizIds }, status: { not: "closed" }, balance: { gt: 0.004 } }, select: { name: true } }),
+        prisma.savingsMovement.count({ where: { businessId: { in: bizIds }, status: { in: ["initiated", "sent", "requested", "processing", "unknown", "needs_review"] } } }),
+      ]);
+      if (potWithMoney || inflight > 0) {
+        return res.status(400).json({
+          code: "SAVINGS_REMAINING",
+          error: potWithMoney
+            ? `Your savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first, then delete your account.`
+            : "A savings deposit or withdrawal is still being processed. Wait for it to finish, then delete your account.",
+        });
+      }
+    }
     for (const biz of businesses.filter((b) => b.providerAccountId || b.anchorAccountId)) {
       try {
         const provider = getProvider(biz);

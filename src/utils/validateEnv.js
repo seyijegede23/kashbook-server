@@ -58,6 +58,21 @@ function validateEnv() {
     problems.push("Dojah sandbox key (test_sk_*) is set against the LIVE base URL — fix the key/URL pair");
   }
 
+  // PiggyVest (savings partner): the key alone decides test vs live, so the
+  // one thing the host can tell us is whether it is THEIR host at all. A typo
+  // in PVB_BASE_URL would send a bearer secret somewhere else.
+  if (process.env.PVB_SECRET_KEY) {
+    const pvbUrl = process.env.PVB_BASE_URL || "https://api.piggyvest.business";
+    let host = "";
+    try { host = new URL(pvbUrl).hostname.toLowerCase(); } catch { host = ""; }
+    if (isProd && host !== "api.piggyvest.business") {
+      problems.push(`PVB_BASE_URL host "${host || pvbUrl}" is not api.piggyvest.business — refusing to send the PiggyVest secret there`);
+    }
+    if (isProd && process.env.PVB_VERIFY_WEBHOOK === "false") {
+      problems.push("PVB_VERIFY_WEBHOOK=false disables PiggyVest webhook signature checks — forbidden in production");
+    }
+  }
+
   if (problems.length) {
     const msg = "[validateEnv] configuration problems:\n  - " + problems.join("\n  - ");
     if (isProd) {

@@ -38,4 +38,24 @@ function isBankLedgerRow(tx) {
   return tx.paymentMethod === "bank" && tx.category === "transfer";
 }
 
-module.exports = { PROVIDER_SOURCES, isBankLedgerRow };
+// ── Savings rows ─────────────────────────────────────────────────────────────
+// A bank row whose `purpose` is set was created by the savings feature: the
+// debit that funds a PiggyVest wallet, the credit when that money comes back,
+// or interest. It is the merchant's own money changing pocket, so it is
+// neither an expense nor income for REPORTING (Insights, the monthly and daily
+// reports, the admin revenue chart) and every such aggregate must carry
+// NOT_SAVINGS (Prisma) or SQL_NOT_SAVINGS (raw SQL).
+//
+// It IS real money for the LEDGER: computeLedgerBalance, the AML money-out
+// windows, the staff transfer cap and the drift alarm must keep counting these
+// rows, because the bank account did move by that amount. Never add the
+// exclusion there.
+const SAVINGS_PURPOSES = Object.freeze(["savings_deposit", "savings_withdrawal", "savings_interest"]);
+const NOT_SAVINGS = Object.freeze({ purpose: null });
+const SQL_NOT_SAVINGS = 'AND "purpose" IS NULL';
+
+function isSavingsRow(tx) {
+  return !!(tx && tx.purpose && SAVINGS_PURPOSES.includes(tx.purpose));
+}
+
+module.exports = { PROVIDER_SOURCES, isBankLedgerRow, SAVINGS_PURPOSES, NOT_SAVINGS, SQL_NOT_SAVINGS, isSavingsRow };

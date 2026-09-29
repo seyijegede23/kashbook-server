@@ -212,6 +212,15 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   fincraWebhookRoute,
 );
+// PiggyVest Business webhook — raw body for the HMAC-SHA512 in x-pvb-signature.
+// It only nudges the savings reconcile (wallet ready, inflow, outflow outcome);
+// every money decision re-reads PiggyVest with our own key.
+app.use(
+  "/webhooks/piggyvest",
+  webhookLimiter,
+  express.raw({ type: "*/*", limit: "1mb" }),
+  require("./src/routes/piggyvestWebhook"),
+);
 // KYC documents for Fincra to fetch: /fcy-docs/<signed token>.<ext>. Public
 // by necessity (their fetcher carries no credentials); guarded by the HMAC in
 // the token, and served from our own host so the document arrives with a real
@@ -311,6 +320,7 @@ app.use("/sync", apiLimiter);
 app.use("/transactions", apiLimiter);
 app.use("/instagram", apiLimiter);
 app.use("/whatsapp", apiLimiter);
+app.use("/savings", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 app.use("/auth", authRoutes);
@@ -340,6 +350,9 @@ app.use("/sync", syncRoutes);
 app.use("/transactions", require("./src/routes/transactions"));
 app.use("/instagram", instagramRoutes);
 app.use("/whatsapp", whatsappRoutes);
+// Savings pots (owner only). Creation and deposits are behind SAVINGS_ENABLED;
+// reads and withdrawals always work so money is never trapped by the switch.
+app.use("/savings", require("./src/routes/savings"));
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
@@ -416,6 +429,14 @@ require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 // The payout half of this loop is inert by construction: Fincra is receive-only
 // (see providers/index.js), so no KashBook payout can exist for it to reconcile.
 require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
+
+// ── Background loop: settle savings every 5 min ──────────────────────────────
+// Provisioning pots, deposits (Anchor row → sent, PiggyVest inflow →
+// completed), withdrawals (verify → completed|failed), interest, and the
+// ledger-pot integrity checks (pot vs movements, reserve vs bank). Runs even
+// without PiggyVest keys, because ledger pots need no partner. Leader-elected
+// via withCronLock(4014); heartbeat "savings-reconcile".
+require("./src/utils/savingsReconcile").startSavingsReconcileLoop(5 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────
 // Summary of today's money in/out per user, or a nudge if nothing was

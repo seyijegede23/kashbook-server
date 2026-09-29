@@ -52,7 +52,7 @@ async function collectAnalytics() {
       prisma.user.count({ where: { plan: "PREMIUM" } }),
       prisma.user.count({ where: { createdAt: { gte: since24h } } }),
       prisma.business.count({ where: { virtualAccountNumber: { not: null } } }),
-      prisma.transaction.aggregate({ where: { type: "income" }, _sum: { amount: true } }),
+      prisma.transaction.aggregate({ where: { type: "income", ...require("../config/moneySources").NOT_SAVINGS }, _sum: { amount: true } }),
       prisma.transaction.count({ where: { category: "transfer", type: "expense", createdAt: { gte: since24h } } }),
       prisma.transaction.count({ where: { category: "bill", createdAt: { gte: since24h } } }),
       prisma.auditLog.count({ where: { action: { contains: "FAILED" }, createdAt: { gte: since24h } } }),

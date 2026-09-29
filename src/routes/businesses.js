@@ -390,11 +390,22 @@ router.get("/:id/balance", requirePermission("canViewBalance"), async (req, res)
     if (!biz) return res.status(404).json({ error: "Business not found" });
     const bankingId = biz.providerAccountId || biz.anchorAccountId;
     if (!bankingId)
-      return res.json({ balance: 0, hasAccount: false });
+      return res.json({ balance: 0, grossBalance: 0, savingsReserved: 0, hasAccount: false });
+
+    // The cache holds the GROSS bank figure (transfers adjust it by what left
+    // the account). The reserve is read fresh every time: it is one indexed
+    // aggregate, and a stale reserve would show money as spendable that the
+    // send would then refuse. `balance` = spendable; the app shows the
+    // reserve as "₦X saved" beside it.
+    const { getReservedBalance, netSpendable } = require("../utils/savingsReserve");
+    const reserved = await getReservedBalance(biz.id);
+    const shape = (gross, extra = {}) => ({
+      balance: netSpendable(gross, reserved), grossBalance: gross, savingsReserved: reserved, hasAccount: true, ...extra,
+    });
 
     const cachedVal = balanceCache.getBalance(biz.id);
     if (cachedVal !== undefined) {
-      return res.json({ balance: cachedVal, hasAccount: true, cached: true });
+      return res.json(shape(cachedVal, { cached: true }));
     }
 
     const provider = getProvider(biz);
@@ -403,17 +414,17 @@ router.get("/:id/balance", requirePermission("canViewBalance"), async (req, res)
     if (provider.pooledWallet) {
       const balance = await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN");
       balanceCache.setBalance(biz.id, balance);
-      return res.json({ balance, hasAccount: true });
+      return res.json(shape(balance));
     }
 
     try {
       const { balance } = await anchor.getAccountBalance(biz.anchorAccountId);
       balanceCache.setBalance(biz.id, balance);
-      return res.json({ balance, hasAccount: true });
+      return res.json(shape(balance));
     } catch (anchorErr) {
       console.warn("[Anchor balance] falling back to local math:", anchorErr.message);
       const balance = await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN");
-      return res.json({ balance, hasAccount: true, fallback: true });
+      return res.json(shape(balance, { fallback: true }));
     }
   } catch (err) {
     console.error("Balance lookup failed:", err);
@@ -839,6 +850,23 @@ router.delete("/:id", async (req, res) => {
     const count = await prisma.business.count({ where: { userId: req.user.id } });
     if (count <= 1) {
       return res.status(400).json({ error: "Cannot delete your only business" });
+    }
+
+    // Savings guard: deleting the business cascades its pots and movements
+    // away. Money set aside in a ledger pot would silently become spendable
+    // again, and a PiggyVest wallet would be orphaned with nothing pointing at
+    // it. Refuse while any pot holds money or a movement is still settling.
+    const [potWithMoney, inflight] = await Promise.all([
+      prisma.savingsPot.findFirst({ where: { businessId: req.params.id, status: { not: "closed" }, balance: { gt: 0.004 } }, select: { name: true } }),
+      prisma.savingsMovement.count({ where: { businessId: req.params.id, status: { in: ["initiated", "sent", "requested", "processing", "unknown", "needs_review"] } } }),
+    ]);
+    if (potWithMoney || inflight > 0) {
+      return res.status(400).json({
+        code: "SAVINGS_REMAINING",
+        error: potWithMoney
+          ? `The savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first.`
+          : "A savings deposit or withdrawal is still being processed. Wait for it to finish first.",
+      });
     }
 
     const deleted = await prisma.business.deleteMany({

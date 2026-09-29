@@ -23,11 +23,16 @@ const CRON_INTERVAL_MIN = {
   // Same reasoning, and sharper: a payroll cron that stops means staff quietly
   // don't get asked to be paid, and nobody finds out until someone complains.
   salaryPayments: 24 * 60,
-  // The Fincra loop only writes an "ok" beat after a SUCCESSFUL list, so a
-  // dead credential shows up here as stale within ~10 minutes. Before
-  // 2026-09-10 the beat was written before the call and the loop 401'd for
-  // hours behind a green health page.
+  // The Fincra loop writes an "error" beat (never "ok") while its credential
+  // is rejected, and an error status counts as stale below, so a dead key
+  // shows on the health page within one cron cycle. Before 2026-09-10 the
+  // beat was written "ok" before the call and the loop 401'd for hours
+  // behind a green health page.
   "fincra-reconcile": 5,
+  // Savings: a loop that stops means deposits never complete and withdrawals
+  // never settle, with merchants staring at "processing". Same rule: an
+  // "error" beat (a dead PiggyVest key) reads as stale.
+  "savings-reconcile": 5,
 };
 
 async function pingDb() {
@@ -90,7 +95,10 @@ async function collectHealth() {
       status: h.lastStatus,
       error: h.lastError || null,
       retired,
-      stale: !retired && ageMin > expected * 2,
+      // Too old, OR the last run said so itself: a loop that runs on time but
+      // fails every time (a rejected partner key) is exactly as dead as one
+      // that stopped, and refreshing lastRunAt must not hide it.
+      stale: !retired && (ageMin > expected * 2 || h.lastStatus === "error"),
     };
   });
 

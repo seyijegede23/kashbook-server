@@ -54,8 +54,10 @@ async function checkAlerts(health = {}) {
     }
     const stale = (health.crons || []).find((c) => c.stale);
     if (stale) {
-      if (await fire(`cron_stale_${stale.name}`, "A cron stopped running",
-        `Cron "${stale.name}" last ran ${stale.ageMin} min ago.`))
+      const why = stale.status === "error" && stale.error
+        ? `Cron "${stale.name}" is failing: ${String(stale.error).slice(0, 160)} (last run ${stale.ageMin} min ago).`
+        : `Cron "${stale.name}" last ran ${stale.ageMin} min ago.`;
+      if (await fire(`cron_stale_${stale.name}`, "A cron stopped running", why))
         fired.push(`cron_stale_${stale.name}`);
     }
     if (health.heldTransactions > 0) {

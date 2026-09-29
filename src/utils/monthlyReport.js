@@ -12,6 +12,7 @@
 // affect anything else.
 
 const prisma = require("./db");
+const { NOT_SAVINGS } = require("../config/moneySources");
 const { renderEmail, txnRow, escHtml } = require("./emailLayout");
 const { getTransport } = require("./transactionEmail");
 
@@ -76,13 +77,13 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: dateThis },
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: dateThis, ...NOT_SAVINGS },
       _sum: { amount: true },
       _count: { _all: true },
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis },
+      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis, ...NOT_SAVINGS },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -93,7 +94,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: datePrev },
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: datePrev, ...NOT_SAVINGS },
       _sum: { amount: true },
     }),
     prisma.expense.groupBy({
@@ -103,7 +104,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId", "category"],
-      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis },
+      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis, ...NOT_SAVINGS },
       _sum: { amount: true },
     }),
   ]);
@@ -113,6 +114,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   // still real money. NULL matchedAmount (pre-column matches) = fully matched.
   const remainderWhere = (type, date) => ({
     ...bizScope, type, date,
+    ...NOT_SAVINGS,
     matchedAmount: { not: null },
     ...(type === "income"
       ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }] }

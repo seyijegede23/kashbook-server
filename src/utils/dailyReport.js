@@ -29,10 +29,12 @@ async function sendDailyReports() {
   });
   if (businesses.length === 0) return { users: 0 };
 
-  // Today's totals, one query for all businesses.
+  // Today's totals, one query for all businesses. Savings movements are the
+  // merchant's own money changing pocket, not money in or out.
+  const { NOT_SAVINGS } = require("../config/moneySources");
   const grouped = await prisma.transaction.groupBy({
     by: ["businessId", "type"],
-    where: { businessId: { in: businesses.map((b) => b.id) }, date: { gte: since } },
+    where: { businessId: { in: businesses.map((b) => b.id) }, date: { gte: since }, ...NOT_SAVINGS },
     _sum: { amount: true },
     _count: { _all: true },
   });

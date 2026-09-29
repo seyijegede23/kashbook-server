@@ -8,6 +8,7 @@ const anchor = require("../utils/anchor");
 const { getProvider } = require("../providers");
 const { getCountryConfig } = require("../config/countries");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
+const { getSpendableBalance } = require("../utils/savingsReserve");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { runPreTransferChecks, MONEY_OUT_SOURCES } = require("../utils/amlChecks");
 const { staffSpendLast24h, decideStaffCap, APPROVAL_TTL_MS } = require("../utils/staffTransferCap");
@@ -118,18 +119,15 @@ router.get("/balance", requirePermission("canViewBalance"), async (req, res) => 
     });
     if (!biz) return res.status(404).json({ error: "Business not found" });
     const bankingId = biz.providerAccountId || biz.anchorAccountId;
-    if (!bankingId) return res.json({ balance: 0 });
+    if (!bankingId) return res.json({ balance: 0, grossBalance: 0, savingsReserved: 0 });
 
-    const provider = getProvider(biz);
-    // Pooled-wallet providers (Fincra) have no per-business balance — derive it
-    // from our ledger. Anchor exposes a real per-account balance.
-    if (provider.pooledWallet) {
-      return res.json({ balance: await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN") });
-    }
-    const { balance } = await anchor.getAccountBalance(bankingId);
-    res.json({ balance });
+    // `balance` is what can be SPENT: the bank's figure minus what is set aside
+    // in ledger savings pots. The same subtraction gates executeTransfer, so
+    // the number shown is the number the send will be checked against.
+    const { gross, reserved, spendable } = await getSpendableBalance(biz);
+    res.json({ balance: spendable, grossBalance: gross, savingsReserved: reserved });
   } catch (err) {
-    if (err.code === "ANCHOR_NOT_CONFIGURED") return res.json({ balance: 0 });
+    if (err.code === "ANCHOR_NOT_CONFIGURED") return res.json({ balance: 0, grossBalance: 0, savingsReserved: 0 });
     console.error("[transfers/balance]", err.message);
     res.status(500).json({ error: "Failed to fetch balance" });
   }
@@ -817,6 +815,10 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
       return res.status(400).json({ error: err.message, code: err.code });
     if (err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
       return res.status(400).json({ error: err.message, code: err.code });
+    // The destination is one of this business's own savings pots: a refusal
+    // with a pointer (Savings → Put in), not a failure.
+    if (err.code === "SAVINGS_DEST_USE_DEPOSIT")
+      return res.status(409).json({ error: err.message, code: err.code, potId: err.potId || null });
     console.error("Transfer error:", err);
     res.status(400).json({ error: "Transfer failed" });
   }
@@ -1085,9 +1087,14 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
       "INSUFFICIENT_BALANCE", "RECIPIENT_UNVERIFIED", "UNKNOWN_BANK",
       "NO_BANKING", "ANCHOR_NOT_CONFIGURED", "BANKING_NOT_AVAILABLE", "NOT_IMPLEMENTED",
     ]);
-    const safeToRetry = SAFE_TO_RETRY.has(err.code);
+    // A request whose destination is one of the business's own savings pots
+    // is refused for good: re-approving it would hit the same guard every
+    // time, so it is not offered again, and it is certain (the executor
+    // raised it before any bank call), so it is not an ambiguity alert either.
+    const refusedForGood = err.code === "SAVINGS_DEST_USE_DEPOSIT";
+    const safeToRetry = SAFE_TO_RETRY.has(err.code) || (err.moneyMoved === false && !refusedForGood);
     const reason = (err.message || "Transfer failed").slice(0, 300);
-    if (!safeToRetry) {
+    if (!safeToRetry && !refusedForGood) {
       console.error(
         `[transfers/approve] AMBIGUOUS FAILURE on request ${req.params.id} — parked as failed, DO NOT re-approve without checking the provider:`,
         err.code || err.message,
@@ -1118,6 +1125,8 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
 
     if (err.code === "INSUFFICIENT_BALANCE" || err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
       return res.status(400).json({ error: err.message, code: err.code });
+    if (refusedForGood)
+      return res.status(409).json({ error: err.message, code: err.code, potId: err.potId || null });
     console.error("[transfers/approve]", err);
     res.status(400).json({ error: "Transfer failed" });
   }

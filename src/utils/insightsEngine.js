@@ -23,6 +23,9 @@
  */
 
 const prisma = require("./db");
+// Savings rows (a deposit to the merchant's own pot, its return, interest) are
+// not trade: every income/expense predicate below carries this exclusion.
+const { NOT_SAVINGS } = require("../config/moneySources");
 
 // ── Money formatting ─────────────────────────────────────────────────────────
 const CURRENCY_SYMBOLS = {
@@ -851,7 +854,7 @@ async function sumIncome(businessId, range, channel) {
       _count: { _all: true },
     }),
     prisma.transaction.aggregate({
-      where: { businessId, type: "income", date, matchedSaleId: null, matchedCustomerId: null, ...(channel ? { channel } : {}) },
+      where: { businessId, type: "income", date, matchedSaleId: null, matchedCustomerId: null, ...NOT_SAVINGS, ...(channel ? { channel } : {}) },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -869,7 +872,7 @@ async function sumExpenses(businessId, range) {
   const [exp, bank, remainder] = await Promise.all([
     prisma.expense.aggregate({ where: { businessId, date }, _sum: { amount: true }, _count: { _all: true } }),
     prisma.transaction.aggregate({
-      where: { businessId, type: "expense", matchedExpenseId: null, date },
+      where: { businessId, type: "expense", matchedExpenseId: null, date, ...NOT_SAVINGS },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -892,6 +895,7 @@ async function sumMatchedRemainder(businessId, type, date, channel) {
     where: {
       businessId, type, date,
       matchedAmount: { not: null },
+      ...NOT_SAVINGS,
       ...(type === "income"
         ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }] }
         : { matchedExpenseId: { not: null } }),
@@ -964,7 +968,7 @@ const HANDLERS = {
       }),
       prisma.transaction.groupBy({
         by: ["category"],
-        where: { businessId: business.id, type: "expense", matchedExpenseId: null, date },
+        where: { businessId: business.id, type: "expense", matchedExpenseId: null, date, ...NOT_SAVINGS },
         _sum: { amount: true },
       }),
     ]);
@@ -1100,7 +1104,7 @@ const HANDLERS = {
       }),
       prisma.transaction.groupBy({
         by: ["channel"],
-        where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, date },
+        where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, date, ...NOT_SAVINGS },
         _sum: { amount: true },
       }),
     ]);
@@ -1165,6 +1169,7 @@ const HANDLERS = {
       return { answer: "This business doesn't have a bank account yet — open one from the Dashboard to see a balance." };
     }
     const cache = require("./balanceCache");
+    const { getReservedBalance, netSpendable } = require("./savingsReserve");
     let bal = cache.getBalance(business.id);
     if (bal === undefined) {
       const provider = require("../providers").getProvider(business);
@@ -1184,7 +1189,12 @@ const HANDLERS = {
         }
       }
     }
-    return { answer: `Your bank balance is ${money(bal, business.baseCurrency)}.`, data: { balance: bal } };
+    // The cache is the gross bank figure; what the merchant can spend is that
+    // minus the savings reserve, which is what the Dashboard shows too.
+    const reserved = await getReservedBalance(business.id);
+    const spendable = netSpendable(bal, reserved);
+    const saved = reserved > 0 ? ` ${money(reserved, business.baseCurrency)} of it is set aside in savings, so ${money(spendable, business.baseCurrency)} is available to spend.` : "";
+    return { answer: `Your bank balance is ${money(bal, business.baseCurrency)}.${saved}`, data: { balance: spendable, grossBalance: bal, savingsReserved: reserved } };
   },
 
   async best_day({ business, range, hadExplicitRange }) {
@@ -1201,7 +1211,8 @@ const HANDLERS = {
         UNION ALL
         SELECT "date", amount FROM "Transaction"
         WHERE "businessId" = ${business.id} AND type = 'income'
-          AND "matchedSaleId" IS NULL AND "matchedCustomerId" IS NULL AND "date" >= ${r.start} AND "date" < ${r.end}
+          AND "matchedSaleId" IS NULL AND "matchedCustomerId" IS NULL AND "purpose" IS NULL
+          AND "date" >= ${r.start} AND "date" < ${r.end}
       ) t
       GROUP BY 1
     `;
@@ -1657,7 +1668,7 @@ async function generateInsightCards(business) {
     }),
     prisma.transaction.groupBy({
       by: ["category"],
-      where: { businessId: business.id, type: "expense", matchedExpenseId: null, date: { gte: thisMonth.start, lt: thisMonth.end } },
+      where: { businessId: business.id, type: "expense", matchedExpenseId: null, date: { gte: thisMonth.start, lt: thisMonth.end }, ...NOT_SAVINGS },
       _sum: { amount: true },
     }),
     prisma.$queryRaw`
@@ -1677,7 +1688,7 @@ async function generateInsightCards(business) {
     }),
     prisma.transaction.groupBy({
       by: ["channel"],
-      where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end } },
+      where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end }, ...NOT_SAVINGS },
       _sum: { amount: true },
     }),
   ]);
