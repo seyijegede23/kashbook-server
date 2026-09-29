@@ -265,6 +265,20 @@ async function reconcileSavings({ walletId = null, full = false, logger = consol
         logger.warn?.(`[savings-reconcile] withdrawal ${m.reference}: ${e.message}`);
       }
     }
+    // 3b. Early-withdrawal fees the landing path did not sweep (a crash between
+    // the landing and the sweep). collectBreakFee claims before it transfers,
+    // so this can never charge twice.
+    const uncollected = await prisma.savingsMovement.findMany({
+      where: {
+        type: "withdrawal", fee: { gt: 0 }, feeCollectedAt: null,
+        OR: [{ backing: "ledger", status: "completed" }, { backing: "piggyvest", landedTransactionId: { not: null } }],
+      },
+      select: { id: true },
+      take: 50,
+    });
+    for (const m of uncollected) {
+      await savings.collectBreakFee(m.id).catch((e) => logger.warn?.(`[savings-reconcile] break fee ${m.id}: ${e.message}`));
+    }
     // 4. Completed at PiggyVest, but the Anchor credit never showed up (or was
     // booked as plain income because nothing tied it to us). Alert; a human
     // matches it. Amount alone is never enough to re-tag a customer's payment.

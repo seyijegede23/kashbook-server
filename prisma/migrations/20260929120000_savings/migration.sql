@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS "SavingsMovement" (
   -- never reached PiggyVest) and when the last one ran.
   "verifyMisses"         INTEGER NOT NULL DEFAULT 0,
   "lastVerifiedAt"       TIMESTAMP(3),
+  -- Early-withdrawal fee on a flexible lock: `fee` is what was charged, this
+  -- is when it was swept to KashBook's fee account (a claim, set before the
+  -- book transfer so it can never be collected twice).
+  "feeCollectedAt"       TIMESTAMP(3),
   "completedAt"          TIMESTAMP(3),
   "createdAt"            TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt"            TIMESTAMP(3) NOT NULL,

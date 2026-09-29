@@ -123,7 +123,11 @@ async function markLanded({ movementId, transactionId, amount }) {
     where: { id: movementId, landedTransactionId: null },
     data: { landedTransactionId: transactionId, landedAmount: Number(amount) || 0 },
   });
-  return r.count === 1;
+  if (r.count !== 1) return false;
+  // The money is in the account now: an early-withdrawal fee, if any, is
+  // swept from here (a no-op for a withdrawal with no fee).
+  await require("./savings").collectBreakFee(movementId).catch((e) => console.error("[savings] break fee on landing:", e.message));
+  return true;
 }
 
 module.exports = { decideCreditPurpose, classifyInboundCredit, markLanded, loadCandidates, WITHDRAWAL_REF_RE };

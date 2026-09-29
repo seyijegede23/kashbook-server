@@ -22,7 +22,7 @@ const piggyvest = require("../services/piggyvest");
 const anchor = require("./anchor");
 const { executeTransfer } = require("./executeTransfer");
 const { getSpendableBalance } = require("./savingsReserve");
-const { computeTransferFee, MONEY_EPS } = require("../config/fees");
+const { computeTransferFee, computeBreakFee, MONEY_EPS } = require("../config/fees");
 const { resolveBusinessLimits, formatAmountForBusiness } = require("../config/amlLimits");
 const { decrypt } = require("./crypto");
 const { matchBankCode, namesOverlap } = require("./fcyConversion");
@@ -679,13 +679,23 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
     }
 
     const lock = lockAllows(fresh, { confirmEarly });
+    // Breaking a flexible lock costs a share of the amount (config/fees.js).
+    // The refusal that asks for confirmation carries the figure, so the app
+    // can say "taking ₦50,000 out early costs ₦1,000" before the merchant agrees.
+    const breakFee = lock.early || lock.code === "EARLY_WITHDRAWAL_CONFIRM" ? computeBreakFee(amt) : { fee: 0, bps: 0 };
     if (!lock.ok) {
       const when = lock.until.toLocaleDateString("en-NG", { day: "numeric", month: "short", year: "numeric" });
       throw new SavingsError(
-        lock.code === "POT_LOCKED" ? `This pot is locked until ${when}.` : `This pot is meant to stay untouched until ${when}. Confirm to take money out early.`,
-        lock.code, lock.code === "POT_LOCKED" ? 423 : 409, { lockUntil: fresh.lockUntil },
+        lock.code === "POT_LOCKED"
+          ? `This pot is locked until ${when}.`
+          : breakFee.fee > 0
+            ? `This pot is meant to stay untouched until ${when}. Taking ${formatAmountForBusiness(biz, amt)} out early costs ${formatAmountForBusiness(biz, breakFee.fee)}. Confirm to continue.`
+            : `This pot is meant to stay untouched until ${when}. Confirm to take money out early.`,
+        lock.code, lock.code === "POT_LOCKED" ? 423 : 409,
+        { lockUntil: fresh.lockUntil, fee: breakFee.fee, feeBps: breakFee.bps },
       );
     }
+    const fee = lock.early ? breakFee.fee : 0;
 
     if (fresh.backing === "ledger") {
       const result = await prisma.$transaction(async (px) => {
@@ -695,7 +705,7 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
         });
         if (claim.count !== 1) throw new SavingsError(`This pot has ${formatAmountForBusiness(biz, fresh.balance)}.`, "INSUFFICIENT_POT_BALANCE", 400, { potBalance: fresh.balance });
         const movement = await px.savingsMovement.create({
-          data: { potId: fresh.id, businessId: biz.id, userId: user?.id || biz.userId, type: "withdrawal", backing: "ledger", amount: amt, status: "completed", reference, completedAt: new Date() },
+          data: { potId: fresh.id, businessId: biz.id, userId: user?.id || biz.userId, type: "withdrawal", backing: "ledger", amount: amt, fee, status: "completed", reference, completedAt: new Date() },
         });
         const updatedPot = await px.savingsPot.findUnique({ where: { id: fresh.id } });
         // A float drifting a hair below zero is a rounding artefact, not money.
@@ -705,7 +715,14 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
         }
         return { movement, pot: updatedPot };
       });
-      await audit({ req, action: "SAVINGS_WITHDRAWAL", resourceType: "savingsPot", resourceId: fresh.id, metadata: { amount: amt, backing: "ledger", reference, early: !!lock.early } });
+      await audit({ req, action: "SAVINGS_WITHDRAWAL", resourceType: "savingsPot", resourceId: fresh.id, metadata: { amount: amt, backing: "ledger", reference, early: !!lock.early, fee } });
+      // The money is in the Anchor account already, so the fee is swept now.
+      // Best effort: a failed sweep alerts a human and never blocks the
+      // withdrawal the merchant just confirmed.
+      if (fee > 0) {
+        await collectBreakFee(result.movement.id).catch((e) => console.error(`[savings] break fee ${reference}:`, e.message));
+        result.movement = await prisma.savingsMovement.findUnique({ where: { id: result.movement.id } });
+      }
       return result;
     }
 
@@ -736,10 +753,12 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
 
     // Row first, claim second, partner call third. The claim is what makes a
     // second request on the same row impossible even if the lock were lost.
+    // `fee` is the early-withdrawal charge, collected only once the money has
+    // landed in the Anchor account (collectBreakFee, from markLanded).
     const movement = await prisma.savingsMovement.create({
       data: {
         potId: fresh.id, businessId: biz.id, userId: user?.id || biz.userId, type: "withdrawal", backing: "piggyvest",
-        amount: amt, status: "requested", reference,
+        amount: amt, fee, status: "requested", reference,
         payoutAccountNumber: target.accountNumber, payoutBankCode: target.bankCode,
         narration: `KashBook savings ${reference}`,
       },
@@ -785,11 +804,66 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
       });
       console.error(`[savings] withdrawal ${reference} outcome unknown:`, e.message);
     }
-    await audit({ req, action: "SAVINGS_WITHDRAWAL", resourceType: "savingsPot", resourceId: fresh.id, metadata: { amount: amt, backing: "piggyvest", reference, early: !!lock.early, forfeit: countThisMonth >= FREE_WITHDRAWALS_PER_MONTH } });
+    await audit({ req, action: "SAVINGS_WITHDRAWAL", resourceType: "savingsPot", resourceId: fresh.id, metadata: { amount: amt, backing: "piggyvest", reference, early: !!lock.early, fee, forfeit: countThisMonth >= FREE_WITHDRAWALS_PER_MONTH } });
     const m = await prisma.savingsMovement.findUnique({ where: { id: movement.id } });
     const p = await prisma.savingsPot.findUnique({ where: { id: fresh.id } });
     return { movement: m, pot: p, pending: true };
   });
+}
+
+// Sweep the early-withdrawal fee to KashBook's fee account. Called once the
+// money is in the Anchor account: right after a ledger withdrawal, and when a
+// PiggyVest withdrawal lands (markLanded) or the reconcile loop finds a landed
+// one still uncollected.
+//
+// The claim comes BEFORE the transfer. A double sweep would charge the
+// merchant twice; a missed one costs KashBook a fee. So on a failure the row
+// stays claimed, nothing retries by itself, and a human settles it from the
+// alert (Anchor dedups on the reference for 24h anyway).
+async function collectBreakFee(movementId) {
+  const mv = await prisma.savingsMovement.findUnique({ where: { id: movementId }, include: { pot: { select: { name: true } } } });
+  if (!mv || mv.type !== "withdrawal" || !(Number(mv.fee) > 0) || mv.feeCollectedAt) return false;
+  if (mv.backing === "piggyvest" && !mv.landedTransactionId) return false; // wait for the landing
+  if (mv.backing === "ledger" && mv.status !== "completed") return false;
+  const feeAccount = process.env.ANCHOR_FEE_ACCOUNT_ID;
+  if (!feeAccount) return false;
+  const biz = await prisma.business.findUnique({
+    where: { id: mv.businessId },
+    select: { id: true, userId: true, name: true, anchorAccountId: true, baseCurrency: true, country: true },
+  });
+  if (!biz?.anchorAccountId) return false;
+  const claim = await prisma.savingsMovement.updateMany({ where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() } });
+  if (claim.count !== 1) return false;
+  const reference = `${mv.reference}_bfee`;
+  const fee = Math.round(Number(mv.fee) * 100) / 100;
+  try {
+    const book = await anchor.createBookTransfer({
+      fromAccountId: biz.anchorAccountId,
+      toAccountId: feeAccount,
+      amount: fee,
+      reason: `Savings early withdrawal fee · ${mv.pot?.name || "pot"}`,
+      reference,
+    });
+    // The ledger row: real money off the account (computeLedgerBalance counts
+    // it), left out of the reports by its purpose.
+    await prisma.transaction.create({
+      data: {
+        businessId: biz.id, userId: biz.userId, type: "expense", amount: fee,
+        description: `Early withdrawal fee · ${mv.pot?.name || "savings"} · Ref: ${reference}`,
+        category: "transfer", paymentMethod: "bank", date: new Date(), source: "anchor",
+        reference, providerTxnId: book?.transferId || undefined, purpose: "savings_fee",
+        currency: biz.baseCurrency || "NGN",
+      },
+    }).catch((e) => { if (e.code !== "P2002") throw e; });
+    try { balanceCache.adjustBalance(biz.id, -fee); } catch { /* noop */ }
+    await audit({ action: "SAVINGS_BREAK_FEE", resourceType: "savingsMovement", resourceId: mv.id, metadata: { fee, reference, backing: mv.backing } });
+    return true;
+  } catch (e) {
+    console.error(`[savings] break fee sweep failed for ${mv.reference}:`, e.message);
+    await audit({ action: "SAVINGS_BREAK_FEE_FAILED", resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, error: String(e.message || "").slice(0, 200) } });
+    require("./alerts").fireAlert(`savings-break-fee-${mv.id}`, "Savings break fee not collected", `The ₦${fee} early-withdrawal fee on ${mv.reference} (${biz.name}) could not be swept: ${String(e.message || "").slice(0, 120)}. The row is marked collected so it is never charged twice; collect it by hand.`).catch(() => {});
+    return false;
+  }
 }
 
 // Apply a verify answer to a withdrawal. Claims are guarded on the statuses
@@ -882,6 +956,7 @@ module.exports = {
   withdrawFromPot,
   applyWithdrawalOutcome,
   failDepositAtBank,
+  collectBreakFee,
   resolvePayoutTarget,
   replayOutcome,
   IN_FLIGHT,

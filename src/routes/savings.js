@@ -87,12 +87,15 @@ router.get("/", async (req, res) => {
       { saved: 0, reserved, interestEarned: 0, interestAccruedMtd: 0 },
     );
     const profile = await prisma.savingsProfile.findUnique({ where: { businessId: biz.id }, select: { status: true } });
+    const brk = require("../config/fees").breakFeeConfig();
     res.json({
       enabled: savings.isEnabled(),
       pots: pots.map(savings.publicPot),
       totals,
       partner: { available: savings.partnerAvailable(), status: profile?.status || "none", name: "PiggyVest" },
       hasBankAccount: !!(biz.providerAccountId || biz.anchorAccountId),
+      // What breaking a flexible lock costs, so the app can say so up front.
+      breakFee: { enabled: brk.enabled && brk.bps > 0, bps: brk.bps, pct: brk.bps / 100, min: brk.min },
     });
   } catch (err) {
     sendError(res, err);

@@ -792,11 +792,48 @@ const markerCount = (eventId) => prisma.processedWebhook.count({ where: { eventI
     const w1 = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "fw1" });
     assert.strictEqual(w1.status, 409, JSON.stringify(w1.body));
     assert.strictEqual(w1.body?.code, "EARLY_WITHDRAWAL_CONFIRM");
+    // The refusal names the price of breaking the lock: 2% of ₦1,000 is ₦20,
+    // floored at the ₦100 minimum.
+    assert.strictEqual(w1.body?.fee, 100, JSON.stringify(w1.body));
+    assert.strictEqual(w1.body?.feeBps, 200);
     assert.strictEqual((await dbPot(pot.id)).balance, 5_000);
+    assert.strictEqual(bookCalls.length, 0, "no fee is swept before the merchant confirms");
     const w2 = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "fw1", confirmEarly: true });
     assert.strictEqual(w2.status, 200, JSON.stringify(w2.body));
     assert.strictEqual(w2.body.movement.status, "completed");
+    assert.strictEqual(w2.body.movement.fee, 100);
     assert.strictEqual(w2.body.pot.balance, 4_000);
+    // The fee is swept from the Anchor account to the fee account at once, and
+    // booked as a savings_fee row: real money for the ledger, invisible to reports.
+    assert.strictEqual(bookCalls.length, 1, JSON.stringify(bookCalls));
+    assert.strictEqual(bookCalls[0].toAccountId, "fee-acct-e2e");
+    assert.strictEqual(bookCalls[0].amount, 100);
+    assert.strictEqual(bookCalls[0].reference, "kb_svw_fw1_bfee");
+    const feeRow = await dbTxnByRef("kb_svw_fw1_bfee");
+    assert.ok(feeRow, "fee Transaction row");
+    assert.strictEqual(feeRow.purpose, "savings_fee");
+    assert.strictEqual(feeRow.type, "expense");
+    assert.strictEqual(feeRow.amount, 100);
+    assert.ok((await dbMovementByRef("kb_svw_fw1")).feeCollectedAt, "fee claimed as collected");
+    ctx.flexPot = pot;
+  });
+
+  await test("a big early withdrawal pays 2% (₦2,000 on ₦100,000); an on-time withdrawal pays nothing", async () => {
+    const pot = ctx.flexPot;
+    anchorState.gross = 5_000_000;
+    await depositTo(pot.id, { amount: 100_000, idempotencyKey: "f2" });
+    const before = bookCalls.length;
+    const w = await withdrawFrom(pot.id, { amount: 100_000, idempotencyKey: "fw2", confirmEarly: true });
+    assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+    assert.strictEqual(w.body.movement.fee, 2_000);
+    assert.strictEqual(bookCalls.length, before + 1);
+    assert.strictEqual(bookCalls[before].amount, 2_000);
+    // Lock expired: no confirmation, no fee.
+    await prisma.savingsPot.update({ where: { id: pot.id }, data: { lockUntil: minutesAgo(5) } });
+    const free = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "fw3" });
+    assert.strictEqual(free.status, 200, JSON.stringify(free.body));
+    assert.strictEqual(free.body.movement.fee, 0);
+    assert.strictEqual(bookCalls.length, before + 1, "no sweep for an on-time withdrawal");
   });
 
   await test("a lock needs a mode, and a mode needs a date", async () => {
@@ -1379,6 +1416,33 @@ const markerCount = (eventId) => prisma.processedWebhook.count({ where: { eventI
     await reconcileSavings({ full: false });
     assert.ok(await alertFired(`savings-unlanded-${row.id}`));
     assert.strictEqual((await dbMovement(row.id)).landedTransactionId, null);
+  });
+
+  await test("a PiggyVest early-withdrawal fee is swept only once the money has landed, and only once", async () => {
+    const row = await dbMovementByRef("kb_svw_wd4b");
+    // Pretend this was an early withdrawal from a flexible lock (fee ₦100).
+    await prisma.savingsMovement.update({ where: { id: row.id }, data: { fee: 100, feeCollectedAt: null } });
+    const before = bookCalls.length;
+    await reconcileSavings({ full: false });
+    assert.strictEqual(bookCalls.length, before, "nothing is swept before the landing");
+    // The landing arrives (as the credit writers record it).
+    const landing = await prisma.transaction.create({
+      data: {
+        businessId: BIZ_ID, userId: owner.id, type: "income", amount: 1_000, description: "landing", category: "transfer",
+        paymentMethod: "bank", date: new Date(), source: "anchor", reference: "landing_wd4b", purpose: "savings_withdrawal",
+      },
+    });
+    const { markLanded } = require("../src/utils/savingsCredit");
+    assert.strictEqual(await markLanded({ movementId: row.id, transactionId: landing.id, amount: 1_000 }), true);
+    assert.strictEqual(bookCalls.length, before + 1, "the sweep follows the landing");
+    assert.strictEqual(bookCalls[before].reference, "kb_svw_wd4b_bfee");
+    assert.strictEqual(bookCalls[before].amount, 100);
+    assert.strictEqual((await dbTxnByRef("kb_svw_wd4b_bfee"))?.purpose, "savings_fee");
+    assert.ok((await dbMovement(row.id)).feeCollectedAt);
+    // Neither the reconcile backstop nor a second landing call sweeps again.
+    await reconcileSavings({ full: false });
+    assert.strictEqual(await markLanded({ movementId: row.id, transactionId: landing.id, amount: 1_000 }), false);
+    assert.strictEqual(bookCalls.length, before + 1, "one sweep, ever");
   });
 
   // ══ 8. WEBHOOK ════════════════════════════════════════════════════════════

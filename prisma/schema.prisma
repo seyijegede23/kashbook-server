@@ -542,6 +542,9 @@ model SavingsMovement {
   // minutes apart, means the request never reached PiggyVest) and the last check.
   verifyMisses        Int        @default(0)
   lastVerifiedAt      DateTime?
+  // Early-withdrawal fee on a flexible lock: `fee` is what was charged, this
+  // is when it was swept to the fee account (claimed before the transfer).
+  feeCollectedAt      DateTime?
   completedAt         DateTime?
   createdAt           DateTime   @default(now())
   updatedAt           DateTime   @updatedAt

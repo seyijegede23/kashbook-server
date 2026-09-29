@@ -793,13 +793,14 @@ test("the money-critical uniques exist in the model (a retry can never send or b
 // ══ 12. REPORTING EXCLUDES SAVINGS, THE LEDGER KEEPS THEM ═════════════════
 section("12. savings rows are left out of reports and kept in the ledger, AML windows and the staff cap");
 
-test("moneySources exports the exclusion and isSavingsRow recognises only the three purposes", () => {
+test("moneySources exports the exclusion and isSavingsRow recognises only the four purposes", () => {
   assert.deepStrictEqual(moneySources.NOT_SAVINGS, { purpose: null });
   assert.strictEqual(moneySources.SQL_NOT_SAVINGS, 'AND "purpose" IS NULL');
-  assert.deepStrictEqual([...moneySources.SAVINGS_PURPOSES], ["savings_deposit", "savings_withdrawal", "savings_interest"]);
+  assert.deepStrictEqual([...moneySources.SAVINGS_PURPOSES], ["savings_deposit", "savings_withdrawal", "savings_interest", "savings_fee"]);
   assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_deposit" }), true);
   assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_withdrawal" }), true);
   assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_interest" }), true);
+  assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_fee" }), true);
   assert.strictEqual(moneySources.isSavingsRow({ purpose: null }), false);
   assert.strictEqual(moneySources.isSavingsRow({ purpose: "refund" }), false);
   assert.strictEqual(moneySources.isSavingsRow({}), false);
@@ -1279,6 +1280,78 @@ test("balance readers report spendable and expose gross + reserved", () => {
   assert.ok(/balance: netSpendable\(gross, reserved\), grossBalance: gross, savingsReserved: reserved/.test(bz), "businesses balance route");
   const sr = read("src/utils/salaryRunner.js");
   assert.ok(/getSpendableBalance\(biz\)\)\.spendable/.test(sr), "salary runner must pay from spendable");
+});
+
+// ══ 19. BREAKING A FLEXIBLE LOCK ═══════════════════════════════════════════
+section("19. breaking a flexible lock costs 2%, at least ₦100, never more than the amount, and is swept once");
+
+const fees = require("../src/config/fees");
+
+test("2% of the amount, to the kobo", () => {
+  process.env.ANCHOR_FEE_ACCOUNT_ID = process.env.ANCHOR_FEE_ACCOUNT_ID || "fee-acct-test";
+  delete process.env.SAVINGS_BREAK_FEE_BPS; delete process.env.SAVINGS_BREAK_FEE_MIN;
+  assert.strictEqual(fees.computeBreakFee(100_000).fee, 2_000);
+  assert.strictEqual(fees.computeBreakFee(12_345.67).fee, 246.91);
+  assert.strictEqual(fees.computeBreakFee(50_000).bps, 200);
+});
+
+test("floored at ₦100, capped at the amount itself", () => {
+  assert.strictEqual(fees.computeBreakFee(1_000).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(4_999).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(5_000).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(5_050).fee, 101);
+  assert.strictEqual(fees.computeBreakFee(60).fee, 60, "a ₦60 withdrawal cannot cost ₦100");
+  assert.strictEqual(fees.computeBreakFee(0).fee, 0);
+  assert.strictEqual(fees.computeBreakFee(-5).fee, 0);
+});
+
+test("the numbers come from env, within sane bounds", () => {
+  process.env.SAVINGS_BREAK_FEE_BPS = "300"; process.env.SAVINGS_BREAK_FEE_MIN = "50";
+  assert.strictEqual(fees.computeBreakFee(10_000).fee, 300);
+  assert.strictEqual(fees.computeBreakFee(1_000).fee, 50);
+  process.env.SAVINGS_BREAK_FEE_BPS = "5000"; // 50%: a typo, not a policy
+  assert.strictEqual(fees.computeBreakFee(10_000).bps, 200);
+  process.env.SAVINGS_BREAK_FEE_BPS = "0";
+  assert.strictEqual(fees.computeBreakFee(10_000).fee, 0, "0 bps switches the fee off");
+  assert.strictEqual(fees.computeBreakFee(10_000).enabled, false);
+  delete process.env.SAVINGS_BREAK_FEE_BPS; delete process.env.SAVINGS_BREAK_FEE_MIN;
+});
+
+test("no fee account, no fee: a charge nothing can collect is never made", () => {
+  const prev = process.env.ANCHOR_FEE_ACCOUNT_ID;
+  delete process.env.ANCHOR_FEE_ACCOUNT_ID;
+  assert.strictEqual(fees.computeBreakFee(100_000).fee, 0);
+  assert.strictEqual(fees.computeBreakFee(100_000).enabled, false);
+  process.env.ANCHOR_FEE_ACCOUNT_ID = prev;
+});
+
+test("collectBreakFee claims feeCollectedAt BEFORE the book transfer, books a savings_fee row, and never retries by itself", () => {
+  const body = fnBody(sv, "async function collectBreakFee(");
+  mustPrecede(body, "where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() }", "anchor.createBookTransfer(", "break fee");
+  assert.ok(/if \(claim\.count !== 1\) return false/.test(body), "the claim count is checked");
+  assert.ok(/purpose: "savings_fee"/.test(body), "the fee row carries purpose savings_fee");
+  assert.ok(/category: "transfer"/.test(body) && /type: "expense"/.test(body), "the fee row is a bank expense the ledger counts");
+  assert.ok(/mv\.backing === "piggyvest" && !mv\.landedTransactionId\) return false/.test(body), "a PiggyVest fee waits for the landing");
+  assert.ok(/SAVINGS_BREAK_FEE_FAILED/.test(body) && !/feeCollectedAt: null \}/.test(body.slice(body.indexOf("catch (e)"))), "a failed sweep alerts and stays claimed");
+  assert.strictEqual(countOf(body, "anchor.createBookTransfer("), 1);
+});
+
+test("the fee is charged on early withdrawals only, carried in the confirmation, and swept from the landing", () => {
+  const w = fnBody(sv, "async function withdrawFromPot(");
+  assert.ok(/const fee = lock\.early \? breakFee\.fee : 0/.test(w), "fee only when the lock is broken early");
+  assert.ok(/\{ lockUntil: fresh\.lockUntil, fee: breakFee\.fee, feeBps: breakFee\.bps \}/.test(w), "EARLY_WITHDRAWAL_CONFIRM carries the fee");
+  assert.ok(/if \(fee > 0\) \{\s*await collectBreakFee\(result\.movement\.id\)/.test(w), "ledger withdrawal sweeps at once");
+  const credit = read("src/utils/savingsCredit.js");
+  assert.ok(/require\("\.\/savings"\)\.collectBreakFee\(movementId\)/.test(fnBody(credit, "async function markLanded(")), "markLanded sweeps the fee");
+  const rec = read("src/utils/savingsReconcile.js");
+  assert.ok(/feeCollectedAt: null/.test(rec) && /savings\.collectBreakFee\(m\.id\)/.test(rec), "the reconcile loop is the backstop");
+});
+
+test("savings_fee is a savings purpose on both sides, so reports skip it and the ledger keeps it", () => {
+  assert.ok(moneySources.SAVINGS_PURPOSES.includes("savings_fee"));
+  assert.ok(moneySources.isSavingsRow({ purpose: "savings_fee" }));
+  const client = fs.readFileSync(path.join(ROOT, "..", "src", "utils", "matchedCredit.js"), "utf8");
+  assert.ok(/"savings_fee"/.test(client), "the app's SAVINGS_PURPOSES must list savings_fee");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

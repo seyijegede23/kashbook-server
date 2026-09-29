@@ -50,7 +50,10 @@ function isBankLedgerRow(tx) {
 // windows, the staff transfer cap and the drift alarm must keep counting these
 // rows, because the bank account did move by that amount. Never add the
 // exclusion there.
-const SAVINGS_PURPOSES = Object.freeze(["savings_deposit", "savings_withdrawal", "savings_interest"]);
+// savings_fee is the early-withdrawal charge swept to KashBook's fee account:
+// real money off the bank account (the ledger keeps it), not trade (reports
+// leave it out, as they do the transfer fee on an ordinary send).
+const SAVINGS_PURPOSES = Object.freeze(["savings_deposit", "savings_withdrawal", "savings_interest", "savings_fee"]);
 const NOT_SAVINGS = Object.freeze({ purpose: null });
 const SQL_NOT_SAVINGS = 'AND "purpose" IS NULL';
 

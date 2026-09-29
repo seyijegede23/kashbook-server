@@ -62,6 +62,34 @@ function computeTransferFee(amount, route) {
     breakdown: { nip: NIP_FEE, platform: PLATFORM_MARGIN, stampDuty: statutoryStamp },
   };
 }
+// ── Savings: breaking a flexible lock ───────────────────────────────────────
+// Taking money out of a flexible-locked pot before its date costs a share of
+// the amount, floored at a minimum and never more than the amount itself.
+// Owner's numbers (2026-09-29): 2% (200 bps), minimum ₦100. Both live in env
+// so they can change without a deploy: SAVINGS_BREAK_FEE_BPS,
+// SAVINGS_BREAK_FEE_MIN. Off when there is no fee account to sweep into,
+// because a fee nothing can collect must not be charged.
+const BREAK_FEE_BPS_DEFAULT = 200;
+const BREAK_FEE_MIN_DEFAULT = 100;
+function breakFeeConfig() {
+  const bps = Number(process.env.SAVINGS_BREAK_FEE_BPS);
+  const min = Number(process.env.SAVINGS_BREAK_FEE_MIN);
+  return {
+    bps: Number.isFinite(bps) && bps >= 0 && bps <= 1000 ? Math.round(bps) : BREAK_FEE_BPS_DEFAULT,
+    min: Number.isFinite(min) && min >= 0 ? Math.round(min * 100) / 100 : BREAK_FEE_MIN_DEFAULT,
+    enabled: feesEnabled(),
+  };
+}
+function computeBreakFee(amount) {
+  const { bps, min, enabled } = breakFeeConfig();
+  const amt = Number(amount) || 0;
+  if (!enabled || bps === 0 || amt <= 0) return { fee: 0, bps, min, enabled: enabled && bps > 0 };
+  let fee = Math.round((amt * bps) / 100) / 100; // bps of the amount, to the kobo
+  fee = Math.max(fee, min);
+  fee = Math.min(fee, amt);
+  return { fee: Math.round(fee * 100) / 100, bps, min, enabled: true };
+}
+
 module.exports = {
   MONEY_EPS,
   NIP_FEE,
@@ -70,4 +98,6 @@ module.exports = {
   PLATFORM_MARGIN,
   feesEnabled,
   computeTransferFee,
+  breakFeeConfig,
+  computeBreakFee,
 };
