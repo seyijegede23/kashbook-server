@@ -83,8 +83,9 @@ async function authMiddleware(req, res, next) {
       dailyTransferCap = Number(usable?.dailyTransferCap ?? 0) || 0;
     }
 
-    // `plan` is this user's own plan; `effectivePlan` is what gates features
-    // (staff inherit their employer's plan, resolved above).
+    // `plan` is this user's own plan; `effectivePlan` is the employer's for
+    // staff (resolved above). Since 2026-10-02 the app is free and nothing
+    // gates on either; both stay in the payload for older clients.
     req.user = {
       id:            user.id,
       accountType:   user.accountType.toLowerCase(),

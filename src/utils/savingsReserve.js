@@ -1,16 +1,13 @@
 // The savings reserve: how much of a business's bank balance is set aside in
-// ledger pots and therefore NOT spendable.
+// pots and therefore NOT spendable.
 //
-// A `ledger` pot moves no money. It is a promise the server keeps: the naira
-// stays in the merchant's Anchor account and every path that spends from that
-// account subtracts the reserve first. That is enforceable only because the
-// account has no card and no other exit: every debit goes through
-// executeTransfer, and executeTransfer's balance gate calls netSpendable.
+// A pot moves no money. It is a promise the server keeps: the naira stays in
+// the merchant's Anchor account and every path that spends from that account
+// subtracts the reserve first. That is enforceable only because the account
+// has no card and no other exit: every debit goes through executeTransfer,
+// and executeTransfer's balance gate calls netSpendable.
 //
-// PiggyVest pots hold their money in a PiggyVest wallet, so they never appear
-// here. Closed pots hold nothing. Pots in `error` or `provisioning` are
-// PiggyVest pots by construction (ledger pots are born active) and their
-// balance is zero, but the query keeps them out explicitly anyway.
+// Closed pots hold nothing, so only active pots count.
 //
 // This module must never import executeTransfer: it is imported BY it.
 const prisma = require("./db");
@@ -18,7 +15,7 @@ const { MONEY_EPS } = require("../config/fees");
 
 async function getReservedBalance(businessId, client = prisma) {
   const agg = await client.savingsPot.aggregate({
-    where: { businessId, backing: "ledger", status: "active" },
+    where: { businessId, status: "active" },
     _sum: { balance: true },
   });
   return Math.max(0, Number(agg._sum.balance || 0));
@@ -27,7 +24,7 @@ async function getReservedBalance(businessId, client = prisma) {
 // Spendable = gross − reserved, floored at zero. Gross is what the bank says
 // is available; a reserve larger than gross means money left the account by a
 // path the server did not gate (or the bank is temporarily behind), which the
-// reconcile loop alarms on. The floor keeps the spend gate refusing, not
+// integrity loop alarms on. The floor keeps the spend gate refusing, not
 // throwing, in that state.
 function netSpendable(gross, reserved) {
   const g = Number(gross) || 0;

@@ -12,13 +12,10 @@ function validateEnv() {
   const isProd = process.env.NODE_ENV === "production";
   const problems = [];
 
-  // Webhook signing secrets — without these, money/subscription webhooks would
-  // either fail-open (fraudulent inbound credits) or be rejected wholesale.
+  // Webhook signing secret — without it, money webhooks would either fail-open
+  // (fraudulent inbound credits) or be rejected wholesale.
   if (!process.env.ANCHOR_WEBHOOK_SECRET) {
     problems.push("ANCHOR_WEBHOOK_SECRET is not set (Anchor webhook signatures cannot be verified)");
-  }
-  if (!process.env.REVENUECAT_WEBHOOK_AUTH) {
-    problems.push("REVENUECAT_WEBHOOK_AUTH is not set (RevenueCat subscription webhooks will be rejected)");
   }
 
   // The webhook-verification kill switch must never be on in production.
@@ -56,21 +53,6 @@ function validateEnv() {
   const dojahLiveUrl = dojahUrl.includes("api.dojah.io") && !dojahUrl.includes("sandbox");
   if (dojahKey.startsWith("test_sk_") && dojahLiveUrl) {
     problems.push("Dojah sandbox key (test_sk_*) is set against the LIVE base URL — fix the key/URL pair");
-  }
-
-  // PiggyVest (savings partner): the key alone decides test vs live, so the
-  // one thing the host can tell us is whether it is THEIR host at all. A typo
-  // in PVB_BASE_URL would send a bearer secret somewhere else.
-  if (process.env.PVB_SECRET_KEY) {
-    const pvbUrl = process.env.PVB_BASE_URL || "https://api.piggyvest.business";
-    let host = "";
-    try { host = new URL(pvbUrl).hostname.toLowerCase(); } catch { host = ""; }
-    if (isProd && host !== "api.piggyvest.business") {
-      problems.push(`PVB_BASE_URL host "${host || pvbUrl}" is not api.piggyvest.business — refusing to send the PiggyVest secret there`);
-    }
-    if (isProd && process.env.PVB_VERIFY_WEBHOOK === "false") {
-      problems.push("PVB_VERIFY_WEBHOOK=false disables PiggyVest webhook signature checks — forbidden in production");
-    }
   }
 
   if (problems.length) {

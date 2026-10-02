@@ -128,13 +128,6 @@ router.post("/", async (req, res) => {
   }
 
   try {
-    if (req.user.plan !== "PREMIUM") {
-      const count = await prisma.business.count({ where: { userId: req.user.id } });
-      if (count >= 1) {
-        return res.status(403).json({ error: "Free plan allows only 1 business. Upgrade to Pro to manage multiple businesses." });
-      }
-    }
-
     // One account can't hold two businesses with the same name
     // (case- and whitespace-insensitive) — avoids duplicate NUBANs/receipts.
     const mine = await prisma.business.findMany({
@@ -853,19 +846,16 @@ router.delete("/:id", async (req, res) => {
     }
 
     // Savings guard: deleting the business cascades its pots and movements
-    // away. Money set aside in a ledger pot would silently become spendable
-    // again, and a PiggyVest wallet would be orphaned with nothing pointing at
-    // it. Refuse while any pot holds money or a movement is still settling.
-    const [potWithMoney, inflight] = await Promise.all([
-      prisma.savingsPot.findFirst({ where: { businessId: req.params.id, status: { not: "closed" }, balance: { gt: 0.004 } }, select: { name: true } }),
-      prisma.savingsMovement.count({ where: { businessId: req.params.id, status: { in: ["initiated", "sent", "requested", "processing", "unknown", "needs_review"] } } }),
-    ]);
-    if (potWithMoney || inflight > 0) {
+    // away, and money set aside in a pot would silently become spendable
+    // again. Refuse while any pot holds money.
+    const potWithMoney = await prisma.savingsPot.findFirst({
+      where: { businessId: req.params.id, status: { not: "closed" }, balance: { gt: 0.004 } },
+      select: { name: true },
+    });
+    if (potWithMoney) {
       return res.status(400).json({
         code: "SAVINGS_REMAINING",
-        error: potWithMoney
-          ? `The savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first.`
-          : "A savings deposit or withdrawal is still being processed. Wait for it to finish first.",
+        error: `The savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first.`,
       });
     }
 

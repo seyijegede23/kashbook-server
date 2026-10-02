@@ -1,4 +1,4 @@
-// Insights ("ask your books") — PREMIUM. A deterministic Q&A algorithm over
+// Insights ("ask your books"). A deterministic Q&A algorithm over
 // the business's own data (utils/insightsEngine.js). No AI, no external calls.
 const router = require("express").Router();
 const prisma = require("../utils/db");
@@ -12,17 +12,6 @@ router.use(auth);
 // Staff act on their employer's books (same convention as invoices/transfers).
 function ownerId(req) {
   return req.user.accountType === "staff" ? req.user.employerId : req.user.id;
-}
-
-function premiumGate(req, res) {
-  if (req.user.effectivePlan !== "PREMIUM") {
-    res.status(403).json({
-      error: "Business Insights is a Premium feature. Upgrade to ask questions about your books.",
-      code: "PREMIUM_REQUIRED",
-    });
-    return false;
-  }
-  return true;
 }
 
 async function resolveBusiness(req, res) {
@@ -49,7 +38,6 @@ async function resolveBusiness(req, res) {
 // nextContext? }.
 router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
   try {
-    if (!premiumGate(req, res)) return;
     const biz = await resolveBusiness(req, res);
     if (!biz) return;
 
@@ -75,7 +63,6 @@ router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
 // GET /insights/cards?businessId= — auto-generated observation cards
 router.get("/cards", requirePermission("canViewReports"), async (req, res) => {
   try {
-    if (!premiumGate(req, res)) return;
     const biz = await resolveBusiness(req, res);
     if (!biz) return;
     const cards = await generateInsightCards(biz);
@@ -86,7 +73,7 @@ router.get("/cards", requirePermission("canViewReports"), async (req, res) => {
   }
 });
 
-// GET /insights/suggestions — static example questions (free to view; asking is gated)
+// GET /insights/suggestions — static example questions
 router.get("/suggestions", (req, res) => {
   res.json({ suggestions: SUGGESTIONS });
 });

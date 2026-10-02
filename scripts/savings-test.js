@@ -1,16 +1,20 @@
-// Savings (pots): the pure parts, plus structural guards. No network, no DB.
+// Savings (ledger pots): the pure parts, plus structural guards. No network, no DB.
 //   node scripts/savings-test.js
 //
-// The money paths (ledger deposit, PiggyVest deposit → NIP → inflow, withdrawal
-// → verify → Anchor credit) need Postgres and the partners and live in
-// scripts/savings-e2e-test.js. What CAN be pinned here is everything a wrong
-// answer would silently mis-book: how an inbound credit is recognised as the
-// merchant's own savings coming home, how wallet inflows pair with deposits,
-// when a withdrawal may be called failed, the reserve arithmetic behind the
-// spend gate, lock semantics, the webhook HMAC, kobo maths; and, read from the
-// source as text, that the guards the plan names sit in the order it names.
+// A pot moves no money. Its balance is a reserve that executeTransfer subtracts
+// in its balance gate; deposits and withdrawals are single atomic writes under
+// the business lock; breaking a flexible lock early costs a fee that is swept
+// to KashBook's fee account and booked as a Transaction with purpose
+// "savings_fee". What CAN be pinned here is everything a wrong answer would
+// silently mis-book: the reserve arithmetic behind the spend gate, lock
+// semantics, the break-fee schedule, the idempotent replay, which rows reports
+// skip and the ledger keeps; and, read from the source as text, that the
+// guards sit in the order the design names, that the migration matches the
+// schema, and that nothing of the removed PiggyVest integration is left.
+//
+// The money paths themselves (deposit, withdraw, the fee sweep, the reconcile
+// loop) need Postgres and Anchor and live in scripts/savings-e2e-test.js.
 const assert = require("assert");
-const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -33,10 +37,9 @@ const SRC = path.join(ROOT, "src");
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 
 const savings = require("../src/utils/savings");
-const { decideCreditPurpose } = require("../src/utils/savingsCredit");
 const { netSpendable } = require("../src/utils/savingsReserve");
-const piggyvest = require("../src/services/piggyvest");
-const { MONEY_EPS } = require("../src/config/fees");
+const fees = require("../src/config/fees");
+const { MONEY_EPS } = fees;
 const moneySources = require("../src/config/moneySources");
 
 // ── source helpers ───────────────────────────────────────────────────────────
@@ -89,329 +92,24 @@ const mustPrecede = (hay, a, b, what) => {
   assert.ok(ia < ib, `${what}: "${a}" must come before "${b}" (found at ${ia} vs ${ib})`);
 };
 const countOf = (hay, needle) => hay.split(needle).length - 1;
-
-// ══ 1. INBOUND CREDIT CLASSIFICATION ═══════════════════════════════════════
-section("1. a pot payout coming home is never booked as a customer's payment, and vice versa");
-
-const POT_ACCT = "1234567890";
-const cand = (id, reference, amount, potAccountNumber = POT_ACCT) => ({ id, reference, amount, potAccountNumber });
-
-test("tier 1: our reference in the narration, exact amount", () => {
-  const r = decideCreditPurpose({ narration: "KashBook savings kb_svw_ab12cd34", senderAccount: "9999999999", amount: 5000, candidates: [cand("m1", "kb_svw_ab12cd34", 5000)] });
-  assert.deepStrictEqual(r, { purpose: "savings_withdrawal", movementId: "m1", tier: 1 });
-});
-
-test("tier 1: the reference match is case-insensitive (banks upper-case narrations)", () => {
-  const r = decideCreditPurpose({ narration: "KASHBOOK SAVINGS KB_SVW_AB12CD34", amount: 5000, candidates: [cand("m1", "kb_svw_ab12cd34", 5000)] });
-  assert.strictEqual(r.movementId, "m1");
-  assert.strictEqual(r.tier, 1);
-});
-
-test("tier 1: a landing a little UNDER the request (fee on the way) is still ours", () => {
-  const r = decideCreditPurpose({ narration: "kb_svw_ab12cd34", amount: 4950, candidates: [cand("m1", "kb_svw_ab12cd34", 5000)] });
-  assert.strictEqual(r.purpose, "savings_withdrawal");
-  assert.strictEqual(r.movementId, "m1");
-});
-
-test("tier 1: a landing OVER the request is not ours → income, reason reference_amount_over", () => {
-  const r = decideCreditPurpose({ narration: "kb_svw_ab12cd34", senderAccount: POT_ACCT, amount: 5000.01, candidates: [cand("m1", "kb_svw_ab12cd34", 5000)] });
-  assert.strictEqual(r.purpose, null);
-  assert.strictEqual(r.review, "reference_amount_over");
-  assert.strictEqual(r.movementId, undefined);
-});
-
-test("tier 1: an over-amount reference hit does NOT fall through to a tier-2 amount match on another row", () => {
-  // Same sender, another open withdrawal happens to be 5000.01: the reference
-  // named m1, so m2 must not be claimed by amount.
-  const r = decideCreditPurpose({ narration: "kb_svw_ab12cd34", senderAccount: POT_ACCT, amount: 5000.01, candidates: [cand("m1", "kb_svw_ab12cd34", 5000), cand("m2", "kb_svw_ffffffff", 5000.01)] });
-  assert.strictEqual(r.purpose, null);
-  assert.strictEqual(r.review, "reference_amount_over");
-});
-
-test("tier 1: a reference in the narration that matches no candidate falls to tier 2", () => {
-  const r = decideCreditPurpose({ narration: "kb_svw_unknown1", senderAccount: POT_ACCT, amount: 3000, candidates: [cand("m2", "kb_svw_ab12cd34", 3000)] });
-  assert.deepStrictEqual(r, { purpose: "savings_withdrawal", movementId: "m2", tier: 2 });
-});
-
-test("tier 2: sender is the pot's funding account and exactly one open withdrawal has this amount", () => {
-  const r = decideCreditPurpose({ narration: "Transfer", senderAccount: POT_ACCT, amount: 3000, candidates: [cand("m1", "kb_svw_a", 5000), cand("m2", "kb_svw_b", 3000)] });
-  assert.deepStrictEqual(r, { purpose: "savings_withdrawal", movementId: "m2", tier: 2 });
-});
-
-test("tier 2: the amount must match to the kobo (IEEE floats compared in kobo)", () => {
-  const r = decideCreditPurpose({ senderAccount: POT_ACCT, amount: 5000.1, candidates: [cand("m1", "kb_svw_a", 5000.10)] });
-  assert.strictEqual(r.movementId, "m1");
-  const r2 = decideCreditPurpose({ senderAccount: POT_ACCT, amount: 5000.11, candidates: [cand("m1", "kb_svw_a", 5000.10)] });
-  assert.strictEqual(r2.purpose, null);
-  assert.strictEqual(r2.review, "sender_no_amount_match");
-});
-
-test("tier 2: two open withdrawals of the same amount → ambiguous, booked as income with a review reason", () => {
-  const r = decideCreditPurpose({ senderAccount: POT_ACCT, amount: 3000, candidates: [cand("m1", "kb_svw_a", 3000), cand("m2", "kb_svw_b", 3000)] });
-  assert.strictEqual(r.purpose, null);
-  assert.strictEqual(r.review, "ambiguous_amount");
-  assert.strictEqual(r.movementId, undefined);
-});
-
-test("tier 2: sender account is formatted (spaces, dashes) but still 10 digits", () => {
-  const r = decideCreditPurpose({ senderAccount: "123-456 7890", amount: 3000, candidates: [cand("m2", "kb_svw_b", 3000)] });
-  assert.strictEqual(r.movementId, "m2");
-});
-
-test("tier 2: a candidate from ANOTHER pot's account is not matched by amount", () => {
-  const r = decideCreditPurpose({ senderAccount: POT_ACCT, amount: 3000, candidates: [cand("m9", "kb_svw_z", 3000, "0000000000")] });
-  assert.deepStrictEqual(r, { purpose: null });
-});
-
-test("non-10-digit sender never matches by amount (no review reason: not a pot account)", () => {
-  for (const sender of ["12345", "12345678901"]) {
-    const r = decideCreditPurpose({ narration: "Transfer", senderAccount: sender, amount: 3000, candidates: [cand("m2", "kb_svw_b", 3000)] });
-    assert.deepStrictEqual(r, { purpose: null }, `sender=${JSON.stringify(sender)}`);
+// Every source-like file under a directory, recursively.
+function walk(dir, out = []) {
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) walk(p, out);
+    else if (ent.isFile() && /\.(js|cjs|mjs|json|sql|prisma|md|html)$/.test(ent.name)) out.push(p);
   }
-  // A NAMED sender with no account is somebody: plain income, no review.
-  for (const sender of ["", null, undefined]) {
-    const r = decideCreditPurpose({ narration: "Transfer", senderAccount: sender, senderName: "Ada Buyer", amount: 3000, candidates: [cand("m2", "kb_svw_b", 3000)] });
-    assert.deepStrictEqual(r, { purpose: null }, `sender=${JSON.stringify(sender)}`);
-  }
-});
-
-test("rail bank name + amount alone is never enough (no sender account, no reference)", () => {
-  // Named sender: income, full stop.
-  const named = decideCreditPurpose({ narration: "VFD MFB transfer", senderAccount: null, senderName: "VFD MFB", amount: 3000, candidates: [cand("m2", "kb_svw_b", 3000)] });
-  assert.deepStrictEqual(named, { purpose: null });
-});
-
-test("an UNATTRIBUTED credit (no sender at all) equal to an open withdrawal is income, but flagged so the matchers wait for the webhook", () => {
-  const r = decideCreditPurpose({ narration: "NIP transfer", senderAccount: null, senderName: null, amount: 3000, candidates: [cand("m2", "kb_svw_b", 3000)] });
-  assert.deepStrictEqual(r, { purpose: null, review: "possible_savings_landing" });
-  // A different amount is nobody's withdrawal: nothing to wait for.
-  const other = decideCreditPurpose({ narration: "NIP transfer", senderAccount: null, senderName: null, amount: 2999, candidates: [cand("m2", "kb_svw_b", 3000)] });
-  assert.deepStrictEqual(other, { purpose: null });
-});
-
-test("no candidates → plain income, no matter the narration", () => {
-  assert.deepStrictEqual(decideCreditPurpose({ narration: "kb_svw_ab12cd34", senderAccount: POT_ACCT, amount: 5000, candidates: [] }), { purpose: null });
-  assert.deepStrictEqual(decideCreditPurpose({ narration: "kb_svw_ab12cd34", amount: 5000 }), { purpose: null });
-});
-
-test("zero, negative or non-numeric amounts are never tagged", () => {
-  for (const amount of [0, -5, "abc", null, undefined]) {
-    assert.deepStrictEqual(decideCreditPurpose({ narration: "kb_svw_ab12cd34", senderAccount: POT_ACCT, amount, candidates: [cand("m1", "kb_svw_ab12cd34", 5000)] }), { purpose: null }, `amount=${amount}`);
-  }
-});
-
-// ══ 2. PAIRING WALLET INFLOWS WITH DEPOSITS ════════════════════════════════
-section("2. each PiggyVest inflow settles at most one deposit, and only when it can be ours");
-
-const dep = (id, status, reference, amount, createdAt) => ({ id, status, reference, amount, createdAt });
-const inflow = (id, amount, narration = "", category = "") => ({ id, amount, narration, category });
-
-test("oldest deposit first: one inflow of ₦1,000 settles the older of two ₦1,000 sent deposits", () => {
-  const deposits = [
-    dep("d2", "sent", "kb_sv_b", 1000, "2026-09-29T10:05:00Z"),
-    dep("d1", "sent", "kb_sv_a", 1000, "2026-09-29T10:00:00Z"),
-  ];
-  const { pairs, leftoverInflows } = savings.pairInflows(deposits, [inflow("i1", 1000, "Funding")]);
-  assert.deepStrictEqual(pairs, [{ depositId: "d1", inflowId: "i1" }]);
-  assert.deepStrictEqual(leftoverInflows, []);
-});
-
-test("one inflow is consumed once: two deposits, one inflow → one pair", () => {
-  const deposits = [dep("d1", "sent", "kb_sv_a", 1000, "2026-09-29T10:00:00Z"), dep("d2", "sent", "kb_sv_b", 1000, "2026-09-29T10:05:00Z")];
-  const { pairs } = savings.pairInflows(deposits, [inflow("i1", 1000)]);
-  assert.strictEqual(pairs.length, 1);
-  const ids = new Set(pairs.map((p) => p.inflowId));
-  assert.strictEqual(ids.size, pairs.length);
-});
-
-test("two inflows, two deposits → each inflow used exactly once", () => {
-  const deposits = [dep("d1", "sent", "kb_sv_a", 1000, "2026-09-29T10:00:00Z"), dep("d2", "sent", "kb_sv_b", 1000, "2026-09-29T10:05:00Z")];
-  const { pairs, leftoverInflows } = savings.pairInflows(deposits, [inflow("i1", 1000), inflow("i2", 1000)]);
-  assert.deepStrictEqual(pairs, [{ depositId: "d1", inflowId: "i1" }, { depositId: "d2", inflowId: "i2" }]);
-  assert.deepStrictEqual(leftoverInflows, []);
-});
-
-test("a SENT deposit may pair on amount alone (the money is known to have left Anchor)", () => {
-  const { pairs } = savings.pairInflows([dep("d1", "sent", "kb_sv_a", 2500, "2026-09-29T10:00:00Z")], [inflow("i1", 2500, "NIP transfer")]);
-  assert.deepStrictEqual(pairs, [{ depositId: "d1", inflowId: "i1" }]);
-});
-
-test("an INITIATED deposit needs our reference in the inflow narration", () => {
-  const d = dep("d1", "initiated", "kb_sv_a", 2500, "2026-09-29T10:00:00Z");
-  assert.deepStrictEqual(savings.pairInflows([d], [inflow("i1", 2500, "NIP transfer")]).pairs, []);
-  assert.deepStrictEqual(savings.pairInflows([d], [inflow("i1", 2500, "Savings Rent KB_SV_A")]).pairs, [{ depositId: "d1", inflowId: "i1" }]);
-});
-
-test("an UNKNOWN deposit needs our reference in the inflow narration", () => {
-  const d = dep("d1", "unknown", "kb_sv_a", 2500, "2026-09-29T10:00:00Z");
-  assert.deepStrictEqual(savings.pairInflows([d], [inflow("i1", 2500)]).pairs, []);
-  assert.deepStrictEqual(savings.pairInflows([d], [inflow("i1", 2500, "kb_sv_a")]).pairs, [{ depositId: "d1", inflowId: "i1" }]);
-});
-
-test("the reference match is exact per deposit: kb_sv_a does not claim an inflow for kb_sv_ab", () => {
-  const d = dep("d1", "initiated", "kb_sv_ab", 2500, "2026-09-29T10:00:00Z");
-  // The inflow carries kb_sv_a only; kb_sv_ab is not a substring of it.
-  assert.deepStrictEqual(savings.pairInflows([d], [inflow("i1", 2500, "kb_sv_a")]).pairs, []);
-});
-
-test("an interest inflow never pairs on amount (narration)", () => {
-  const { pairs, leftoverInflows } = savings.pairInflows([dep("d1", "sent", "kb_sv_a", 12.5, "2026-09-29T10:00:00Z")], [inflow("i1", 12.5, "Interest payout")]);
-  assert.deepStrictEqual(pairs, []);
-  assert.strictEqual(leftoverInflows.length, 1);
-});
-
-test("an interest inflow never pairs on amount (category)", () => {
-  const { pairs } = savings.pairInflows([dep("d1", "sent", "kb_sv_a", 12.5, "2026-09-29T10:00:00Z")], [inflow("i1", 12.5, "", "interest")]);
-  assert.deepStrictEqual(pairs, []);
-});
-
-test("an interest inflow DOES pair when it carries our reference (reference beats the interest rule)", () => {
-  const { pairs } = savings.pairInflows([dep("d1", "sent", "kb_sv_a", 12.5, "2026-09-29T10:00:00Z")], [inflow("i1", 12.5, "kb_sv_a interest", "interest")]);
-  assert.deepStrictEqual(pairs, [{ depositId: "d1", inflowId: "i1" }]);
-});
-
-test("amount pairing is to the kobo: ₦1,000 does not settle a ₦999.99 inflow", () => {
-  assert.deepStrictEqual(savings.pairInflows([dep("d1", "sent", "kb_sv_a", 1000, "2026-09-29T10:00:00Z")], [inflow("i1", 999.99)]).pairs, []);
-});
-
-test("a deposit with no reference never pairs on the empty string", () => {
-  const { pairs } = savings.pairInflows([dep("d1", "initiated", "", 1000, "2026-09-29T10:00:00Z")], [inflow("i1", 1000, "anything")]);
-  assert.deepStrictEqual(pairs, []);
-});
-
-test("inputs are not mutated and leftovers keep their order", () => {
-  const deposits = [dep("d2", "sent", "kb_sv_b", 1000, "2026-09-29T10:05:00Z"), dep("d1", "sent", "kb_sv_a", 1000, "2026-09-29T10:00:00Z")];
-  const inflows = [inflow("i1", 5), inflow("i2", 1000), inflow("i3", 7)];
-  const { leftoverInflows } = savings.pairInflows(deposits, inflows);
-  assert.deepStrictEqual(deposits.map((d) => d.id), ["d2", "d1"]);
-  assert.deepStrictEqual(leftoverInflows.map((i) => i.id), ["i1", "i3"]);
-});
-
-test("an inflow that arrived BEFORE the deposit was made cannot be its landing (amount-only pairing)", () => {
-  const d = { id: "d1", status: "sent", reference: "kb_sv_late", amount: 1000, createdAt: "2026-09-29T10:00:00Z" };
-  const early = { id: "i0", amount: 1000, narration: "NIP transfer", category: "credit", createdAt: "2026-09-29T09:30:00Z" };
-  const later = { id: "i1", amount: 1000, narration: "NIP transfer", category: "credit", createdAt: "2026-09-29T10:03:00Z" };
-  const { pairs } = savings.pairInflows([d], [early, later]);
-  assert.deepStrictEqual(pairs, [{ depositId: "d1", inflowId: "i1" }]);
-  // Clock skew of a few minutes is tolerated; an inflow with no time is allowed.
-  const skew = { id: "i2", amount: 1000, narration: "NIP", category: "credit", createdAt: "2026-09-29T09:57:00Z" };
-  assert.strictEqual(savings.pairInflows([d], [skew]).pairs.length, 1);
-  const untimed = { id: "i3", amount: 1000, narration: "NIP", category: "credit" };
-  assert.strictEqual(savings.pairInflows([d], [untimed]).pairs.length, 1);
-});
-
-test("the month key follows Lagos time (UTC+1), not UTC", () => {
-  // 23:30 UTC on the last day of September is 00:30 on 1 October in Lagos.
-  assert.strictEqual(savings.monthKey(new Date("2026-09-30T23:30:00Z")), "2026-10");
-  assert.strictEqual(savings.monthKey(new Date("2026-09-30T22:59:00Z")), "2026-09");
-});
-
-// ══ 3. WITHDRAWAL OUTCOMES ═════════════════════════════════════════════════
-section("3. a withdrawal is completed or failed only on PiggyVest's own word");
+  return out;
+}
+// Lines of `text` (1-based) matching `re`, for a readable failure.
+const linesMatching = (text, re) => text.split("\n").map((l, i) => (re.test(l) ? i + 1 : 0)).filter(Boolean);
 
 const T0 = new Date("2026-09-29T12:00:00Z");
-const minutesAgo = (m) => new Date(T0.getTime() - m * 60 * 1000);
+const future = new Date(T0.getTime() + 30 * 86400000);
+const past = new Date(T0.getTime() - 86400000);
 
-test("verify success → completed, misses reset", () => {
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "success" }, now: T0 }), { next: "completed", misses: 0 });
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "unknown", verify: { status: "success" }, verifyMisses: 1, now: T0 }), { next: "completed", misses: 0 });
-});
-
-test("verify failed → failed", () => {
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "failed" }, now: T0 }), { next: "failed", misses: 0 });
-});
-
-test("verify pending → keep waiting, misses reset to 0", () => {
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "pending" }, verifyMisses: 1, now: T0 }), { next: null, misses: 0 });
-});
-
-test("a missing or malformed verify answer is 'pending', never a terminal state", () => {
-  assert.strictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: null, now: T0 }).next, null);
-  assert.strictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: {}, now: T0 }).next, null);
-  assert.strictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "weird" }, now: T0 }).next, null);
-});
-
-test("first not_found → one miss, still open", () => {
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "not_found" }, verifyMisses: 0, lastVerifiedAt: null, now: T0 }), { next: null, misses: 1 });
-});
-
-test("second not_found only 5 minutes later does NOT count (a webhook nudge right after the poll)", () => {
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "not_found" }, verifyMisses: 1, lastVerifiedAt: minutesAgo(5), now: T0 }), { next: null, misses: 1 });
-});
-
-test("second not_found 10 minutes later → failed", () => {
-  assert.deepStrictEqual(savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "not_found" }, verifyMisses: 1, lastVerifiedAt: minutesAgo(10), now: T0 }), { next: "failed", misses: 2 });
-});
-
-test("(cadence) at the loop's own 5-minute spacing the second counted miss is reachable: t, t+5 (uncounted, anchor untouched), t+10 → failed", () => {
-  // applyWithdrawalOutcome only advances lastVerifiedAt on a COUNTED miss, so
-  // the anchor stays at t through the t+5 nudge and t+10 is spaced.
-  const t0 = new Date("2026-09-29T10:00:00Z");
-  const m1 = savings.decideWithdrawalOutcome({ status: "unknown", verify: { status: "not_found" }, verifyMisses: 0, lastVerifiedAt: null, now: t0 });
-  assert.deepStrictEqual(m1, { next: null, misses: 1 });
-  const t5 = new Date(t0.getTime() + 5 * 60000);
-  const m2 = savings.decideWithdrawalOutcome({ status: "unknown", verify: { status: "not_found" }, verifyMisses: 1, lastVerifiedAt: t0, now: t5 });
-  assert.deepStrictEqual(m2, { next: null, misses: 1 }, "uncounted: the anchor must not move");
-  const t10 = new Date(t0.getTime() + 10 * 60000);
-  const m3 = savings.decideWithdrawalOutcome({ status: "unknown", verify: { status: "not_found" }, verifyMisses: 1, lastVerifiedAt: t0, now: t10 });
-  assert.deepStrictEqual(m3, { next: "failed", misses: 2 });
-});
-
-test("a first miss always counts, even right after a pending answer stamped the row", () => {
-  const r = savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "not_found" }, verifyMisses: 0, lastVerifiedAt: new Date(Date.now() - 60000), now: new Date() });
-  assert.deepStrictEqual(r, { next: null, misses: 1 });
-});
-
-test("a withdrawal PiggyVest ACCEPTED (a reference came back) is never auto-failed on not_found: it goes to review", () => {
-  const r = savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "not_found" }, verifyMisses: 1, lastVerifiedAt: minutesAgo(10), now: T0, accepted: true });
-  assert.deepStrictEqual(r, { next: "needs_review", misses: 2 });
-});
-
-test("the streak is a streak: a pending answer between two not_founds resets it", () => {
-  const afterPending = savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "pending" }, verifyMisses: 1, lastVerifiedAt: minutesAgo(20), now: T0 });
-  assert.strictEqual(afterPending.misses, 0);
-  const r = savings.decideWithdrawalOutcome({ status: "processing", verify: { status: "not_found" }, verifyMisses: afterPending.misses, lastVerifiedAt: minutesAgo(10), now: T0 });
-  assert.deepStrictEqual(r, { next: null, misses: 1 });
-});
-
-test("a row that is not processing/unknown is never changed by a verify answer", () => {
-  for (const status of ["requested", "completed", "failed", "needs_review"]) {
-    const r = savings.decideWithdrawalOutcome({ status, verify: { status: "success" }, verifyMisses: 3, now: T0 });
-    assert.deepStrictEqual(r, { next: null, misses: 3 }, status);
-  }
-});
-
-// ══ 4. PRE-ANCHOR ERRORS ═══════════════════════════════════════════════════
-section("4. a deposit is failed outright only when the bank was never called");
-
-test("known pre-Anchor codes", () => {
-  for (const code of ["INSUFFICIENT_BALANCE", "RECIPIENT_UNVERIFIED", "UNKNOWN_BANK", "NO_BANKING", "SAVINGS_DEST_USE_DEPOSIT", "BAD_PURPOSE", "ANCHOR_NOT_CONFIGURED"]) {
-    assert.strictEqual(savings.isPreAnchorError(Object.assign(new Error("x"), { code })), true, code);
-  }
-});
-
-test("moneyMoved:false is trusted whatever the code", () => {
-  assert.strictEqual(savings.isPreAnchorError(Object.assign(new Error("x"), { code: "WHATEVER", moneyMoved: false })), true);
-  assert.strictEqual(savings.isPreAnchorError({ moneyMoved: false }), true);
-});
-
-test("an unknown error, a timeout, or moneyMoved:true is NOT pre-Anchor (money may have moved)", () => {
-  assert.strictEqual(savings.isPreAnchorError(new Error("socket hang up")), false);
-  assert.strictEqual(savings.isPreAnchorError(Object.assign(new Error("t"), { code: "ETIMEDOUT" })), false);
-  assert.strictEqual(savings.isPreAnchorError(Object.assign(new Error("t"), { code: "INSUFFICIENT_BALANCE", moneyMoved: true })), true); // code still wins: the gate throws before the call
-  assert.strictEqual(savings.isPreAnchorError(Object.assign(new Error("t"), { moneyMoved: true })), false);
-  assert.strictEqual(savings.isPreAnchorError(null), false);
-  assert.strictEqual(savings.isPreAnchorError(undefined), false);
-});
-
-test("executeTransfer's INSUFFICIENT_BALANCE carries moneyMoved:false", () => {
-  const src = read("src/utils/executeTransfer.js");
-  const gate = src.slice(src.indexOf('err.code = "INSUFFICIENT_BALANCE"'), src.indexOf('err.code = "INSUFFICIENT_BALANCE"') + 300);
-  assert.ok(/err\.moneyMoved = false/.test(gate), "INSUFFICIENT_BALANCE does not set moneyMoved = false");
-});
-
-// ══ 5. THE RESERVE ═════════════════════════════════════════════════════════
-section("5. spendable = gross − reserved, floored, rounded to the kobo");
+// ══ 1. THE RESERVE ═════════════════════════════════════════════════════════
+section("1. spendable = gross − reserved, floored, rounded to the kobo");
 
 test("plain subtraction", () => {
   assert.strictEqual(netSpendable(1000, 250), 750);
@@ -445,16 +143,18 @@ test("a negative or garbage reserve counts as zero; garbage gross counts as zero
   assert.strictEqual(netSpendable("abc", 0), 0);
 });
 
-// ══ 6. LOCKS ═══════════════════════════════════════════════════════════════
-section("6. a strict lock is server-enforced, a flexible one asks");
+test("numeric strings (a Decimal serialised by the bank client) are read as numbers", () => {
+  assert.strictEqual(netSpendable("1000.50", "250.25"), 750.25);
+});
 
-const future = new Date(T0.getTime() + 30 * 86400000);
-const past = new Date(T0.getTime() - 86400000);
+// ══ 2. LOCKS ═══════════════════════════════════════════════════════════════
+section("2. a strict lock is server-enforced, a flexible one asks");
 
 test("no lock → allowed", () => {
   assert.deepStrictEqual(savings.lockAllows({ lockUntil: null, lockMode: null }, { now: T0 }), { ok: true });
   assert.deepStrictEqual(savings.lockAllows({}, { now: T0 }), { ok: true });
   assert.deepStrictEqual(savings.lockAllows(null, { now: T0 }), { ok: true });
+  assert.deepStrictEqual(savings.lockAllows(undefined, { now: T0 }), { ok: true });
 });
 
 test("expired lock → allowed, whatever the mode", () => {
@@ -468,195 +168,260 @@ test("strict + future → POT_LOCKED even with confirmEarly", () => {
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.code, "POT_LOCKED");
   assert.strictEqual(r.until.getTime(), future.getTime());
+  assert.strictEqual(savings.lockAllows({ lockUntil: future, lockMode: "strict" }, { now: T0 }).code, "POT_LOCKED");
 });
 
-test("flexible + future without confirmation → EARLY_WITHDRAWAL_CONFIRM", () => {
+test("flexible + future without confirmation → EARLY_WITHDRAWAL_CONFIRM, with the date", () => {
   const r = savings.lockAllows({ lockUntil: future, lockMode: "flexible" }, { now: T0 });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.code, "EARLY_WITHDRAWAL_CONFIRM");
+  assert.strictEqual(r.until.getTime(), future.getTime());
 });
 
 test("flexible + future with confirmation → allowed and marked early", () => {
   assert.deepStrictEqual(savings.lockAllows({ lockUntil: future, lockMode: "flexible" }, { now: T0, confirmEarly: true }), { ok: true, early: true });
 });
 
+test("a lock with a date but no mode behaves as flexible (never silently strict)", () => {
+  assert.strictEqual(savings.lockAllows({ lockUntil: future, lockMode: null }, { now: T0 }).code, "EARLY_WITHDRAWAL_CONFIRM");
+  assert.deepStrictEqual(savings.lockAllows({ lockUntil: future }, { now: T0, confirmEarly: true }), { ok: true, early: true });
+});
+
 test("lockUntil as an ISO string works the same", () => {
   assert.strictEqual(savings.lockAllows({ lockUntil: future.toISOString(), lockMode: "strict" }, { now: T0 }).code, "POT_LOCKED");
+  assert.deepStrictEqual(savings.lockAllows({ lockUntil: past.toISOString(), lockMode: "strict" }, { now: T0 }), { ok: true });
 });
 
-// ══ 7. STRAY INFLOWS ═══════════════════════════════════════════════════════
-section("7. an inflow that is not our deposit is interest or an outside deposit");
-
-test("interest by category or narration", () => {
-  assert.strictEqual(savings.classifyUnattributedInflow({ category: "interest", narration: "" }), "interest");
-  assert.strictEqual(savings.classifyUnattributedInflow({ category: "credit", narration: "Monthly Interest payout" }), "interest");
-  assert.strictEqual(savings.classifyUnattributedInflow({ category: "INTEREST_PAYOUT" }), "interest");
+test("lockAllows trusts its caller (any truthy confirmEarly consents), so the ROUTE must coerce to a strict boolean", () => {
+  // Pinned on purpose: the helper treats the string "false" as consent, which
+  // is only safe because the route passes `confirmEarly === true` (section 12).
+  assert.strictEqual(savings.lockAllows({ lockUntil: future, lockMode: "flexible" }, { now: T0, confirmEarly: "false" }).ok, true);
+  assert.ok(/confirmEarly: confirmEarly === true/.test(read("src/routes/savings.js")), "the route must coerce confirmEarly");
 });
 
-test("everything else is an external deposit", () => {
-  assert.strictEqual(savings.classifyUnattributedInflow({ category: "credit", narration: "Transfer from ADA OBI" }), "external_deposit");
-  assert.strictEqual(savings.classifyUnattributedInflow({}), "external_deposit");
-  assert.strictEqual(savings.classifyUnattributedInflow(null), "external_deposit");
-});
+// ══ 3. BREAKING A FLEXIBLE LOCK ════════════════════════════════════════════
+section("3. breaking a flexible lock costs 2%, at least ₦100, never more than the amount");
 
-// ══ 8. WEBHOOK SIGNATURE ═══════════════════════════════════════════════════
-section("8. the PiggyVest webhook is fail-closed");
-
-const SECRET = "pvb_test_secret_0123456789";
-const sign = (buf, key = SECRET) => crypto.createHmac("sha512", key).update(buf).digest("hex");
-const EVENT = { eventId: "evt_1", eventType: "bank-transfer.outflow.success", eventData: { reference: "kb_svw_abc", amount: 500000 } };
-const withSecret = (fn) => {
-  const prev = process.env.PVB_SECRET_KEY;
-  process.env.PVB_SECRET_KEY = SECRET;
-  try { fn(); } finally { if (prev === undefined) delete process.env.PVB_SECRET_KEY; else process.env.PVB_SECRET_KEY = prev; }
+const withFeeEnv = (env, fn) => {
+  const keys = ["ANCHOR_FEE_ACCOUNT_ID", "SAVINGS_BREAK_FEE_BPS", "SAVINGS_BREAK_FEE_MIN"];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  Object.assign(process.env, env);
+  try { fn(); }
+  finally { for (const k of keys) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; } }
 };
+const FEE_ENV = { ANCHOR_FEE_ACCOUNT_ID: "fee-acct-test" };
 
-test("valid signature over the raw bytes (Buffer and string)", () => withSecret(() => {
-  const raw = Buffer.from(JSON.stringify(EVENT));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, sign(raw)), true);
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw.toString("utf8"), sign(raw)), true);
+test("2% of the amount, to the kobo", () => withFeeEnv(FEE_ENV, () => {
+  assert.strictEqual(fees.computeBreakFee(100_000).fee, 2_000);
+  assert.strictEqual(fees.computeBreakFee(12_345.67).fee, 246.91);
+  assert.strictEqual(fees.computeBreakFee(50_000).bps, 200);
+  assert.strictEqual(fees.computeBreakFee(50_000).enabled, true);
+  assert.strictEqual(fees.computeBreakFee(1_000_000).fee, 20_000);
 }));
 
-test("a pretty-printed body verifies only via JSON.stringify(JSON.parse(raw))", () => withSecret(() => {
-  const compact = Buffer.from(JSON.stringify(EVENT));
-  const pretty = Buffer.from(JSON.stringify(EVENT, null, 2));
-  assert.notStrictEqual(pretty.toString(), compact.toString());
-  const sigOverCompact = sign(compact);
-  assert.notStrictEqual(sign(pretty), sigOverCompact, "test premise: the raw bytes differ");
-  assert.strictEqual(piggyvest.verifyWebhookSignature(pretty, sigOverCompact), true);
+test("floored at ₦100, capped at the amount itself", () => withFeeEnv(FEE_ENV, () => {
+  assert.strictEqual(fees.computeBreakFee(1_000).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(4_999).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(5_000).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(5_050).fee, 101);
+  assert.strictEqual(fees.computeBreakFee(60).fee, 60, "a ₦60 withdrawal cannot cost ₦100");
+  assert.strictEqual(fees.computeBreakFee(100).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(0.01).fee, 0.01);
+  assert.strictEqual(fees.computeBreakFee(0).fee, 0);
+  assert.strictEqual(fees.computeBreakFee(-5).fee, 0);
+  assert.strictEqual(fees.computeBreakFee("abc").fee, 0);
 }));
 
-test("the compact fallback does not accept a signature over some OTHER body", () => withSecret(() => {
-  const pretty = Buffer.from(JSON.stringify(EVENT, null, 2));
-  const other = Buffer.from(JSON.stringify({ ...EVENT, eventData: { ...EVENT.eventData, amount: 1 } }));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(pretty, sign(other)), false);
+test("the numbers come from env, within sane bounds", () => withFeeEnv({ ...FEE_ENV, SAVINGS_BREAK_FEE_BPS: "300", SAVINGS_BREAK_FEE_MIN: "50" }, () => {
+  assert.strictEqual(fees.computeBreakFee(10_000).fee, 300);
+  assert.strictEqual(fees.computeBreakFee(1_000).fee, 50);
+  assert.deepStrictEqual(fees.breakFeeConfig(), { bps: 300, min: 50, enabled: true });
+  process.env.SAVINGS_BREAK_FEE_BPS = "5000"; // 50%: a typo, not a policy
+  assert.strictEqual(fees.computeBreakFee(10_000).bps, 200);
+  process.env.SAVINGS_BREAK_FEE_BPS = "-1";
+  assert.strictEqual(fees.computeBreakFee(10_000).bps, 200);
+  process.env.SAVINGS_BREAK_FEE_BPS = "abc";
+  assert.strictEqual(fees.computeBreakFee(10_000).bps, 200);
+  process.env.SAVINGS_BREAK_FEE_MIN = "-5";
+  assert.strictEqual(fees.breakFeeConfig().min, 100);
+  process.env.SAVINGS_BREAK_FEE_MIN = "12.345";
+  assert.strictEqual(fees.breakFeeConfig().min, 12.35, "the minimum is rounded to the kobo");
 }));
 
-test("header case is tolerated (upper-case hex, surrounding whitespace)", () => withSecret(() => {
-  const raw = Buffer.from(JSON.stringify(EVENT));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, ` ${sign(raw).toUpperCase()} `), true);
+test("0 bps switches the fee off", () => withFeeEnv({ ...FEE_ENV, SAVINGS_BREAK_FEE_BPS: "0" }, () => {
+  assert.strictEqual(fees.computeBreakFee(10_000).fee, 0);
+  assert.strictEqual(fees.computeBreakFee(10_000).enabled, false);
 }));
 
-test("wrong secret → false", () => withSecret(() => {
-  const raw = Buffer.from(JSON.stringify(EVENT));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, sign(raw, "another_secret")), false);
+test("no fee account, no fee: a charge nothing can collect is never made", () => withFeeEnv({}, () => {
+  assert.strictEqual(fees.computeBreakFee(100_000).fee, 0);
+  assert.strictEqual(fees.computeBreakFee(100_000).enabled, false);
+  assert.strictEqual(fees.breakFeeConfig().enabled, false);
+  assert.strictEqual(fees.breakFeeConfig().bps, 200, "the schedule is still reported, so the app can show it");
 }));
 
-test("tampered body → false", () => withSecret(() => {
-  const raw = Buffer.from(JSON.stringify(EVENT));
-  const sig = sign(raw);
-  const tampered = Buffer.from(JSON.stringify({ ...EVENT, eventData: { ...EVENT.eventData, amount: 1 } }));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(tampered, sig), false);
+test("the fee is always a 2-dp number (never a float artefact the ledger would carry)", () => withFeeEnv(FEE_ENV, () => {
+  for (const amt of [0.29, 5000.01, 12_345.67, 99_999.99, 1.1, 333.33]) {
+    const { fee } = fees.computeBreakFee(amt);
+    assert.strictEqual(fee, Math.round(fee * 100) / 100, `fee for ${amt} is ${fee}`);
+  }
 }));
 
-test("non-hex, wrong-length (sha256) or empty header → false, no throw", () => withSecret(() => {
-  const raw = Buffer.from(JSON.stringify(EVENT));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, "z".repeat(128)), false);
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, crypto.createHmac("sha256", SECRET).update(raw).digest("hex")), false);
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, ""), false);
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, "sha512=" + sign(raw)), false);
-}));
+// ══ 4. IDEMPOTENT REPLAY ═══════════════════════════════════════════════════
+section("4. a repeated request answers with the row it already made, never a second");
 
-test("missing header → false", () => withSecret(() => {
-  const raw = Buffer.from(JSON.stringify(EVENT));
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, undefined), false);
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, null), false);
-}));
+test("same amount → the existing movement, replay:true, same pot object", () => {
+  const existing = { id: "m1", amount: 5000, type: "deposit", status: "completed" };
+  const pot = { id: "p1", balance: 5000 };
+  const r = savings.replayOutcome(existing, 5000, pot);
+  assert.deepStrictEqual(r, { movement: existing, pot, replay: true });
+  assert.strictEqual(r.movement, existing);
+  assert.strictEqual(r.pot, pot);
+});
 
-test("missing secret → false even with a signature computed with the empty key", () => {
-  const prev = process.env.PVB_SECRET_KEY;
-  delete process.env.PVB_SECRET_KEY;
+test("amounts are compared in kobo (IEEE drift and numeric strings are the same money)", () => {
+  const existing = { id: "m1", amount: 5000.01 };
+  assert.strictEqual(savings.replayOutcome(existing, 5000.01, null).replay, true);
+  assert.strictEqual(savings.replayOutcome(existing, "5000.01", null).replay, true);
+  assert.strictEqual(savings.replayOutcome({ amount: 0.1 + 0.2 }, 0.3, null).replay, true);
+});
+
+test("a different amount under the same key → IDEMPOTENCY_MISMATCH 409 (a client bug, named)", () => {
+  const existing = { id: "m1", amount: 5000 };
+  assert.throws(() => savings.replayOutcome(existing, 5000.01, null), (e) => {
+    assert.ok(e instanceof savings.SavingsError);
+    assert.strictEqual(e.code, "IDEMPOTENCY_MISMATCH");
+    assert.strictEqual(e.status, 409);
+    return true;
+  });
+  assert.throws(() => savings.replayOutcome(existing, 4999.99, null), /already used for a different amount/);
+});
+
+test("SavingsError carries code, HTTP status and extras, and is a real Error", () => {
+  const e = new savings.SavingsError("msg", "SOME_CODE", 423, { lockUntil: future, fee: 100 });
+  assert.ok(e instanceof Error);
+  assert.strictEqual(e.message, "msg");
+  assert.strictEqual(e.code, "SOME_CODE");
+  assert.strictEqual(e.status, 423);
+  assert.strictEqual(e.lockUntil, future);
+  assert.strictEqual(e.fee, 100);
+  assert.strictEqual(new savings.SavingsError("m", "C").status, 400, "status defaults to 400");
+});
+
+// ══ 5. PURPOSES ════════════════════════════════════════════════════════════
+section("5. savings_fee is the only savings purpose, on both sides");
+
+test("moneySources: SAVINGS_PURPOSES === [\"savings_fee\"], frozen", () => {
+  assert.deepStrictEqual([...moneySources.SAVINGS_PURPOSES], ["savings_fee"]);
+  assert.ok(Object.isFrozen(moneySources.SAVINGS_PURPOSES), "SAVINGS_PURPOSES must be frozen");
+  assert.deepStrictEqual(moneySources.NOT_SAVINGS, { purpose: null });
+  assert.ok(Object.isFrozen(moneySources.NOT_SAVINGS), "NOT_SAVINGS must be frozen (it is spread into many where clauses)");
+  assert.strictEqual(moneySources.SQL_NOT_SAVINGS, 'AND "purpose" IS NULL');
+});
+
+test("isSavingsRow recognises savings_fee and nothing else", () => {
+  assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_fee" }), true);
+  for (const purpose of ["savings_deposit", "savings_withdrawal", "savings_interest", "refund", "", null, undefined, "SAVINGS_FEE"]) {
+    assert.strictEqual(moneySources.isSavingsRow({ purpose }), false, `purpose=${JSON.stringify(purpose)}`);
+  }
+  assert.strictEqual(moneySources.isSavingsRow({}), false);
+  assert.strictEqual(moneySources.isSavingsRow(null), false);
+  assert.strictEqual(moneySources.isSavingsRow(undefined), false);
+});
+
+test("the app's matchedCredit.js lists exactly [\"savings_fee\"] and skips savings rows in reports", () => {
+  const client = fs.readFileSync(path.join(ROOT, "..", "src", "utils", "matchedCredit.js"), "utf8");
+  const m = client.match(/export const SAVINGS_PURPOSES\s*=\s*(\[[^\]]*\])/);
+  assert.ok(m, "the app's matchedCredit.js must export SAVINGS_PURPOSES");
+  assert.deepStrictEqual(JSON.parse(m[1].replace(/'/g, '"')), ["savings_fee"]);
+  assert.ok(/export const isSavingsRow/.test(client), "the app must export isSavingsRow");
+  assert.ok(/isExcludedFromReports[\s\S]*isSavingsRow\(t\)/.test(client), "report sums must drop savings rows");
+  assert.ok(!/savings_deposit|savings_withdrawal|savings_interest/.test(client), "the app must not know the dead purposes");
+});
+
+// ══ 6. THE SWITCH ══════════════════════════════════════════════════════════
+section("6. SAVINGS_ENABLED gates creation and deposits only, on the literal \"true\"");
+
+const sv = read("src/utils/savings.js");
+
+test("isEnabled only on the literal \"true\"", () => {
+  const prev = process.env.SAVINGS_ENABLED;
   try {
-    const raw = Buffer.from(JSON.stringify(EVENT));
-    assert.strictEqual(piggyvest.verifyWebhookSignature(raw, sign(raw, "")), false);
-    assert.strictEqual(piggyvest.isConfigured(), false);
-  } finally { if (prev !== undefined) process.env.PVB_SECRET_KEY = prev; }
+    delete process.env.SAVINGS_ENABLED;
+    assert.strictEqual(savings.isEnabled(), false);
+    process.env.SAVINGS_ENABLED = "true";
+    assert.strictEqual(savings.isEnabled(), true);
+    for (const v of ["1", "TRUE", "True", "yes", "on", " true", "true ", ""]) {
+      process.env.SAVINGS_ENABLED = v;
+      assert.strictEqual(savings.isEnabled(), false, `SAVINGS_ENABLED=${JSON.stringify(v)} must not enable`);
+    }
+  } finally { if (prev === undefined) delete process.env.SAVINGS_ENABLED; else process.env.SAVINGS_ENABLED = prev; }
 });
 
-test("a non-JSON body still verifies over the raw bytes only", () => withSecret(() => {
-  const raw = Buffer.from("not json at all");
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, sign(raw)), true);
-  assert.strictEqual(piggyvest.verifyWebhookSignature(raw, sign(Buffer.from("other"))), false);
-}));
-
-test("the route refuses a bad signature before parsing and never trusts the payload for money", () => {
-  const src = read("src/routes/piggyvestWebhook.js");
-  mustPrecede(src, "verifyWebhookSignature(raw, header)", "JSON.parse(raw", "webhook route");
-  assert.ok(/return res\.status\(401\)/.test(src), "bad signature must answer 401");
-  assert.ok(/piggyvest\.verifyTransaction\(movement\.reference\)/.test(src), "outflow events must re-verify with our own key");
-  assert.ok(!/eventData\.status|d\.status\s*===\s*["']success/.test(src), "the payload's status must not decide the outcome");
-  mustPrecede(src, "await handleEvent(evt)", "processedWebhook.create", "dedup marker is written after handling");
-  assert.ok(/PVB_VERIFY_WEBHOOK === "false" && process\.env\.NODE_ENV !== "production"/.test(src), "the verify bypass must be dev-only");
+test("createPot and depositToPot are gated; withdrawals, closing, the reserve and the loop run with the switch off", () => {
+  assert.ok(/if \(!isEnabled\(\)\) throw/.test(fnBody(sv, "async function createPot(")), "createPot not gated");
+  assert.ok(/if \(!isEnabled\(\)\) throw/.test(fnBody(sv, "async function depositToPot(")), "depositToPot not gated");
+  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function withdrawFromPot(")), "withdrawals must work with the switch off");
+  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function closePot(")), "closing must work with the switch off");
+  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function collectBreakFee(")), "the fee sweep must run with the switch off");
+  assert.ok(!/isEnabled\(\)|SAVINGS_ENABLED/.test(read("src/utils/savingsReconcile.js")), "the reconcile loop must run with the switch off");
+  assert.ok(!/isEnabled\(\)|SAVINGS_ENABLED/.test(read("src/utils/savingsReserve.js")), "the reserve must apply with the switch off");
+  assert.ok(!/isEnabled\(\)|SAVINGS_ENABLED/.test(read("src/utils/executeTransfer.js")), "the spend gate must apply with the switch off");
 });
 
-// ══ 9. KOBO MATHS ══════════════════════════════════════════════════════════
-section("9. naira ↔ kobo round-trips");
+// ══ 7. VIEWS ═══════════════════════════════════════════════════════════════
+section("7. what the app sees");
 
-test("toKoboInt / fromKobo round-trip 0.01 and 1234.56", () => {
-  assert.strictEqual(piggyvest.toKoboInt(0.01), 1);
-  assert.strictEqual(piggyvest.fromKobo(1), 0.01);
-  assert.strictEqual(piggyvest.toKoboInt(1234.56), 123456);
-  assert.strictEqual(piggyvest.fromKobo(123456), 1234.56);
-  assert.strictEqual(piggyvest.fromKobo(piggyvest.toKoboInt(1234.56)), 1234.56);
-  assert.strictEqual(piggyvest.toKoboInt(5000.01), 500001); // IEEE 5000.01*100 = 500001.00000000006
-  assert.strictEqual(piggyvest.toKoboInt(0.29), 29);        // 0.29*100 = 28.999999999999996
-});
-
-test("99.999 rounds to ₦100.00 (10000 kobo), never truncates to 9999", () => {
-  assert.strictEqual(piggyvest.toKoboInt(99.999), 10000);
-  assert.strictEqual(piggyvest.fromKobo(piggyvest.toKoboInt(99.999)), 100);
+test("publicPot: locked follows lockUntil vs now, balance is a number, nothing internal leaks", () => {
+  const base = { id: "p1", businessId: "b1", userId: "u1", name: "Rent", targetAmount: 100000, status: "active", balance: "2500.5", lockMode: "flexible", createdAt: T0, closedAt: null, updatedAt: T0 };
+  const open = savings.publicPot({ ...base, lockUntil: new Date(Date.now() + 86400000) });
+  assert.strictEqual(open.locked, true);
+  assert.strictEqual(open.balance, 2500.5);
+  assert.strictEqual(savings.publicPot({ ...base, lockUntil: new Date(Date.now() - 86400000) }).locked, false);
+  assert.strictEqual(savings.publicPot({ ...base, lockUntil: null }).locked, false);
+  assert.strictEqual(savings.publicPot({ ...base, balance: null }).balance, 0);
+  assert.ok(!("userId" in open) && !("updatedAt" in open), "publicPot must not echo internal columns");
+  assert.deepStrictEqual(Object.keys(open).sort(), ["balance", "businessId", "closedAt", "createdAt", "id", "lockMode", "lockUntil", "locked", "name", "status", "targetAmount"]);
+  assert.strictEqual(savings.publicPot(null), null);
 });
 
-test("garbage is zero, and fromKobo rounds a fractional kobo", () => {
-  assert.strictEqual(piggyvest.toKoboInt("abc"), 0);
-  assert.strictEqual(piggyvest.toKoboInt(null), 0);
-  assert.strictEqual(piggyvest.fromKobo(undefined), 0);
-  assert.strictEqual(piggyvest.fromKobo("123456"), 1234.56);
-  assert.strictEqual(piggyvest.fromKobo(100.4), 1);
+test("publicMovement: amount and fee are numbers, feeCollectedAt stays server-side", () => {
+  const m = savings.publicMovement({ id: "m1", potId: "p1", businessId: "b1", userId: "u1", type: "withdrawal", amount: "5000", fee: "100", status: "completed", reference: "kb_svw_abc", createdAt: T0, completedAt: T0, feeCollectedAt: T0 });
+  assert.strictEqual(m.amount, 5000);
+  assert.strictEqual(m.fee, 100);
+  assert.ok(!("feeCollectedAt" in m) && !("businessId" in m) && !("userId" in m));
+  assert.deepStrictEqual(Object.keys(m).sort(), ["amount", "completedAt", "createdAt", "fee", "id", "potId", "reference", "status", "type"]);
+  assert.strictEqual(savings.publicMovement({ id: "m2", amount: null, fee: undefined }).fee, 0);
+  assert.strictEqual(savings.publicMovement(null), null);
 });
 
-test("the wire body sends integer kobo", () => {
-  const src = read("src/services/piggyvest.js");
-  const body = fnBody(src, "async function transferToBank(");
-  assert.ok(/amount:\s*toKoboInt\(amount\)/.test(body), "transferToBank must send toKoboInt(amount)");
-  const fund = fnBody(src, "async function testFunding(");
-  assert.ok(/amount:\s*toKoboInt\(amount\)/.test(fund), "testFunding must send toKoboInt(amount)");
+test("reference prefixes are distinct and exported", () => {
+  assert.strictEqual(savings.DEPOSIT_REF_PREFIX, "kb_sv_");
+  assert.strictEqual(savings.WITHDRAWAL_REF_PREFIX, "kb_svw_");
+  assert.ok(!savings.WITHDRAWAL_REF_PREFIX.startsWith(savings.DEPOSIT_REF_PREFIX) || savings.DEPOSIT_REF_PREFIX !== savings.WITHDRAWAL_REF_PREFIX);
+  assert.ok(Number.isInteger(savings.MAX_POTS) && savings.MAX_POTS > 0);
 });
 
-// ══ 10. TRANSFER STATUS WORDS ══════════════════════════════════════════════
-section("10. unrecognised partner words are pending, never success");
-
-test("success words", () => {
-  for (const s of ["success", "SUCCESS", "Successful", "completed", "paid", "settled"]) assert.strictEqual(piggyvest.normaliseTransferStatus(s), "success", s);
-});
-test("failure words", () => {
-  for (const s of ["failed", "FAILURE", "reversed", "declined", "rejected", "cancelled", "canceled"]) assert.strictEqual(piggyvest.normaliseTransferStatus(s), "failed", s);
-});
-test("anything else is pending", () => {
-  for (const s of ["processing", "pending", "queued", "", null, undefined, "successs", "ok", 200]) assert.strictEqual(piggyvest.normaliseTransferStatus(s), "pending", String(s));
-});
-test("verifyTransaction maps a 404 or an empty record to not_found (never to failed by itself)", () => {
-  const src = read("src/services/piggyvest.js");
-  const body = fnBody(src, "async function verifyTransaction(");
-  assert.ok(/e\.status === 404\) return \{ status: "not_found"/.test(body), "404 → not_found");
-  assert.ok(/Object\.keys\(d\)\.length === 0\)\) return \{ status: "not_found"/.test(body), "empty data → not_found");
-  assert.ok(!/status: "failed"/.test(body), "verifyTransaction must not invent 'failed'");
-});
-
-// ══ 11. MIGRATION ↔ SCHEMA ═════════════════════════════════════════════════
-section("11. the tables the code writes are the tables the migration creates");
+// ══ 8. MIGRATION ↔ SCHEMA ══════════════════════════════════════════════════
+section("8. the tables the code writes are the tables the migration creates");
 
 const MIGRATION_DIR = path.join(ROOT, "prisma", "migrations", "20260929120000_savings");
 const migrationSql = fs.readFileSync(path.join(MIGRATION_DIR, "migration.sql"), "utf8");
 const schema = read("prisma/schema.prisma");
-const TABLES = ["SavingsProfile", "SavingsPot", "SavingsMovement"];
+const TABLES = ["SavingsPot", "SavingsMovement"];
+const SCALAR_TYPES = "String|Int|Float|DateTime|Boolean|Json";
 
-function migrationColumns(table) {
-  const head = `"${table}" (`;
+function tableBody(table) {
+  const head = `CREATE TABLE IF NOT EXISTS "${table}" (`;
   const open = migrationSql.indexOf(head);
-  assert.ok(open >= 0, `CREATE TABLE "${table}" missing from the migration`);
-  const body = migrationSql.slice(open + head.length, migrationSql.indexOf(`CONSTRAINT "${table}_pkey"`, open));
-  return new Set([...body.matchAll(/^\s*"(\w+)"\s+/gm)].map((m) => m[1]));
+  assert.ok(open >= 0, `CREATE TABLE IF NOT EXISTS "${table}" missing from the migration`);
+  const close = migrationSql.indexOf(`CONSTRAINT "${table}_pkey"`, open);
+  assert.ok(close > open, `${table}: no primary key constraint`);
+  return migrationSql.slice(open + head.length, close);
+}
+function migrationColumns(table) {
+  return new Map([...tableBody(table).matchAll(/^\s*"(\w+)"\s+([^,\n]+)/gm)].map((m) => [m[1], m[2].trim()]));
 }
 function modelBody(model) {
   const start = schema.indexOf(`model ${model} {`);
@@ -664,35 +429,47 @@ function modelBody(model) {
   return schema.slice(start, schema.indexOf("\n}", start));
 }
 function modelFields(model) {
-  return new Set([...modelBody(model).matchAll(/^\s+(\w+)\s+(String|Int|Float|DateTime|Boolean|Json)(\?|\[\])?(\s|$)/gm)].map((m) => m[1]));
+  // [ \t] not \s: \s crosses newlines, and a field with no attributes would
+  // then swallow the NEXT line as its attribute text.
+  return [...modelBody(model).matchAll(new RegExp(`^[ \\t]+(\\w+)[ \\t]+(${SCALAR_TYPES})(\\?|\\[\\])?(?:[ \\t]+([^\\n]*))?$`, "gm"))]
+    .map((m) => ({ field: m[1], type: m[2], optional: m[3] === "?", list: m[3] === "[]", attrs: m[4] || "" }));
 }
 
 for (const table of TABLES) {
   test(`${table}: every Prisma field has a column, and every column a field`, () => {
     const cols = migrationColumns(table);
     const fields = modelFields(table);
-    assert.ok(fields.size >= 5, `parsed too few fields for ${table}: ${[...fields]}`);
-    const missingCols = [...fields].filter((f) => !cols.has(f));
-    const missingFields = [...cols].filter((c) => !fields.has(c));
+    assert.ok(fields.length >= 5, `parsed too few fields for ${table}: ${fields.map((f) => f.field)}`);
+    const missingCols = fields.filter((f) => !cols.has(f.field)).map((f) => f.field);
+    const missingFields = [...cols.keys()].filter((c) => !fields.some((f) => f.field === c));
     assert.deepStrictEqual(missingCols, [], `fields with no column: ${missingCols}`);
     assert.deepStrictEqual(missingFields, [], `columns with no field: ${missingFields}`);
   });
 }
 
-test("column types agree with the model (Float ↔ DOUBLE PRECISION, Int ↔ INTEGER, DateTime ↔ TIMESTAMP, nullability)", () => {
+test("column types, nullability and defaults agree with the model", () => {
   const sqlType = { String: "TEXT", Int: "INTEGER", Float: "DOUBLE PRECISION", DateTime: "TIMESTAMP(3)", Boolean: "BOOLEAN", Json: "JSONB" };
   for (const table of TABLES) {
-    const head = `"${table}" (`;
-    const open = migrationSql.indexOf(head);
-    const body = migrationSql.slice(open + head.length, migrationSql.indexOf(`CONSTRAINT "${table}_pkey"`, open));
-    const colDefs = new Map([...body.matchAll(/^\s*"(\w+)"\s+([^,\n]+)/gm)].map((m) => [m[1], m[2].trim()]));
-    for (const m of modelBody(table).matchAll(/^\s+(\w+)\s+(String|Int|Float|DateTime|Boolean|Json)(\?)?(\s|$)/gm)) {
-      const [, field, type, optional] = m;
-      const def = colDefs.get(field);
-      assert.ok(def, `${table}.${field}: no column definition`);
-      assert.ok(def.startsWith(sqlType[type]), `${table}.${field}: model ${type} but column "${def}"`);
+    const cols = migrationColumns(table);
+    for (const f of modelFields(table)) {
+      const def = cols.get(f.field);
+      assert.ok(def, `${table}.${f.field}: no column definition`);
+      assert.ok(!f.list, `${table}.${f.field}: scalar lists are not expected here`);
+      assert.ok(def.startsWith(sqlType[f.type]), `${table}.${f.field}: model ${f.type} but column "${def}"`);
       const notNull = /NOT NULL/.test(def);
-      assert.strictEqual(notNull, !optional, `${table}.${field}: model ${optional ? "optional" : "required"} but column ${notNull ? "NOT NULL" : "nullable"}`);
+      assert.strictEqual(notNull, !f.optional, `${table}.${f.field}: model ${f.optional ? "optional" : "required"} but column ${notNull ? "NOT NULL" : "nullable"}`);
+      // @default("x") ↔ DEFAULT 'x'; @default(0) ↔ DEFAULT 0; @default(now()) ↔ DEFAULT CURRENT_TIMESTAMP.
+      // @default(uuid()) and @updatedAt are Prisma-side and have no SQL default.
+      const d = f.attrs.match(/@default\(("([^"]*)"|([\d.]+)|now\(\)|uuid\(\))\)/);
+      const sqlDefault = def.match(/DEFAULT\s+('([^']*)'|([\d.]+)|CURRENT_TIMESTAMP)/);
+      if (d && !/uuid\(\)/.test(d[0])) {
+        assert.ok(sqlDefault, `${table}.${f.field}: model has ${d[0]} but the column has no DEFAULT`);
+        if (d[2] !== undefined) assert.strictEqual(sqlDefault[2], d[2], `${table}.${f.field}: default differs`);
+        else if (d[3] !== undefined) assert.strictEqual(Number(sqlDefault[3]), Number(d[3]), `${table}.${f.field}: default differs`);
+        else assert.strictEqual(sqlDefault[1], "CURRENT_TIMESTAMP", `${table}.${f.field}: now() must be CURRENT_TIMESTAMP`);
+      } else if (!d) {
+        assert.ok(!sqlDefault, `${table}.${f.field}: column has ${sqlDefault && sqlDefault[0]} but the model has no @default`);
+      }
     }
   }
 });
@@ -705,7 +482,7 @@ test("Transaction.purpose is a nullable String in the model and ONE nullable TEX
   assert.ok(/^ALTER TABLE "Transaction" ADD COLUMN IF NOT EXISTS "purpose" TEXT;$/.test(alters[0].trim()), `unexpected ALTER: ${alters[0]}`);
 });
 
-test("the migration is additive: no DROP, no ALTER COLUMN, no RENAME, no TRUNCATE", () => {
+test("the migration is additive: no DROP, no ALTER COLUMN, no RENAME, no TRUNCATE, no DELETE, no UPDATE", () => {
   const code = migrationSql.replace(/--[^\n]*/g, "");
   assert.ok(!/\bDROP\b/i.test(code), "contains DROP");
   assert.ok(!/\bALTER\s+COLUMN\b/i.test(code), "contains ALTER COLUMN");
@@ -715,7 +492,7 @@ test("the migration is additive: no DROP, no ALTER COLUMN, no RENAME, no TRUNCAT
   assert.ok(!/\bUPDATE\s+"/i.test(code), "contains UPDATE");
 });
 
-test("ALTER TABLE touches only Transaction (ADD COLUMN IF NOT EXISTS) and the three new tables (FK constraints)", () => {
+test("ALTER TABLE touches only Transaction (ADD COLUMN IF NOT EXISTS) and the two new tables (FK constraints)", () => {
   const alters = [...migrationSql.matchAll(/ALTER TABLE\s+"(\w+)"\s*([\s\S]*?);/g)].map((m) => ({ table: m[1], rest: m[2].replace(/\s+/g, " ").trim() }));
   assert.ok(alters.length >= 1, "no ALTER TABLE found");
   for (const a of alters) {
@@ -728,9 +505,24 @@ test("ALTER TABLE touches only Transaction (ADD COLUMN IF NOT EXISTS) and the th
   }
 });
 
+test("exactly the two tables are created; SavingsProfile and every PiggyVest column are gone from migration and schema", () => {
+  const created = [...migrationSql.matchAll(/CREATE TABLE IF NOT EXISTS "(\w+)"/g)].map((m) => m[1]);
+  assert.deepStrictEqual(created.sort(), [...TABLES].sort());
+  for (const text of [migrationSql, schema]) {
+    assert.ok(!/SavingsProfile/.test(text), "SavingsProfile must not exist");
+    assert.ok(!/pvWalletId|pvAccountNumber|pvTxnId|pvCustomerId|backing|landedTransactionId|verifyMisses|lastVerifiedAt|interestAccrued/.test(text), "a PiggyVest-era column survived");
+  }
+  assert.ok(!/model Savings(?!Pot|Movement)\w*/.test(schema), "only SavingsPot and SavingsMovement may exist");
+  // The movement is lean: a deposit or withdrawal, already completed.
+  const mvCols = [...migrationColumns("SavingsMovement").keys()].sort();
+  assert.deepStrictEqual(mvCols, ["amount", "businessId", "completedAt", "createdAt", "fee", "feeCollectedAt", "id", "potId", "reference", "status", "type", "updatedAt", "userId"]);
+  const potCols = [...migrationColumns("SavingsPot").keys()].sort();
+  assert.deepStrictEqual(potCols, ["balance", "businessId", "closedAt", "createdAt", "id", "lockMode", "lockUntil", "name", "status", "targetAmount", "updatedAt", "userId"]);
+});
+
 test("every CREATE TABLE / INDEX is IF NOT EXISTS, and FKs are guarded by pg_constraint lookups (re-runnable)", () => {
   const creates = [...migrationSql.matchAll(/CREATE (?:UNIQUE )?(?:TABLE|INDEX)\b[^\n]*/g)].map((m) => m[0]);
-  assert.ok(creates.length >= 3 + 1, "too few CREATE statements");
+  assert.ok(creates.length >= TABLES.length + 1, "too few CREATE statements");
   for (const c of creates) assert.ok(/IF NOT EXISTS/.test(c), `not idempotent: ${c}`);
   const fkAdds = [...migrationSql.matchAll(/ADD CONSTRAINT "(\w+)"\s+FOREIGN KEY/g)].map((m) => m[1]);
   const guards = [...migrationSql.matchAll(/conname = '(\w+)'/g)].map((m) => m[1]);
@@ -760,53 +552,40 @@ test("unique and index names follow Prisma's <Table>_<cols>_key / _idx conventio
   assert.deepStrictEqual(missing, [], `schema indexes with no migration index: ${missing}`);
   assert.deepStrictEqual(extra, [], `migration indexes not in the schema: ${extra}`);
   for (const [k, v] of expected) assert.strictEqual(found.get(k).unique, v.unique, `${k}: uniqueness differs`);
+  assert.ok(expected.size >= 4, `expected the reference unique plus three indexes, parsed ${expected.size}`);
 });
 
-test("FK names follow <Table>_<col>_fkey and cover every @relation in the three models, with ON DELETE CASCADE", () => {
+test("FK names follow <Table>_<col>_fkey, point at the related model, cover every @relation, with ON DELETE CASCADE", () => {
   const expected = [];
   for (const table of TABLES) {
-    for (const m of modelBody(table).matchAll(/@relation\(fields:\s*\[(\w+)\],\s*references:\s*\[id\](?:,\s*onDelete:\s*(\w+))?/g)) {
-      expected.push({ name: `${table}_${m[1]}_fkey`, cascade: m[2] === "Cascade" });
+    for (const m of modelBody(table).matchAll(/^\s+(\w+)\s+(\w+)\s+@relation\(fields:\s*\[(\w+)\],\s*references:\s*\[id\](?:,\s*onDelete:\s*(\w+))?/gm)) {
+      expected.push({ name: `${table}_${m[3]}_fkey`, refTable: m[2], cascade: m[4] === "Cascade" });
     }
   }
-  assert.ok(expected.length >= 4, `expected at least 4 relations, parsed ${expected.length}`);
+  assert.strictEqual(expected.length, 3, `expected 3 relations (pot→business, movement→pot, movement→business), parsed ${expected.length}`);
   for (const e of expected) {
-    const re = new RegExp(`ADD CONSTRAINT "${e.name}"\\s+FOREIGN KEY \\("\\w+"\\) REFERENCES "\\w+"\\("id"\\)\\s+ON DELETE (\\w+)`);
+    const re = new RegExp(`ADD CONSTRAINT "${e.name}"\\s+FOREIGN KEY \\("\\w+"\\) REFERENCES "(\\w+)"\\("id"\\)\\s+ON DELETE (\\w+)`);
     const m = migrationSql.match(re);
     assert.ok(m, `FK ${e.name} missing from the migration`);
-    assert.strictEqual(m[1] === "CASCADE", e.cascade, `${e.name}: onDelete differs between schema and migration`);
+    assert.strictEqual(m[1], e.refTable, `${e.name}: references "${m[1]}", schema says ${e.refTable}`);
+    assert.strictEqual(m[2] === "CASCADE", e.cascade, `${e.name}: onDelete differs between schema and migration`);
+    assert.ok(e.cascade, `${e.name}: a business delete must take its pots and movements with it (the routes refuse while money remains)`);
   }
   const fkCount = countOf(migrationSql, "FOREIGN KEY");
   assert.strictEqual(fkCount, expected.length, `migration has ${fkCount} FKs, schema has ${expected.length} relations`);
 });
 
-test("the money-critical uniques exist in the model (a retry can never send or book twice)", () => {
+test("the money-critical unique exists: SavingsMovement.reference (a retried request can never book twice)", () => {
   const mv = modelBody("SavingsMovement");
   assert.ok(/^\s+reference\s+String\s+@unique/m.test(mv), "SavingsMovement.reference not @unique");
-  assert.ok(/^\s+pvTxnId\s+String\?\s+@unique/m.test(mv), "SavingsMovement.pvTxnId not @unique");
-  assert.ok(/^\s+transactionId\s+String\?\s+@unique/m.test(mv), "SavingsMovement.transactionId not @unique");
-  assert.ok(/^\s+landedTransactionId\s+String\?\s+@unique/m.test(mv), "SavingsMovement.landedTransactionId not @unique");
-  assert.ok(/^\s+pvWalletId\s+String\?\s+@unique/m.test(modelBody("SavingsPot")), "SavingsPot.pvWalletId not @unique");
-  assert.ok(/^\s+businessId\s+String\s+@unique/m.test(modelBody("SavingsProfile")), "SavingsProfile.businessId not @unique");
+  assert.ok(/CREATE UNIQUE INDEX IF NOT EXISTS "SavingsMovement_reference_key"\s+ON "SavingsMovement" \("reference"\)/.test(migrationSql), "unique index on reference missing");
+  assert.ok(/^\s+fee\s+Float\s+@default\(0\)/m.test(mv), "SavingsMovement.fee Float @default(0)");
+  assert.ok(/^\s+feeCollectedAt\s+DateTime\?/m.test(mv), "SavingsMovement.feeCollectedAt DateTime?");
+  assert.ok(/^\s+balance\s+Float\s+@default\(0\)/m.test(modelBody("SavingsPot")), "SavingsPot.balance Float @default(0)");
 });
 
-// ══ 12. REPORTING EXCLUDES SAVINGS, THE LEDGER KEEPS THEM ═════════════════
-section("12. savings rows are left out of reports and kept in the ledger, AML windows and the staff cap");
-
-test("moneySources exports the exclusion and isSavingsRow recognises only the four purposes", () => {
-  assert.deepStrictEqual(moneySources.NOT_SAVINGS, { purpose: null });
-  assert.strictEqual(moneySources.SQL_NOT_SAVINGS, 'AND "purpose" IS NULL');
-  assert.deepStrictEqual([...moneySources.SAVINGS_PURPOSES], ["savings_deposit", "savings_withdrawal", "savings_interest", "savings_fee"]);
-  assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_deposit" }), true);
-  assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_withdrawal" }), true);
-  assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_interest" }), true);
-  assert.strictEqual(moneySources.isSavingsRow({ purpose: "savings_fee" }), true);
-  assert.strictEqual(moneySources.isSavingsRow({ purpose: null }), false);
-  assert.strictEqual(moneySources.isSavingsRow({ purpose: "refund" }), false);
-  assert.strictEqual(moneySources.isSavingsRow({}), false);
-  assert.strictEqual(moneySources.isSavingsRow(null), false);
-  assert.ok(Object.isFrozen(moneySources.NOT_SAVINGS), "NOT_SAVINGS must be frozen (it is spread into many where clauses)");
-});
+// ══ 9. REPORTING EXCLUDES SAVINGS, THE LEDGER KEEPS THEM ═══════════════════
+section("9. savings rows are left out of reports and kept in the ledger, AML windows and the staff cap");
 
 const hasExclusion = (text) => /NOT_SAVINGS/.test(text) || /purpose:\s*null/.test(text);
 const REPORTING = [
@@ -819,8 +598,8 @@ for (const { file, minPrisma, minRaw } of REPORTING) {
   test(`${file}: every income/expense money aggregate over prisma.transaction carries NOT_SAVINGS`, () => {
     const src = read(file);
     // Money aggregates: sums and row lists that feed a figure. A `count` of
-    // outbound transfers (snapshots.js ops telemetry) is not a money figure and
-    // a savings deposit IS a real transfer, so counts are not in scope here.
+    // outbound transfers (snapshots.js ops telemetry) is not a money figure,
+    // so counts are not in scope here.
     const calls = transactionCalls(src).filter((c) => c.method !== "count" && /type:\s*"(income|expense)"/.test(c.arg));
     assert.ok(calls.length >= minPrisma, `expected at least ${minPrisma} income/expense aggregates, found ${calls.length}`);
     const bad = calls.filter((c) => !hasExclusion(c.arg));
@@ -869,8 +648,8 @@ test("ledgerReconcile.js (if present) keeps savings rows too", () => {
   assert.ok(!/NOT_SAVINGS|purpose/.test(fs.readFileSync(p, "utf8")), "ledgerReconcile filters on purpose");
 });
 
-// ══ 13. THE SPEND GATE ═════════════════════════════════════════════════════
-section("13. executeTransfer refuses to spend what is set aside, and stamps savings debits");
+// ══ 10. THE SPEND GATE ═════════════════════════════════════════════════════
+section("10. executeTransfer refuses to spend what is set aside, and knows nothing else about savings");
 
 const et = read("src/utils/executeTransfer.js");
 
@@ -883,361 +662,325 @@ test("the gate subtracts the reserve: getReservedBalance + netSpendable feed the
   assert.ok(/balance \+ MONEY_EPS < Number\(amount\) \+ totalCost/.test(before), "gate comparison changed");
   const after = et.slice(gateIdx, gateIdx + 300);
   assert.ok(/err\.reserved = reserved/.test(after), "INSUFFICIENT_BALANCE does not name the reserved amount");
+  assert.ok(/err\.availableBalance = balance/.test(after), "INSUFFICIENT_BALANCE does not name the spendable figure");
+  assert.ok(/err\.moneyMoved = false/.test(after), "INSUFFICIENT_BALANCE does not set moneyMoved = false");
   assert.ok(/^const \{ getReservedBalance, netSpendable \} = require\("\.\/savingsReserve"\);/m.test(et), "savingsReserve import");
+  // One gate: the reserve is read exactly once, next to the bank read.
+  assert.strictEqual(countOf(et, "getReservedBalance("), 1);
+  assert.ok(gateIdx < et.indexOf("anchor.createBookTransfer("), "the gate must precede the book transfer");
+  assert.ok(gateIdx < et.indexOf("anchor.createTransfer("), "the gate must precede the NIP transfer");
 });
 
-test("savingsReserve never imports executeTransfer (it is imported BY it)", () => {
-  const src = read("src/utils/savingsReserve.js");
-  assert.ok(!/require\(["'][^"']*executeTransfer/.test(src), "savingsReserve imports executeTransfer: circular");
-  assert.ok(/backing: "ledger", status: "active"/.test(src), "reserve must sum only ACTIVE LEDGER pots");
-});
-
-test("the Transaction row stores providerTxnId (Anchor transfer id) and purpose", () => {
+test("the Transaction row stores providerTxnId (Anchor transfer id) and the return carries it", () => {
   const createIdx = et.indexOf("prisma.transaction.create(");
+  assert.ok(createIdx > 0, "no prisma.transaction.create");
   const create = callArg(et, createIdx + "prisma.transaction.create".length);
   assert.ok(/providerTxnId:\s*providerTransferId/.test(create), "create does not store providerTxnId from providerTransferId");
-  assert.ok(/purpose:\s*purpose/.test(create), "create does not store purpose");
   assert.ok(/providerTransferId = nip\?\.transferId/.test(et), "NIP transfer id is not captured");
   assert.ok(/providerTransferId = book\?\.transferId/.test(et), "book transfer id is not captured");
-  assert.ok(/return \{ reference: ref, route, transactionId: txn\.id, transaction: txn, fee, providerTransferId \}/.test(et), "return does not carry providerTransferId");
+  assert.ok(/return \{ reference: ref, route, transactionId: txn\.id, transaction: txn, fee, totalCost, providerTransferId \}/.test(et), "return does not carry providerTransferId and totalCost");
 });
 
-test("only savings_deposit is an accepted purpose, and it skips the internal-route lookup", () => {
-  assert.ok(/if \(purpose && purpose !== "savings_deposit"\)/.test(et), "unknown purposes are not refused");
-  assert.ok(/err\.code = "BAD_PURPOSE"/.test(et));
-  assert.ok(/const internalDest = purpose === "savings_deposit" \? null : await prisma\.business\.findFirst/.test(et), "savings deposits must not book-route on a NUBAN collision");
+test("executeTransfer has NO purpose parameter, books no purpose, and routes nothing to a pot", () => {
+  const params = et.slice(et.indexOf("async function executeTransfer({"), et.indexOf("} = {}) {"));
+  assert.ok(params.length > 0 && params.length < 3000, "could not isolate the parameter list");
+  assert.ok(!/\bpurpose\b/.test(params), "executeTransfer must not accept a purpose");
+  const create = callArg(et, et.indexOf("prisma.transaction.create(") + "prisma.transaction.create".length);
+  assert.ok(!/\bpurpose\b/.test(create), "executeTransfer must not stamp a purpose (only the fee sweep does)");
+  assert.ok(!/BAD_PURPOSE|SAVINGS_DEST_USE_DEPOSIT|savingsPot|savingsMovement|savings_deposit/.test(et), "a PiggyVest-era branch survived");
+  assert.ok(/const internalDest = await prisma\.business\.findFirst\(/.test(et), "route detection must be unconditional again");
 });
 
-test("a plain send to one of the business's own pot accounts is refused BEFORE idempotency, routing and the bank", () => {
-  const guard = et.indexOf('err.code = "SAVINGS_DEST_USE_DEPOSIT"');
-  assert.ok(guard > 0, "no SAVINGS_DEST_USE_DEPOSIT guard");
-  const guardCall = et.lastIndexOf("prisma.savingsPot.findFirst", guard);
-  assert.ok(guardCall > 0 && guardCall < guard);
-  const guardArg = callArg(et, et.indexOf("(", guardCall));
-  assert.ok(/pvAccountNumber: String\(accountNumber\)/.test(guardArg), "guard must key on pvAccountNumber");
-  assert.ok(/businessId: business\.id/.test(guardArg), "guard must be scoped to THIS business");
-  assert.ok(/status: \{ not: "closed" \}/.test(guardArg), "guard must skip closed pots");
-  assert.ok(/if \(!purpose && accountNumber\)/.test(et), "guard must apply only to sends WITHOUT a purpose");
-  assert.ok(guard < et.indexOf('route: "idempotent_skip"'), "guard must run before the idempotency short-circuit");
-  assert.ok(guard < et.indexOf("const internalDest"), "guard must run before route detection");
-  assert.ok(guard < et.indexOf("anchor.getAccountBalance"), "guard must run before any Anchor call");
+test("savingsReserve never imports executeTransfer, sums only ACTIVE pots, and knows no pot backing", () => {
+  const src = read("src/utils/savingsReserve.js");
+  assert.ok(!/require\(["'][^"']*executeTransfer/.test(src), "savingsReserve imports executeTransfer: circular");
+  const agg = fnBody(src, "async function getReservedBalance(");
+  assert.ok(/savingsPot\.aggregate\(/.test(agg), "reserve must be one aggregate");
+  assert.ok(/where: \{ businessId, status: "active" \}/.test(agg), "reserve must sum only ACTIVE pots of THIS business");
+  assert.ok(/_sum: \{ balance: true \}/.test(agg));
+  assert.ok(/Math\.max\(0, Number\(agg\._sum\.balance \|\| 0\)\)/.test(agg), "an empty aggregate is zero, never NaN");
+  assert.ok(!/backing/.test(src), "there is one kind of pot now; a `backing` filter would be a query on a column that no longer exists");
+  const spend = fnBody(src, "async function getSpendableBalance(");
+  assert.ok(/source: "none"/.test(spend) && /spendable: 0/.test(spend), "no bank account → nothing spendable, not a throw");
+  assert.ok(/spendable: netSpendable\(gross, reserved\)/.test(spend));
 });
 
-// ══ 14. INBOUND CREDITS: CLASSIFY BEFORE BOOKING ═══════════════════════════
-section("14. both credit writers ask savingsCredit BEFORE prisma.transaction.create");
+// ══ 11. THE SERVICE ════════════════════════════════════════════════════════
+section("11. nothing moves: deposits and withdrawals are single guarded writes under the business lock");
 
-test("routes/anchor.js: classification precedes the repair block and the credit create; savings rows skip the matchers", () => {
-  const src = read("src/routes/anchor.js");
-  const classify = src.indexOf("classifyInboundCredit(biz, { amount, sender, narration })");
-  assert.ok(classify > 0, "webhook credit path does not call classifyInboundCredit");
-  const repair = src.indexOf('description: { contains: "Anonymous sender" }');
-  assert.ok(repair > 0 && classify < repair, "classification must precede the reconcile-repair block");
-  const creates = [...src.matchAll(/prisma\.transaction\.create\(/g)].map((m) => m.index);
-  const creditCreate = creates.find((i) => /purpose: "savings_withdrawal"/.test(callArg(src, i + "prisma.transaction.create".length)));
-  assert.ok(creditCreate !== undefined, "no credit create stamps purpose savings_withdrawal");
-  assert.ok(classify < creditCreate, "classification must precede the credit create");
-  const between = src.slice(classify, creditCreate);
-  assert.ok(!/withBusinessLock\(biz\.id, async \(\) => \{[\s\S]*classifyInboundCredit/.test(src.slice(0, classify + 100)), "classification must run outside the lock");
-  // The repair stamps purpose only when the poller's row is still untouched:
-  // a row a matcher already paid an invoice or a debt with is left alone and
-  // a human is alerted (SAVINGS_LANDING_CONFLICT).
-  assert.ok(/tagSavings \? \{ purpose: "savings_withdrawal" \}/.test(between), "the repair update must stamp purpose (when safe)");
-  assert.ok(/matchedSaleId \|\| full\?\.matchedCustomerId \|\| full\?\.matchedExpenseId \|\| invoicePaid/.test(between), "the repair must check for a prior match before re-tagging");
-  assert.ok(/SAVINGS_LANDING_CONFLICT/.test(between), "a conflicting repair must be audited");
-  // After the create: the savings branch returns before push-as-payment and the matchers.
-  const savingsBranch = src.indexOf("if (isSavings) {", creditCreate);
-  const matchers = src.indexOf("tryMatchInvoice(biz, amount", creditCreate);
-  const emailIdx = src.indexOf("sendTransactionEmail", creditCreate);
-  assert.ok(savingsBranch > 0 && matchers > 0 && savingsBranch < matchers, "savings branch must come before the invoice matcher");
-  assert.ok(savingsBranch < emailIdx, "savings branch must come before the credit email");
-  const branch = src.slice(savingsBranch, matchers);
-  assert.ok(/markLanded\(\{ movementId: savingsHit\.movementId, transactionId: createdRow\.id, amount \}\)/.test(branch), "savings branch must markLanded");
-  assert.ok(/balanceCache"\)\.adjustBalance\(biz\.id/.test(branch), "savings branch must still adjust the balance cache");
-  assert.ok(/\n\s+return;\n\s+\}/.test(branch), "savings branch must return before the payment treatment");
-  // The repaired path lands the movement too.
-  assert.ok(/markLanded\(\{ movementId: savingsHit\.movementId, transactionId: repaired\.id, amount \}\)/.test(src), "repair path must markLanded");
+test("savings.js calls no transfer path: the only Anchor call is the fee sweep's book transfer", () => {
+  // The header comment may NAME executeTransfer (the gate the reserve relies
+  // on); the code must never require or call it.
+  assert.ok(!/require\([^)]*executeTransfer|executeTransfer\(|anchor\.createTransfer\(|createCounterparty|verifyCounterparty|transferToBank/.test(sv), "a pot must never move money");
+  const anchorCalls = [...sv.matchAll(/\banchor\.(\w+)\(/g)].map((m) => m[1]);
+  assert.deepStrictEqual(anchorCalls, ["createBookTransfer"], `anchor calls in savings.js: ${anchorCalls}`);
+  const fee = fnBody(sv, "async function collectBreakFee(");
+  assert.ok(/anchor\.createBookTransfer\(/.test(fee), "the one book transfer must live in collectBreakFee");
+  assert.ok(!/anchor\.getAccountBalance/.test(fnBody(sv, "async function depositToPot(")), "the deposit reads the bank through getSpendableBalance only");
 });
 
-test("utils/anchorReconcile.js: classification precedes the create; savings rows get no compliance flag, push-as-payment or matcher", () => {
-  const src = read("src/utils/anchorReconcile.js");
-  const classify = src.indexOf("classifyInboundCredit(biz, { amount, sender, narration })");
-  const create = src.indexOf("prisma.transaction.create(");
-  assert.ok(classify > 0, "poller does not call classifyInboundCredit");
-  assert.ok(create > 0 && classify < create, "classification must precede prisma.transaction.create");
-  assert.strictEqual(countOf(src, "prisma.transaction.create("), 1, "the poller should have exactly one credit create");
-  const createArg = callArg(src, create + "prisma.transaction.create".length);
-  assert.ok(/isSavings \? \{ purpose: "savings_withdrawal" \}/.test(createArg), "create must stamp purpose");
-  // The ComplianceFlag row is written BEFORE the savings branch: a held or
-  // flagged savings landing must carry the flag the admin queue resolves it
-  // through, or it would stay held forever. The branch then returns before
-  // the push-as-payment and the matchers.
-  const branch = src.indexOf("if (isSavings) {", create);
-  const flag = src.indexOf("complianceFlag.create", create);
-  const push = src.indexOf("buildInboundNotification({", create);
-  const matcher = src.indexOf("tryMatchInvoice(biz, amount", create);
-  assert.ok(branch > 0 && flag > 0 && flag < branch, "the compliance flag must be written before the savings branch");
-  assert.ok(push > 0 && matcher > 0 && branch < push && branch < matcher, "savings branch must return before the payment push and the matchers");
-  const b = src.slice(branch, push);
-  assert.ok(/markLanded\(/.test(b) && /adjustBalance\(biz\.id/.test(b) && /continue;/.test(b), "savings branch must markLanded, adjust the cache and continue");
-  // An unattributed credit equal to an open withdrawal keeps the matchers off.
-  assert.ok(/possible_savings_landing/.test(src) && /if \(!maybeSavings\) await tryMatchInvoice/.test(src), "possible savings landings must skip the invoice matcher");
-});
-
-test("savingsCredit: markLanded is guarded on landedTransactionId null; candidates are un-landed PV withdrawals only", () => {
-  const src = read("src/utils/savingsCredit.js");
-  const landed = fnBody(src, "async function markLanded(");
-  assert.ok(/where: \{ id: movementId, landedTransactionId: null \}/.test(landed), "markLanded is not a guarded claim");
-  assert.ok(!/status:/.test(landed), "markLanded must not change status (verify does)");
-  const load = fnBody(src, "async function loadCandidates(");
-  assert.ok(/type: "withdrawal"/.test(load) && /backing: "piggyvest"/.test(load) && /landedTransactionId: null/.test(load), "loadCandidates filter");
-  // Open withdrawals always; completed-but-unlanded ones only for a week, so a
-  // single missed landing cannot make every later same-amount credit ambiguous.
-  assert.ok(/status: \{ in: \["processing", "unknown"\] \}/.test(load), "processing|unknown candidates");
-  assert.ok(/status: "completed", createdAt: \{ gte: weekAgo \}/.test(load), "completed candidates age out after a week");
-  const wrap = fnBody(src, "async function classifyInboundCredit(");
-  assert.ok(/catch \(e\)/.test(wrap) && /return \{ purpose: null \}/.test(wrap), "classifyInboundCredit must never throw (a credit must still book)");
-});
-
-// ══ 15. THE SERVICE'S CLAIMS ═══════════════════════════════════════════════
-section("15. state changes are guarded claims; the partner is never called twice for one reference");
-
-const sv = read("src/utils/savings.js");
-
-test("withdrawFromPot: the requested → processing claim precedes transferToBank, inside the business lock, after assertNotFrozen", () => {
-  const body = fnBody(sv, "async function withdrawFromPot(");
-  mustPrecede(body, "prisma.withBusinessLock(biz.id", "await assertNotFrozen(biz)", "withdraw");
-  mustPrecede(body, "await assertNotFrozen(biz)", "piggyvest.transferToBank(", "withdraw");
-  mustPrecede(body, 'where: { id: movement.id, status: "requested" }, data: { status: "processing" }', "piggyvest.transferToBank(", "withdraw");
-  assert.ok(/if \(claim\.count !== 1\) throw new SavingsError/.test(body), "the claim count is not checked");
-  assert.strictEqual(countOf(body, "piggyvest.transferToBank("), 1, "transferToBank must be called exactly once");
-  mustPrecede(body, "WITHDRAWAL_IN_FLIGHT", "piggyvest.transferToBank(", "withdraw");
-  assert.ok(/status: \{ in: \["requested", "processing", "unknown"\] \}/.test(body), "in-flight guard set");
-  mustPrecede(body, "lockAllows(fresh", "piggyvest.transferToBank(", "withdraw");
-  mustPrecede(body, "INTEREST_FORFEIT_CONFIRM", "piggyvest.transferToBank(", "withdraw");
-  assert.ok(/resolvePayoutTarget\(biz\)/.test(body), "payout target must be the merchant's own verified NUBAN");
-  // After the POST: a timeout/5xx parks the row as unknown, never re-sends.
-  const after = body.slice(body.indexOf("piggyvest.transferToBank("));
-  assert.ok(/status: "unknown"/.test(after), "a mid-flight failure must park the row as unknown");
-  assert.ok(/\[400, 401, 403, 404, 422\]\.includes\(Number\(e\.status\)\)/.test(after), "only definite 4xx fail the row");
-  assert.ok(!/status: "completed"/.test(after), "withdrawFromPot must never mark completed itself");
-});
-
-test("depositToPot: the movement row exists before executeTransfer, inside the lock, after assertNotFrozen and the AML checks", () => {
+test("depositToPot: lock → freeze check → idempotency → live spendable → one $transaction with a guarded claim", () => {
   const body = fnBody(sv, "async function depositToPot(");
   mustPrecede(body, "prisma.withBusinessLock(biz.id", "await assertNotFrozen(biz)", "deposit");
-  mustPrecede(body, "await assertNotFrozen(biz)", "executeTransfer({", "deposit");
-  mustPrecede(body, "await runChecks()", "prisma.savingsMovement.create(", "deposit (PV)");
-  const pv = body.slice(body.indexOf("// PiggyVest: a real NIP transfer"));
-  mustPrecede(pv, "prisma.savingsMovement.create(", "executeTransfer({", "deposit (PV)");
-  assert.ok(/status: "initiated", reference,/.test(pv), "PV deposit row is created as initiated with the reference");
-  assert.ok(/purpose: "savings_deposit"/.test(pv), "executeTransfer must be called with purpose savings_deposit");
-  assert.ok(/reference,\s*\n?\s*amlCheck/.test(pv) || /reference,/.test(pv), "the movement reference must be the transfer reference");
-  assert.strictEqual(countOf(body, "executeTransfer({"), 1, "executeTransfer must be called exactly once");
-  // Idempotency: existing reference returns the row, never re-sends.
-  mustPrecede(body, "prisma.savingsMovement.findUnique({ where: { reference } })", "executeTransfer({", "deposit");
+  mustPrecede(body, "await assertNotFrozen(biz)", "prisma.savingsMovement.findUnique({ where: { reference } })", "deposit");
+  mustPrecede(body, "prisma.savingsMovement.findUnique({ where: { reference } })", "getSpendableBalance(biz)", "deposit");
+  mustPrecede(body, "getSpendableBalance(biz)", "prisma.$transaction(async (px)", "deposit");
+  mustPrecede(body, "prisma.$transaction(async (px)", "px.savingsPot.updateMany({", "deposit");
+  assert.strictEqual(countOf(body, "prisma.$transaction("), 1, "one $transaction");
+  assert.strictEqual(countOf(body, "px.savingsPot.updateMany("), 1, "one claim");
+  assert.ok(/where: \{ id: fresh\.id, status: "active" \},\s*data: \{ balance: \{ increment: amt \} \}/.test(body), "deposit claim");
+  assert.ok(/if \(claim\.count !== 1\) throw new SavingsError/.test(body), "the claim count is not checked");
+  assert.ok(/px\.savingsMovement\.create\(/.test(body) && /type: "deposit", amount: amt, status: "completed", reference, completedAt: new Date\(\)/.test(body), "the movement row is written in the same $transaction, completed");
+  assert.ok(body.indexOf("px.savingsPot.updateMany(") < body.indexOf("px.savingsMovement.create("), "claim before the movement row");
+});
+
+test("depositToPot: BALANCE_UNAVAILABLE fails closed, spendable gates the amount, idempotency replays", () => {
+  const body = fnBody(sv, "async function depositToPot(");
+  assert.ok(/try \{ live = await getSpendableBalance\(biz\); \}/.test(body), "the bank read is wrapped");
+  assert.ok(/"BALANCE_UNAVAILABLE", 503/.test(body), "an unreadable bank must refuse with 503, never deposit on a guess");
+  assert.ok(/"NO_BANKING", 503/.test(body), "ANCHOR_NOT_CONFIGURED maps to NO_BANKING 503");
+  mustPrecede(body, "BALANCE_UNAVAILABLE", "prisma.$transaction(async (px)", "deposit");
+  assert.ok(/if \(live\.spendable \+ MONEY_EPS < amt\)/.test(body), "deposit must refuse beyond spendable (with the kobo tolerance)");
+  assert.ok(/"INSUFFICIENT_BALANCE", 400, \{ availableBalance: live\.spendable, reserved: live\.reserved \}/.test(body), "INSUFFICIENT_BALANCE names spendable and reserved");
   assert.ok(/return replayOutcome\(existing, amt, fresh\)/.test(body), "replay must go through replayOutcome");
-  // replayOutcome: a failed row answers with the ORIGINAL refusal, a different
-  // amount under the same key is a client bug, an in-flight row replays.
-  const ro = fnBody(sv, "function replayOutcome(");
-  assert.ok(/IDEMPOTENCY_MISMATCH/.test(ro) && /existing\.status === "failed"/.test(ro) && /replay: true/.test(ro), "replayOutcome contract");
-  // The `sent` write is a guarded claim so a webhook/reconcile settlement in
-  // flight is never dragged back to sent.
-  assert.ok(/where: \{ id: movement\.id, status: \{ in: \["initiated", "unknown"\] \} \},\s*data: \{\s*status: "sent"/.test(body), "sent must be a guarded claim");
-  // Outcome handling: pre-Anchor → failed, else unknown.
-  const after = body.slice(body.indexOf("executeTransfer({"));
-  mustPrecede(after, "if (isPreAnchorError(e))", 'status: "unknown"', "deposit outcome");
-  assert.ok(/where: \{ id: movement\.id, status: "initiated" \},\s*data: \{ status: "failed"/.test(after), "failed claim guarded on initiated");
-  assert.ok(/where: \{ id: movement\.id, status: "initiated" \},\s*data: \{ status: "unknown"/.test(after), "unknown claim guarded on initiated");
+  assert.ok(/IDEMPOTENCY_REUSED/.test(body), "a key reused on another pot is refused");
+  mustPrecede(body, "IDEMPOTENCY_REUSED", "return replayOutcome(existing, amt, fresh)", "deposit");
+  assert.ok(/fresh\.businessId !== biz\.id/.test(body), "the pot must belong to the business (re-checked under the lock)");
+  assert.ok(/fresh\.status !== "active"/.test(body), "only an active pot takes money");
 });
 
-test("ledger deposit and withdrawal are single guarded updateMany claims inside $transaction, with the balance gate", () => {
-  const dbody = fnBody(sv, "async function depositToPot(");
-  const ledgerDep = dbody.slice(dbody.indexOf('if (fresh.backing === "ledger")'), dbody.indexOf("// PiggyVest: a real NIP transfer"));
-  assert.ok(/getSpendableBalance\(biz\)/.test(ledgerDep), "ledger deposit must read the live spendable balance");
-  assert.ok(/BALANCE_UNAVAILABLE/.test(ledgerDep), "ledger deposit must fail closed when the bank is unreachable");
-  assert.ok(/live\.spendable \+ MONEY_EPS < amt/.test(ledgerDep), "ledger deposit must refuse beyond spendable");
-  assert.ok(/where: \{ id: fresh\.id, status: "active", backing: "ledger" \},\s*data: \{ balance: \{ increment: amt \} \}/.test(ledgerDep), "ledger deposit claim");
-  assert.ok(/if \(claim\.count !== 1\) throw/.test(ledgerDep), "ledger deposit claim count check");
-  assert.ok(/prisma\.\$transaction\(async \(px\)/.test(ledgerDep), "ledger deposit must be one $transaction");
-  const wbody = fnBody(sv, "async function withdrawFromPot(");
-  const ledgerW = wbody.slice(wbody.indexOf('if (fresh.backing === "ledger")'), wbody.indexOf("// PiggyVest."));
-  assert.ok(/status: "active", backing: "ledger", balance: \{ gte: amt - MONEY_EPS \}/.test(ledgerW), "ledger withdrawal claim must require balance >= amount");
-  assert.ok(/balance: \{ decrement: amt \}/.test(ledgerW), "ledger withdrawal decrements");
-  assert.ok(/if \(claim\.count !== 1\) throw/.test(ledgerW), "ledger withdrawal claim count check");
+test("withdrawFromPot: lock → freeze check → idempotency → lockAllows → one guarded claim with the balance predicate", () => {
+  const body = fnBody(sv, "async function withdrawFromPot(");
+  mustPrecede(body, "prisma.withBusinessLock(biz.id", "await assertNotFrozen(biz)", "withdraw");
+  mustPrecede(body, "await assertNotFrozen(biz)", "prisma.savingsMovement.findUnique({ where: { reference } })", "withdraw");
+  mustPrecede(body, "prisma.savingsMovement.findUnique({ where: { reference } })", "lockAllows(fresh", "withdraw");
+  mustPrecede(body, "lockAllows(fresh", "px.savingsPot.updateMany({", "withdraw");
+  mustPrecede(body, "lockAllows(fresh", "prisma.$transaction(async (px)", "withdraw");
+  assert.ok(/lockAllows\(fresh, \{ confirmEarly \}\)/.test(body), "lockAllows must see the merchant's confirmation");
+  assert.strictEqual(countOf(body, "px.savingsPot.updateMany("), 1, "one claim");
+  assert.ok(/where: \{ id: fresh\.id, status: "active", balance: \{ gte: amt - MONEY_EPS \} \},\s*data: \{ balance: \{ decrement: amt \} \}/.test(body), "withdrawal claim must require balance >= amount and decrement it");
+  assert.ok(/if \(claim\.count !== 1\) throw new SavingsError\(/.test(body) && /INSUFFICIENT_POT_BALANCE/.test(body), "the claim count is checked and named");
+  assert.ok(/type: "withdrawal", amount: amt, fee, status: "completed", reference, completedAt: new Date\(\)/.test(body), "the movement row carries the fee and is completed");
+  assert.ok(/updatedPot\.balance < 0 && updatedPot\.balance > -MONEY_EPS/.test(body), "a sub-kobo negative is clamped to zero, a real negative is not hidden");
+  assert.ok(/return replayOutcome\(existing, amt, fresh\)/.test(body), "replay must go through replayOutcome");
 });
 
-test("SAVINGS_ENABLED gates creation and deposits only", () => {
-  assert.ok(/if \(!isEnabled\(\)\) throw/.test(fnBody(sv, "async function createPot(")), "createPot not gated");
-  assert.ok(/if \(!isEnabled\(\)\) throw/.test(fnBody(sv, "async function depositToPot(")), "depositToPot not gated");
-  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function withdrawFromPot(")), "withdrawals must work with the switch off");
-  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function closePot(")), "closing must work with the switch off");
-  assert.ok(!/isEnabled\(\)/.test(read("src/utils/savingsReconcile.js")), "the reconcile loop must run with the switch off");
-  assert.ok(!/isEnabled\(\)|SAVINGS_ENABLED/.test(read("src/utils/savingsReserve.js")), "the reserve must apply with the switch off");
-  const prev = process.env.SAVINGS_ENABLED;
-  delete process.env.SAVINGS_ENABLED;
-  assert.strictEqual(savings.isEnabled(), false);
-  process.env.SAVINGS_ENABLED = "true";
-  assert.strictEqual(savings.isEnabled(), true);
-  process.env.SAVINGS_ENABLED = "1";
-  assert.strictEqual(savings.isEnabled(), false, "only the literal 'true' enables");
-  if (prev === undefined) delete process.env.SAVINGS_ENABLED; else process.env.SAVINGS_ENABLED = prev;
+test("withdrawFromPot: the fee is charged on early withdrawals only, quoted in the confirmation, swept at once", () => {
+  const w = fnBody(sv, "async function withdrawFromPot(");
+  assert.ok(/const breakFee = lock\.early \|\| lock\.code === "EARLY_WITHDRAWAL_CONFIRM" \? computeBreakFee\(amt\) : \{ fee: 0, bps: 0 \}/.test(w), "the fee is computed for the quote and the charge, nothing else");
+  assert.ok(/const fee = lock\.early \? breakFee\.fee : 0/.test(w), "fee only when the lock is broken early");
+  // feeBps is 0 whenever nothing will be charged, so the app never shows a
+  // rate for a free withdrawal.
+  assert.ok(/\{ lockUntil: fresh\.lockUntil, fee: breakFee\.fee, feeBps: breakFee\.fee > 0 \? breakFee\.bps : 0 \}/.test(w), "EARLY_WITHDRAWAL_CONFIRM carries the fee and the rate (0 when free)");
+  assert.ok(/lock\.code === "POT_LOCKED" \? 423 : 409/.test(w), "POT_LOCKED is 423, the confirmation ask is 409");
+  mustPrecede(w, "if (!lock.ok) {", "const fee = lock.early ? breakFee.fee : 0", "withdraw");
+  assert.ok(/if \(fee > 0\) \{\s*await collectBreakFee\(result\.movement\.id\)\.catch\(/.test(w), "the sweep runs right after the withdrawal and never fails it");
+  mustPrecede(w, "prisma.$transaction(async (px)", "await collectBreakFee(result.movement.id)", "withdraw");
+  assert.ok(/early: !!lock\.early, fee \}/.test(w), "the audit row names early and the fee");
 });
 
-test("applyWithdrawalOutcome claims only from processing|unknown and resets the miss streak on a terminal state", () => {
-  const body = fnBody(sv, "async function applyWithdrawalOutcome(");
-  assert.ok(/where: \{ id: movement\.id, status: \{ in: \["processing", "unknown"\] \} \},\s*data: \{\s*status: decision\.next/.test(body), "terminal claim not guarded");
-  assert.ok(/if \(r\.count !== 1\) return null/.test(body), "terminal claim count not checked");
-  assert.ok(/verifyMisses: 0/.test(body), "terminal state must reset misses");
+test("collectBreakFee: feeCollectedAt is claimed BEFORE the book transfer, the row is a savings_fee expense, a failure stays claimed", () => {
+  const body = fnBody(sv, "async function collectBreakFee(");
+  const claim = "where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() }";
+  mustPrecede(body, claim, "anchor.createBookTransfer(", "break fee");
+  assert.ok(/if \(claim\.count !== 1\) return false/.test(body), "the claim count is checked");
+  assert.strictEqual(countOf(body, "anchor.createBookTransfer("), 1, "exactly one book transfer");
+  // Nothing to collect, or nowhere to collect it → out before the claim.
+  mustPrecede(body, 'mv.type !== "withdrawal" || mv.status !== "completed" || !(Number(mv.fee) > 0) || mv.feeCollectedAt', claim, "break fee");
+  mustPrecede(body, "process.env.ANCHOR_FEE_ACCOUNT_ID", claim, "break fee");
+  mustPrecede(body, "if (!biz?.anchorAccountId) return false", claim, "break fee");
+  // The transfer and its ledger row.
+  const xfer = callArg(body, body.indexOf("(", body.indexOf("anchor.createBookTransfer(")));
+  assert.ok(/fromAccountId: biz\.anchorAccountId/.test(xfer) && /toAccountId: feeAccount/.test(xfer) && /amount: fee/.test(xfer), "merchant → fee account, the fee");
+  assert.ok(/reference,/.test(xfer) && /const reference = `\$\{mv\.reference\}_bfee`/.test(body), "the sweep's reference derives from the movement's (Anchor dedups on it)");
+  const create = callArg(body, body.indexOf("(", body.indexOf("prisma.transaction.create(")));
+  assert.ok(/purpose: "savings_fee"/.test(create), "the fee row carries purpose savings_fee");
+  assert.ok(/type: "expense"/.test(create) && /category: "transfer"/.test(create) && /paymentMethod: "bank"/.test(create) && /source: "anchor"/.test(create), "the fee row is a bank expense the ledger counts");
+  assert.ok(/providerTxnId: book\?\.transferId/.test(create), "the fee row stores Anchor's transfer id");
+  assert.ok(/amount: fee/.test(create));
+  assert.ok(/e\.code !== "P2002"/.test(body), "a duplicate ledger row (retry) is tolerated");
+  assert.ok(/adjustBalance\(biz\.id, -fee\)/.test(body), "the balance cache drops by the fee");
+  // Failure: alert + audit, never un-claim, never retry.
+  const after = body.slice(body.indexOf("} catch (e) {"));
+  assert.ok(/SAVINGS_BREAK_FEE_FAILED/.test(after) && /severity: "alert"/.test(after), "a failed sweep is audited at alert severity");
+  assert.ok(/fireAlert\(`savings-break-fee-\$\{mv\.id\}`/.test(after), "a failed sweep pages a human");
+  assert.ok(!/feeCollectedAt: null \}/.test(after), "a failed sweep must stay claimed (never charged twice)");
+  assert.ok(/return false/.test(after), "a failed sweep returns false");
+  assert.ok(/const fee = Math\.round\(Number\(mv\.fee\) \* 100\) \/ 100/.test(body), "the swept fee is the stored fee, to the kobo");
 });
 
-test("createPot (PiggyVest): the pot row is written provisioning with no wallet id BEFORE createSubAccount, and createSubAccount is called once", () => {
-  const body = fnBody(sv, "async function createPot(");
-  mustPrecede(body, 'status: "provisioning"', "piggyvest.createSubAccount(", "createPot");
-  assert.strictEqual(countOf(body, "piggyvest.createSubAccount("), 1);
-  mustPrecede(body, "ensureProfile(biz, user)", "piggyvest.createSubAccount(", "createPot");
-  assert.ok(/status: "provisioning", \.\.\.lock \}/.test(body), "PV pot row must be created as provisioning");
-  const after = body.slice(body.indexOf("piggyvest.createSubAccount("));
-  assert.ok(!/status: "active"/.test(after), "createPot must not activate a PV pot itself (activatePot does, after the funding account resolves)");
+test("closePot: under the lock, only an empty, active pot, by a guarded claim", () => {
+  const body = fnBody(sv, "async function closePot(");
+  mustPrecede(body, "prisma.withBusinessLock(pot.businessId", "toKobo(fresh.balance) > 0", "close");
+  assert.ok(/"POT_NOT_EMPTY", 409/.test(body), "a pot with money cannot be closed");
+  mustPrecede(body, "POT_NOT_EMPTY", 'where: { id: pot.id, status: "active" }', "close");
+  assert.ok(/status: "closed", balance: 0, closedAt: new Date\(\)/.test(body));
+  assert.ok(/if \(r\.count !== 1\) throw new SavingsError/.test(body), "the close claim count is checked");
 });
 
-test("activatePot fails closed to error when the wallet bank cannot be mapped to an Anchor code", () => {
-  const body = fnBody(sv, "async function activatePot(");
-  assert.ok(/anchor\.getBanks\(\)/.test(body) && /matchBankCode\(banks, acct\.bankName\)/.test(body), "must map via Anchor's bank list");
-  const noCode = body.slice(body.indexOf("if (!code) {"), body.indexOf("if (!code) {") + 400);
-  assert.ok(/status: "error"/.test(noCode), "unmapped bank must set error");
-  assert.ok(/where: \{ id: pot\.id, status: "provisioning" \}/.test(body), "activation is a guarded claim on provisioning");
+test("assertNotFrozen checks the business and the owner, and runs inside the lock on both money paths", () => {
+  const body = fnBody(sv, "async function assertNotFrozen(");
+  assert.ok(/biz\?\.accountStatus && biz\.accountStatus !== "active"/.test(body), "business freeze");
+  assert.ok(/owner\?\.accountStatus && owner\.accountStatus !== "active"/.test(body), "owner freeze");
+  assert.strictEqual(countOf(body, '"FROZEN", 423'), 2);
+  for (const fn of ["depositToPot", "withdrawFromPot"]) {
+    const b = fnBody(sv, `async function ${fn}(`);
+    assert.ok(b.indexOf("prisma.withBusinessLock(biz.id") < b.indexOf("await assertNotFrozen(biz)"), `${fn}: freeze check must be inside the lock`);
+  }
 });
 
-test("ensureProfile: KYC tier, email, phone and BVN gates before the partner call; BVN is never logged", () => {
-  const body = fnBody(sv, "async function ensureProfile(");
-  mustPrecede(body, "resolveBusinessLimits(biz)", "piggyvest.createCustomer(", "ensureProfile");
-  mustPrecede(body, "!user?.email || !user?.phone", "piggyvest.createCustomer(", "ensureProfile");
-  mustPrecede(body, "decrypt(biz.kycBvn)", "piggyvest.createCustomer(", "ensureProfile");
-  assert.ok(!/console\.\w+\([^)]*bvn/i.test(body), "BVN must not be logged");
-  assert.ok(!/metadata: \{[^}]*bvn/i.test(body), "BVN must not be audited");
-  assert.ok(/thirdPartyId: user\.id/.test(body), "third_party_identifier must be our user id");
-  assert.ok(/returnIfExist=true/.test(fnBody(read("src/services/piggyvest.js"), "async function createCustomer(")), "createCustomer must be idempotent by returnIfExist");
+test("amounts are positive, 2-dp numbers; references derive from the client key with a per-prefix namespace", () => {
+  const va = fnBody(sv, "function validateAmount(");
+  assert.ok(/if \(!\(n > 0\)\) throw/.test(va) && /if \(!money2dp\(n\)\) throw/.test(va));
+  assert.ok(/const depositRef = \(key\) => keyedRef\(DEPOSIT_REF_PREFIX, key\)/.test(sv));
+  assert.ok(/const withdrawalRef = \(key\) => keyedRef\(WITHDRAWAL_REF_PREFIX, key\)/.test(sv));
+  assert.ok(/replace\(\/\[\^a-zA-Z0-9\]\/g, ""\)\.slice\(0, 40\)/.test(sv), "the client key is sanitised and bounded");
+  assert.ok(/crypto\.randomBytes\(8\)\.toString\("hex"\)/.test(sv), "a missing key gets a random reference (no accidental replay)");
 });
 
-// ══ 16. THE PARTNER CLIENT ═════════════════════════════════════════════════
-section("16. PiggyVest POSTs that move money or create wallets are single-attempt");
-
-test("transferToBank uses attempts: 1", () => {
-  const src = read("src/services/piggyvest.js");
-  const body = fnBody(src, "async function transferToBank(");
-  assert.ok(/attempts:\s*1\b/.test(body), "transferToBank is not single-attempt");
-  assert.ok(/method:\s*"POST"/.test(body));
-});
-
-test("createSubAccount uses attempts: 1", () => {
-  const src = read("src/services/piggyvest.js");
-  const body = fnBody(src, "async function createSubAccount(");
-  assert.ok(/attempts:\s*1\b/.test(body), "createSubAccount is not single-attempt");
-});
-
-test("pvbFetch defaults to one attempt and only retries transient failures; a 200 with status:false is a failure", () => {
-  const src = read("src/services/piggyvest.js");
-  assert.ok(/attempts = 1/.test(fnBody(src, "async function pvbFetch(")), "pvbFetch must default to attempts = 1");
-  assert.ok(/if \(attempt === attempts \|\| !isTransient\(err\)\) throw err/.test(src), "non-transient errors must not be retried");
-  assert.ok(/!res\.ok \|\| data\?\.status === false/.test(src), "envelope status:false must be a failure");
-  assert.strictEqual(piggyvest.isTransient({ status: 500 }), true);
-  assert.strictEqual(piggyvest.isTransient({ status: 429 }), true);
-  assert.strictEqual(piggyvest.isTransient({ status: 400 }), false);
-  assert.strictEqual(piggyvest.isTransient({ status: 404 }), false);
-  assert.strictEqual(piggyvest.isTransient({ code: "ETIMEDOUT" }), true);
-  assert.strictEqual(piggyvest.isTransient(new Error("fetch failed")), true);
-  assert.strictEqual(piggyvest.isTransient(new Error("boom")), false);
-});
-
-test("a timeout surfaces as ETIMEDOUT (unknown), not as 'not sent'", () => {
-  const src = read("src/services/piggyvest.js");
-  assert.ok(/e\?\.name === "AbortError"[\s\S]{0,300}err\.code = "ETIMEDOUT"/.test(src), "AbortError must map to ETIMEDOUT");
-});
-
-test("testFunding refuses in production", () => {
-  const src = read("src/services/piggyvest.js");
-  assert.ok(/NODE_ENV === "production"[\s\S]{0,200}PVB_TEST_ONLY/.test(fnBody(src, "async function testFunding(")));
-});
-
-// ══ 17. THE ROUTE ══════════════════════════════════════════════════════════
-section("17. owner only, PIN before money, AML inside the lock, OTP whitelist");
+// ══ 12. THE ROUTE ══════════════════════════════════════════════════════════
+section("12. owner only, PIN before money, no AML, no OTP");
 
 const rt = read("src/routes/savings.js");
 
 test("router is auth + requireUnfrozen + ownerOnly for every endpoint", () => {
   const head = rt.slice(0, rt.indexOf('router.get("/"'));
+  assert.ok(head.length > 0, "router.get(\"/\") not found");
   assert.ok(/router\.use\(auth\);/.test(head), "auth middleware");
   assert.ok(/router\.use\(requireUnfrozen\);/.test(head), "requireUnfrozen middleware");
   assert.ok(/router\.use\(ownerOnly\(/.test(head), "ownerOnly middleware");
+  mustPrecede(head, "router.use(auth);", "router.use(requireUnfrozen);", "route order");
+  mustPrecede(head, "router.use(requireUnfrozen);", "router.use(ownerOnly(", "route order");
+  assert.ok(/const \{ ownerOnly \} = require\("\.\.\/middleware\/requirePermission"\)/.test(head), "ownerOnly from requirePermission");
+  assert.ok(!/requirePermission\(/.test(rt), "no per-permission grant can reach savings: owner only");
 });
 
-test("deposit: checkPin precedes depositToPot", () => {
+test("deposit: checkPin precedes depositToPot, a failed PIN stops the handler", () => {
   const body = handlerBody(rt, "post", "/pots/:id/deposit");
   mustPrecede(body, "await checkPin(req, res)", "savings.depositToPot(", "deposit route");
   assert.ok(/if \(!\(await checkPin\(req, res\)\)\) return;/.test(body), "a failed PIN must stop the handler");
+  assert.ok(/savings\.depositToPot\(\{ biz, user: \{ id: req\.user\.id \}, pot, amount, idempotencyKey, req \}\)/.test(body), "depositToPot call shape");
+  assert.ok(/replay: !!result\.replay/.test(body), "the response says when it is a replay");
 });
 
-test("withdraw: checkPin precedes withdrawFromPot", () => {
+test("withdraw: checkPin precedes withdrawFromPot, confirmEarly is a strict boolean", () => {
   const body = handlerBody(rt, "post", "/pots/:id/withdraw");
   mustPrecede(body, "await checkPin(req, res)", "savings.withdrawFromPot(", "withdraw route");
   assert.ok(/if \(!\(await checkPin\(req, res\)\)\) return;/.test(body), "a failed PIN must stop the handler");
-  assert.ok(/confirmEarly: confirmEarly === true/.test(body) && /acceptInterestForfeit: acceptInterestForfeit === true/.test(body), "confirmations must be strict booleans");
+  assert.ok(/confirmEarly: confirmEarly === true/.test(body), "confirmEarly must be a strict boolean");
+  assert.ok(!/acceptInterestForfeit/.test(rt), "there is no interest to forfeit any more");
+  assert.ok(/replay: !!result\.replay/.test(body));
 });
 
 test("checkPin audits PIN_FAILED and uses verifyTransactionPin", () => {
   const body = fnBody(rt, "async function checkPin(");
   assert.ok(/verifyTransactionPin\(req\.user\.id, req\.body\?\.pin\)/.test(body));
   assert.ok(/action: "PIN_FAILED"/.test(body));
+  assert.ok(/return false/.test(body) && /return true/.test(body));
 });
 
-test("deposit: the AML pipeline runs through runChecks (inside the lock) with the OTP_REQUIRED whitelist", () => {
-  const body = handlerBody(rt, "post", "/pots/:id/deposit");
-  assert.ok(/runPreTransferChecks\(\{ req, user: owner, business: biz, amount: Number\(amount\), otp \}\)/.test(body), "runPreTransferChecks call");
-  assert.ok(/amlCheck\.code === "OTP_REQUIRED" && amlCheck\.otpTarget/.test(body), "OTP dispatch on OTP_REQUIRED");
-  assert.ok(/dispatchOtp\(amlCheck\.otpTarget, TRANSFER_OTP_TYPE/.test(body), "dispatchOtp with the transfer OTP type");
-  // Whitelist: the response body carries otpIdentifier (masked) and never otpTarget.
-  const outcome = body.slice(body.indexOf("body: { error: amlCheck.error"), body.indexOf("body: { error: amlCheck.error") + 200);
-  assert.ok(/otpIdentifier/.test(outcome), "OTP outcome must carry otpIdentifier");
-  assert.ok(!/otpTarget/.test(outcome), "OTP outcome must NOT leak otpTarget");
-  assert.ok(!/\.\.\.amlCheck/.test(body), "amlCheck must never be spread into a response");
-  // The service runs runChecks inside withBusinessLock, before the movement row.
-  const svc = fnBody(sv, "async function depositToPot(");
-  mustPrecede(svc, "prisma.withBusinessLock(biz.id", "await runChecks()", "service");
-  mustPrecede(svc, "await runChecks()", "prisma.savingsMovement.create(", "service");
-});
-
-test("the route never exposes the funding account of a pot that is not active, nor the BVN", () => {
+test("no AML pipeline, no OTP, no BVN, no partner in the route", () => {
+  assert.ok(!/runPreTransferChecks|dispatchOtp|amlChecks|TRANSFER_OTP_TYPE|otpTarget|otpIdentifier/.test(rt), "the route must not run the transfer AML/OTP pipeline");
   assert.ok(!/kycBvn|bvn/i.test(rt), "route file must not touch the BVN");
-  const pub = fnBody(sv, "function publicPot(");
-  assert.ok(/pot\.backing === "piggyvest" && pot\.status === "active" && pot\.pvAccountNumber/.test(pub), "fundingAccount only on active PV pots");
+  assert.ok(!/profile|ensureProfile|SavingsProfile/i.test(rt), "no partner profile");
 });
 
-// ══ 18. WIRING ═════════════════════════════════════════════════════════════
-section("18. loop, heartbeat, delete guard, match guard, server mounts");
+test("GET /savings reports the switch, the reserve and the break-fee schedule; a pot id is scoped to the caller's business", () => {
+  const body = handlerBody(rt, "get", "/");
+  assert.ok(/enabled: savings\.isEnabled\(\)/.test(body));
+  assert.ok(/totals: \{ saved, reserved \}/.test(body));
+  assert.ok(/breakFee: breakFeeView\(\)/.test(body));
+  assert.ok(/status: \{ not: "closed" \}/.test(body), "closed pots are not listed");
+  const load = fnBody(rt, "async function loadPot(");
+  assert.ok(/pot\.businessId !== String\(businessId\)/.test(load) && /loadBusiness\(req, pot\.businessId\)/.test(load), "loadPot must prove the pot belongs to a business the caller owns");
+  assert.ok(/userId: req\.user\.id/.test(fnBody(rt, "async function loadBusiness(")), "loadBusiness must scope to the owner");
+  const errs = fnBody(rt, "function sendError(");
+  assert.ok(/stack: _s, name: _n, \.\.\.extra/.test(errs), "SavingsError extras (fee, lockUntil, availableBalance) reach the app; the stack never does");
+});
 
-test('withCronLock(4014) / SAVINGS_RECONCILE_LOCK = 4014 appears exactly once, and 4014 is not another loop\'s key', () => {
-  const rec = read("src/utils/savingsReconcile.js");
+// ══ 13. WIRING ═════════════════════════════════════════════════════════════
+section("13. loop, heartbeat, delete guards, balance readers, match guard, server mounts");
+
+const rec = read("src/utils/savingsReconcile.js");
+
+test("withCronLock(4014) / SAVINGS_RECONCILE_LOCK = 4014 appears exactly once, and 4014 is not another loop's key", () => {
   assert.strictEqual(countOf(rec, "SAVINGS_RECONCILE_LOCK = 4014"), 1, "SAVINGS_RECONCILE_LOCK = 4014 must appear once");
+  assert.strictEqual(countOf(rec, "4014"), 2, "4014 appears in the constant and the header comment only");
   assert.ok(/withCronLock\(SAVINGS_RECONCILE_LOCK,/.test(rec), "the loop must take the cron lock");
+  assert.strictEqual(countOf(rec.replace(/\/\/[^\n]*/g, ""), "withCronLock("), 1, "one cron lock (code, not the header comment)");
   const others = ["server.js", ...fs.readdirSync(path.join(SRC, "utils")).map((f) => `src/utils/${f}`)].filter((f) => f !== "src/utils/savingsReconcile.js" && f.endsWith(".js"));
   // Code only: server.js mentions 4014 in a comment next to the loop start.
   for (const f of others) assert.ok(!/\.withCronLock\(\s*4014/.test(read(f)), `${f} also locks 4014`);
   assert.strictEqual(countOf(read("server.js").replace(/\/\/[^\n]*/g, ""), "4014"), 0, "server.js code must not use 4014 itself");
+});
+
+test("the loop heartbeats \"savings-reconcile\" on success and on error, and never overlaps itself", () => {
   assert.ok(/recordHeartbeat\("savings-reconcile", "ok"\)/.test(rec), "heartbeat on success");
-  assert.ok(/fireAlert\("savings-pvb-auth"/.test(rec), "auth failures must alert");
+  assert.ok(/recordHeartbeat\("savings-reconcile", "error"/.test(rec), "heartbeat on error");
+  const loop = fnBody(rec, "function startSavingsReconcileLoop(");
+  assert.ok(/if \(running\) return;/.test(loop) && /running = false/.test(loop), "re-entrancy guard");
+  assert.ok(/setInterval\(tick, intervalMs\)/.test(loop) && /return \(\) => clearInterval\(t\)/.test(loop));
+  assert.ok(/module\.exports = \{ reconcileSavings, startSavingsReconcileLoop, SAVINGS_RECONCILE_LOCK \}/.test(rec));
 });
 
-test('healthCheck.js knows the "savings-reconcile" heartbeat', () => {
-  assert.ok(/"savings-reconcile":\s*\d+/.test(read("src/utils/healthCheck.js")));
+test("the loop does exactly three things: uncollected break fees, pot drift, over-reserve", () => {
+  const body = fnBody(rec, "async function reconcileSavings(");
+  assert.ok(/stats = \{ feesCollected: 0, drift: 0, overReserved: 0, errors: 0 \}/.test(body), "stats shape");
+  // 1. fee backstop
+  assert.ok(/type: "withdrawal", status: "completed", fee: \{ gt: 0 \}, feeCollectedAt: null/.test(body), "backstop selects completed withdrawals with an unswept fee");
+  assert.ok(/savings\.collectBreakFee\(m\.id\)/.test(body), "the backstop goes through collectBreakFee (which claims first)");
+  // 2. drift, compared in kobo
+  assert.ok(/inK - outK !== toKobo\(pot\.balance\)/.test(body), "drift compares in kobo");
+  assert.ok(/fireAlert\(`savings-ledger-drift-\$\{pot\.id\}`/.test(body), "drift alerts");
+  assert.ok(/status: "completed"/.test(body), "only completed movements count");
+  // 3. over-reserve
+  assert.ok(/Number\(r\._sum\.balance\) > gross \+ MONEY_EPS/.test(body), "over-reserve compares against the bank with the kobo tolerance");
+  assert.ok(/fireAlert\(`savings-overreserved-\$\{biz\.id\}`/.test(body), "over-reserve alerts");
+  assert.ok(/action: "SAVINGS_OVERRESERVED"/.test(body) && /severity: "alert"/.test(body), "over-reserve is audited");
+  assert.ok(/e\.code === "ANCHOR_NOT_CONFIGURED"\) break/.test(body), "an unconfigured bank stops the reserve check, not the loop");
+  // No partner: no verify, no inflow pairing, no interest, no wallet.
+  assert.ok(!/verifyTransaction|pairInflows|interest|wallet|inflow|applyWithdrawalOutcome|activatePot/i.test(body), "a PiggyVest-era pass survived");
+  assert.ok(!/updateMany|\.update\(|\.create\(/.test(body), "the loop only reads, sweeps through collectBreakFee, and alerts; it never edits a pot");
 });
 
-test("routes/auth.js: the delete-account guard refuses while a pot holds money or a movement is in flight", () => {
+test('healthCheck.js knows the "savings-reconcile" heartbeat at the loop\'s cadence', () => {
+  const hc = read("src/utils/healthCheck.js");
+  const m = hc.match(/"savings-reconcile":\s*(\d+)/);
+  assert.ok(m, 'healthCheck.js lacks "savings-reconcile"');
+  const minutes = Number(m[1]);
+  const loopMinutes = Number(read("server.js").match(/startSavingsReconcileLoop\((\d+) \* 60 \* 1000\)/)?.[1]);
+  assert.ok(loopMinutes > 0, "server.js must start the loop with an explicit minute interval");
+  assert.ok(minutes >= loopMinutes, `healthCheck expects a heartbeat every ${minutes} min but the loop runs every ${loopMinutes}`);
+});
+
+test("routes/auth.js: /delete-account refuses while a pot holds money, and /me reports features.savings", () => {
   const src = read("src/routes/auth.js");
-  assert.ok(/prisma\.savingsPot\.findFirst\(\{ where: \{ businessId: \{ in: bizIds \}, status: \{ not: "closed" \}, balance: \{ gt: 0\.004 \} \}/.test(src), "pot balance guard");
-  assert.ok(/prisma\.savingsMovement\.count\(\{ where: \{ businessId: \{ in: bizIds \}, status: \{ in: \["initiated", "sent", "requested", "processing", "unknown", "needs_review"\] \} \}/.test(src), "in-flight movement guard");
-  assert.ok(/code: "SAVINGS_REMAINING"/.test(src), "SAVINGS_REMAINING code");
+  const body = handlerBody(src, "post", "/delete-account");
+  assert.ok(/prisma\.savingsPot\.findFirst\(\{\s*where: \{ businessId: \{ in: bizIds \}, status: \{ not: "closed" \}, balance: \{ gt: 0\.004 \} \}/.test(body), "pot balance guard");
+  assert.ok(/code: "SAVINGS_REMAINING"/.test(body), "SAVINGS_REMAINING code");
+  mustPrecede(body, 'code: "SAVINGS_REMAINING"', "prisma.$transaction(", "delete-account: the guard must run before anything is deleted");
+  assert.ok(!/savingsMovement/.test(body), "there are no in-flight movements to wait for any more");
   assert.ok(/savings: process\.env\.SAVINGS_ENABLED === "true"/.test(src), "features.savings");
-  assert.ok(/savingsInterest: process\.env\.SAVINGS_ENABLED === "true" && !!process\.env\.PVB_SECRET_KEY/.test(src), "features.savingsInterest");
+  assert.ok(!/savingsInterest/.test(src), "features.savingsInterest is gone");
+});
+
+test("routes/businesses.js: DELETE /:id refuses while a pot holds money; the balance route reports spendable", () => {
+  const bz = read("src/routes/businesses.js");
+  const del = handlerBody(bz, "delete", "/:id");
+  assert.ok(/prisma\.savingsPot\.findFirst\(\{\s*where: \{ businessId: req\.params\.id, status: \{ not: "closed" \}, balance: \{ gt: 0\.004 \} \}/.test(del), "pot balance guard");
+  assert.ok(/code: "SAVINGS_REMAINING"/.test(del), "SAVINGS_REMAINING code");
+  mustPrecede(del, 'code: "SAVINGS_REMAINING"', "prisma.business.deleteMany(", "DELETE /:id: the guard must run before the delete");
+  const bal = handlerBody(bz, "get", "/:id/balance");
+  assert.ok(/balance: netSpendable\(gross, reserved\), grossBalance: gross, savingsReserved: reserved/.test(bal), "businesses balance route");
+  assert.ok(/getReservedBalance\(biz\.id\)/.test(bal), "the reserve is read fresh, never cached");
+  assert.ok(/balance: 0, grossBalance: 0, savingsReserved: 0, hasAccount: false/.test(bal), "no account → zeros");
+});
+
+test("routes/transfers.js and salaryRunner.js pay from spendable", () => {
+  const tr = read("src/routes/transfers.js");
+  assert.ok(/getSpendableBalance\(biz\)/.test(tr) && /balance: spendable, grossBalance: gross, savingsReserved: reserved/.test(tr), "transfers balance route");
+  const sr = read("src/utils/salaryRunner.js");
+  assert.ok(/getSpendableBalance\(biz\)\)\.spendable/.test(sr), "salary runner must pay from spendable");
 });
 
 test("routes/transactions.js: both match loaders refuse savings rows", () => {
@@ -1251,107 +994,58 @@ test("routes/transactions.js: both match loaders refuse savings rows", () => {
   assert.ok(/isSavingsRow\s*\}\s*=\s*require\("\.\.\/config\/moneySources"\)/.test(src), "isSavingsRow must come from moneySources");
 });
 
-test("server.js: /webhooks/piggyvest is mounted with express.raw BEFORE express.json; /savings is mounted behind apiLimiter; the loop is started", () => {
+test("server.js: /savings is mounted behind apiLimiter, the loop is started, and there is no PiggyVest webhook", () => {
   const src = read("server.js");
-  const mount = src.indexOf('"/webhooks/piggyvest"');
-  const json = src.indexOf("app.use(express.json(");
-  assert.ok(mount > 0, "webhook not mounted");
-  assert.ok(json > 0 && mount < json, "webhook must be mounted before express.json");
-  const block = src.slice(src.lastIndexOf("app.use(", mount), src.indexOf(");", mount));
-  assert.ok(/express\.raw\(/.test(block), "webhook mount lacks express.raw");
-  assert.ok(/webhookLimiter/.test(block), "webhook mount lacks webhookLimiter");
-  assert.ok(/piggyvestWebhook/.test(block), "webhook mount does not use routes/piggyvestWebhook");
   assert.ok(/app\.use\("\/savings", apiLimiter\)/.test(src), "/savings must be rate limited");
   assert.ok(/app\.use\("\/savings", require\("\.\/src\/routes\/savings"\)\)/.test(src), "/savings router not mounted");
-  assert.ok(/startSavingsReconcileLoop\(/.test(src), "reconcile loop not started");
   assert.ok(src.indexOf('app.use("/savings", apiLimiter)') < src.indexOf('app.use("/savings", require('), "limiter must precede the router");
+  assert.ok(/require\("\.\/src\/utils\/savingsReconcile"\)\.startSavingsReconcileLoop\(/.test(src), "reconcile loop not started");
+  assert.ok(!/webhooks\/piggyvest|piggyvestWebhook/i.test(src), "the PiggyVest webhook must be gone");
+  assert.ok(!/express\.raw\([^)]*\)[^\n]*savings/i.test(src), "nothing savings-related takes a raw body");
 });
 
-test("validateEnv.js refuses a foreign PVB host and a disabled webhook check in production", () => {
-  const src = read("src/utils/validateEnv.js");
-  assert.ok(/api\.piggyvest\.business/.test(src), "live host check");
-  assert.ok(/PVB_VERIFY_WEBHOOK === "false"/.test(src), "webhook bypass check");
+// ══ 14. THE PARTNER IS GONE ════════════════════════════════════════════════
+section("14. nothing of the PiggyVest integration is left");
+
+test("the removed modules do not exist", () => {
+  for (const rel of ["src/services/piggyvest.js", "src/routes/piggyvestWebhook.js", "src/utils/savingsCredit.js"]) {
+    assert.ok(!fs.existsSync(path.join(ROOT, rel)), `${rel} still exists`);
+  }
 });
 
-test("balance readers report spendable and expose gross + reserved", () => {
-  const tr = read("src/routes/transfers.js");
-  assert.ok(/getSpendableBalance\(biz\)/.test(tr) && /balance: spendable, grossBalance: gross, savingsReserved: reserved/.test(tr), "transfers balance route");
-  const bz = read("src/routes/businesses.js");
-  assert.ok(/balance: netSpendable\(gross, reserved\), grossBalance: gross, savingsReserved: reserved/.test(bz), "businesses balance route");
-  const sr = read("src/utils/salaryRunner.js");
-  assert.ok(/getSpendableBalance\(biz\)\)\.spendable/.test(sr), "salary runner must pay from spendable");
-});
+// "piggyvest" is matched case-insensitively (the partner's name in any
+// spelling). The rest are identifiers and are matched exactly: the audit
+// actions SAVINGS_DEPOSIT / SAVINGS_WITHDRAWAL are the live feature's own
+// names and are not the dead purposes savings_deposit / savings_withdrawal.
+const FORBIDDEN = [
+  { label: "piggyvest (any case)", re: /piggyvest/i },
+  { label: "pvWalletId", re: /pvWalletId/ },
+  { label: "savingsCredit", re: /savingsCredit/ },
+  { label: "savings_withdrawal", re: /savings_withdrawal/ },
+  { label: "savings_deposit", re: /savings_deposit/ },
+  { label: "savings_interest", re: /savings_interest/ },
+];
+const SWEEP_FILES = [path.join(ROOT, "server.js"), ...walk(SRC)];
 
-// ══ 19. BREAKING A FLEXIBLE LOCK ═══════════════════════════════════════════
-section("19. breaking a flexible lock costs 2%, at least ₦100, never more than the amount, and is swept once");
+for (const { label, re } of FORBIDDEN) {
+  test(`no file under src/ or server.js mentions ${label}`, () => {
+    const hits = [];
+    for (const f of SWEEP_FILES) {
+      const lines = linesMatching(fs.readFileSync(f, "utf8"), re);
+      for (const l of lines) hits.push(`${path.relative(ROOT, f).replace(/\\/g, "/")}:${l}`);
+    }
+    assert.deepStrictEqual(hits, [], `found in: ${hits.join(", ")}`);
+  });
+}
 
-const fees = require("../src/config/fees");
-
-test("2% of the amount, to the kobo", () => {
-  process.env.ANCHOR_FEE_ACCOUNT_ID = process.env.ANCHOR_FEE_ACCOUNT_ID || "fee-acct-test";
-  delete process.env.SAVINGS_BREAK_FEE_BPS; delete process.env.SAVINGS_BREAK_FEE_MIN;
-  assert.strictEqual(fees.computeBreakFee(100_000).fee, 2_000);
-  assert.strictEqual(fees.computeBreakFee(12_345.67).fee, 246.91);
-  assert.strictEqual(fees.computeBreakFee(50_000).bps, 200);
-});
-
-test("floored at ₦100, capped at the amount itself", () => {
-  assert.strictEqual(fees.computeBreakFee(1_000).fee, 100);
-  assert.strictEqual(fees.computeBreakFee(4_999).fee, 100);
-  assert.strictEqual(fees.computeBreakFee(5_000).fee, 100);
-  assert.strictEqual(fees.computeBreakFee(5_050).fee, 101);
-  assert.strictEqual(fees.computeBreakFee(60).fee, 60, "a ₦60 withdrawal cannot cost ₦100");
-  assert.strictEqual(fees.computeBreakFee(0).fee, 0);
-  assert.strictEqual(fees.computeBreakFee(-5).fee, 0);
-});
-
-test("the numbers come from env, within sane bounds", () => {
-  process.env.SAVINGS_BREAK_FEE_BPS = "300"; process.env.SAVINGS_BREAK_FEE_MIN = "50";
-  assert.strictEqual(fees.computeBreakFee(10_000).fee, 300);
-  assert.strictEqual(fees.computeBreakFee(1_000).fee, 50);
-  process.env.SAVINGS_BREAK_FEE_BPS = "5000"; // 50%: a typo, not a policy
-  assert.strictEqual(fees.computeBreakFee(10_000).bps, 200);
-  process.env.SAVINGS_BREAK_FEE_BPS = "0";
-  assert.strictEqual(fees.computeBreakFee(10_000).fee, 0, "0 bps switches the fee off");
-  assert.strictEqual(fees.computeBreakFee(10_000).enabled, false);
-  delete process.env.SAVINGS_BREAK_FEE_BPS; delete process.env.SAVINGS_BREAK_FEE_MIN;
-});
-
-test("no fee account, no fee: a charge nothing can collect is never made", () => {
-  const prev = process.env.ANCHOR_FEE_ACCOUNT_ID;
-  delete process.env.ANCHOR_FEE_ACCOUNT_ID;
-  assert.strictEqual(fees.computeBreakFee(100_000).fee, 0);
-  assert.strictEqual(fees.computeBreakFee(100_000).enabled, false);
-  process.env.ANCHOR_FEE_ACCOUNT_ID = prev;
-});
-
-test("collectBreakFee claims feeCollectedAt BEFORE the book transfer, books a savings_fee row, and never retries by itself", () => {
-  const body = fnBody(sv, "async function collectBreakFee(");
-  mustPrecede(body, "where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() }", "anchor.createBookTransfer(", "break fee");
-  assert.ok(/if \(claim\.count !== 1\) return false/.test(body), "the claim count is checked");
-  assert.ok(/purpose: "savings_fee"/.test(body), "the fee row carries purpose savings_fee");
-  assert.ok(/category: "transfer"/.test(body) && /type: "expense"/.test(body), "the fee row is a bank expense the ledger counts");
-  assert.ok(/mv\.backing === "piggyvest" && !mv\.landedTransactionId\) return false/.test(body), "a PiggyVest fee waits for the landing");
-  assert.ok(/SAVINGS_BREAK_FEE_FAILED/.test(body) && !/feeCollectedAt: null \}/.test(body.slice(body.indexOf("catch (e)"))), "a failed sweep alerts and stays claimed");
-  assert.strictEqual(countOf(body, "anchor.createBookTransfer("), 1);
-});
-
-test("the fee is charged on early withdrawals only, carried in the confirmation, and swept from the landing", () => {
-  const w = fnBody(sv, "async function withdrawFromPot(");
-  assert.ok(/const fee = lock\.early \? breakFee\.fee : 0/.test(w), "fee only when the lock is broken early");
-  assert.ok(/\{ lockUntil: fresh\.lockUntil, fee: breakFee\.fee, feeBps: breakFee\.bps \}/.test(w), "EARLY_WITHDRAWAL_CONFIRM carries the fee");
-  assert.ok(/if \(fee > 0\) \{\s*await collectBreakFee\(result\.movement\.id\)/.test(w), "ledger withdrawal sweeps at once");
-  const credit = read("src/utils/savingsCredit.js");
-  assert.ok(/require\("\.\/savings"\)\.collectBreakFee\(movementId\)/.test(fnBody(credit, "async function markLanded(")), "markLanded sweeps the fee");
-  const rec = read("src/utils/savingsReconcile.js");
-  assert.ok(/feeCollectedAt: null/.test(rec) && /savings\.collectBreakFee\(m\.id\)/.test(rec), "the reconcile loop is the backstop");
-});
-
-test("savings_fee is a savings purpose on both sides, so reports skip it and the ledger keeps it", () => {
-  assert.ok(moneySources.SAVINGS_PURPOSES.includes("savings_fee"));
-  assert.ok(moneySources.isSavingsRow({ purpose: "savings_fee" }));
-  const client = fs.readFileSync(path.join(ROOT, "..", "src", "utils", "matchedCredit.js"), "utf8");
-  assert.ok(/"savings_fee"/.test(client), "the app's SAVINGS_PURPOSES must list savings_fee");
+test("no live code reads a PiggyVest env var, and the env validator has forgotten it", () => {
+  const hits = [];
+  for (const f of SWEEP_FILES) {
+    const lines = linesMatching(fs.readFileSync(f, "utf8"), /PVB_|PIGGY/);
+    for (const l of lines) hits.push(`${path.relative(ROOT, f).replace(/\\/g, "/")}:${l}`);
+  }
+  assert.deepStrictEqual(hits, [], `found in: ${hits.join(", ")}`);
+  assert.ok(!/PVB_|piggy/i.test(read("src/utils/validateEnv.js")));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

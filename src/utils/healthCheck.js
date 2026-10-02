@@ -29,10 +29,8 @@ const CRON_INTERVAL_MIN = {
   // beat was written "ok" before the call and the loop 401'd for hours
   // behind a green health page.
   "fincra-reconcile": 5,
-  // Savings: a loop that stops means deposits never complete and withdrawals
-  // never settle, with merchants staring at "processing". Same rule: an
-  // "error" beat (a dead PiggyVest key) reads as stale.
-  "savings-reconcile": 5,
+  // Savings integrity: uncollected break fees, pot drift, over-reserve.
+  "savings-reconcile": 30,
 };
 
 async function pingDb() {

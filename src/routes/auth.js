@@ -611,10 +611,8 @@ router.get("/me", authMiddleware, async (req, res) => {
         // so the tile and the API can never disagree.
         features: {
           fcy: process.env.FCY_ENABLED === "true",
-          // Savings pots: SAVINGS_ENABLED opens creation and deposits; the
-          // interest (PiggyVest) option additionally needs the partner keys.
+          // Savings pots: SAVINGS_ENABLED opens creation and deposits.
           savings: process.env.SAVINGS_ENABLED === "true",
-          savingsInterest: process.env.SAVINGS_ENABLED === "true" && !!process.env.PVB_SECRET_KEY,
         },
         accountType: safe.accountType.toLowerCase(),
         settings: {
@@ -784,22 +782,19 @@ router.post("/delete-account", authMiddleware, async (req, res) => {
     const anchor = require("../utils/anchor");
     const { getProvider } = require("../providers");
     const { computeLedgerBalance } = require("../utils/ledgerBalance");
-    // Savings guard: a pot with money in it, or a movement still settling,
-    // is money the deletion would strand (a PiggyVest wallet nobody can
-    // reach; a reserve with no account behind it). Checked before the bank
+    // Savings guard: a pot with money in it is money the deletion would
+    // strand (a reserve with no account behind it). Checked before the bank
     // balance so the message names the right thing to do first.
     const bizIds = businesses.map((b) => b.id);
     if (bizIds.length) {
-      const [potWithMoney, inflight] = await Promise.all([
-        prisma.savingsPot.findFirst({ where: { businessId: { in: bizIds }, status: { not: "closed" }, balance: { gt: 0.004 } }, select: { name: true } }),
-        prisma.savingsMovement.count({ where: { businessId: { in: bizIds }, status: { in: ["initiated", "sent", "requested", "processing", "unknown", "needs_review"] } } }),
-      ]);
-      if (potWithMoney || inflight > 0) {
+      const potWithMoney = await prisma.savingsPot.findFirst({
+        where: { businessId: { in: bizIds }, status: { not: "closed" }, balance: { gt: 0.004 } },
+        select: { name: true },
+      });
+      if (potWithMoney) {
         return res.status(400).json({
           code: "SAVINGS_REMAINING",
-          error: potWithMoney
-            ? `Your savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first, then delete your account.`
-            : "A savings deposit or withdrawal is still being processed. Wait for it to finish, then delete your account.",
+          error: `Your savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first, then delete your account.`,
         });
       }
     }
@@ -1227,7 +1222,6 @@ router.get("/staff", authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────
 router.post("/staff", authMiddleware, async (req, res) => {
   if (req.user.accountType === "staff") return res.status(403).json({ error: "Forbidden: Staff cannot create staff" });
-  if (req.user.plan !== "PREMIUM") return res.status(403).json({ error: "Staff accounts require a Pro plan. Upgrade to add team members.", code: "PRO_REQUIRED" });
 
   // Staff sign in with an identifier — phone OR email works for /auth/login,
   // so either is enough here. The client form offers both.
@@ -1292,11 +1286,10 @@ router.post("/staff", authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────
 // PATCH /auth/staff/:id/permissions
 //
-// The grant surface. Three gates, and all three are deliberate:
+// The grant surface. Two gates, and both are deliberate:
 //   1. owner-only        — a staff member must never be able to widen their own
 //                          access, nor a colleague's
-//   2. Pro plan          — staff are a paid feature; permissions are part of it
-//   3. transaction PIN   — the same proof required to move money, because
+//   2. transaction PIN   — the same proof required to move money, because
 //                          granting canTransfer IS granting the ability to move
 //                          money. A password-authenticated session that has been
 //                          left open on a shop counter must not be enough.
@@ -1306,19 +1299,6 @@ router.patch("/staff/:id/permissions", authMiddleware, async (req, res) => {
     return res.status(403).json({ error: "Only the business owner can change staff permissions.", code: "OWNER_ONLY" });
 
   const { pin, permissions = {}, dailyTransferCap } = req.body || {};
-
-  // Pro gates GRANTING, never REVOKING.
-  //
-  // A flat plan check here creates a trap: enforcement in authMiddleware does
-  // not care about the plan, so when a subscription lapses the staff member
-  // keeps every capability — including sending money — while the owner is
-  // locked out of the only screen that could take it away. Their own billing
-  // status must never be able to strand them with access they want removed.
-  const wantsAny =
-    permissions.canViewBalance === true || permissions.canTransfer === true ||
-    permissions.canViewReports === true || permissions.canManagePayables === true;
-  if (req.user.plan !== "PREMIUM" && wantsAny)
-    return res.status(403).json({ error: "Staff permissions require a Pro plan.", code: "PRO_REQUIRED" });
 
   try {
     const staff = await prisma.user.findUnique({

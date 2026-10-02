@@ -57,12 +57,6 @@ router.post("/", validateCustomer, async (req, res) => {
       if (!owned) return res.status(403).json({ error: "Forbidden" });
     }
 
-    if (req.user.effectivePlan !== "PREMIUM") {
-      const count = await prisma.customer.count({ where: { userId } });
-      if (count >= 20) {
-        return res.status(403).json({ error: "Free plan allows up to 20 customers. Upgrade to Pro for unlimited customers." });
-      }
-    }
     let customer;
     if (trimmedPhone) {
       // Use upsert so a duplicate phone returns the existing customer instead of crashing

@@ -156,12 +156,6 @@ router.get("/", async (req, res) => {
 //                  accountNumber, bankCode, bankName, pin }
 router.post("/", async (req, res) => {
   try {
-    if (req.user.plan !== "PREMIUM") {
-      return res.status(403).json({
-        error: "Staff payments need a Pro plan.",
-        code: "PRO_REQUIRED",
-      });
-    }
     const {
       businessId, staffUserId, amount, frequency = "monthly",
       anchorDay, accountNumber, bankCode, bankName, pin,

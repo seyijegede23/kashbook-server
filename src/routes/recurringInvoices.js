@@ -1,4 +1,4 @@
-// Recurring invoices — PREMIUM. CRUD for the rules; the daily cron
+// Recurring invoices. CRUD for the rules; the daily cron
 // (utils/recurringInvoiceRunner.js) turns due rules into real SENT invoices.
 const router = require("express").Router();
 const prisma = require("../utils/db");
@@ -56,12 +56,6 @@ router.get("/", async (req, res) => {
 // POST /recurring-invoices { businessId, customerId?, description, amount, frequency, dueInDays?, startDate? }
 router.post("/", async (req, res) => {
   try {
-    if (req.user.effectivePlan !== "PREMIUM") {
-      return res.status(403).json({
-        error: "Recurring invoices are a Premium feature. Upgrade to automate your repeat billing.",
-        code: "PREMIUM_REQUIRED",
-      });
-    }
     const uid = ownerId(req);
     const { businessId, customerId, startDate } = req.body;
     const description = String(req.body.description || "").trim();

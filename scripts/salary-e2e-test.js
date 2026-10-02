@@ -315,11 +315,12 @@ const dbSchedule = (id) => prisma.salarySchedule.findUnique({ where: { id } });
     assert.strictEqual(r.body?.code, "ALREADY_SCHEDULED");
   });
 
-  await test("a FREE-plan owner gets PRO_REQUIRED", async () => {
+  await test("the plan gates nothing: a FREE owner can schedule staff payments", async () => {
     await prisma.user.update({ where: { id: owner.id }, data: { plan: "FREE" } });
     const r = await mkSchedule({ staffUserId: staff2.id });
-    assert.strictEqual(r.status, 403);
-    assert.strictEqual(r.body?.code, "PRO_REQUIRED");
+    assert.strictEqual(r.status, 201, `the app is free, got ${r.status} ${JSON.stringify(r.body)}`);
+    // Leave the section as it found it: staff2 is scheduled again further down.
+    await prisma.salarySchedule.delete({ where: { id: r.body.id } });
     await prisma.user.update({ where: { id: owner.id }, data: { plan: "PREMIUM" } });
   });
 

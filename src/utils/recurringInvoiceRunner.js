@@ -1,11 +1,10 @@
 // Recurring-invoice runner — processes due RecurringInvoice rules (daily cron,
-// see server.js). For each due ACTIVE rule whose owner is PREMIUM:
+// see server.js). For each due ACTIVE rule:
 //   • creates a real SENT invoice (auto-numbered, one line item) + share link,
 //     inside withBusinessLock so the invoiceCounter can't race other creators;
 //   • advances nextDue by the rule's frequency (catch-up safe: a rule overdue
 //     by several periods produces ONE invoice and jumps to the next future due);
 //   • pushes the owner a notification with the invoice number so they can share.
-// Free owners' rules are SKIPPED (not deactivated) — they resume on upgrade.
 // Per-rule try/catch: one bad rule never halts the batch. Never throws.
 
 const crypto = require("crypto");
@@ -19,12 +18,11 @@ function isoDay(d = new Date()) {
 }
 
 async function processRecurringInvoices(now = new Date()) {
-  let created = 0, skippedFree = 0, failed = 0;
+  let created = 0, failed = 0;
   try {
     const due = await prisma.recurringInvoice.findMany({
       where: { active: true, nextDue: { lte: now } },
       include: {
-        user: { select: { id: true, plan: true } },
         customer: { select: { id: true, name: true } },
         business: { select: { id: true, name: true, userId: true, country: true, baseCurrency: true } },
       },
@@ -34,18 +32,12 @@ async function processRecurringInvoices(now = new Date()) {
     for (const rule of due) {
       try {
         // Advance the schedule FIRST in all outcomes below (skip or create) so a
-        // broken/free rule can't be retried every night forever.
+        // broken rule can't be retried every night forever.
         let next = computeNextDue(rule.frequency, rule.nextDue);
         while (next <= now) next = computeNextDue(rule.frequency, next);
 
         if (!rule.business) {
           await prisma.recurringInvoice.update({ where: { id: rule.id }, data: { active: false } });
-          continue;
-        }
-        // PREMIUM gate — paid feature; free owners' rules pause silently.
-        if (rule.user?.plan !== "PREMIUM") {
-          skippedFree++;
-          await prisma.recurringInvoice.update({ where: { id: rule.id }, data: { nextDue: next } });
           continue;
         }
 
@@ -99,13 +91,13 @@ async function processRecurringInvoices(now = new Date()) {
       }
     }
 
-    if (created || skippedFree || failed) {
-      console.log(`[recurringInvoices] created ${created}, skipped(free) ${skippedFree}, failed ${failed}`);
+    if (created || failed) {
+      console.log(`[recurringInvoices] created ${created}, failed ${failed}`);
     }
   } catch (err) {
     console.error("[recurringInvoices] batch failed:", err.message);
   }
-  return { created, skippedFree, failed };
+  return { created, failed };
 }
 
 module.exports = { processRecurringInvoices };

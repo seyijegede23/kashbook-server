@@ -224,7 +224,6 @@ model Business {
   staffTransferRequests StaffTransferRequest[]
   salarySchedules       SalarySchedule[]
   salaryPayments        SalaryPayment[]
-  savingsProfile        SavingsProfile?
   savingsPots           SavingsPot[]
   savingsMovements      SavingsMovement[]
 
@@ -449,110 +448,54 @@ model FcyConversion {
 }
 
 // ── Savings ──────────────────────────────────────────────────────────────────
-// Money-path detail in utils/savings.js; the reserve maths in
-// utils/savingsReserve.js; the partner client in services/piggyvest.js.
+// Pots ring-fenced in the merchant's own Anchor account. Money-path detail in
+// utils/savings.js; the reserve maths in utils/savingsReserve.js.
 
-// One PiggyVest Business customer per business, created on the first
-// PiggyVest pot and never before.
-model SavingsProfile {
-  id                String   @id @default(uuid())
-  businessId        String   @unique
-  business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  pvCustomerId      String?
-  pvDefaultWalletId String?
-  status            String   @default("pending") // pending | ready | error
-  error             String?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
-}
-
-// A pot. `backing` says where the money is:
-//   ledger     in the Anchor account; `balance` is the truth and the spend
-//              gate subtracts the sum of active ledger pots from the bank
-//              balance (utils/savingsReserve.js).
-//   piggyvest  in a PiggyVest wallet; `balance` is a copy synced from the
-//              partner and is never incremented locally.
+// A pot. Nothing moves: `balance` is a reserve that every spend path subtracts
+// from the bank balance before it lets money out.
 model SavingsPot {
-  id                   String    @id @default(uuid())
-  businessId           String
-  business             Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  userId               String
-  name                 String
-  targetAmount         Float?
-  backing              String    // ledger | piggyvest
-  status               String    @default("active") // provisioning | active | error | closed
-  balance              Float     @default(0)
-  pvWalletId           String?   @unique
-  pvAccountNumber      String?
-  pvBankName           String?
-  pvBankCode           String?
-  pvAccountName        String?
-  interestRate         Float?
-  interestAccruedMtd   Float     @default(0)
-  interestEarned       Float     @default(0)
-  // Bank withdrawals this calendar month (PiggyVest forfeits the month's
-  // interest on the fifth); `withdrawalMonth` is the YYYY-MM the count is for.
-  withdrawalCountMonth Int       @default(0)
-  withdrawalMonth      String?
-  lockUntil            DateTime?
-  lockMode             String?   // strict | flexible
-  error                String?
-  closedAt             DateTime?
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
-  movements            SavingsMovement[]
+  id           String    @id @default(uuid())
+  businessId   String
+  business     Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId       String
+  name         String
+  targetAmount Float?
+  status       String    @default("active") // active | closed
+  balance      Float     @default(0)
+  lockUntil    DateTime?
+  lockMode     String?   // strict | flexible
+  closedAt     DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  movements    SavingsMovement[]
 
   @@index([businessId, status])
-  @@index([pvAccountNumber])
 }
 
-// Every movement of money into or out of a pot. `reference` is our own
+// Every movement of money into or out of a pot. `reference` is the client's
 // idempotency key (kb_sv_… deposits, kb_svw_… withdrawals) and is unique, so a
-// retried deposit can never send twice; `pvTxnId` is the partner's id for
-// inflows, interest and external deposits, unique so the reconcile loop books
-// each partner transaction once.
+// retried request answers with the row it already made. `fee` is the
+// early-withdrawal charge on a flexible lock and `feeCollectedAt` is when it
+// was swept to the fee account (claimed before the book transfer, so never twice).
 model SavingsMovement {
-  id                  String     @id @default(uuid())
-  potId               String
-  pot                 SavingsPot @relation(fields: [potId], references: [id], onDelete: Cascade)
-  businessId          String
-  business            Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  userId              String?
-  type                String     // deposit | withdrawal | interest | external_deposit
-  backing             String     // ledger | piggyvest
-  amount              Float
-  fee                 Float      @default(0)
-  landedAmount        Float?
-  // ledger:      completed
-  // pv deposit:  initiated | sent | completed | failed | unknown | needs_review
-  // pv withdraw: requested | processing | completed | failed | unknown | needs_review
-  // interest / external_deposit: completed
-  status              String
-  reference           String     @unique
-  transactionId       String?    @unique // the Anchor debit (deposit) or credit (withdrawal landing)
-  landedTransactionId String?    @unique
-  providerTransferId  String?    // Anchor transfer id for a deposit
-  pvReference         String?
-  pvTxnId             String?    @unique
-  payoutAccountNumber String?
-  payoutBankCode      String?
-  narration           String?
-  error               String?
-  // Withdrawal verify bookkeeping: consecutive "not found" answers (two, ten
-  // minutes apart, means the request never reached PiggyVest) and the last check.
-  verifyMisses        Int        @default(0)
-  lastVerifiedAt      DateTime?
-  // Early-withdrawal fee on a flexible lock: `fee` is what was charged, this
-  // is when it was swept to the fee account (claimed before the transfer).
-  feeCollectedAt      DateTime?
-  completedAt         DateTime?
-  createdAt           DateTime   @default(now())
-  updatedAt           DateTime   @updatedAt
+  id             String     @id @default(uuid())
+  potId          String
+  pot            SavingsPot @relation(fields: [potId], references: [id], onDelete: Cascade)
+  businessId     String
+  business       Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId         String?
+  type           String     // deposit | withdrawal
+  amount         Float
+  fee            Float      @default(0)
+  status         String     @default("completed")
+  reference      String     @unique
+  feeCollectedAt DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
 
   @@index([potId, createdAt])
   @@index([businessId, createdAt])
-  @@index([status])
-  @@index([providerTransferId])
 }
 
 model CustomCategory {
@@ -773,9 +716,9 @@ model Transaction {
   // records what the PROVIDER called it, so a row can always be traced back to
   // the source event without parsing the description.
   providerTxnId     String?
-  // Why this bank row exists when it is NOT trade: savings_deposit (a
-  // transfer to the business's own PiggyVest wallet), savings_withdrawal (that
-  // money landing back), savings_interest. Set only by server money paths.
+  // Why this bank row exists when it is NOT trade. Today only "savings_fee":
+  // the early-withdrawal charge swept to KashBook's fee account when a
+  // merchant breaks a flexible savings lock. Set only by server money paths.
   // Reporting aggregates exclude rows carrying a purpose (config/moneySources
   // NOT_SAVINGS); the ledger balance keeps them, because the money moved.
   purpose           String?

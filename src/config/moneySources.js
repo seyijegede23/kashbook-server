@@ -39,21 +39,19 @@ function isBankLedgerRow(tx) {
 }
 
 // ── Savings rows ─────────────────────────────────────────────────────────────
-// A bank row whose `purpose` is set was created by the savings feature: the
-// debit that funds a PiggyVest wallet, the credit when that money comes back,
-// or interest. It is the merchant's own money changing pocket, so it is
-// neither an expense nor income for REPORTING (Insights, the monthly and daily
-// reports, the admin revenue chart) and every such aggregate must carry
-// NOT_SAVINGS (Prisma) or SQL_NOT_SAVINGS (raw SQL).
+// A bank row whose `purpose` is set was created by the savings feature. Today
+// that is only "savings_fee": the early-withdrawal charge swept to KashBook's
+// fee account when a merchant breaks a flexible lock. It is not trade, so it
+// is neither an expense nor income for REPORTING (Insights, the monthly and
+// daily reports, the admin revenue chart), and every such aggregate must carry
+// NOT_SAVINGS (Prisma) or SQL_NOT_SAVINGS (raw SQL), exactly as they already
+// leave out the transfer fee on an ordinary send.
 //
 // It IS real money for the LEDGER: computeLedgerBalance, the AML money-out
 // windows, the staff transfer cap and the drift alarm must keep counting these
 // rows, because the bank account did move by that amount. Never add the
 // exclusion there.
-// savings_fee is the early-withdrawal charge swept to KashBook's fee account:
-// real money off the bank account (the ledger keeps it), not trade (reports
-// leave it out, as they do the transfer fee on an ordinary send).
-const SAVINGS_PURPOSES = Object.freeze(["savings_deposit", "savings_withdrawal", "savings_interest", "savings_fee"]);
+const SAVINGS_PURPOSES = Object.freeze(["savings_fee"]);
 const NOT_SAVINGS = Object.freeze({ purpose: null });
 const SQL_NOT_SAVINGS = 'AND "purpose" IS NULL';
 

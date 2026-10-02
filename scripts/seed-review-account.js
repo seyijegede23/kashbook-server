@@ -14,12 +14,10 @@
  * counter, channel normalisation), so nothing is distinguishable from
  * entries made in the app. Only rows this script wrote are ever removed:
  * anything dated before the seed window or matched to a bank transaction is
- * left alone. The plan is set to PREMIUM with the admin panel's audit action.
- * Pair it with REVENUECAT_PINNED_USER_IDS on the server (routes/revenuecat.js).
+ * left alone.
  */
 const prisma = require("../src/utils/db");
 const bcrypt = require("@node-rs/bcrypt");
-const { audit } = require("../src/utils/audit");
 const { normalizeChannel } = require("../src/utils/salesChannel");
 const { computeNextPayDate, periodKeyFor, referenceFor, SALARY_APPROVAL_TTL_MS } = require("../src/utils/salarySchedule");
 
@@ -151,14 +149,14 @@ function generate() {
 (async () => {
   const user = await prisma.user.findFirst({
     where: { email: { equals: EMAIL, mode: "insensitive" }, accountType: "OWNER" },
-    select: { id: true, email: true, plan: true, firstName: true, lastName: true, businesses: { select: { id: true, name: true, invoiceCounter: true }, orderBy: { createdAt: "asc" } } },
+    select: { id: true, email: true, firstName: true, lastName: true, businesses: { select: { id: true, name: true, invoiceCounter: true }, orderBy: { createdAt: "asc" } } },
   });
   if (!user) throw new Error(`no owner account for ${EMAIL}`);
   const biz = user.businesses[0];
   if (!biz) throw new Error("that account has no business");
   const ownerName = [user.firstName, user.lastName].filter(Boolean).join(" ") || "Owner";
   const { sales, expenses, invoices } = generate();
-  console.log(`${DRY ? "[dry] " : ""}account ${user.id} (${user.plan}) business "${biz.name}" ${biz.id}`);
+  console.log(`${DRY ? "[dry] " : ""}account ${user.id} business "${biz.name}" ${biz.id}`);
   console.log(`window ${ymd(START)} → ${ymd(TODAY)}: ${sales.length} sales, ${expenses.length} expenses, ${invoices.length} invoices generated`);
   const done = [];
 
@@ -176,17 +174,7 @@ function generate() {
     done.push(`rebuild: removed ${s.count} sales, ${e.count} expenses, ${inv.count} invoices; invoice counter reset`);
   }
 
-  // 1. Plan
-  if (user.plan !== "PREMIUM") {
-    if (!DRY) {
-      await prisma.user.update({ where: { id: user.id }, data: { plan: "PREMIUM" } });
-      await audit({ action: "ADMIN_PLAN_UPGRADE", resourceType: "user", resourceId: user.id, severity: "info",
-        actorOverride: { type: "system", id: "seed-review-account" }, metadata: { reason: "store review account" } }).catch(() => {});
-    }
-    done.push("plan → PREMIUM");
-  }
-
-  // 2. Customers (unique on userId+phone, so upsert like the route)
+  // 1. Customers (unique on userId+phone, so upsert like the route)
   const customerByName = {};
   for (const c of await prisma.customer.findMany({ where: { businessId: biz.id } })) customerByName[c.name] = c;
   for (const c of CUSTOMERS) {
@@ -201,7 +189,7 @@ function generate() {
     done.push(`customer ${c.name}`);
   }
 
-  // 3. Products, keyed by barcode (unique per business)
+  // 2. Products, keyed by barcode (unique per business)
   const existingBarcodes = new Set((await prisma.inventoryItem.findMany({ where: { businessId: biz.id }, select: { barcode: true } })).map((i) => i.barcode));
   for (const p of PRODUCTS) {
     if (existingBarcodes.has(p.barcode)) continue;
@@ -212,7 +200,7 @@ function generate() {
     done.push(`product ${p.name} [${p.barcode}]`);
   }
 
-  // 4. Sales and expenses, keyed by date + amount + note so a rerun adds nothing
+  // 3. Sales and expenses, keyed by date + amount + note so a rerun adds nothing
   const key = (r) => `${new Date(r.date).toISOString()}|${r.amount}|${r.notes}`;
   // Existing rows are read from a day before the window start: the first
   // rent entry is dated 09:00 on the 1st, before START's noon, and without
@@ -235,7 +223,7 @@ function generate() {
   }
   if (newExpenses.length) done.push(`${newExpenses.length} expenses, ₦${newExpenses.reduce((s, x) => s + x.amount, 0).toLocaleString("en-NG")} in total`);
 
-  // 5. Invoices, in date order so the numbers run with the calendar
+  // 4. Invoices, in date order so the numbers run with the calendar
   const existingInv = new Set((await prisma.invoice.findMany({ where: { businessId: biz.id }, select: { issueDate: true, total: true } })).map((i) => `${i.issueDate}|${i.total}`));
   let counter = biz.invoiceCounter;
   for (const inv of invoices) {
@@ -256,7 +244,7 @@ function generate() {
     done.push(`invoice INV-${String(counter).padStart(3, "0")} ${inv.status} ${ymd(inv.issue)} ${inv.customer} ₦${inv.total.toLocaleString("en-NG")}`);
   }
 
-  // 6. Staff logins with their grants, the way POST /auth/staff and the
+  // 5. Staff logins with their grants, the way POST /auth/staff and the
   //    permissions route write them. Keyed by phone.
   const owner = await prisma.user.findUnique({ where: { id: user.id }, select: { businessName: true } });
   const staffByPhone = {};
@@ -276,7 +264,7 @@ function generate() {
     if (row) staffByPhone[s.phone] = row;
   }
 
-  // 7. Salaries: one schedule per staff member, paid history for every month
+  // 6. Salaries: one schedule per staff member, paid history for every month
   //    of the window, next pay date after this one. Consent is bound to the
   //    payee, and these schedules are written with a payee key that can never
   //    match ("demo:never-authorized"), so the runner suspends them instead of

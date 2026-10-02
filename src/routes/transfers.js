@@ -724,14 +724,15 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
     });
 
     if (outcome.status) return res.status(outcome.status).json(outcome.body);
-    const { reference, route, fee } = outcome.exec;
+    const { reference, route, fee, totalCost } = outcome.exec;
 
-    // Optimistically reflect the debit (amount + fee) in the cached "cash at
-    // bank" so the dashboard shows the new balance immediately on its next
-    // refetch, instead of the up-to-60s-stale value. Reconciles with Anchor when
-    // the cache entry expires. Never let a display-cache tweak affect the result.
+    // Optimistically reflect the debit (amount + everything the bank took: our
+    // fee and the stamp duty above ₦10k) in the cached "cash at bank" so the
+    // dashboard shows the new balance immediately on its next refetch, instead
+    // of the up-to-60s-stale value. Reconciles with Anchor when the cache entry
+    // expires. Never let a display-cache tweak affect the result.
     try {
-      require("../utils/balanceCache").adjustBalance(biz.id, -(Number(amount) + Number(fee || 0)));
+      require("../utils/balanceCache").adjustBalance(biz.id, -(Number(amount) + Number(totalCost ?? fee ?? 0)));
     } catch { /* noop */ }
 
     // Remember the recipient — powers the Send Money "Recents" chips.
@@ -815,10 +816,6 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
       return res.status(400).json({ error: err.message, code: err.code });
     if (err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
       return res.status(400).json({ error: err.message, code: err.code });
-    // The destination is one of this business's own savings pots: a refusal
-    // with a pointer (Savings → Put in), not a failure.
-    if (err.code === "SAVINGS_DEST_USE_DEPOSIT")
-      return res.status(409).json({ error: err.message, code: err.code, potId: err.potId || null });
     console.error("Transfer error:", err);
     res.status(400).json({ error: "Transfer failed" });
   }
@@ -1042,10 +1039,10 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
     });
 
     if (outcome.status) return res.status(outcome.status).json(outcome.body);
-    const { reference, route, fee } = outcome.exec;
+    const { reference, route, fee, totalCost } = outcome.exec;
 
     try {
-      require("../utils/balanceCache").adjustBalance(biz.id, -(Number(request.amount) + Number(fee || 0)));
+      require("../utils/balanceCache").adjustBalance(biz.id, -(Number(request.amount) + Number(totalCost ?? fee ?? 0)));
     } catch { /* noop */ }
 
     res.json({ status: "success", reference, route, fee, requestId: request.id });
@@ -1087,14 +1084,11 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
       "INSUFFICIENT_BALANCE", "RECIPIENT_UNVERIFIED", "UNKNOWN_BANK",
       "NO_BANKING", "ANCHOR_NOT_CONFIGURED", "BANKING_NOT_AVAILABLE", "NOT_IMPLEMENTED",
     ]);
-    // A request whose destination is one of the business's own savings pots
-    // is refused for good: re-approving it would hit the same guard every
-    // time, so it is not offered again, and it is certain (the executor
-    // raised it before any bank call), so it is not an ambiguity alert either.
-    const refusedForGood = err.code === "SAVINGS_DEST_USE_DEPOSIT";
-    const safeToRetry = SAFE_TO_RETRY.has(err.code) || (err.moneyMoved === false && !refusedForGood);
+    // The executor stamps moneyMoved:false on every refusal it raises before
+    // the bank call, so those are safe to offer again too.
+    const safeToRetry = SAFE_TO_RETRY.has(err.code) || err.moneyMoved === false;
     const reason = (err.message || "Transfer failed").slice(0, 300);
-    if (!safeToRetry && !refusedForGood) {
+    if (!safeToRetry) {
       console.error(
         `[transfers/approve] AMBIGUOUS FAILURE on request ${req.params.id} — parked as failed, DO NOT re-approve without checking the provider:`,
         err.code || err.message,
@@ -1125,8 +1119,6 @@ router.post("/approvals/:id/approve", ownerOnly("Only the business owner can app
 
     if (err.code === "INSUFFICIENT_BALANCE" || err.code === "RECIPIENT_UNVERIFIED" || err.code === "UNKNOWN_BANK")
       return res.status(400).json({ error: err.message, code: err.code });
-    if (refusedForGood)
-      return res.status(409).json({ error: err.message, code: err.code, potId: err.potId || null });
     console.error("[transfers/approve]", err);
     res.status(400).json({ error: "Transfer failed" });
   }

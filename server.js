@@ -123,7 +123,7 @@ const apiLimiter = rateLimit({
   message: { error: "Too many requests. Please slow down." },
 });
 
-// Webhooks: per-IP flood guard. Legitimate providers (Anchor/RevenueCat) come
+// Webhooks: per-IP flood guard. Legitimate providers (Anchor, Fincra, Meta) come
 // from a small set of IPs well under this; an attacker flooding from one IP is cut off.
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -212,15 +212,6 @@ app.use(
   express.raw({ type: "application/json", limit: "1mb" }),
   fincraWebhookRoute,
 );
-// PiggyVest Business webhook — raw body for the HMAC-SHA512 in x-pvb-signature.
-// It only nudges the savings reconcile (wallet ready, inflow, outflow outcome);
-// every money decision re-reads PiggyVest with our own key.
-app.use(
-  "/webhooks/piggyvest",
-  webhookLimiter,
-  express.raw({ type: "*/*", limit: "1mb" }),
-  require("./src/routes/piggyvestWebhook"),
-);
 // KYC documents for Fincra to fetch: /fcy-docs/<signed token>.<ext>. Public
 // by necessity (their fetcher carries no credentials); guarded by the HMAC in
 // the token, and served from our own host so the document arrives with a real
@@ -250,9 +241,6 @@ app.use(
 app.use(compression());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-// RevenueCat webhook — header-token auth (no body signature), so it's fine
-// after express.json. Keeps User.plan in sync with subscriptions.
-app.use("/webhooks/revenuecat", webhookLimiter, require("./src/routes/revenuecat"));
 app.use((_req, res, next) => {
   res.setHeader("ngrok-skip-browser-warning", "1");
   next();
@@ -430,13 +418,12 @@ require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 // (see providers/index.js), so no KashBook payout can exist for it to reconcile.
 require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
-// ── Background loop: settle savings every 5 min ──────────────────────────────
-// Provisioning pots, deposits (Anchor row → sent, PiggyVest inflow →
-// completed), withdrawals (verify → completed|failed), interest, and the
-// ledger-pot integrity checks (pot vs movements, reserve vs bank). Runs even
-// without PiggyVest keys, because ledger pots need no partner. Leader-elected
-// via withCronLock(4014); heartbeat "savings-reconcile".
-require("./src/utils/savingsReconcile").startSavingsReconcileLoop(5 * 60 * 1000);
+// ── Background loop: savings integrity every 30 min ──────────────────────────
+// Sweeps any early-withdrawal fee a crash left uncollected, checks each pot's
+// balance against its movements, and alarms when a business has more set aside
+// than the bank holds. Leader-elected via withCronLock(4014); heartbeat
+// "savings-reconcile".
+require("./src/utils/savingsReconcile").startSavingsReconcileLoop(30 * 60 * 1000);
 
 // ── Background cron: daily business report at 8pm Lagos time ─────────────────
 // Summary of today's money in/out per user, or a nudge if nothing was

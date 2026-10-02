@@ -1,6 +1,6 @@
-// Monthly P&L report email — a PREMIUM feature. Sent on the 1st of each month
-// for the PREVIOUS Africa/Lagos calendar month (WAT, UTC+1, no DST), to every
-// PREMIUM owner who had at least one transaction that month. One email per
+// Monthly P&L report email. Sent on the 1st of each month for the PREVIOUS
+// Africa/Lagos calendar month (WAT, UTC+1, no DST), to every owner who had at
+// least one transaction that month. One email per
 // owner, a section per active business: money in / out, net profit, transaction
 // count, month-over-month income change, estimated VAT (when the business
 // enabled it) and the top expense categories.
@@ -175,11 +175,10 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   }
   if (byUser.size === 0) return { range, users: [] };
 
-  // PREMIUM gate: the monthly P&L is a paid feature — only PREMIUM owners are
-  // selected (same string filter the admin stats use). Free owners simply get
-  // no email; there's no request context here, so this is the whole gate.
+  // Every owner with activity gets the report; the only thing that still drops
+  // one is a missing email address (checked below).
   const owners = await prisma.user.findMany({
-    where: { id: { in: [...byUser.keys()] }, plan: "PREMIUM" },
+    where: { id: { in: [...byUser.keys()] } },
     select: { id: true, email: true, firstName: true },
   });
 

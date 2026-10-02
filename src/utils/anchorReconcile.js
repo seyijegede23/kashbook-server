@@ -137,12 +137,6 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     const { sender, narration } = await resolveCreditSender(t, a);
     const description = buildInboundDescription({ sender, narration, reference });
 
-    // Savings: the merchant's own money coming home from a PiggyVest pot is
-    // booked with purpose "savings_withdrawal" and gets none of the payment
-    // treatment (push, invoice/IG/WA matching). Decided before the create.
-    const savingsHit = await require("./savingsCredit").classifyInboundCredit(biz, { amount, sender, narration });
-    const isSavings = savingsHit.purpose === "savings_withdrawal";
-
     // Read the owner's compliance status — inbound credits to a frozen
     // user or business still post (the money is already moved) but get
     // held/flagged for review.
@@ -190,7 +184,6 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
           providerTxnId: paymentRelId || transferRelId || t.id || reference || null,
           flagSeverity,
           complianceStatus,
-          ...(isSavings ? { purpose: "savings_withdrawal" } : {}),
         },
       });
     } catch (createErr) {
@@ -200,9 +193,7 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
       throw createErr;
     }
 
-    // Persist ComplianceFlag rows for any inbound that warrants review. Before
-    // the savings branch: a held/flagged row must always have the flag the
-    // admin queue resolves it through, whatever the money turned out to be.
+    // Persist ComplianceFlag rows for any inbound that warrants review.
     if (frozen || flagCTR) {
       await prisma.complianceFlag.create({
         data: {
@@ -214,18 +205,9 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
           description: frozen
             ? `Inbound credit of ₦${amount.toLocaleString("en-NG")} arrived on a frozen account.`
             : `Inbound credit of ₦${amount.toLocaleString("en-NG")} meets the CTR auto-flag threshold.`,
-          metadata: { amount, senderName: sender?.name || sender?.label || null, senderBank: sender?.bank || null, senderAccountNumber: sender?.accountNumber || null, ...(isSavings ? { purpose: "savings_withdrawal" } : {}) },
+          metadata: { amount, senderName: sender?.name || sender?.label || null, senderBank: sender?.bank || null, senderAccountNumber: sender?.accountNumber || null },
         },
       });
-    }
-
-    if (isSavings) {
-      await require("./savingsCredit").markLanded({ movementId: savingsHit.movementId, transactionId: txn.id, amount }).catch(() => {});
-      try { require("./balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
-      await pushTo(biz.userId, "Savings arrived", `${require("../config/amlLimits").formatAmountForBusiness(biz, amount)} from your savings is now in your account.`).catch(() => {});
-      created++;
-      if (onCreate) onCreate({ biz, amount, reference });
-      continue;
     }
 
     const { title, body } = buildInboundNotification({
@@ -236,28 +218,19 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
     });
     await pushTo(biz.userId, title, body);
 
-    // A credit this feed cannot attribute (no sender) that equals an open
-    // savings withdrawal is left for the webhook, which knows the sender, to
-    // tag: running the matchers now could pay an invoice with the merchant's
-    // own savings and the webhook's repair would then have to undo it.
-    const maybeSavings = savingsHit.review === "possible_savings_landing";
-    if (maybeSavings) {
-      console.log(`[reconcile] ₦${amount} to ${biz.name} matches an open savings withdrawal; matchers skipped pending the webhook`);
-    }
-
     // Auto-reconcile: if exactly one open invoice matches the credited amount
     // within the last 90 days, record a payment and recalc status.
-    if (!maybeSavings) await tryMatchInvoice(biz, amount, reference).catch((err) =>
+    await tryMatchInvoice(biz, amount, reference).catch((err) =>
       console.warn(`[reconcile] invoice match failed for ${biz.name}: ${err.message}`),
     );
 
     // Auto-confirm a matching Instagram payment request (fire-and-forget).
-    if (!maybeSavings) await require("./igPaymentMatch").tryMatchIgPayment(biz, amount).catch((err) =>
+    await require("./igPaymentMatch").tryMatchIgPayment(biz, amount).catch((err) =>
       console.warn(`[reconcile] ig payment match failed for ${biz.name}: ${err.message}`),
     );
 
     // Auto-confirm a matching WhatsApp payment request (fire-and-forget).
-    if (!maybeSavings) await require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch((err) =>
+    await require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch((err) =>
       console.warn(`[reconcile] wa payment match failed for ${biz.name}: ${err.message}`),
     );
 

@@ -642,11 +642,10 @@ const send = (amount, over = {}) =>
     assert.strictEqual(anchorCalls.length, before);
     await prisma.user.update({ where: { id: staff.id }, data: { accountStatus: "active" } });
   });
-  await test("a lapsed Pro plan cannot GRANT, but can still REVOKE", async () => {
+  await test("the plan gates nothing: a FREE owner can GRANT and REVOKE alike", async () => {
     await prisma.user.update({ where: { id: owner.id }, data: { plan: "FREE" } });
     const up = await grant({ canTransfer: true, canViewBalance: true }, 50_000);
-    assert.strictEqual(up.status, 403);
-    assert.strictEqual(up.body.code, "PRO_REQUIRED");
+    assert.strictEqual(up.status, 200, `the app is free, got ${up.status} ${JSON.stringify(up.body)}`);
     const down = await grant(ALL_OFF, 0);
     assert.strictEqual(down.status, 200, "an owner must never be locked out of removing access");
     await prisma.user.update({ where: { id: owner.id }, data: { plan: "PREMIUM" } });

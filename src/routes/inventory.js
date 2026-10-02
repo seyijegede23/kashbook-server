@@ -63,14 +63,6 @@ router.post("/", validateInventoryItem, async (req, res) => {
       if (!owned) return res.status(403).json({ error: "Forbidden" });
     }
 
-    if (req.user.effectivePlan !== "PREMIUM") {
-      const userId = getTargetUserId(req);
-      const count = await prisma.inventoryItem.count({ where: { userId } });
-      if (count >= 20) {
-        return res.status(403).json({ error: "Free plan allows up to 20 inventory items. Upgrade to Pro for unlimited items." });
-      }
-    }
-
     const item = await prisma.inventoryItem.create({
       data: {
         userId: getTargetUserId(req),
