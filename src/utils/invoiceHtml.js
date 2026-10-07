@@ -244,13 +244,10 @@ function paymentBlock(payment, qrDataUrl, shareUrl, opts = {}) {
   const linkLine = shareUrl
     ? `<div class="pay-link" style="margin-top:8px;font-size:11px;color:#6B7280;word-break:break-all;">${esc(shareUrl)}</div>`
     : "";
-  const sourceTag = payment.source === "nuban"
-    ? `<span class="pay-badge" style="display:inline-block;font-size:9px;font-weight:800;letter-spacing:0.5px;color:${variant === "hero" ? "#fff" : accent};background:${variant === "hero" ? "rgba(255,255,255,0.22)" : `${accent}1A`};padding:3px 7px;border-radius:6px;margin-left:8px;text-transform:uppercase;">Auto-reconciling</span>`
-    : "";
 
   const inner = `
     <div style="flex:1;">
-      <div class="pay-title">Pay Into${sourceTag}</div>
+      <div class="pay-title">Pay Into</div>
       ${payment.bank ? `<div class="pay-row"><span class="pay-label">Bank</span><span class="pay-value">${esc(payment.bank)}</span></div>` : ""}
       <div class="pay-row"><span class="pay-label">Account No</span><span class="pay-value" style="font-weight:800;font-size:16px;letter-spacing:0.5px;">${esc(payment.number)}</span></div>
       ${payment.name ? `<div class="pay-row"><span class="pay-label">Account Name</span><span class="pay-value">${esc(payment.name)}</span></div>` : ""}
