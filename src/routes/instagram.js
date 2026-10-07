@@ -15,6 +15,7 @@ const prisma = require("../utils/db");
 const ig = require("../utils/instagram");
 const { encrypt, decrypt } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
+const { allocateInvoiceNumber } = require("../utils/invoiceNumber");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -731,8 +732,7 @@ router.post("/conversations/:id/create-invoice", async (req, res) => {
     const ownerUserId = ownerId(req);
     const result = await prisma.withBusinessLock(business.id, async () => {
       const customer = await resolveIgCustomer(business, convo, ownerUserId, { create: true });
-      const biz = await prisma.business.update({ where: { id: business.id }, data: { invoiceCounter: { increment: 1 } } });
-      const invoiceNumber = `INV-${String(biz.invoiceCounter).padStart(3, "0")}`;
+      const invoiceNumber = await allocateInvoiceNumber(prisma, business.id, "invoice");
       const invoice = await prisma.invoice.create({
         data: {
           businessId: business.id, customerId: customer.id, userId: ownerUserId,

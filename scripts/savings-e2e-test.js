@@ -178,7 +178,10 @@ const failures = [];
 async function test(name, fn) {
   try { await fn(); console.log(`  PASS  ${name}`); passed++; }
   catch (e) {
-    console.log(`  FAIL  ${name}\n        ${String(e.message).split("\n")[0]}`);
+    // assert's first line is only "Expected values to be strictly equal:";
+    // the values that explain the failure are on the lines after it.
+    const detail = String(e.message).split("\n").filter((l) => l.trim()).slice(0, 6).join("\n        ");
+    console.log(`  FAIL  ${name}\n        ${detail}`);
     failures.push(`${name}: ${String(e.message).split("\n")[0]}`);
     failed++;
   }
@@ -220,7 +223,11 @@ async function wipe() {
   await prisma.processedWebhook.deleteMany({});
   await prisma.alertState.deleteMany({});
   await prisma.cronHeartbeat.deleteMany({});
-  await prisma.auditLog.deleteMany({});
+  // AuditLog is append-only (trigger, migration 20260803170000). Its purge flag
+  // does not actually let a DELETE through (the trigger returns NULL, which
+  // skips the row silently), so a scratch reset truncates, which row triggers
+  // never see. The backup restore does the same.
+  await prisma.$executeRawUnsafe('TRUNCATE TABLE "AuditLog"');
   await prisma.otpCode.deleteMany({});
   await prisma.business.deleteMany({});
   await prisma.user.deleteMany({});
@@ -839,6 +846,11 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(await dbMovementByRef("kb_svw_fw1"), null, "nothing is written before the merchant confirms");
     assert.strictEqual(bookCalls.length, 0, "no fee is swept before the merchant confirms");
 
+    // Other pots from earlier scenarios in this section still hold money, so the
+    // reserve is the business total: assert the change, not an absolute figure.
+    const reservedBefore = (
+      await prisma.savingsPot.aggregate({ _sum: { balance: true }, where: { businessId: BIZ_ID, status: "active" } })
+    )._sum.balance || 0;
     const w2 = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "fw1", confirmEarly: true });
     assert.strictEqual(w2.status, 200, JSON.stringify(w2.body));
     assert.strictEqual(w2.body.replay, false);
@@ -846,7 +858,7 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(w2.body.movement.status, "completed");
     assert.strictEqual(w2.body.movement.fee, 100);
     assert.strictEqual(w2.body.pot.balance, 4_000, "the fee comes off the bank account, not the pot");
-    assert.strictEqual(w2.body.reserved, 4_000);
+    assert.ok(sameKobo(w2.body.reserved, reservedBefore - 1_000), `reserved ${reservedBefore} → ${w2.body.reserved}`);
     // The fee is swept from the Anchor account to the fee account at once, and
     // booked as a savings_fee row: real money for the ledger, invisible to reports.
     assert.strictEqual(bookCalls.length, 1, JSON.stringify(bookCalls));

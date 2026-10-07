@@ -10,6 +10,7 @@
 const crypto = require("crypto");
 const prisma = require("./db");
 const { computeNextDue } = require("./recurringSchedule");
+const { allocateInvoiceNumber } = require("./invoiceNumber");
 const { pushTo } = require("./pushNotification");
 const { formatAmountForBusiness } = require("../config/amlLimits");
 
@@ -46,11 +47,7 @@ async function processRecurringInvoices(now = new Date()) {
           : null;
 
         const invoice = await prisma.withBusinessLock(rule.businessId, async () => {
-          const biz = await prisma.business.update({
-            where: { id: rule.businessId },
-            data: { invoiceCounter: { increment: 1 } },
-          });
-          const invoiceNumber = `INV-${String(biz.invoiceCounter).padStart(3, "0")}`;
+          const invoiceNumber = await allocateInvoiceNumber(prisma, rule.businessId, "invoice");
           const inv = await prisma.invoice.create({
             data: {
               businessId: rule.businessId,

@@ -121,7 +121,8 @@ model Business {
   kycId                      String? // generic primary KYC identifier (encrypted)
   kycIdType                  String    @default("BVN") // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   invoiceCounter             Int       @default(0)
-  taxId                      String? // display-only Tax ID / RC number for documents (P&L, invoices)
+  invoicePrefix              String? // NULL = "INV-"; "" = plain numbers. Quotes keep "QTE-".
+  taxId                     String? // display-only Tax ID / RC number for documents (P&L, invoices)
   virtualAccountRef          String?
   virtualAccountId           String?
   // @unique: one NUBAN belongs to exactly one business. Without this, the
@@ -1041,8 +1042,15 @@ model Invoice {
   total          Float             @default(0)
   amountPaid     Float             @default(0)
   notes          String?
-  terms          String?
+  terms          String? // Terms & Conditions text (not the payment terms below)
   template       String            @default("classic")
+  // due_on_receipt | net_15 | net_30 | net_45 | net_60 | due_end_of_month |
+  // due_end_of_next_month | custom. The client derives dueDate from it.
+  paymentTerms   String?
+  orderNumber    String? // the customer's PO / reference number
+  subject        String?
+  salespersonId  String? // the owner or one of their staff; no FK on purpose
+  salespersonName String? // copied at save time so the document keeps it
   items          InvoiceItem[]
   payments       InvoicePayment[]
   shareLink      InvoiceShareLink?

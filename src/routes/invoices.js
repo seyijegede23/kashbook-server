@@ -1,8 +1,81 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const authMiddleware = require("../middleware/auth");
+const {
+  allocateInvoiceNumber,
+  formatInvoiceNumber,
+  invoicePrefixOf,
+  normalizePrefix,
+  normalizeNextNumber,
+} = require("../utils/invoiceNumber");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+const PAYMENT_TERMS = new Set([
+  "due_on_receipt", "net_15", "net_30", "net_45", "net_60",
+  "due_end_of_month", "due_end_of_next_month", "custom",
+]);
+
+function cleanText(v, max) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s ? s.slice(0, max) : null;
+}
+
+// The invoice's customer. A customerId must belong to this owner. With no id,
+// or an id the server has not seen yet (a customer the app created a moment
+// ago, still in flight), a typed name finds that owner's customer of the same
+// name in this business or creates one. Invoice has no name column of its own,
+// so before this a hand-typed customer vanished from the invoice on next sync.
+async function resolveCustomerId(body, businessId, ownerUserId) {
+  const id = body.customerId ? String(body.customerId) : null;
+  if (id) {
+    const own = await prisma.customer.findFirst({ where: { id, userId: ownerUserId }, select: { id: true } });
+    if (own) return own.id;
+  }
+  const name = typeof body.customerName === "string" ? body.customerName.trim().slice(0, 100) : "";
+  if (!name) return null;
+  const same = await prisma.customer.findFirst({
+    where: { userId: ownerUserId, businessId, name: { equals: name, mode: "insensitive" } },
+    select: { id: true },
+  });
+  if (same) return same.id;
+  const created = await prisma.customer.create({
+    data: { userId: ownerUserId, businessId, name },
+    select: { id: true },
+  });
+  return created.id;
+}
+
+// The optional detail fields from the Add Invoice screen. Only keys present in
+// the body come back, so an update that leaves them out does not wipe them.
+async function readDetailFields(body, targetUserId) {
+  const out = {};
+  if ("paymentTerms" in body) {
+    out.paymentTerms = PAYMENT_TERMS.has(body.paymentTerms) ? body.paymentTerms : null;
+  }
+  if ("orderNumber" in body) out.orderNumber = cleanText(body.orderNumber, 50);
+  if ("subject" in body) out.subject = cleanText(body.subject, 250);
+  if ("salespersonId" in body) {
+    out.salespersonId = null;
+    out.salespersonName = null;
+    const id = body.salespersonId ? String(body.salespersonId) : null;
+    if (id) {
+      // The owner or one of the owner's staff, nobody else. An unknown id is
+      // dropped rather than refused: the app saves invoices optimistically, and
+      // failing the whole invoice over a stale staff pick would lose it.
+      const person = await prisma.user.findFirst({
+        where: { id, OR: [{ id: targetUserId }, { employerId: targetUserId }] },
+        select: { id: true, firstName: true, lastName: true },
+      });
+      if (person) {
+        out.salespersonId = person.id;
+        out.salespersonName = `${person.firstName || ""} ${person.lastName || ""}`.trim() || null;
+      }
+    }
+  }
+  return out;
+}
 
 function getTargetUserId(req) {
   return req.user.accountType === "staff" ? req.user.employerId : req.user.id;
@@ -132,13 +205,12 @@ router.post("/", authMiddleware, async (req, res) => {
     const biz = await ownsBusiness(req, businessId);
     if (!biz) return res.status(403).json({ error: "Access denied" });
 
-    // Auto-increment invoice counter
+    const details = await readDetailFields(req.body, userId);
+    const resolvedCustomerId = await resolveCustomerId(req.body, businessId, userId);
+
+    // Next number off the business counter, with the owner's prefix.
     const isQuote = type === "quote";
-    const updatedBiz = await prisma.business.update({
-      where: { id: businessId },
-      data: { invoiceCounter: { increment: 1 } },
-    });
-    const invoiceNumber = `${isQuote ? "QTE" : "INV"}-${String(updatedBiz.invoiceCounter).padStart(3, "0")}`;
+    const invoiceNumber = await allocateInvoiceNumber(prisma, businessId, isQuote ? "quote" : "invoice");
 
     // Calculate totals
     const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
@@ -154,11 +226,13 @@ router.post("/", authMiddleware, async (req, res) => {
     const invoice = await prisma.invoice.create({
       data: {
         businessId,
-        customerId: customerId || null,
+        customerId: resolvedCustomerId,
         userId,
         invoiceNumber,
         type: isQuote ? "quote" : "invoice",
-        status: status.toUpperCase(),
+        // A new document is a draft or sent. PAID and the rest come from
+        // payments, never from the create body.
+        status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
         issueDate,
         dueDate: dueDate || null,
         subtotal,
@@ -171,6 +245,7 @@ router.post("/", authMiddleware, async (req, res) => {
         notes: notes || null,
         terms: terms || null,
         template,
+        ...details,
         items: {
           create: items.map((it) => ({
             name: it.name,
@@ -188,6 +263,54 @@ router.post("/", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to create invoice" });
+  }
+});
+
+// ── PATCH /invoices/numbering ─────────────────────────────────────────────────
+// The gear beside Invoice# on the Add Invoice screen. Owner only: the prefix
+// and the next number apply to every invoice the business issues from now on.
+router.patch("/numbering", authMiddleware, async (req, res) => {
+  try {
+    if (req.user.accountType === "staff") {
+      return res.status(403).json({ error: "Only the owner can change invoice numbering.", code: "OWNER_ONLY" });
+    }
+    const body = req.body || {};
+    if (!body.businessId) return res.status(400).json({ error: "businessId required" });
+    const biz = await ownsBusiness(req, body.businessId);
+    if (!biz) return res.status(403).json({ error: "Access denied" });
+
+    const prefix = body.prefix === undefined ? invoicePrefixOf(biz) : normalizePrefix(body.prefix);
+    if (prefix === null) {
+      return res.status(400).json({
+        error: "Use up to 10 letters, numbers or - _ / . # for the prefix.",
+        code: "BAD_PREFIX",
+      });
+    }
+    const next = body.nextNumber === undefined ? biz.invoiceCounter + 1 : normalizeNextNumber(body.nextNumber);
+    if (next === null) {
+      return res.status(400).json({ error: "The next number must be a whole number from 1.", code: "BAD_NUMBER" });
+    }
+
+    // Refuse a starting point that is already taken, so the owner hears about
+    // it now instead of the allocator silently skipping ahead later.
+    const number = formatInvoiceNumber(prefix, next);
+    const clash = await prisma.invoice.findFirst({
+      where: { businessId: biz.id, invoiceNumber: number },
+      select: { id: true },
+    });
+    if (clash) {
+      return res.status(409).json({ error: `${number} is already used.`, code: "NUMBER_IN_USE", number });
+    }
+
+    const updated = await prisma.business.update({
+      where: { id: biz.id },
+      data: { invoicePrefix: prefix, invoiceCounter: next - 1 },
+      select: { invoicePrefix: true, invoiceCounter: true },
+    });
+    res.json({ ...updated, next: number });
+  } catch (err) {
+    console.error("invoice numbering error:", err);
+    res.status(500).json({ error: "Failed to update invoice numbering" });
   }
 });
 
@@ -241,13 +364,27 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
     const total = Math.max(0, subtotal + taxAmount - discountAmount);
 
+    const details = await readDetailFields(req.body, getTargetUserId(req));
+    const resolvedCustomerId = await resolveCustomerId(req.body, existing.businessId, getTargetUserId(req));
+
+    // "Save and send" from the editor moves a draft to SENT. Nothing else can
+    // change status here: payments and voiding have their own routes.
+    const statusPatch =
+      typeof req.body.status === "string" &&
+      req.body.status.toUpperCase() === "SENT" &&
+      existing.status === "DRAFT"
+        ? { status: "SENT" }
+        : {};
+
     // Replace all items
     await prisma.invoiceItem.deleteMany({ where: { invoiceId: req.params.id } });
 
     const invoice = await prisma.invoice.update({
       where: { id: req.params.id },
       data: {
-        customerId: customerId || null,
+        ...details,
+        ...statusPatch,
+        customerId: resolvedCustomerId,
         issueDate: issueDate || existing.issueDate,
         dueDate: dueDate || null,
         subtotal,
@@ -419,11 +556,7 @@ router.post("/:id/convert-to-invoice", authMiddleware, async (req, res) => {
     if (existing.type !== "quote")
       return res.status(400).json({ error: "Only a quote can be converted." });
 
-    const updatedBiz = await prisma.business.update({
-      where: { id: existing.businessId },
-      data: { invoiceCounter: { increment: 1 } },
-    });
-    const invoiceNumber = `INV-${String(updatedBiz.invoiceCounter).padStart(3, "0")}`;
+    const invoiceNumber = await allocateInvoiceNumber(prisma, existing.businessId, "invoice");
 
     const invoice = await prisma.invoice.update({
       where: { id: req.params.id },
