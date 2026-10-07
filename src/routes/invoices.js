@@ -4,7 +4,8 @@ const authMiddleware = require("../middleware/auth");
 const {
   allocateInvoiceNumber,
   formatInvoiceNumber,
-  invoicePrefixOf,
+  prefixOf,
+  seriesOf,
   normalizePrefix,
   normalizeNextNumber,
   normalizeManualNumber,
@@ -47,6 +48,16 @@ async function resolveCustomerId(body, businessId, ownerUserId) {
     select: { id: true },
   });
   return created.id;
+}
+
+// Numbering responses use the invoice field names for either run of numbers,
+// so the app reads one shape; `kind` says which run it was.
+function numberingOut(row, series) {
+  return {
+    invoicePrefix: row[series.prefix] ?? null,
+    invoiceCounter: row[series.counter],
+    invoiceNumberMode: row[series.mode] === "manual" ? "manual" : "auto",
+  };
 }
 
 // The optional detail fields from the Add Invoice screen. Only keys present in
@@ -220,7 +231,11 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const details = await readDetailFields(req.body, userId);
     const resolvedCustomerId = await resolveCustomerId(req.body, businessId, userId);
-    const isQuote = type === "quote";
+    // invoice | quote | credit_note. A credit note is a credit TO the customer:
+    // no payment terms and no due date.
+    const docType = type === "quote" || type === "credit_note" ? type : "invoice";
+    const isCredit = docType === "credit_note";
+    if (isCredit) details.paymentTerms = null;
 
     // Calculate totals
     const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
@@ -247,7 +262,7 @@ router.post("/", authMiddleware, async (req, res) => {
         }
         invoiceNumber = manualNumber;
       } else {
-        invoiceNumber = await allocateInvoiceNumber(prisma, businessId, isQuote ? "quote" : "invoice");
+        invoiceNumber = await allocateInvoiceNumber(prisma, businessId, docType);
       }
       return prisma.invoice.create({
         data: {
@@ -255,12 +270,12 @@ router.post("/", authMiddleware, async (req, res) => {
           customerId: resolvedCustomerId,
           userId,
           invoiceNumber,
-          type: isQuote ? "quote" : "invoice",
+          type: docType,
           // A new document is a draft or sent. PAID and the rest come from
           // payments, never from the create body.
           status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
           issueDate,
-          dueDate: dueDate || null,
+          dueDate: isCredit ? null : dueDate || null,
           subtotal,
           taxRate: Number(taxRate) || 0,
           taxAmount,
@@ -309,30 +324,34 @@ router.patch("/numbering", authMiddleware, async (req, res) => {
     const biz = await ownsBusiness(req, body.businessId);
     if (!biz) return res.status(403).json({ error: "Access denied" });
 
+    // Which run of numbers: invoices (shared with quotes) or credit notes.
+    const kind = body.kind === "credit_note" ? "credit_note" : "invoice";
+    const series = seriesOf(kind);
+
     // auto: the server issues the next number (prefix + counter).
-    // manual: the app asks for a number on every new invoice. The prefix and
+    // manual: the app asks for a number on every new document. The prefix and
     // counter are kept so switching back to auto carries on where it was.
-    const mode = body.mode === undefined ? (biz.invoiceNumberMode === "manual" ? "manual" : "auto") : body.mode;
+    const mode = body.mode === undefined ? (biz[series.mode] === "manual" ? "manual" : "auto") : body.mode;
     if (mode !== "auto" && mode !== "manual") {
       return res.status(400).json({ error: "Numbering is auto or manual.", code: "BAD_MODE" });
     }
     if (mode === "manual") {
       const updated = await prisma.business.update({
         where: { id: biz.id },
-        data: { invoiceNumberMode: "manual" },
-        select: { invoicePrefix: true, invoiceCounter: true, invoiceNumberMode: true },
+        data: { [series.mode]: "manual" },
+        select: { [series.prefix]: true, [series.counter]: true, [series.mode]: true },
       });
-      return res.json({ ...updated, next: null });
+      return res.json({ ...numberingOut(updated, series), kind, next: null });
     }
 
-    const prefix = body.prefix === undefined ? invoicePrefixOf(biz) : normalizePrefix(body.prefix);
+    const prefix = body.prefix === undefined ? prefixOf(biz, kind) : normalizePrefix(body.prefix, kind);
     if (prefix === null) {
       return res.status(400).json({
         error: "Use up to 10 letters, numbers or - _ / . # for the prefix.",
         code: "BAD_PREFIX",
       });
     }
-    const next = body.nextNumber === undefined ? biz.invoiceCounter + 1 : normalizeNextNumber(body.nextNumber);
+    const next = body.nextNumber === undefined ? biz[series.counter] + 1 : normalizeNextNumber(body.nextNumber);
     if (next === null) {
       return res.status(400).json({ error: "The next number must be a whole number from 1.", code: "BAD_NUMBER" });
     }
@@ -345,14 +364,14 @@ router.patch("/numbering", authMiddleware, async (req, res) => {
       if (await numberTaken(prisma, biz.id, number)) return null;
       return prisma.business.update({
         where: { id: biz.id },
-        data: { invoicePrefix: prefix, invoiceCounter: next - 1, invoiceNumberMode: "auto" },
-        select: { invoicePrefix: true, invoiceCounter: true, invoiceNumberMode: true },
+        data: { [series.prefix]: prefix, [series.counter]: next - 1, [series.mode]: "auto" },
+        select: { [series.prefix]: true, [series.counter]: true, [series.mode]: true },
       });
     });
     if (!result) {
       return res.status(409).json({ error: `${number} is already used.`, code: "NUMBER_IN_USE", number });
     }
-    res.json({ ...result, next: number });
+    res.json({ ...numberingOut(result, series), kind, next: number });
   } catch (err) {
     console.error("invoice numbering error:", err);
     res.status(500).json({ error: "Failed to update invoice numbering" });
@@ -409,7 +428,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
     }
     const total = Math.max(0, subtotal + taxAmount - discountAmount);
 
+    // A credit note cannot shrink below the credit already used from it.
+    const isCredit = existing.type === "credit_note";
+    if (isCredit && total + 0.005 < (existing.amountPaid || 0)) {
+      return res.status(400).json({
+        error: "This credit note has credit in use; its total cannot go below that.",
+        code: "CREDIT_BELOW_USED",
+        used: existing.amountPaid,
+      });
+    }
+
     const details = await readDetailFields(req.body, getTargetUserId(req));
+    if (isCredit && "paymentTerms" in details) details.paymentTerms = null;
     const resolvedCustomerId = await resolveCustomerId(req.body, existing.businessId, getTargetUserId(req));
 
     // "Save and send" from the editor moves a draft to SENT. Nothing else can
@@ -460,7 +490,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
           ...(newNumber ? { invoiceNumber: newNumber } : {}),
           customerId: resolvedCustomerId,
           issueDate: issueDate || existing.issueDate,
-          dueDate: dueDate || null,
+          dueDate: isCredit ? null : dueDate || null,
           subtotal,
           taxRate: Number(taxRate) || 0,
           taxAmount,
@@ -514,6 +544,29 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     if (!allowed.includes(newStatus))
       return res.status(400).json({ error: `Status must be one of: ${allowed.join(", ")}` });
 
+    // SENT is how a draft goes out (or a credit note opens). On anything past
+    // draft it would wipe PARTIAL or PAID, so it changes nothing there.
+    if (newStatus === "SENT" && existing.status !== "DRAFT") {
+      const same = await prisma.invoice.findUnique({ where: { id: existing.id }, include: INCLUDE });
+      return res.json(formatInvoice(same));
+    }
+    // Money or credit already on a document pins it: a credit note that has
+    // given credit cannot be voided or redrafted, an invoice that received
+    // credit cannot be voided, and nothing with payments goes back to draft.
+    // Otherwise the credit would vanish from one side of the link.
+    if (existing.type === "credit_note" && (existing.amountPaid || 0) > 0 && newStatus !== "SENT") {
+      return res.status(409).json({ error: "This credit note has been used.", code: "CREDIT_IN_USE" });
+    }
+    if (existing.type !== "credit_note" && newStatus === "VOID") {
+      const applied = await prisma.creditApplication.count({ where: { invoiceId: existing.id } });
+      if (applied) {
+        return res.status(409).json({ error: "Credit has been applied to this invoice.", code: "CREDITS_APPLIED" });
+      }
+    }
+    if (newStatus === "DRAFT" && (existing.amountPaid || 0) > 0) {
+      return res.status(409).json({ error: "Payments are recorded on this document.", code: "PAYMENTS_RECORDED" });
+    }
+
     const invoice = await prisma.invoice.update({
       where: { id: req.params.id },
       data: { status: newStatus },
@@ -539,6 +592,8 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "Access denied" });
     if (existing.type === "quote")
       return res.status(403).json({ error: "Quotes can't take payments — convert it to an invoice first.", code: "QUOTE_NO_PAYMENT" });
+    if (existing.type === "credit_note")
+      return res.status(403).json({ error: "A credit note is used by applying it to an invoice or recording a refund.", code: "CREDIT_NOTE_NO_PAYMENT" });
     if (existing.status === "VOID")
       return res.status(400).json({ error: "Cannot record payment on a VOID invoice" });
 
@@ -593,6 +648,155 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
     if (err.status === 400) return res.status(400).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: "Failed to record payment" });
+  }
+});
+
+// ── Credit notes: apply to an invoice, or refund ───────────────────────────────
+// A credit note's amountPaid is the credit already used. Both routes re-read
+// both documents under the business lock and write everything in one
+// transaction, so two taps (or two phones) cannot spend the same credit twice.
+
+const OPEN_STATUSES = ["SENT", "PARTIAL", "OVERDUE"];
+const REFUND_METHODS = ["cash", "transfer", "card", "cheque", "other"];
+const toMoney = (v) => Math.round(Number(v) * 100) / 100;
+
+function creditError(status, code, error, extra = {}) {
+  return Object.assign(new Error(error), { status, code, extra });
+}
+function sendCreditError(res, err, fallback) {
+  if (err.status) return res.status(err.status).json({ error: err.message, code: err.code, ...err.extra });
+  console.error(fallback, err);
+  return res.status(500).json({ error: fallback });
+}
+// Lagos calendar day, like the overdue checks above.
+const lagosToday = () => new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
+
+// POST /invoices/:id/apply-credit  { invoiceId, amount }  (:id = the credit note)
+router.post("/:id/apply-credit", authMiddleware, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const invoiceId = body.invoiceId ? String(body.invoiceId) : null;
+    const amount = toMoney(body.amount);
+    if (!invoiceId) return res.status(400).json({ error: "invoiceId required" });
+    if (!(amount > 0)) return res.status(400).json({ error: "Enter an amount.", code: "BAD_AMOUNT" });
+
+    const note = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!note) return res.status(404).json({ error: "Credit note not found" });
+    if (!(await ownsBusiness(req, note.businessId))) return res.status(403).json({ error: "Access denied" });
+    if (note.type !== "credit_note") {
+      return res.status(400).json({ error: "Only a credit note can be applied.", code: "NOT_A_CREDIT_NOTE" });
+    }
+
+    const result = await prisma.withBusinessLock(note.businessId, async () => {
+      const cn = await prisma.invoice.findUnique({ where: { id: note.id } });
+      const inv = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+      if (!inv || inv.businessId !== cn.businessId || (inv.type || "invoice") !== "invoice") {
+        throw creditError(404, "INVOICE_NOT_FOUND", "Invoice not found.");
+      }
+      if (!OPEN_STATUSES.includes(cn.status)) {
+        throw creditError(409, "CREDIT_NOT_OPEN", "This credit note is not open.");
+      }
+      if (!OPEN_STATUSES.includes(inv.status)) {
+        throw creditError(409, "INVOICE_NOT_OPEN", "That invoice is not waiting for payment.");
+      }
+      // Credit belongs to one customer and can only pay that customer's invoices.
+      if (!cn.customerId || cn.customerId !== inv.customerId) {
+        throw creditError(409, "CUSTOMER_MISMATCH", "The credit note and the invoice are for different customers.");
+      }
+      const remaining = toMoney(cn.total - cn.amountPaid);
+      const outstanding = toMoney(inv.total - inv.amountPaid);
+      if (amount > remaining) {
+        throw creditError(400, "EXCEEDS_CREDIT", "That is more than the credit left.", { remaining });
+      }
+      if (amount > outstanding) {
+        throw creditError(400, "EXCEEDS_BALANCE", "That is more than the invoice still owes.", { outstanding });
+      }
+
+      const when = new Date();
+      const invPaid = toMoney(inv.amountPaid + amount);
+      const invStatus =
+        invPaid >= toMoney(inv.total) ? "PAID" : inv.dueDate && inv.dueDate < lagosToday() ? "OVERDUE" : "PARTIAL";
+      const cnUsed = toMoney(cn.amountPaid + amount);
+      const cnStatus = cnUsed >= toMoney(cn.total) ? "PAID" : "PARTIAL";
+
+      const [, , , updatedInvoice, updatedCredit] = await prisma.$transaction([
+        prisma.creditApplication.create({
+          data: { businessId: cn.businessId, creditNoteId: cn.id, invoiceId: inv.id, amount, date: when },
+        }),
+        // The invoice's balance falls like any payment; the method says it was credit.
+        prisma.invoicePayment.create({
+          data: { invoiceId: inv.id, amount, method: "credit_note", note: cn.invoiceNumber, date: when },
+        }),
+        // The credit note keeps its own record of where the credit went.
+        prisma.invoicePayment.create({
+          data: { invoiceId: cn.id, amount, method: "credit_applied", note: inv.invoiceNumber, date: when },
+        }),
+        prisma.invoice.update({ where: { id: inv.id }, data: { amountPaid: invPaid, status: invStatus }, include: INCLUDE }),
+        prisma.invoice.update({ where: { id: cn.id }, data: { amountPaid: cnUsed, status: cnStatus }, include: INCLUDE }),
+      ]);
+      return { invoice: updatedInvoice, creditNote: updatedCredit };
+    });
+
+    res.status(201).json({ creditNote: formatInvoice(result.creditNote), invoice: formatInvoice(result.invoice) });
+  } catch (err) {
+    return sendCreditError(res, err, "Failed to apply credit");
+  }
+});
+
+// POST /invoices/:id/refund  { amount, method, note?, date? }  (:id = the credit note)
+// Records money given back to the customer. Like invoice payments, it is a
+// record on the document; it does not write to the sales or expense books.
+router.post("/:id/refund", authMiddleware, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const amount = toMoney(body.amount);
+    const method = String(body.method || "cash").toLowerCase();
+    if (!(amount > 0)) return res.status(400).json({ error: "Enter an amount.", code: "BAD_AMOUNT" });
+    if (!REFUND_METHODS.includes(method)) {
+      return res.status(400).json({ error: "Unknown refund method.", code: "BAD_METHOD" });
+    }
+    const when = body.date ? new Date(body.date) : new Date();
+    if (Number.isNaN(when.getTime())) return res.status(400).json({ error: "Invalid date", code: "BAD_DATE" });
+
+    const note = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!note) return res.status(404).json({ error: "Credit note not found" });
+    if (!(await ownsBusiness(req, note.businessId))) return res.status(403).json({ error: "Access denied" });
+    if (note.type !== "credit_note") {
+      return res.status(400).json({ error: "Only a credit note can be refunded.", code: "NOT_A_CREDIT_NOTE" });
+    }
+
+    const updated = await prisma.withBusinessLock(note.businessId, async () => {
+      const cn = await prisma.invoice.findUnique({ where: { id: note.id } });
+      if (!OPEN_STATUSES.includes(cn.status)) {
+        throw creditError(409, "CREDIT_NOT_OPEN", "This credit note is not open.");
+      }
+      const remaining = toMoney(cn.total - cn.amountPaid);
+      if (amount > remaining) {
+        throw creditError(400, "EXCEEDS_CREDIT", "That is more than the credit left.", { remaining });
+      }
+      const cnUsed = toMoney(cn.amountPaid + amount);
+      const [, row] = await prisma.$transaction([
+        prisma.invoicePayment.create({
+          data: {
+            invoiceId: cn.id,
+            amount,
+            method: `refund_${method}`,
+            note: body.note ? String(body.note).trim().slice(0, 200) || null : null,
+            date: when,
+          },
+        }),
+        prisma.invoice.update({
+          where: { id: cn.id },
+          data: { amountPaid: cnUsed, status: cnUsed >= toMoney(cn.total) ? "PAID" : "PARTIAL" },
+          include: INCLUDE,
+        }),
+      ]);
+      return row;
+    });
+
+    res.status(201).json(formatInvoice(updated));
+  } catch (err) {
+    return sendCreditError(res, err, "Failed to record refund");
   }
 });
 
@@ -658,6 +862,15 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId)))
       return res.status(403).json({ error: "Access denied" });
+    if (existing.type === "credit_note" && (existing.amountPaid || 0) > 0) {
+      return res.status(409).json({ error: "This credit note has been used.", code: "CREDIT_IN_USE" });
+    }
+    if (existing.type !== "credit_note") {
+      const applied = await prisma.creditApplication.count({ where: { invoiceId: existing.id } });
+      if (applied) {
+        return res.status(409).json({ error: "Credit has been applied to this invoice.", code: "CREDITS_APPLIED" });
+      }
+    }
 
     await prisma.invoice.delete({ where: { id: req.params.id } });
     res.json({ ok: true });

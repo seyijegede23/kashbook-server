@@ -108,6 +108,27 @@ const STATUS_LABELS = {
   void:    "Void",
 };
 
+// What kind of document this is, and what it is called on paper.
+function docKindOf(invoice) {
+  if (invoice?.type === "credit_note") return "credit_note";
+  if (invoice?.type === "quote") return "quote";
+  return "invoice";
+}
+const DOC_TITLES = { invoice: "Invoice", quote: "Quote", credit_note: "Credit Note" };
+
+// A credit note reads its states as Zoho does: Open while credit is left,
+// Closed when it is all used.
+const CREDIT_STATUS_LABELS = { draft: "Draft", sent: "Open", partial: "Open", paid: "Closed", void: "Void" };
+const CREDIT_STATUS_COLORS = { draft: "#6B7280", sent: "#3B82F6", partial: "#3B82F6", paid: "#10B981", void: "#9CA3AF" };
+
+// A small title above the number, for the templates that otherwise print only
+// the number (Classic, Minimal). Invoices keep their look.
+function kindTag(invoice, align = "right") {
+  const kind = docKindOf(invoice);
+  if (kind === "invoice") return "";
+  return `<div style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:1px;text-align:${align};margin-bottom:2px;">${DOC_TITLES[kind]}</div>`;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Main entry
 // ──────────────────────────────────────────────────────────────────────────
@@ -132,8 +153,9 @@ function buildInvoiceHtml({
 function buildCtx({ invoice, business, customer, payment, shareUrl, qrDataUrl }) {
   // Lagos date (UTC+1) — dueDate is a Lagos wall-calendar "YYYY-MM-DD" string.
   const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
+  const isCredit = docKindOf(invoice) === "credit_note";
   const liveStatus =
-    invoice.status !== "paid" && invoice.status !== "void" && invoice.dueDate && invoice.dueDate < today
+    !isCredit && invoice.status !== "paid" && invoice.status !== "void" && invoice.dueDate && invoice.dueDate < today
       ? "overdue"
       : (invoice.status || "draft").toLowerCase();
 
@@ -144,12 +166,12 @@ function buildCtx({ invoice, business, customer, payment, shareUrl, qrDataUrl })
     invoice,
     business: business || {},
     customer: customer || null,
-    payment: payment || null,
+    payment: isCredit ? null : payment || null,
     shareUrl: shareUrl || "",
     qrDataUrl: qrDataUrl || "",
     liveStatus,
-    statusColor: STATUS_COLORS[liveStatus] || "#6B7280",
-    statusLabel: STATUS_LABELS[liveStatus] || "Draft",
+    statusColor: (isCredit ? CREDIT_STATUS_COLORS : STATUS_COLORS)[liveStatus] || "#6B7280",
+    statusLabel: (isCredit ? CREDIT_STATUS_LABELS : STATUS_LABELS)[liveStatus] || "Draft",
     balance,
     currency,
     accent: business?.color || "#2563EB",
@@ -185,8 +207,27 @@ function totals(invoice, currency, balance, liveStatus) {
     ${t.discountAmount > 0 ? `<div class="totals-row"><span>Discount</span><span>-${fmt(t.discountAmount, currency)}</span></div>` : ""}
     <hr class="totals-divider" />
     <div class="totals-grand"><span>Total</span><span>${fmt(t.total, currency)}</span></div>
-    ${t.amountPaid > 0 ? `<div class="totals-row" style="color:#10B981;font-weight:600;"><span>Amount Paid</span><span>${fmt(t.amountPaid, currency)}</span></div>` : ""}
+    ${docKindOf(t) === "credit_note" ? creditTotals(t, currency, balance) : paidTotals(t, currency, balance, liveStatus)}`;
+}
+
+// On an invoice, credit applied from credit notes (payments with method
+// "credit_note") is shown apart from money actually paid.
+function paidTotals(t, currency, balance, liveStatus) {
+  const credits = (t.payments || [])
+    .filter((p) => p.method === "credit_note")
+    .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+  const paid = Math.max(0, Number(t.amountPaid || 0) - credits);
+  return `
+    ${credits > 0 ? `<div class="totals-row" style="color:#10B981;font-weight:600;"><span>Credits Applied</span><span>${fmt(credits, currency)}</span></div>` : ""}
+    ${paid > 0 ? `<div class="totals-row" style="color:#10B981;font-weight:600;"><span>Amount Paid</span><span>${fmt(paid, currency)}</span></div>` : ""}
     <div class="balance-row ${liveStatus === "paid" ? "balance-paid" : ""}"><span>Balance Due</span><span>${fmt(balance, currency)}</span></div>`;
+}
+
+// A credit note: what has been used (applied or refunded) and what is left.
+function creditTotals(t, currency, balance) {
+  return `
+    ${t.amountPaid > 0 ? `<div class="totals-row" style="color:#6B7280;font-weight:600;"><span>Credits Used</span><span>${fmt(t.amountPaid, currency)}</span></div>` : ""}
+    <div class="balance-row balance-paid"><span>Credits Remaining</span><span>${fmt(balance, currency)}</span></div>`;
 }
 
 // Payment-terms codes the app stores, as the document prints them. "custom"
@@ -203,18 +244,19 @@ const PAYMENT_TERMS_LABELS = {
 
 function metaBlocks(invoice, customer, liveStatus) {
   const isQuote = invoice.type === "quote";
-  const termsLabel = !isQuote && PAYMENT_TERMS_LABELS[invoice.paymentTerms];
+  const isCredit = invoice.type === "credit_note";
+  const termsLabel = !isQuote && !isCredit && PAYMENT_TERMS_LABELS[invoice.paymentTerms];
   // Bill To on the left; the dates and references as one compact label/value
   // list on the right, so five details take the height the old row of three
   // did and a typical invoice still fits on one page. Inline styles keep it the
   // same across the four templates; values inherit each template's font.
   const rows = [
-    ["Issue Date", invoice.issueDate, null],
+    [isCredit ? "Credit Date" : "Issue Date", invoice.issueDate, null],
     termsLabel ? ["Terms", termsLabel, null] : null,
     invoice.dueDate
       ? [isQuote ? "Expiry Date" : "Due Date", invoice.dueDate, liveStatus === "overdue" ? "#EF4444" : null]
       : null,
-    invoice.orderNumber ? [isQuote ? "Reference" : "Order Number", invoice.orderNumber, null] : null,
+    invoice.orderNumber ? [isQuote || isCredit ? "Reference" : "Order Number", invoice.orderNumber, null] : null,
     invoice.salespersonName ? ["Salesperson", invoice.salespersonName, null] : null,
   ].filter(Boolean);
   const LABEL = "font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:10.5px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.6px;white-space:nowrap;padding-top:2px;";
@@ -342,7 +384,7 @@ function classicTemplate(ctx) {
       <div class="biz-name">${esc(bizName)}</div>
     </div>
     <div style="text-align:right;">
-      <div class="invoice-number">${esc(invoice.invoiceNumber)}</div>
+      ${kindTag(invoice)}<div class="invoice-number">${esc(invoice.invoiceNumber)}</div>
       <div class="status-badge">${statusLabel.toUpperCase()}</div>
     </div>
   </div>
@@ -407,7 +449,7 @@ function modernTemplate(ctx) {
       <div class="biz-name-dark">${esc(bizName)}</div>
     </div>
     <div class="inv-block">
-      <div class="inv-label">Invoice</div>
+      <div class="inv-label">${DOC_TITLES[docKindOf(invoice)]}</div>
       <div class="inv-number">${esc(invoice.invoiceNumber)}</div>
       <div class="status-pill">${statusLabel.toUpperCase()}</div>
     </div>
@@ -471,7 +513,7 @@ function minimalTemplate(ctx) {
       <div class="biz-name-min">${esc(bizName)}</div>
     </div>
     <div style="text-align:right;">
-      <div class="inv-number-min">${esc(invoice.invoiceNumber)}</div>
+      ${kindTag(invoice)}<div class="inv-number-min">${esc(invoice.invoiceNumber)}</div>
       <div class="status-min">${statusLabel}</div>
     </div>
   </div>
@@ -551,11 +593,11 @@ function boldTemplate(ctx) {
   <div class="hero">
     ${logoUrl ? `<img src="${esc(logoUrl)}" class="hero-logo" alt="logo"/>` : ""}
     <div class="hero-biz">${esc(bizName)}</div>
-    <div class="hero-label">Invoice</div>
+    <div class="hero-label">${DOC_TITLES[docKindOf(invoice)]}</div>
     <div class="hero-number">${esc(invoice.invoiceNumber)}</div>
     <div class="hero-status">${statusLabel.toUpperCase()}</div>
     <div class="hero-amount">
-      <div class="hero-amount-label">Amount Due</div>
+      <div class="hero-amount-label">${docKindOf(invoice) === "credit_note" ? "Credits Remaining" : "Amount Due"}</div>
       <div class="hero-amount-value">${fmt(balance, currency)}</div>
     </div>
   </div>

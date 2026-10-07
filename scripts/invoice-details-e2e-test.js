@@ -297,9 +297,158 @@ async function main() {
     check("a one-off typed number is allowed in auto mode", typedLower.status === 201, typedLower.status);
     const autoAfter = await create(owner.id, { customerId: bola.id });
     check("the allocator skips a number typed in another case", autoAfter.body?.invoiceNumber === "KB/051", autoAfter.body?.invoiceNumber);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log("\nCredit notes");
+    const bizRow = async () => prisma.business.findUnique({ where: { id: biz.id } });
+    const invCounterBefore = (await bizRow()).invoiceCounter;
+    const one = [{ name: "Rice returned", quantity: 1, rate: 1500 }];
+    const cn1 = await create(owner.id, {
+      type: "credit_note", customerId: bola.id, items: one, status: "sent",
+      dueDate: "2026-12-01", paymentTerms: "net_30", orderNumber: "KB/010",
+    });
+    check("a credit note is created", cn1.status === 201 && cn1.body?.type === "credit_note", [cn1.status, cn1.body?.type]);
+    check("it has its own numbers, CN-001", cn1.body?.invoiceNumber === "CN-001", cn1.body?.invoiceNumber);
+    check("it opens as SENT (shown as Open)", cn1.body?.status === "SENT", cn1.body?.status);
+    check("a credit note never has terms or a due date", cn1.body?.dueDate === null && cn1.body?.paymentTerms === null, [cn1.body?.dueDate, cn1.body?.paymentTerms]);
+    check("the reference is kept", cn1.body?.orderNumber === "KB/010", cn1.body?.orderNumber);
+    check("the invoice counter does not move", (await bizRow()).invoiceCounter === invCounterBefore, [(await bizRow()).invoiceCounter, invCounterBefore]);
+    check("the credit note counter does", (await bizRow()).creditNoteCounter === 1, (await bizRow()).creditNoteCounter);
+
+    const cnNumbering = await call("PATCH", "/invoices/numbering", owner.id, { businessId: biz.id, kind: "credit_note", prefix: "CR/", nextNumber: 5 });
+    check("credit notes take their own prefix and next number", cnNumbering.status === 200 && cnNumbering.body?.kind === "credit_note" && cnNumbering.body?.invoicePrefix === "CR/" && cnNumbering.body?.next === "CR/005", cnNumbering.body);
+    const cn2 = await create(owner.id, { type: "credit_note", customerId: bola.id, items: one, status: "sent" });
+    check("the next credit note uses them", cn2.body?.invoiceNumber === "CR/005", cn2.body?.invoiceNumber);
+    check("invoice numbering is untouched", (await bizRow()).invoicePrefix === "KB/", (await bizRow()).invoicePrefix);
+
+    const payCn = await call("POST", `/invoices/${cn1.body?.id}/payments`, owner.id, { amount: 100, method: "cash" });
+    check("a credit note takes no payments", payCn.status === 403 && payCn.body?.code === "CREDIT_NOTE_NO_PAYMENT", payCn);
+
+    const target = await create(owner.id, { customerId: bola.id, items: [{ name: "Rice", quantity: 2, rate: 1500 }], status: "sent" });
+    const apply1 = await call("POST", `/invoices/${cn1.body?.id}/apply-credit`, owner.id, { invoiceId: target.body?.id, amount: 1000 });
+    check("credit is applied to the customer's invoice", apply1.status === 201, apply1);
+    check("the credit note is partly used", apply1.body?.creditNote?.amountPaid === 1000 && apply1.body?.creditNote?.status === "PARTIAL", [apply1.body?.creditNote?.amountPaid, apply1.body?.creditNote?.status]);
+    check("the invoice balance falls", apply1.body?.invoice?.amountPaid === 1000 && apply1.body?.invoice?.status === "PARTIAL", [apply1.body?.invoice?.amountPaid, apply1.body?.invoice?.status]);
+    const credPay = (apply1.body?.invoice?.payments || []).find((p) => p.method === "credit_note");
+    check("the invoice shows it as credit from CN-001", credPay?.note === "CN-001" && credPay?.amount === 1000, credPay);
+    const usePay = (apply1.body?.creditNote?.payments || []).find((p) => p.method === "credit_applied");
+    check("the credit note records where it went", usePay?.note === target.body?.invoiceNumber, usePay);
+    check("the link row exists", (await prisma.creditApplication.count({ where: { creditNoteId: cn1.body?.id, invoiceId: target.body?.id } })) === 1);
+    const tooMuch = await call("POST", `/invoices/${cn1.body?.id}/apply-credit`, owner.id, { invoiceId: target.body?.id, amount: 600 });
+    check("more than the credit left is refused", tooMuch.status === 400 && tooMuch.body?.code === "EXCEEDS_CREDIT" && tooMuch.body?.remaining === 500, tooMuch.body);
+    const apply2 = await call("POST", `/invoices/${cn1.body?.id}/apply-credit`, owner.id, { invoiceId: target.body?.id, amount: 500 });
+    check("using the rest closes the credit note", apply2.body?.creditNote?.status === "PAID" && apply2.body?.creditNote?.amountPaid === 1500, [apply2.body?.creditNote?.status, apply2.body?.creditNote?.amountPaid]);
+    const apply3 = await call("POST", `/invoices/${cn1.body?.id}/apply-credit`, owner.id, { invoiceId: target.body?.id, amount: 1 });
+    check("a closed credit note cannot be applied", apply3.status === 409 && apply3.body?.code === "CREDIT_NOT_OPEN", apply3.body);
+
+    const zedInv = await create(owner.id, { customerId: zed.id, items: one, status: "sent" });
+    const mismatch = await call("POST", `/invoices/${cn2.body?.id}/apply-credit`, owner.id, { invoiceId: zedInv.body?.id, amount: 100 });
+    check("credit cannot pay another customer's invoice", mismatch.status === 409 && mismatch.body?.code === "CUSTOMER_MISMATCH", mismatch.body);
+    const small = await create(owner.id, { customerId: bola.id, items: [{ name: "Salt", quantity: 1, rate: 200 }], status: "sent" });
+    const over = await call("POST", `/invoices/${cn2.body?.id}/apply-credit`, owner.id, { invoiceId: small.body?.id, amount: 300 });
+    check("more than the invoice owes is refused", over.status === 400 && over.body?.code === "EXCEEDS_BALANCE" && over.body?.outstanding === 200, over.body);
+    const draftInv = await create(owner.id, { customerId: bola.id, items: one });
+    const toDraft = await call("POST", `/invoices/${cn2.body?.id}/apply-credit`, owner.id, { invoiceId: draftInv.body?.id, amount: 100 });
+    check("credit cannot go to a draft invoice", toDraft.status === 409 && toDraft.body?.code === "INVOICE_NOT_OPEN", toDraft.body);
+    const draftCn = await create(owner.id, { type: "credit_note", customerId: bola.id, items: one });
+    const fromDraft = await call("POST", `/invoices/${draftCn.body?.id}/apply-credit`, owner.id, { invoiceId: small.body?.id, amount: 100 });
+    check("a draft credit note cannot be applied", fromDraft.status === 409 && fromDraft.body?.code === "CREDIT_NOT_OPEN", fromDraft.body);
+    const quoteAsCredit = await call("POST", `/invoices/${target.body?.id}/apply-credit`, owner.id, { invoiceId: small.body?.id, amount: 1 });
+    check("an invoice cannot be applied as credit", quoteAsCredit.status === 400 && quoteAsCredit.body?.code === "NOT_A_CREDIT_NOTE", quoteAsCredit.body);
+    const otherOwnerApply = await call("POST", `/invoices/${cn2.body?.id}/apply-credit`, other.id, { invoiceId: small.body?.id, amount: 1 });
+    check("another owner cannot apply this credit", otherOwnerApply.status === 403, otherOwnerApply.status);
+
+    console.log("\nRefunds");
+    const r1 = await call("POST", `/invoices/${cn2.body?.id}/refund`, owner.id, { amount: 500, method: "cash", note: "Paid back at the counter" });
+    check("a refund uses credit", r1.status === 201 && r1.body?.amountPaid === 500 && r1.body?.status === "PARTIAL", [r1.status, r1.body?.amountPaid, r1.body?.status]);
+    check("it is recorded with its method", (r1.body?.payments || []).some((p) => p.method === "refund_cash" && p.note === "Paid back at the counter"), r1.body?.payments);
+    const r2 = await call("POST", `/invoices/${cn2.body?.id}/refund`, owner.id, { amount: 2000, method: "transfer" });
+    check("more than the credit left is refused", r2.status === 400 && r2.body?.code === "EXCEEDS_CREDIT", r2.body);
+    const r3 = await call("POST", `/invoices/${cn2.body?.id}/refund`, owner.id, { amount: 10, method: "bitcoin" });
+    check("an unknown method is refused", r3.status === 400 && r3.body?.code === "BAD_METHOD", r3.body);
+    const r4 = await call("POST", `/invoices/${cn2.body?.id}/refund`, owner.id, { amount: 1000, method: "transfer" });
+    check("refunding the rest closes it", r4.body?.status === "PAID" && r4.body?.amountPaid === 1500, [r4.body?.status, r4.body?.amountPaid]);
+
+    console.log("\nUsed documents are pinned");
+    const voidUsed = await call("PATCH", `/invoices/${cn1.body?.id}/status`, owner.id, { status: "VOID" });
+    check("a used credit note cannot be voided", voidUsed.status === 409 && voidUsed.body?.code === "CREDIT_IN_USE", voidUsed.body);
+    const delUsed = await call("DELETE", `/invoices/${cn1.body?.id}`, owner.id);
+    check("or deleted", delUsed.status === 409 && delUsed.body?.code === "CREDIT_IN_USE", delUsed.body);
+    const voidCredited = await call("PATCH", `/invoices/${target.body?.id}/status`, owner.id, { status: "VOID" });
+    check("an invoice that received credit cannot be voided", voidCredited.status === 409 && voidCredited.body?.code === "CREDITS_APPLIED", voidCredited.body);
+    const delCredited = await call("DELETE", `/invoices/${target.body?.id}`, owner.id);
+    check("or deleted", delCredited.status === 409 && delCredited.body?.code === "CREDITS_APPLIED", delCredited.body);
+    let dbRefused = false;
+    try { await prisma.invoice.delete({ where: { id: target.body?.id } }); } catch { dbRefused = true; }
+    check("the database refuses it too", dbRefused);
+    const resend = await call("PATCH", `/invoices/${target.body?.id}/status`, owner.id, { status: "SENT" });
+    check("SENT on a part-paid invoice changes nothing", resend.status === 200 && resend.body?.status === "PARTIAL", resend.body?.status);
+    const redraft = await call("PATCH", `/invoices/${target.body?.id}/status`, owner.id, { status: "DRAFT" });
+    check("nothing with payments goes back to draft", redraft.status === 409 && redraft.body?.code === "PAYMENTS_RECORDED", redraft.body);
+    const cn4 = await create(owner.id, { type: "credit_note", customerId: bola.id, items: [{ name: "Credit", quantity: 1, rate: 1000 }], status: "sent" });
+    await call("POST", `/invoices/${cn4.body?.id}/refund`, owner.id, { amount: 400, method: "cash" });
+    const shrink = await call("PUT", `/invoices/${cn4.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-08", items: [{ name: "Less", quantity: 1, rate: 100 }] });
+    check("a credit note cannot shrink below the credit used", shrink.status === 400 && shrink.body?.code === "CREDIT_BELOW_USED" && shrink.body?.used === 400, [shrink.status, shrink.body]);
+    const grow = await call("PUT", `/invoices/${cn4.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-08", items: [{ name: "More", quantity: 1, rate: 1200 }] });
+    check("but it can change while it stays above it", grow.status === 200 && grow.body?.total === 1200, [grow.status, grow.body?.total]);
+    const voidFree = await call("PATCH", `/invoices/${draftCn.body?.id}/status`, owner.id, { status: "VOID" });
+    check("an unused credit note can be voided", voidFree.status === 200 && voidFree.body?.status === "VOID", voidFree.body?.status);
+
+    console.log("\nTwo phones, one credit");
+    const cn3 = await create(owner.id, { type: "credit_note", customerId: bola.id, items: [{ name: "Credit", quantity: 1, rate: 1000 }], status: "sent" });
+    const big = await create(owner.id, { customerId: bola.id, items: [{ name: "Big order", quantity: 1, rate: 5000 }], status: "sent" });
+    const both = await Promise.all([
+      call("POST", `/invoices/${cn3.body?.id}/apply-credit`, owner.id, { invoiceId: big.body?.id, amount: 1000 }),
+      call("POST", `/invoices/${cn3.body?.id}/apply-credit`, owner.id, { invoiceId: big.body?.id, amount: 1000 }),
+      call("POST", `/invoices/${cn3.body?.id}/refund`, owner.id, { amount: 1000, method: "cash" }),
+    ]);
+    const okCount = both.filter((r) => r.status === 201).length;
+    const cn3Row = await prisma.invoice.findUnique({ where: { id: cn3.body?.id } });
+    check("the same credit is spent exactly once", okCount === 1 && cn3Row.amountPaid === 1000, [both.map((r) => r.status), cn3Row.amountPaid]);
+    const bigRow = await prisma.invoice.findUnique({ where: { id: big.body?.id } });
+    const bigApplied = await prisma.creditApplication.aggregate({ _sum: { amount: true }, where: { invoiceId: big.body?.id } });
+    check("and the invoice got at most that much", bigRow.amountPaid === (bigApplied._sum.amount || 0) && bigRow.amountPaid <= 1000, [bigRow.amountPaid, bigApplied._sum.amount]);
+
+    console.log("\nPrinted credit note");
+    const { buildInvoiceHtml } = require("../src/utils/invoiceHtml");
+    const cnHtml = buildInvoiceHtml({
+      invoice: { ...apply2.body?.creditNote, status: "paid" },
+      business: { name: "Test Biz", virtualAccountNumber: "1234567890", virtualAccountBank: "9PSB" },
+      customer: { name: "Bola Buyer" },
+      payment: { bank: "9PSB", number: "1234567890", name: "Test Biz", source: "nuban" },
+    });
+    check("it is titled Credit Note", cnHtml.includes("Credit Note"));
+    check("it says Closed, not Paid", cnHtml.includes("CLOSED") && !cnHtml.includes(">PAID<"));
+    check("it shows credits used and remaining", cnHtml.includes("Credits Used") && cnHtml.includes("Credits Remaining") && !cnHtml.includes("Balance Due"));
+    check("it has no Pay Into block", !cnHtml.includes("Pay Into"));
+    const invHtml = buildInvoiceHtml({
+      invoice: { ...apply2.body?.invoice, status: "partial" },
+      business: { name: "Test Biz" },
+      customer: { name: "Bola Buyer" },
+    });
+    check("the invoice shows credits applied apart from payments", invHtml.includes("Credits Applied") && !invHtml.includes("Amount Paid"), [invHtml.includes("Credits Applied"), invHtml.includes("Amount Paid")]);
+
+    console.log("\nDeleting a whole business");
+    const tmpBiz = await prisma.business.create({ data: { userId: owner.id, name: "Temp" } });
+    const tmpCust = await prisma.customer.create({ data: { userId: owner.id, businessId: tmpBiz.id, name: "Temp customer" } });
+    const tCn = await call("POST", "/invoices", owner.id, { businessId: tmpBiz.id, type: "credit_note", customerId: tmpCust.id, issueDate: "2026-10-08", items: one, status: "sent" });
+    const tInv = await call("POST", "/invoices", owner.id, { businessId: tmpBiz.id, customerId: tmpCust.id, issueDate: "2026-10-08", items: one, status: "sent" });
+    await call("POST", `/invoices/${tCn.body?.id}/apply-credit`, owner.id, { invoiceId: tInv.body?.id, amount: 500 });
+    let bizGone = false;
+    try {
+      await prisma.customer.deleteMany({ where: { businessId: tmpBiz.id, invoices: { none: {} } } });
+      await prisma.business.delete({ where: { id: tmpBiz.id } });
+      bizGone = true;
+    } catch (e) {
+      console.log("        ", e.message.split("\n").slice(-1)[0]);
+    }
+    check("a business with applied credit can still be deleted", bizGone);
+    check("its credit links went with it", (await prisma.creditApplication.count({ where: { businessId: tmpBiz.id } })) === 0);
   } finally {
     server.close();
     // Scratch rows: remove what this run made so it can run again cleanly.
+    // Credit links first: they pin their documents (NO ACTION foreign keys).
+    await prisma.creditApplication.deleteMany({ where: { businessId: { in: [biz.id, otherBiz.id] } } }).catch(() => {});
     await prisma.invoice.deleteMany({ where: { businessId: { in: [biz.id, otherBiz.id] } } }).catch(() => {});
     await prisma.recurringInvoice.deleteMany({ where: { businessId: biz.id } }).catch(() => {});
     await prisma.appNotification.deleteMany({ where: { userId: { in: [owner.id, staff.id, other.id] } } }).catch(() => {});

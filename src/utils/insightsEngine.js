@@ -1121,7 +1121,9 @@ const HANDLERS = {
 
   async invoices({ business }) {
     const open = await prisma.invoice.findMany({
-      where: { businessId: business.id, status: { in: ["SENT", "PARTIAL", "OVERDUE"] } },
+      // Invoices only: a sent quote is not owed, and a credit note is owed TO
+      // the customer. (Before credit notes this also counted sent quotes.)
+      where: { businessId: business.id, type: "invoice", status: { in: ["SENT", "PARTIAL", "OVERDUE"] } },
       select: { total: true, amountPaid: true, dueDate: true },
     });
     if (open.length === 0) return { answer: "No unpaid invoices — everything is settled. ✅" };

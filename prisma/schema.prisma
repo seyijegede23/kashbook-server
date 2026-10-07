@@ -123,6 +123,9 @@ model Business {
   invoiceCounter             Int       @default(0)
   invoicePrefix              String? // NULL = "INV-"; "" = plain numbers. Quotes keep "QTE-".
   invoiceNumberMode          String? // NULL/"auto" = server numbers invoices; "manual" = the app asks for one
+  creditNoteCounter          Int       @default(0) // credit notes have their own run of numbers
+  creditNotePrefix           String? // NULL = "CN-"; "" = plain numbers
+  creditNoteNumberMode       String? // NULL/"auto" or "manual", as for invoices
   taxId                     String? // display-only Tax ID / RC number for documents (P&L, invoices)
   virtualAccountRef          String?
   virtualAccountId           String?
@@ -210,6 +213,7 @@ model Business {
   reminders         Reminder[]
   payables          Payable[]
   invoices          Invoice[]
+  creditApplications CreditApplication[]
   recurringExpenses RecurringExpense[]
   recurringInvoices RecurringInvoice[]
   officers          BusinessOfficer[]
@@ -1055,6 +1059,10 @@ model Invoice {
   items          InvoiceItem[]
   payments       InvoicePayment[]
   shareLink      InvoiceShareLink?
+  // Credit notes only: credit this note gave to invoices.
+  creditsGiven    CreditApplication[] @relation("CreditGiven")
+  // Invoices only: credit notes applied to this invoice.
+  creditsReceived CreditApplication[] @relation("CreditReceived")
   createdAt      DateTime          @default(now())
   updatedAt      DateTime          @updatedAt
 
@@ -1072,6 +1080,27 @@ model InvoiceItem {
   quantity    Float   @default(1)
   rate        Float   @default(0)
   amount      Float   @default(0)
+}
+
+// Credit from a credit note (an Invoice with type "credit_note") applied to an
+// invoice of the same customer. The invoice also carries an InvoicePayment
+// with method "credit_note"; this row links the two documents. Document links
+// are NO ACTION so a document with credit attached cannot be deleted alone.
+model CreditApplication {
+  id           String   @id @default(uuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  creditNoteId String
+  creditNote   Invoice  @relation("CreditGiven", fields: [creditNoteId], references: [id], onDelete: NoAction)
+  invoiceId    String
+  invoice      Invoice  @relation("CreditReceived", fields: [invoiceId], references: [id], onDelete: NoAction)
+  amount       Float
+  date         DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@index([creditNoteId])
+  @@index([invoiceId])
+  @@index([businessId])
 }
 
 model InvoicePayment {
