@@ -7,6 +7,8 @@ const {
   invoicePrefixOf,
   normalizePrefix,
   normalizeNextNumber,
+  normalizeManualNumber,
+  numberTaken,
 } = require("../utils/invoiceNumber");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -205,12 +207,20 @@ router.post("/", authMiddleware, async (req, res) => {
     const biz = await ownsBusiness(req, businessId);
     if (!biz) return res.status(403).json({ error: "Access denied" });
 
+    // A number the owner typed ("manually each time" or "only for this
+    // invoice"). Nothing typed means the server numbers it, whatever the
+    // business's mode: an older app that never sends one must still work.
+    const manualNumber = normalizeManualNumber(req.body.invoiceNumber);
+    if (manualNumber === null) {
+      return res.status(400).json({
+        error: "Use up to 30 letters, numbers, spaces or - _ / . # for the invoice number.",
+        code: "BAD_INVOICE_NUMBER",
+      });
+    }
+
     const details = await readDetailFields(req.body, userId);
     const resolvedCustomerId = await resolveCustomerId(req.body, businessId, userId);
-
-    // Next number off the business counter, with the owner's prefix.
     const isQuote = type === "quote";
-    const invoiceNumber = await allocateInvoiceNumber(prisma, businessId, isQuote ? "quote" : "invoice");
 
     // Calculate totals
     const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
@@ -223,44 +233,64 @@ router.post("/", authMiddleware, async (req, res) => {
     }
     const total = Math.max(0, subtotal + taxAmount - discountAmount);
 
-    const invoice = await prisma.invoice.create({
-      data: {
-        businessId,
-        customerId: resolvedCustomerId,
-        userId,
-        invoiceNumber,
-        type: isQuote ? "quote" : "invoice",
-        // A new document is a draft or sent. PAID and the rest come from
-        // payments, never from the create body.
-        status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
-        issueDate,
-        dueDate: dueDate || null,
-        subtotal,
-        taxRate: Number(taxRate) || 0,
-        taxAmount,
-        discountType: discountType || null,
-        discountValue: Number(discountValue) || 0,
-        discountAmount,
-        total,
-        notes: notes || null,
-        terms: terms || null,
-        template,
-        ...details,
-        items: {
-          create: items.map((it) => ({
-            name: it.name,
-            description: it.description || null,
-            quantity: Number(it.quantity) || 1,
-            rate: Number(it.rate) || 0,
-            amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
-          })),
+    // Choosing the number and writing the invoice happen under the business
+    // lock, the same one the recurring runner and Instagram orders hold while
+    // they number theirs, so a typed number and an automatic one can never land
+    // on the same value.
+    const invoice = await prisma.withBusinessLock(businessId, async () => {
+      let invoiceNumber;
+      if (manualNumber) {
+        if (await numberTaken(prisma, businessId, manualNumber)) {
+          throw Object.assign(new Error(`${manualNumber} is already used.`), {
+            status: 409, code: "NUMBER_IN_USE", number: manualNumber,
+          });
+        }
+        invoiceNumber = manualNumber;
+      } else {
+        invoiceNumber = await allocateInvoiceNumber(prisma, businessId, isQuote ? "quote" : "invoice");
+      }
+      return prisma.invoice.create({
+        data: {
+          businessId,
+          customerId: resolvedCustomerId,
+          userId,
+          invoiceNumber,
+          type: isQuote ? "quote" : "invoice",
+          // A new document is a draft or sent. PAID and the rest come from
+          // payments, never from the create body.
+          status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
+          issueDate,
+          dueDate: dueDate || null,
+          subtotal,
+          taxRate: Number(taxRate) || 0,
+          taxAmount,
+          discountType: discountType || null,
+          discountValue: Number(discountValue) || 0,
+          discountAmount,
+          total,
+          notes: notes || null,
+          terms: terms || null,
+          template,
+          ...details,
+          items: {
+            create: items.map((it) => ({
+              name: it.name,
+              description: it.description || null,
+              quantity: Number(it.quantity) || 1,
+              rate: Number(it.rate) || 0,
+              amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
+            })),
+          },
         },
-      },
-      include: INCLUDE,
+        include: INCLUDE,
+      });
     });
 
     res.status(201).json(formatInvoice(invoice));
   } catch (err) {
+    if (err.status === 409) {
+      return res.status(409).json({ error: err.message, code: err.code, number: err.number });
+    }
     console.error(err);
     res.status(500).json({ error: "Failed to create invoice" });
   }
@@ -279,6 +309,22 @@ router.patch("/numbering", authMiddleware, async (req, res) => {
     const biz = await ownsBusiness(req, body.businessId);
     if (!biz) return res.status(403).json({ error: "Access denied" });
 
+    // auto: the server issues the next number (prefix + counter).
+    // manual: the app asks for a number on every new invoice. The prefix and
+    // counter are kept so switching back to auto carries on where it was.
+    const mode = body.mode === undefined ? (biz.invoiceNumberMode === "manual" ? "manual" : "auto") : body.mode;
+    if (mode !== "auto" && mode !== "manual") {
+      return res.status(400).json({ error: "Numbering is auto or manual.", code: "BAD_MODE" });
+    }
+    if (mode === "manual") {
+      const updated = await prisma.business.update({
+        where: { id: biz.id },
+        data: { invoiceNumberMode: "manual" },
+        select: { invoicePrefix: true, invoiceCounter: true, invoiceNumberMode: true },
+      });
+      return res.json({ ...updated, next: null });
+    }
+
     const prefix = body.prefix === undefined ? invoicePrefixOf(biz) : normalizePrefix(body.prefix);
     if (prefix === null) {
       return res.status(400).json({
@@ -292,22 +338,21 @@ router.patch("/numbering", authMiddleware, async (req, res) => {
     }
 
     // Refuse a starting point that is already taken, so the owner hears about
-    // it now instead of the allocator silently skipping ahead later.
+    // it now instead of the allocator silently skipping ahead later. Under the
+    // business lock, like every other read-then-write of the counter.
     const number = formatInvoiceNumber(prefix, next);
-    const clash = await prisma.invoice.findFirst({
-      where: { businessId: biz.id, invoiceNumber: number },
-      select: { id: true },
+    const result = await prisma.withBusinessLock(biz.id, async () => {
+      if (await numberTaken(prisma, biz.id, number)) return null;
+      return prisma.business.update({
+        where: { id: biz.id },
+        data: { invoicePrefix: prefix, invoiceCounter: next - 1, invoiceNumberMode: "auto" },
+        select: { invoicePrefix: true, invoiceCounter: true, invoiceNumberMode: true },
+      });
     });
-    if (clash) {
+    if (!result) {
       return res.status(409).json({ error: `${number} is already used.`, code: "NUMBER_IN_USE", number });
     }
-
-    const updated = await prisma.business.update({
-      where: { id: biz.id },
-      data: { invoicePrefix: prefix, invoiceCounter: next - 1 },
-      select: { invoicePrefix: true, invoiceCounter: true },
-    });
-    res.json({ ...updated, next: number });
+    res.json({ ...result, next: number });
   } catch (err) {
     console.error("invoice numbering error:", err);
     res.status(500).json({ error: "Failed to update invoice numbering" });
@@ -376,42 +421,78 @@ router.put("/:id", authMiddleware, async (req, res) => {
         ? { status: "SENT" }
         : {};
 
-    // Replace all items
-    await prisma.invoiceItem.deleteMany({ where: { invoiceId: req.params.id } });
+    // A draft's number can be corrected (a typed number with a typo). Once
+    // the invoice has gone out, its number is fixed.
+    let newNumber = null;
+    if ("invoiceNumber" in req.body) {
+      const n = normalizeManualNumber(req.body.invoiceNumber);
+      if (n === null) {
+        return res.status(400).json({
+          error: "Use up to 30 letters, numbers, spaces or - _ / . # for the invoice number.",
+          code: "BAD_INVOICE_NUMBER",
+        });
+      }
+      if (n && n !== existing.invoiceNumber) {
+        if (existing.status !== "DRAFT") {
+          return res.status(400).json({ error: "Only a draft's number can be changed.", code: "NUMBER_LOCKED" });
+        }
+        newNumber = n;
+      }
+    }
 
-    const invoice = await prisma.invoice.update({
-      where: { id: req.params.id },
-      data: {
-        ...details,
-        ...statusPatch,
-        customerId: resolvedCustomerId,
-        issueDate: issueDate || existing.issueDate,
-        dueDate: dueDate || null,
-        subtotal,
-        taxRate: Number(taxRate) || 0,
-        taxAmount,
-        discountType: discountType || null,
-        discountValue: Number(discountValue) || 0,
-        discountAmount,
-        total,
-        notes: notes || null,
-        terms: terms || null,
-        template: template || existing.template,
-        items: {
-          create: items.map((it) => ({
-            name: it.name,
-            description: it.description || null,
-            quantity: Number(it.quantity) || 1,
-            rate: Number(it.rate) || 0,
-            amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
-          })),
+    // The duplicate check runs before anything is written, and under the
+    // business lock when the number changes, like a create.
+    const writeUpdate = async () => {
+      if (newNumber && (await numberTaken(prisma, existing.businessId, newNumber, existing.id))) {
+        throw Object.assign(new Error(`${newNumber} is already used.`), {
+          status: 409, code: "NUMBER_IN_USE", number: newNumber,
+        });
+      }
+
+      // Replace all items
+      await prisma.invoiceItem.deleteMany({ where: { invoiceId: req.params.id } });
+
+      return prisma.invoice.update({
+        where: { id: req.params.id },
+        data: {
+          ...details,
+          ...statusPatch,
+          ...(newNumber ? { invoiceNumber: newNumber } : {}),
+          customerId: resolvedCustomerId,
+          issueDate: issueDate || existing.issueDate,
+          dueDate: dueDate || null,
+          subtotal,
+          taxRate: Number(taxRate) || 0,
+          taxAmount,
+          discountType: discountType || null,
+          discountValue: Number(discountValue) || 0,
+          discountAmount,
+          total,
+          notes: notes || null,
+          terms: terms || null,
+          template: template || existing.template,
+          items: {
+            create: items.map((it) => ({
+              name: it.name,
+              description: it.description || null,
+              quantity: Number(it.quantity) || 1,
+              rate: Number(it.rate) || 0,
+              amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
+            })),
+          },
         },
-      },
-      include: INCLUDE,
-    });
+        include: INCLUDE,
+      });
+    };
+    const invoice = newNumber
+      ? await prisma.withBusinessLock(existing.businessId, writeUpdate)
+      : await writeUpdate();
 
     res.json(formatInvoice(invoice));
   } catch (err) {
+    if (err.status === 409) {
+      return res.status(409).json({ error: err.message, code: err.code, number: err.number });
+    }
     console.error(err);
     res.status(500).json({ error: "Failed to update invoice" });
   }

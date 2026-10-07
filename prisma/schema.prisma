@@ -122,6 +122,7 @@ model Business {
   kycIdType                  String    @default("BVN") // "BVN" | "GhanaCard" | "KE_NID" | "SA_ID" | "EG_NID" | "UG_NIN"
   invoiceCounter             Int       @default(0)
   invoicePrefix              String? // NULL = "INV-"; "" = plain numbers. Quotes keep "QTE-".
+  invoiceNumberMode          String? // NULL/"auto" = server numbers invoices; "manual" = the app asks for one
   taxId                     String? // display-only Tax ID / RC number for documents (P&L, invoices)
   virtualAccountRef          String?
   virtualAccountId           String?

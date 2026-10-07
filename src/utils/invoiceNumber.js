@@ -39,6 +39,32 @@ function normalizeNextNumber(raw) {
   return n;
 }
 
+// A number the owner typed. Up to 30 characters: letters, digits, single
+// spaces and the separators people print on invoices; it must start with a
+// letter, a digit or #. undefined = nothing typed (number it automatically),
+// null = typed but not acceptable. Mirrored in CreateInvoiceScreen.js.
+const MANUAL_NUMBER_RE = /^[A-Za-z0-9#][A-Za-z0-9\-_/.# ]{0,29}$/;
+function normalizeManualNumber(raw) {
+  if (raw === null || raw === undefined) return undefined;
+  const s = String(raw).trim().replace(/\s+/g, " ");
+  if (!s) return undefined;
+  return MANUAL_NUMBER_RE.test(s) ? s : null;
+}
+
+// Is this number already on another document of the business? Case-blind, so
+// "inv-010" and "INV-010" cannot both exist.
+async function numberTaken(db, businessId, number, excludeId = null) {
+  const hit = await db.invoice.findFirst({
+    where: {
+      businessId,
+      invoiceNumber: { equals: number, mode: "insensitive" },
+      ...(excludeId ? { id: { not: excludeId } } : {}),
+    },
+    select: { id: true },
+  });
+  return !!hit;
+}
+
 // Increment the counter and return the first number not already used by this
 // business. The skip loop matters after an owner lowers "next number" below
 // numbers that already exist; the numbering route refuses that exact case, so
@@ -52,11 +78,7 @@ async function allocateInvoiceNumber(db, businessId, type = "invoice") {
     });
     const prefix = type === "quote" ? QUOTE_PREFIX : invoicePrefixOf(biz);
     const number = formatInvoiceNumber(prefix, biz.invoiceCounter);
-    const clash = await db.invoice.findFirst({
-      where: { businessId, invoiceNumber: number },
-      select: { id: true },
-    });
-    if (!clash) return number;
+    if (!(await numberTaken(db, businessId, number))) return number;
   }
   throw new Error("Could not find a free invoice number");
 }
@@ -70,5 +92,7 @@ module.exports = {
   invoicePrefixOf,
   normalizePrefix,
   normalizeNextNumber,
+  normalizeManualNumber,
+  numberTaken,
   allocateInvoiceNumber,
 };

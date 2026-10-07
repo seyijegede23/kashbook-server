@@ -239,6 +239,64 @@ async function main() {
     const list = await call("GET", `/invoices?businessId=${biz.id}`, owner.id);
     const row = (list.body || []).find((i) => i.id === d.id);
     check("the list returns the new fields", !!row && row.paymentTerms === "net_45" && row.subject === "Updated", row && [row.paymentTerms, row.subject]);
+
+    console.log("\nTyped (manual) numbers");
+    const counterOf = async () => (await prisma.business.findUnique({ where: { id: biz.id } })).invoiceCounter;
+    const staffManual = await call("PATCH", "/invoices/numbering", staff.id, { businessId: biz.id, mode: "manual" });
+    check("staff cannot switch numbering to manual", staffManual.status === 403, staffManual.status);
+    const badMode = await call("PATCH", "/invoices/numbering", owner.id, { businessId: biz.id, mode: "sometimes" });
+    check("an unknown mode is refused", badMode.status === 400 && badMode.body?.code === "BAD_MODE", badMode);
+    const toManual = await call("PATCH", "/invoices/numbering", owner.id, { businessId: biz.id, mode: "manual" });
+    check("the owner switches to manual numbering", toManual.status === 200 && toManual.body?.invoiceNumberMode === "manual", toManual);
+    check("switching to manual keeps the prefix and counter", toManual.body?.invoicePrefix === "KB/" && toManual.body?.invoiceCounter === 15, [toManual.body?.invoicePrefix, toManual.body?.invoiceCounter]);
+    const c0 = await counterOf();
+    const m1 = await create(owner.id, { customerId: bola.id, invoiceNumber: "  2026/045 " });
+    check("a typed number is kept exactly, trimmed", m1.status === 201 && m1.body?.invoiceNumber === "2026/045", [m1.status, m1.body?.invoiceNumber]);
+    check("a typed number does not move the counter", (await counterOf()) === c0, [c0, await counterOf()]);
+    const dup = await create(owner.id, { customerId: bola.id, invoiceNumber: "2026/045" });
+    check("the same number again is refused", dup.status === 409 && dup.body?.code === "NUMBER_IN_USE" && dup.body?.number === "2026/045", dup);
+    const dupCase = await create(owner.id, { customerId: bola.id, invoiceNumber: "kb/010" });
+    check("a number differing only in case is refused", dupCase.status === 409, dupCase.status);
+    const badNum = await create(owner.id, { customerId: bola.id, invoiceNumber: "bad*number" });
+    check("characters outside the allowed set are refused", badNum.status === 400 && badNum.body?.code === "BAD_INVOICE_NUMBER", badNum);
+    const hashNum = await create(owner.id, { customerId: bola.id, invoiceNumber: "#045" });
+    check("a number may start with #", hashNum.status === 201 && hashNum.body?.invoiceNumber === "#045", [hashNum.status, hashNum.body?.invoiceNumber]);
+    const tooLong = await create(owner.id, { customerId: bola.id, invoiceNumber: "X".repeat(31) });
+    check("more than 30 characters is refused", tooLong.status === 400, tooLong.status);
+    const fallback = await create(owner.id, { customerId: bola.id });
+    check("manual mode with no number still numbers it (older apps)", fallback.status === 201 && fallback.body?.invoiceNumber === "KB/016", [fallback.status, fallback.body?.invoiceNumber]);
+
+    const race = await Promise.all(
+      Array.from({ length: 5 }, () => create(owner.id, { customerId: bola.id, invoiceNumber: "RACE-1" })),
+    );
+    const won = race.filter((r) => r.status === 201).length;
+    const lost = race.filter((r) => r.status === 409).length;
+    check("five simultaneous saves of one number: exactly one wins", won === 1 && lost === 4, race.map((r) => r.status));
+    check("and only one invoice carries it", (await prisma.invoice.count({ where: { businessId: biz.id, invoiceNumber: "RACE-1" } })) === 1);
+
+    console.log("\nCorrecting a draft's number");
+    const draft = await create(owner.id, { customerId: bola.id, invoiceNumber: "2026/046" });
+    const fixd = await call("PUT", `/invoices/${draft.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-07", items, invoiceNumber: "2026/047" });
+    check("a draft's number can be corrected", fixd.status === 200 && fixd.body?.invoiceNumber === "2026/047", [fixd.status, fixd.body?.invoiceNumber]);
+    const clashPut = await call("PUT", `/invoices/${draft.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07", items: [{ name: "Should not land", quantity: 1, rate: 1 }], invoiceNumber: "2026/045",
+    });
+    check("correcting to a used number is refused", clashPut.status === 409 && clashPut.body?.code === "NUMBER_IN_USE", clashPut);
+    const after = await prisma.invoice.findUnique({ where: { id: draft.body?.id }, include: { items: true } });
+    check("a refused correction writes nothing", after?.invoiceNumber === "2026/047" && after?.items.length === 1 && after.items[0].name === "Rice", [after?.invoiceNumber, after?.items.map((i) => i.name)]);
+    const same = await call("PUT", `/invoices/${draft.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-07", items, invoiceNumber: "2026/047" });
+    check("sending the unchanged number is fine", same.status === 200, same.status);
+    const sentInv = await create(owner.id, { customerId: bola.id, invoiceNumber: "2026/048", status: "sent" });
+    const lockedPut = await call("PUT", `/invoices/${sentInv.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-07", items, invoiceNumber: "2026/049" });
+    check("a sent invoice's number is fixed", lockedPut.status === 400 && lockedPut.body?.code === "NUMBER_LOCKED", lockedPut);
+
+    console.log("\nBack to automatic");
+    const toAuto = await call("PATCH", "/invoices/numbering", owner.id, { businessId: biz.id, mode: "auto", prefix: "KB/", nextNumber: 50 });
+    check("switching back to auto works", toAuto.status === 200 && toAuto.body?.invoiceNumberMode === "auto" && toAuto.body?.next === "KB/050", toAuto);
+    const typedLower = await create(owner.id, { customerId: bola.id, invoiceNumber: "kb/050" });
+    check("a one-off typed number is allowed in auto mode", typedLower.status === 201, typedLower.status);
+    const autoAfter = await create(owner.id, { customerId: bola.id });
+    check("the allocator skips a number typed in another case", autoAfter.body?.invoiceNumber === "KB/051", autoAfter.body?.invoiceNumber);
   } finally {
     server.close();
     // Scratch rows: remove what this run made so it can run again cleanly.
