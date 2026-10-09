@@ -163,7 +163,9 @@ function buildCtx({ invoice, business, customer, payment, shareUrl, qrDataUrl })
   const currency = invoice.currency || "NGN";
 
   return {
-    invoice,
+    // The tax line says VAT for a VAT-registered business; the details list
+    // prints its TIN (books rule, Oct 2026).
+    invoice: { ...invoice, _taxLabel: business?.vatEnabled ? "VAT" : "Tax", _tin: business?.vatEnabled ? business?.taxId || "" : "" },
     business: business || {},
     customer: customer || null,
     payment: isCredit ? null : payment || null,
@@ -203,7 +205,7 @@ function totals(invoice, currency, balance, liveStatus) {
   const t = invoice;
   return `
     <div class="totals-row"><span>Subtotal</span><span>${fmt(t.subtotal, currency)}</span></div>
-    ${t.taxAmount > 0 ? `<div class="totals-row"><span>Tax (${Number(t.taxRate || 0)}%)</span><span>+${fmt(t.taxAmount, currency)}</span></div>` : ""}
+    ${t.taxAmount > 0 ? `<div class="totals-row"><span>${t._taxLabel || "Tax"} (${Number(t.taxRate || 0)}%)</span><span>+${fmt(t.taxAmount, currency)}</span></div>` : ""}
     ${t.discountAmount > 0 ? `<div class="totals-row"><span>Discount</span><span>-${fmt(t.discountAmount, currency)}</span></div>` : ""}
     <hr class="totals-divider" />
     <div class="totals-grand"><span>Total</span><span>${fmt(t.total, currency)}</span></div>
@@ -258,6 +260,8 @@ function metaBlocks(invoice, customer, liveStatus) {
       : null,
     invoice.orderNumber ? [isQuote || isCredit ? "Reference" : "Order Number", invoice.orderNumber, null] : null,
     invoice.salespersonName ? ["Salesperson", invoice.salespersonName, null] : null,
+    invoice._tin ? ["TIN", invoice._tin, null] : null,
+    invoice.irn ? ["IRN", invoice.irn, null] : null,
   ].filter(Boolean);
   const LABEL = "font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:10.5px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.6px;white-space:nowrap;padding-top:2px;";
   const VALUE = "font-size:13.5px;color:#111;font-weight:500;text-align:right;";
