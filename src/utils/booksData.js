@@ -39,16 +39,18 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
   const [sales, expenses, bankRows, invoices, debts] = await Promise.all([
     db.sales.findMany({
       where: { businessId, ...(date ? { date } : {}) },
-      select: { id: true, amount: true, date: true, isCredit: true },
+      // channel and customerId: Insights breaks sales down by them (bookRows
+      // carries every field selected here).
+      select: { id: true, amount: true, date: true, isCredit: true, channel: true, customerId: true },
     }),
     db.expense.findMany({
       where: { businessId, ...(date ? { date } : {}) },
-      select: { id: true, amount: true, date: true },
+      select: { id: true, amount: true, date: true, category: true },
     }),
     db.transaction.findMany({
       where: { businessId, ...(date ? { date } : {}) },
       select: {
-        id: true, type: true, amount: true, date: true, purpose: true,
+        id: true, type: true, amount: true, date: true, purpose: true, channel: true, customerId: true,
         matchedSaleId: true, matchedCustomerId: true, matchedExpenseId: true,
         matchedInvoiceId: true, matchedAmount: true,
       },

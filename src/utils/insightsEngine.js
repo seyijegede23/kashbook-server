@@ -876,7 +876,8 @@ async function sumIncome(businessId, range, channel) {
     return { total: got.books.sales.total, count: lineCount(L) - L.awaitingPayment.count - L.creditUnlinked.count };
   }
   const rows = got.rows.filter((r) => r.type === "income" && r.channel === channel);
-  return { total: Math.round(rows.reduce((t, r) => t + r.amount, 0) * 100) / 100, count: rows.length };
+  const gross = rows.reduce((t, r) => t + r.amount, 0);
+  return { total: Math.round(gross * netShare(got) * 100) / 100, count: rows.length };
 }
 
 async function sumExpenses(businessId, range) {
@@ -885,16 +886,26 @@ async function sumExpenses(businessId, range) {
   return { total: got.books.expenses.total, count: lineCount(got.books.expenses.lines) };
 }
 
+// Rows carry what was received (VAT inside, for a VAT business); the totals
+// are net of VAT. Breakdowns take VAT out in the same proportion, so a
+// channel or a customer is never more than the total it is part of.
+function netShare(got) {
+  const s = got.books.sales;
+  return s.gross > 0 ? s.total / s.gross : 1;
+}
+
 // Income rows of a span grouped by a key (channel, customer, weekday...).
 async function incomeBy(businessId, range, keyOf) {
   const got = await span(businessId, range);
   const out = new Map();
+  if (!got) return out;
+  const share = netShare(got);
   for (const r of (got && got.rows) || []) {
     if (r.type !== "income") continue;
     const k = keyOf(r);
     if (k == null) continue;
     const cur = out.get(k) || { amount: 0, count: 0 };
-    cur.amount += r.amount;
+    cur.amount += r.amount * share;
     cur.count += 1;
     out.set(k, cur);
   }

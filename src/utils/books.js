@@ -140,7 +140,7 @@ function vatInside(amount, vat) {
   return round2((num(amount) * vat.rate) / (100 + vat.rate));
 }
 
-// VAT inside money RECEIVED (a transfer nothing explains, a debt repayment):
+// VAT inside money RECEIVED that no record explains (a bank credit):
 // what a customer pays always includes the VAT, whatever the recording mode.
 function vatInsideReceived(amount, vat) {
   if (!vat.enabled || !(vat.rate > 0)) return 0;
@@ -284,8 +284,11 @@ function computeBooks(input, opts) {
     if (basis === "paid") {
       for (const p of d.payments || []) {
         if (!inRange(p.date, from, to)) continue;
+        // A repayment settles a debt recorded like a sale (net when VAT is
+        // added on top), so its VAT follows the recording mode, as the sale's
+        // would have if it had been paid on the spot.
         const a = num(p.amount);
-        addTo(L.debtPayments, a, vatInsideReceived(a, vat));
+        addTo(L.debtPayments, a, vatInside(a, vat));
       }
     } else if (!d.saleId && inRange(d.date, from, to)) {
       const a = num(d.amount);

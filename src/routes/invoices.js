@@ -14,6 +14,7 @@ const {
 const { vatDeadline, round2 } = require("../utils/books");
 const { sameMoney } = require("../utils/money");
 const { audit } = require("../utils/audit");
+const { recordLink } = require("../utils/paymentLinks");
 
 // Money that enters or leaves the books through an invoice leaves a trail:
 // who recorded, undid or wrote off what. Fire and forget, like the bank routes.
@@ -896,6 +897,7 @@ router.post("/:id/payments/:paymentId/link", authMiddleware, async (req, res) =>
         if (amount > credit.remaining + 0.005) {
           throw creditError(400, "EXCEEDS_TRANSFER", "That is more than is left of the transfer.", { remaining: credit.remaining });
         }
+        await recordLink(px, { req, kind: "invoice_payment", payment: p, transactionId: credit.tx.id });
         await px.invoicePayment.update({
           where: { id: p.id },
           data: { method: "bank", transactionId: credit.tx.id, date: credit.tx.date },

@@ -208,7 +208,18 @@ router.patch("/:id", validateIdParam, async (req, res) => {
             },
           });
           await refreshTotalOwed(px, debt.customerId);
-        } else if (!debt && toCredit && !sale.isCredit && sale.customerId) {
+        } else if (
+          !debt && toCredit && !sale.isCredit && sale.customerId &&
+          // Only the seller's own customer (this business's or one with no
+          // business), as when the sale is created on credit.
+          (await px.customer.count({
+            where: {
+              id: sale.customerId,
+              userId: sale.userId,
+              ...(sale.businessId ? { OR: [{ businessId: sale.businessId }, { businessId: null }] } : {}),
+            },
+          }))
+        ) {
           // Now on credit: open the customer's debt for it.
           await px.debt.create({
             data: { customerId: sale.customerId, amount: newAmount, note: sale.notes || "", date: row.date, saleId: sale.id },

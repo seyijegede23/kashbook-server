@@ -6,6 +6,7 @@ const { normalizeChannel } = require("../utils/salesChannel");
 const { isBankLedgerRow, isSavingsRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
 const { CREDIT_OUTCOMES } = require("../utils/books");
+const { recordLink, linkedFrom } = require("../utils/paymentLinks");
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
 // match endpoints, so "Match to Sale or Debt" silently 404'd and reverted.
@@ -502,7 +503,10 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
     if (!pre) return;
 
     const customer = await prisma.customer.findUnique({ where: { id: customerId } });
-    if (!customer || customer.userId !== getTargetUserId(req))
+    // Another business's customer would move this naira into that business's
+    // books (its debts count there) while the credit stops counting here.
+    if (!customer || customer.userId !== getTargetUserId(req) ||
+        (customer.businessId && customer.businessId !== pre.businessId))
       return res.status(404).json({ error: "Customer not found" });
 
     const result = await prisma.withBusinessLock(pre.businessId, () =>
@@ -527,10 +531,14 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
           const outstanding = debt.amount - debt.paidAmount;
           const payment = Math.min(outstanding, remaining);
           if (payment <= 0) continue;
-          await px.debt.update({
-            where: { id: debt.id },
+          // Compare-and-set: a repayment recorded at the same moment from the
+          // customer screen (locked on another key for a customer with no
+          // business) must not be overwritten.
+          const moved = await px.debt.updateMany({
+            where: { id: debt.id, paidAmount: debt.paidAmount },
             data: { paidAmount: debt.paidAmount + payment, paid: debt.paidAmount + payment >= debt.amount },
           });
+          if (moved.count !== 1) throw matchError(409, "DEBT_CHANGED", "This debt just changed. Try again.");
           await px.debtPayment.create({
             data: {
               debtId: debt.id,
@@ -599,6 +607,10 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
       return res.status(403).json({ error: "Forbidden" });
     if (!tx0.matchedSaleId && !tx0.matchedCustomerId && !tx0.matchedExpenseId && !tx0.matchedInvoiceId)
       return res.json({ matched: false }); // idempotent no-op
+    // Taking invoice payments or debt repayments back out of the books is the
+    // owner's call, as on the invoice itself (OWNER_ONLY there too).
+    if (req.user.accountType === "staff" && (tx0.matchedInvoiceId || tx0.matchedCustomerId))
+      return res.status(403).json({ error: "Only the business owner can do this.", code: "OWNER_ONLY" });
 
     const result = await prisma.withBusinessLock(tx0.businessId, () =>
       prisma.$transaction(async (px) => {
@@ -630,7 +642,19 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
         }
 
         if (tx.matchedCustomerId) {
-          const payments = await px.debtPayment.findMany({ where: { transactionId: tx.id } });
+          const all = await px.debtPayment.findMany({ where: { transactionId: tx.id } });
+          // A repayment recorded by hand and LINKED to this credit existed
+          // before the link: it goes back to what it was, still counted.
+          const payments = [];
+          for (const p of all) {
+            const was = await linkedFrom(px, "debt_payment", p.id, tx.id);
+            if (was) {
+              await px.debtPayment.update({
+                where: { id: p.id },
+                data: { transactionId: null, ...(was.date ? { date: new Date(was.date) } : {}) },
+              });
+            } else payments.push(p);
+          }
           // Group reversals per debt, then walk each debt once.
           const byDebt = new Map();
           for (const p of payments) byDebt.set(p.debtId, (byDebt.get(p.debtId) || 0) + Number(p.amount));
@@ -638,12 +662,13 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
             const debt = await px.debt.findUnique({ where: { id: debtId } });
             if (!debt) continue; // debt deleted since — nothing to restore
             const paidAmount = Math.max(0, debt.paidAmount - reversed);
-            await px.debt.update({
-              where: { id: debtId },
+            const moved = await px.debt.updateMany({
+              where: { id: debtId, paidAmount: debt.paidAmount },
               data: { paidAmount, paid: paidAmount >= debt.amount },
             });
+            if (moved.count !== 1) throw matchError(409, "DEBT_CHANGED", "This debt just changed. Try again.");
           }
-          await px.debtPayment.deleteMany({ where: { transactionId: tx.id } });
+          if (payments.length) await px.debtPayment.deleteMany({ where: { id: { in: payments.map((p) => p.id) } } });
           const allDebts = await px.debt.findMany({ where: { customerId: tx.matchedCustomerId } });
           out.customer = await px.customer.update({
             where: { id: tx.matchedCustomerId },
@@ -656,12 +681,22 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
         // counts on its own again (books rule: one record per naira).
         if (tx.matchedInvoiceId) {
           const payments = await px.invoicePayment.findMany({ where: { transactionId: tx.id } });
-          out.invoices = [];
+          const touched = new Set();
           for (const p of payments) {
             const inv = await px.invoice.findUnique({ where: { id: p.invoiceId } });
             if (!inv) continue;
             if (inv.writtenOffAt) {
               throw matchError(409, "WRITTEN_OFF", `${inv.invoiceNumber} was written off. Undo the write-off first.`);
+            }
+            const was = await linkedFrom(px, "invoice_payment", p.id, tx.id);
+            if (was) {
+              // Recorded by hand, then linked: it keeps counting as it was.
+              await px.invoicePayment.update({
+                where: { id: p.id },
+                data: { transactionId: null, method: was.method || "transfer", ...(was.date ? { date: new Date(was.date) } : {}) },
+              });
+              touched.add(inv.id);
+              continue;
             }
             await px.invoicePayment.delete({ where: { id: p.id } });
             const paid = Math.max(0, Math.round((inv.amountPaid - Number(p.amount)) * 100) / 100);
@@ -672,14 +707,14 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
                 : paid >= inv.total && inv.total > 0 ? "PAID"
                 : paid > 0 ? (overdue ? "OVERDUE" : "PARTIAL")
                 : overdue ? "OVERDUE" : "SENT";
-            out.invoices.push(
-              await px.invoice.update({
-                where: { id: inv.id },
-                data: { amountPaid: paid, status },
-                include: { items: true, payments: { orderBy: { date: "asc" } }, customer: { select: { id: true, name: true, phone: true } } },
-              }),
-            );
+            await px.invoice.update({ where: { id: inv.id }, data: { amountPaid: paid, status } });
+            touched.add(inv.id);
           }
+          // Each invoice once, as it now is, for the app to put in place.
+          out.invoices = await px.invoice.findMany({
+            where: { id: { in: [...touched] } },
+            include: { items: true, payments: { orderBy: { date: "asc" } }, customer: { select: { id: true, name: true, phone: true } } },
+          });
         }
 
         out.transaction = await px.transaction.update({
@@ -736,6 +771,7 @@ router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async
         if (Number(payment.amount) > Number(tx.amount) + 0.005) {
           throw matchError(400, "EXCEEDS_TRANSFER", "The repayment is more than the transfer.");
         }
+        await recordLink(px, { req, kind: "debt_payment", payment, transactionId: tx.id });
         await px.debtPayment.update({ where: { id: payment.id }, data: { transactionId: tx.id, date: tx.date } });
         return px.transaction.update({
           where: { id: tx.id },

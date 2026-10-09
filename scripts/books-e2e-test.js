@@ -512,6 +512,67 @@ const inv = (id) => prisma.invoice.findUnique({ where: { id }, include: { paymen
       eq((await call("POST", `/transactions/${c2b.id}/link-debt-payment`, T, { debtPaymentId: "nope" })).body.code, "PAYMENT_NOT_FOUND");
     });
 
+    section("Unlinking gives the hand record back");
+    await test("unmatch after an invoice link: the payment returns as it was, still counted", async () => {
+      const i = await invoice(2100);
+      const p = (await pay(i.id, { amount: 2100, method: "cash", date: "2026-10-01" })).body.payments[0];
+      const c = await credit(2100);
+      eq((await call("POST", `/invoices/${i.id}/payments/${p.id}/link`, T, { transactionId: c.id })).status, 200);
+      const r = await call("DELETE", `/transactions/${c.id}/match`, T);
+      eq(r.status, 200, JSON.stringify(r.body));
+      const back = await prisma.invoicePayment.findUnique({ where: { id: p.id } });
+      eq(!!back, true, "payment kept"); eq(back.method, "cash"); eq(back.transactionId, null);
+      eq(back.date.toISOString().slice(0, 10), "2026-10-01");
+      eq((await inv(i.id)).status, "PAID");
+      eq(r.body.invoices.length, 1); eq(r.body.invoices[0].payments[0].method, "cash");
+      const t = await txRow(c.id);
+      eq(t.matchedInvoiceId, null); eq(t.matchedAmount, null);
+    });
+    await test("unmatch after a repayment link: the repayment stays, the debt stays paid", async () => {
+      const cu = await prisma.customer.create({ data: { userId: owner.id, businessId: biz.id, name: "Funmi" } });
+      await call("POST", `/customers/${cu.id}/debts`, T, { amount: 900 });
+      const d = await prisma.debt.findFirst({ where: { customerId: cu.id } });
+      await call("POST", `/customers/${cu.id}/debts/${d.id}/payment`, T, { amount: 900 });
+      const dp = await prisma.debtPayment.findFirst({ where: { debtId: d.id } });
+      const c = await credit(900);
+      eq((await call("POST", `/transactions/${c.id}/link-debt-payment`, T, { debtPaymentId: dp.id })).status, 200);
+      eq((await call("DELETE", `/transactions/${c.id}/match`, T)).status, 200);
+      const kept = await prisma.debtPayment.findUnique({ where: { id: dp.id } });
+      eq(!!kept, true, "repayment kept"); eq(kept.transactionId, null);
+      eq(kept.date.getTime(), dp.date.getTime(), "date restored");
+      const dd = await prisma.debt.findUnique({ where: { id: d.id } });
+      eq(dd.paidAmount, 900); eq(dd.paid, true);
+    });
+    await test("staff with bank access can't unmatch counted payments", async () => {
+      await prisma.staffPermission.upsert({
+        where: { userId: staff.id },
+        create: { userId: staff.id, employerId: owner.id, grantedById: owner.id, canViewBalance: true },
+        update: { canViewBalance: true },
+      });
+      const i = await invoice(1300);
+      const c = await credit(1300);
+      eq((await pay(i.id, { amount: 1300, method: "bank", transactionId: c.id })).status, 201);
+      const r = await call("DELETE", `/transactions/${c.id}/match`, TS);
+      eq(r.status, 403); eq(r.body.code, "OWNER_ONLY");
+      await prisma.staffPermission.update({ where: { userId: staff.id }, data: { canViewBalance: false } });
+    });
+    await test("a transfer can't pay another business's customer's debt", async () => {
+      const other = await prisma.customer.create({ data: { userId: owner.id, businessId: vatBiz.id, name: "Other biz" } });
+      await call("POST", `/customers/${other.id}/debts`, T, { amount: 500 });
+      const c = await credit(500);
+      eq((await call("POST", `/transactions/${c.id}/match-debt`, T, { customerId: other.id })).status, 404);
+    });
+    await test("going on credit never opens a debt on another merchant's customer", async () => {
+      const rival = await prisma.user.create({
+        data: { email: `rival-${tag}@t.local`, password: "x", firstName: "R", lastName: "V", businessName: "R", country: "NG", currency: "NGN", accountType: "OWNER" },
+      });
+      const theirs = await prisma.customer.create({ data: { userId: rival.id, name: "Not yours" } });
+      const s = (await call("POST", "/sales", T, { businessId: biz.id, amount: 400, paymentMethod: "cash", date: today })).body;
+      await prisma.sales.update({ where: { id: s.id }, data: { customerId: theirs.id } });
+      eq((await call("PATCH", `/sales/${s.id}`, T, { paymentMethod: "credit" })).status, 200);
+      eq(await prisma.debt.count({ where: { customerId: theirs.id } }), 0);
+    });
+
     section("Race");
     await test("one credit, two invoices at once: it pays only one", async () => {
       const c = await credit(30000);

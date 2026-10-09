@@ -201,7 +201,7 @@ check("VAT return: invoice date, credit note month, deadline the 21st", () => {
   eq(B.vatDeadline("2026-12"), "2027-01-21");
 });
 
-check("money received carries VAT even when sales are recorded net (exclusive)", () => {
+check("an unexplained credit carries VAT even when sales are recorded net (exclusive)", () => {
   const vat = { enabled: true, rate: 7.5, inclusive: false };
   const r = paid({
     sales: [{ amount: 10000, date: "2026-10-01" }],
@@ -210,7 +210,8 @@ check("money received carries VAT even when sales are recorded net (exclusive)",
   }, { vat });
   eq(r.sales.lines.recorded.vat, 0);
   eq(r.sales.lines.bank.vat, 750);
-  eq(r.sales.lines.debtPayments.vat, 150);
+  eq(r.sales.lines.debtPayments.vat, 0); // the debt was recorded net, like the sale
+  eq(paid({ debts: [{ amount: 2150, date: "2026-09-01", payments: [{ amount: 2150, date: "2026-10-03" }] }] }, { vat: { enabled: true, rate: 7.5 } }).sales.lines.debtPayments.vat, 150);
   eq(B.vatInsideReceived(10750, B.vatSettings({ enabled: false })), 0);
 });
 check("a write-off is bad debt at the full unpaid amount, VAT included", () => {

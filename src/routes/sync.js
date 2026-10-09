@@ -344,6 +344,22 @@ async function processOp(op, userId, userName, accountType) {
       const c = await prisma.customer.findUnique({ where: { id: data.id } });
       if (c) {
         await assertOwns(c.businessId);
+        // Same rule as DELETE /customers/:id: owners only, and never once
+        // repayments, credit sales or a matched transfer are in the books.
+        if (accountType === "staff") {
+          throw Object.assign(new Error("Staff cannot delete customers"), { code: "OWNER_ONLY" });
+        }
+        const [repaid, creditSales, transfers] = await Promise.all([
+          prisma.debtPayment.count({ where: { debt: { customerId: c.id } } }),
+          prisma.debt.count({ where: { customerId: c.id, saleId: { not: null } } }),
+          prisma.transaction.count({ where: { matchedCustomerId: c.id } }),
+        ]);
+        if (repaid || creditSales || transfers) {
+          throw Object.assign(
+            new Error("This customer has repayments or credit sales in your books, so they can't be deleted."),
+            { code: "CUSTOMER_HAS_PAYMENTS" },
+          );
+        }
         await prisma.customer.delete({ where: { id: data.id } });
       }
       break;
@@ -424,10 +440,13 @@ async function processOp(op, userId, userName, accountType) {
               },
             });
             const newPaid = Math.min(fresh.amount, Math.round((fresh.paidAmount + amount) * 100) / 100);
-            await px.debt.update({
-              where: { id: fresh.id },
+            // Compare-and-set: match-debt locks on the transfer's business,
+            // which for a customer with no business is another key.
+            const moved = await px.debt.updateMany({
+              where: { id: fresh.id, paidAmount: fresh.paidAmount },
               data: { paidAmount: newPaid, paid: newPaid >= fresh.amount - 0.005 },
             });
+            if (moved.count !== 1) throw Object.assign(new Error("This debt just changed. Try again."), { code: "DEBT_CHANGED" });
             const debts = await px.debt.findMany({ where: { customerId: data.customerId } });
             const totalOwed = debts.reduce((sum, d) => sum + Math.max(0, d.amount - d.paidAmount), 0);
             await px.customer.update({ where: { id: data.customerId }, data: { totalOwed } });

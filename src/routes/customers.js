@@ -246,10 +246,15 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
           data: { debtId: debt.id, amount, note: note || "", date: new Date() },
         });
         const paidAmount = Math.min(debt.amount, Math.round((debt.paidAmount + amount) * 100) / 100);
-        await px.debt.update({
-          where: { id: debt.id },
+        // Compare-and-set: match-debt locks on the transfer's business,
+        // which for a customer with no business is another key.
+        const moved = await px.debt.updateMany({
+          where: { id: debt.id, paidAmount: debt.paidAmount },
           data: { paidAmount, paid: paidAmount >= debt.amount - 0.005 },
         });
+        if (moved.count !== 1) {
+          throw Object.assign(new Error("This debt just changed. Try again."), { status: 409, code: "DEBT_CHANGED" });
+        }
         const debts = await px.debt.findMany({ where: { customerId: customer.id } });
         const totalOwed = debts.reduce((sum, d) => sum + Math.max(0, d.amount - d.paidAmount), 0);
         return px.customer.update({
