@@ -22,7 +22,12 @@ const kobo = (n) => Math.round(Number(n) * 100);
     include: { invoice: { select: { id: true, businessId: true, invoiceNumber: true, type: true } } },
   });
   console.log(`${payments.length} unlinked bank/transfer invoice payment(s)${APPLY ? "" : " (dry run)"}`);
-  let linked = 0;
+
+  // Pass 1: every payment's candidates. A credit is only linked when it is the
+  // ONLY candidate of exactly ONE payment; a credit two payments could claim
+  // goes to neither (which one it paid is a question for the owner).
+  const plan = [];
+  const claims = new Map();
   for (const p of payments) {
     if ((p.invoice.type || "invoice") !== "invoice") continue;
     const from = new Date(p.date.getTime() - 2 * 86400000);
@@ -35,11 +40,23 @@ const kobo = (n) => Math.round(Number(n) * 100);
           date: { gte: from, lte: to },
         },
         select: { id: true, amount: true, date: true, senderName: true },
+        orderBy: { date: "asc" },
       })
     ).filter((t) => kobo(t.amount) === kobo(p.amount));
+    plan.push({ p, candidates });
+    for (const c of candidates) claims.set(c.id, (claims.get(c.id) || 0) + 1);
+  }
+
+  // Pass 2: link the unambiguous ones.
+  let linked = 0;
+  for (const { p, candidates } of plan) {
     const tag = `${p.invoice.invoiceNumber} ${p.method} ${p.amount} on ${p.date.toISOString().slice(0, 10)}`;
     if (candidates.length !== 1) {
       console.log(`  leave  ${tag}: ${candidates.length} matching credit(s)`);
+      continue;
+    }
+    if (claims.get(candidates[0].id) > 1) {
+      console.log(`  leave  ${tag}: its credit could belong to another payment too`);
       continue;
     }
     const tx = candidates[0];

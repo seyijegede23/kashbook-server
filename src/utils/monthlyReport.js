@@ -13,7 +13,7 @@
 
 const prisma = require("./db");
 const { NOT_SAVINGS } = require("../config/moneySources");
-const { booksFor } = require("./booksData");
+const { booksFor, vatReturnFor } = require("./booksData");
 const { renderEmail, txnRow, escHtml } = require("./emailLayout");
 const { getTransport } = require("./transactionEmail");
 
@@ -78,7 +78,8 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: dateThis, ...NOT_SAVINGS },
+      // matchedInvoiceId too: that credit's invoice payment is the entry.
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, date: dateThis, ...NOT_SAVINGS },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -179,7 +180,15 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     const s = get(b.id);
     s.income = now.sales.total;
     s.expense = now.expenses.total;
-    s.vat = now.vatEnabled ? now.sales.vat : 0;
+    // VAT is dated by supply (invoice date, sale date, credit-note month,
+    // advance payments), not by payment: the month's VAT return, whatever the
+    // recording mode. It is what the return due on the 21st must show.
+    if (now.vatEnabled) {
+      const vr = await vatReturnFor(b.id, thisDays.from.slice(0, 7));
+      s.vat = vr ? vr.output : 0;
+    } else {
+      s.vat = 0;
+    }
     s.count += extra;
     s.prevIncome = before ? before.sales.total : 0;
   }
@@ -251,7 +260,7 @@ ${txnRow("Sales (counted when paid)", `+${money(stats.income, cur)}`)}
 ${txnRow("Expenses", `−${money(stats.expense, cur)}`)}
 ${txnRow("Transactions", String(stats.count))}
 ${momRow}
-${vat != null ? txnRow("VAT (estimated)", money(vat, cur)) : ""}
+${vat != null ? txnRow("Output VAT (this month's return)", money(vat, cur)) : ""}
 </table>
 ${topCats ? `<p class="kb-sub" style="margin:12px 0 0 0;font-family:${FONT};font-size:13px;line-height:1.6;color:#71717A;"><strong class="kb-strong" style="color:#18181B;font-weight:600;">Top expenses:</strong> ${escHtml(topCats)}</p>` : ""}
 </td></tr>

@@ -13,6 +13,13 @@ const {
 } = require("../utils/invoiceNumber");
 const { vatDeadline, round2 } = require("../utils/books");
 const { sameMoney } = require("../utils/money");
+const { audit } = require("../utils/audit");
+
+// Money that enters or leaves the books through an invoice leaves a trail:
+// who recorded, undid or wrote off what. Fire and forget, like the bank routes.
+function logMoney(req, action, invoiceId, metadata) {
+  audit({ req, action, resourceType: "invoice", resourceId: invoiceId, metadata }).catch(() => {});
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -114,6 +121,21 @@ const VAT_AUTO_NUMBERING = {
   error: "VAT invoices are numbered in sequence automatically.",
   code: "VAT_AUTO_NUMBERING",
 };
+
+// Bank rows are behind the canViewBalance capability for staff (owners always
+// have it). Linking or freeing a bank row from an invoice is reading and
+// changing the bank ledger, so it needs the same capability.
+function canUseBank(req) {
+  return req.user.accountType !== "staff" || req.user.permissions?.canViewBalance === true;
+}
+const BANK_DENIED = {
+  error: "You don't have access to the bank account. Ask the business owner to link this transfer.",
+  code: "PERMISSION_DENIED",
+  permission: "canViewBalance",
+};
+// Taking a counted payment or refund back out of the books, and giving up on
+// what a customer owes, are the owner's calls (staff cannot delete sales).
+const OWNER_ONLY = { error: "Only the business owner can do this.", code: "OWNER_ONLY" };
 
 function getTargetUserId(req) {
   return req.user.accountType === "staff" ? req.user.employerId : req.user.id;
@@ -438,6 +460,14 @@ router.put("/:id", authMiddleware, async (req, res) => {
     if (existing.writtenOffAt) {
       return res.status(409).json({ error: "This invoice was written off. Undo the write-off first.", code: "WRITTEN_OFF" });
     }
+    if (existing.type !== "quote" && existing.status !== "DRAFT") {
+      const owner = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
+      // An issued VAT document is in a return: it is corrected with a credit
+      // note, never edited (its date or amounts would move VAT between months).
+      if (owner?.vatEnabled) {
+        return res.status(409).json({ error: "Correct an issued VAT invoice with a credit note.", code: "VAT_ISSUED_LOCKED" });
+      }
+    }
 
     const {
       customerId,
@@ -589,40 +619,44 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     // Money or credit already on a document pins it: a credit note that has
     // given credit cannot be voided or redrafted, an invoice that received
     // credit cannot be voided, and nothing with payments goes back to draft.
-    // Otherwise the credit would vanish from one side of the link.
-    if (existing.type === "credit_note" && (existing.amountPaid || 0) > 0 && newStatus !== "SENT") {
-      return res.status(409).json({ error: "This credit note has been used.", code: "CREDIT_IN_USE" });
-    }
-    if (existing.type !== "credit_note" && newStatus === "VOID") {
-      const applied = await prisma.creditApplication.count({ where: { invoiceId: existing.id } });
-      if (applied) {
-        return res.status(409).json({ error: "Credit has been applied to this invoice.", code: "CREDITS_APPLIED" });
+    // Otherwise the credit would vanish from one side of the link. Checked
+    // under the business lock on a fresh read: the auto-matcher (same lock)
+    // could otherwise record a payment between the check and the write.
+    const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
+    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+      const cur = await prisma.invoice.findUnique({ where: { id: existing.id } });
+      if (cur.type === "credit_note" && (cur.amountPaid || 0) > 0 && newStatus !== "SENT") {
+        throw creditError(409, "CREDIT_IN_USE", "This credit note has been used.");
       }
-    }
-    if ((newStatus === "DRAFT" || newStatus === "VOID") && (existing.amountPaid || 0) > 0) {
-      // Books rule: an invoice is voided only before any payment. Money that
-      // came in stays counted; correct the sale with a credit note instead.
-      return res.status(409).json({ error: "Payments are recorded on this document.", code: "PAYMENTS_RECORDED" });
-    }
-    if (newStatus === "VOID" && existing.status !== "DRAFT") {
-      const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
-      if (biz?.vatEnabled && !vatPeriodOpen(existing.issueDate)) {
-        return res.status(409).json({
-          error: "That month's VAT return is due or filed. Issue a credit note instead.",
-          code: "VAT_PERIOD_CLOSED",
-        });
+      if (cur.type !== "credit_note" && newStatus === "VOID") {
+        const applied = await prisma.creditApplication.count({ where: { invoiceId: cur.id } });
+        if (applied) throw creditError(409, "CREDITS_APPLIED", "Credit has been applied to this invoice.");
       }
-    }
-
-    const invoice = await prisma.invoice.update({
-      where: { id: req.params.id },
-      data: { status: newStatus },
-      include: INCLUDE,
+      if ((newStatus === "DRAFT" || newStatus === "VOID") && (cur.amountPaid || 0) > 0) {
+        // Books rule: an invoice is voided only before any payment. Money that
+        // came in stays counted; correct the sale with a credit note instead.
+        throw creditError(409, "PAYMENTS_RECORDED", "Payments are recorded on this document.");
+      }
+      if (biz?.vatEnabled && cur.type !== "quote" && cur.status !== "DRAFT") {
+        // An issued VAT document is in a return: it never goes back to draft
+        // (from where it could be deleted), and is voided only until that
+        // month's return is due.
+        if (newStatus === "DRAFT") {
+          throw creditError(409, "VAT_ISSUED_LOCKED", "An issued VAT invoice can't go back to draft.");
+        }
+        if (newStatus === "VOID" && !vatPeriodOpen(cur.issueDate)) {
+          throw creditError(409, "VAT_PERIOD_CLOSED", "That month's VAT return is due or filed. Issue a credit note instead.");
+        }
+      }
+      return prisma.invoice.update({
+        where: { id: cur.id },
+        data: { status: newStatus },
+        include: INCLUDE,
+      });
     });
     res.json(formatInvoice(invoice));
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to update status" });
+    return sendCreditError(res, err, "Failed to update status");
   }
 });
 
@@ -675,6 +709,7 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
         code: "TRANSACTION_REQUIRED",
       });
     }
+    if (method === "bank" && !canUseBank(req)) return res.status(403).json(BANK_DENIED);
     const when = body.date ? new Date(body.date) : new Date();
     if (Number.isNaN(when.getTime())) return res.status(400).json({ error: "Invalid date", code: "BAD_DATE" });
     const note = body.note ? String(body.note).trim().slice(0, 200) || null : null;
@@ -751,6 +786,9 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
       }),
     );
 
+    logMoney(req, "INVOICE_PAYMENT", invoice.id, {
+      amount, method, transactionId: method === "bank" ? String(body.transactionId) : null,
+    });
     res.status(201).json(formatInvoice(invoice));
   } catch (err) {
     return sendCreditError(res, err, "Failed to record payment");
@@ -763,6 +801,7 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
 // debit is freed). Credit applied from a credit note is not undone here.
 router.delete("/:id/payments/:paymentId", authMiddleware, async (req, res) => {
   try {
+    if (req.user.accountType === "staff") return res.status(403).json(OWNER_ONLY);
     const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
@@ -815,9 +854,66 @@ router.delete("/:id/payments/:paymentId", authMiddleware, async (req, res) => {
         return px.invoice.update({ where: { id: inv.id }, data: { amountPaid: paid, status }, include: INCLUDE });
       }),
     );
+    logMoney(req, "INVOICE_PAYMENT_UNDO", existing.id, { paymentId: String(req.params.paymentId) });
     res.json(formatInvoice(updated));
   } catch (err) {
     return sendCreditError(res, err, "Failed to undo payment");
+  }
+});
+
+// POST /invoices/:id/payments/:paymentId/link  { transactionId }
+// A payment recorded as money outside KashBook (e.g. "Transfer" from a build
+// that had no "into my KashBook account") that actually landed in the account:
+// link it to that credit, so the money counts once (the payment carries it,
+// the credit stops counting on its own).
+router.post("/:id/payments/:paymentId/link", authMiddleware, async (req, res) => {
+  try {
+    if (!canUseBank(req)) return res.status(403).json(BANK_DENIED);
+    const transactionId = req.body && req.body.transactionId ? String(req.body.transactionId) : null;
+    if (!transactionId) return res.status(400).json({ error: "Pick the transfer.", code: "TRANSACTION_REQUIRED" });
+    const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: "Invoice not found" });
+    if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
+
+    const updated = await prisma.withBusinessLock(existing.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const inv = await px.invoice.findUnique({ where: { id: existing.id } });
+        const p = await px.invoicePayment.findUnique({ where: { id: String(req.params.paymentId) } });
+        if (!p || p.invoiceId !== inv.id) throw creditError(404, "PAYMENT_NOT_FOUND", "Payment not found.");
+        if (p.transactionId) throw creditError(409, "ALREADY_LINKED", "This payment is already linked.");
+        // A void document's payments count nowhere: a credit linked to one
+        // would stop counting too, and the money would vanish from the books.
+        if (inv.status === "VOID") throw creditError(409, "INVOICE_VOID", "This document is void.");
+        const kind = String(p.method || "").toLowerCase();
+        if (!["transfer", "other", "cash", "card", "cheque"].includes(kind)) {
+          throw creditError(409, "NOT_LINKABLE", "Only money received can be linked to a transfer.");
+        }
+        const credit = await linkableCredit(px, transactionId, inv.businessId);
+        if ((credit.tx.currency || "NGN") !== (inv.currency || "NGN")) {
+          throw creditError(409, "CURRENCY_MISMATCH", "That bank payment is in a different currency.");
+        }
+        const amount = Number(p.amount);
+        if (amount > credit.remaining + 0.005) {
+          throw creditError(400, "EXCEEDS_TRANSFER", "That is more than is left of the transfer.", { remaining: credit.remaining });
+        }
+        await px.invoicePayment.update({
+          where: { id: p.id },
+          data: { method: "bank", transactionId: credit.tx.id, date: credit.tx.date },
+        });
+        await px.transaction.update({
+          where: { id: credit.tx.id },
+          data: {
+            matchedInvoiceId: credit.tx.matchedInvoiceId || inv.id,
+            matchedAmount: round2(Number(credit.tx.matchedInvoiceId ? credit.tx.matchedAmount || 0 : 0) + amount),
+          },
+        });
+        return px.invoice.findUnique({ where: { id: inv.id }, include: INCLUDE });
+      }),
+    );
+    logMoney(req, "INVOICE_PAYMENT_LINK", existing.id, { paymentId: String(req.params.paymentId), transactionId });
+    res.json(formatInvoice(updated));
+  } catch (err) {
+    return sendCreditError(res, err, "Failed to link the payment");
   }
 });
 
@@ -825,6 +921,7 @@ router.delete("/:id/payments/:paymentId", authMiddleware, async (req, res) => {
 // DELETE /invoices/:id/write-off — take that back.
 router.post("/:id/write-off", authMiddleware, async (req, res) => {
   try {
+    if (req.user.accountType === "staff") return res.status(403).json(OWNER_ONLY);
     const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
@@ -845,6 +942,7 @@ router.post("/:id/write-off", authMiddleware, async (req, res) => {
         include: INCLUDE,
       });
     });
+    logMoney(req, "INVOICE_WRITE_OFF", existing.id, { amount: updated.writtenOffAmount });
     res.json(formatInvoice(updated));
   } catch (err) {
     return sendCreditError(res, err, "Failed to write off");
@@ -853,6 +951,7 @@ router.post("/:id/write-off", authMiddleware, async (req, res) => {
 
 router.delete("/:id/write-off", authMiddleware, async (req, res) => {
   try {
+    if (req.user.accountType === "staff") return res.status(403).json(OWNER_ONLY);
     const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
@@ -861,6 +960,7 @@ router.delete("/:id/write-off", authMiddleware, async (req, res) => {
       data: { writtenOffAt: null, writtenOffAmount: null },
       include: INCLUDE,
     });
+    logMoney(req, "INVOICE_WRITE_OFF_UNDO", existing.id, {});
     res.json(formatInvoice(updated));
   } catch (err) {
     console.error(err);
@@ -979,6 +1079,7 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
     if (method === "bank" && !body.transactionId) {
       return res.status(400).json({ error: "Pick the transfer that paid the refund.", code: "TRANSACTION_REQUIRED" });
     }
+    if (method === "bank" && !canUseBank(req)) return res.status(403).json(BANK_DENIED);
     const when = body.date ? new Date(body.date) : new Date();
     if (Number.isNaN(when.getTime())) return res.status(400).json({ error: "Invalid date", code: "BAD_DATE" });
 
@@ -1036,6 +1137,9 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
       });
     });
 
+    logMoney(req, "CREDIT_NOTE_REFUND", note.id, {
+      amount, method, transactionId: method === "bank" ? String(body.transactionId) : null,
+    });
     res.status(201).json(formatInvoice(updated));
   } catch (err) {
     return sendCreditError(res, err, "Failed to record refund");
@@ -1104,33 +1208,37 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId)))
       return res.status(403).json({ error: "Access denied" });
-    if (existing.type === "credit_note" && (existing.amountPaid || 0) > 0) {
-      return res.status(409).json({ error: "This credit note has been used.", code: "CREDIT_IN_USE" });
-    }
-    if (existing.type !== "credit_note") {
-      const applied = await prisma.creditApplication.count({ where: { invoiceId: existing.id } });
-      if (applied) {
-        return res.status(409).json({ error: "Credit has been applied to this invoice.", code: "CREDITS_APPLIED" });
-      }
-    }
-    // Payments counted in sales go with the invoice if it is deleted, so a paid
-    // invoice stays; undo its payments first, or correct it with a credit note.
-    if ((existing.amountPaid || 0) > 0) {
-      return res.status(409).json({ error: "Payments are recorded on this document.", code: "PAYMENTS_RECORDED" });
-    }
-    if (existing.type !== "quote" && existing.status !== "DRAFT") {
-      const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
-      // VAT invoices are numbered in sequence; an issued one is voided, never removed.
-      if (biz?.vatEnabled) {
-        return res.status(409).json({ error: "An issued VAT invoice can be voided, not deleted.", code: "VAT_ISSUED_LOCKED" });
-      }
-    }
+    const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
 
-    await prisma.invoice.delete({ where: { id: req.params.id } });
+    // Under the business lock on a fresh read: the auto-matcher (same lock)
+    // could otherwise record a payment between the checks and the delete, and
+    // the cascade would take that payment while its bank credit still pointed
+    // at the deleted invoice.
+    await prisma.withBusinessLock(existing.businessId, async () => {
+      const cur = await prisma.invoice.findUnique({ where: { id: existing.id } });
+      if (!cur) return;
+      if (cur.type === "credit_note" && (cur.amountPaid || 0) > 0) {
+        throw creditError(409, "CREDIT_IN_USE", "This credit note has been used.");
+      }
+      if (cur.type !== "credit_note") {
+        const applied = await prisma.creditApplication.count({ where: { invoiceId: cur.id } });
+        if (applied) throw creditError(409, "CREDITS_APPLIED", "Credit has been applied to this invoice.");
+      }
+      // Payments counted in sales go with the invoice if it is deleted, so a
+      // paid invoice stays; undo its payments first, or use a credit note.
+      const linked = await prisma.invoicePayment.count({ where: { invoiceId: cur.id } });
+      if ((cur.amountPaid || 0) > 0 || linked) {
+        throw creditError(409, "PAYMENTS_RECORDED", "Payments are recorded on this document.");
+      }
+      // VAT invoices are numbered in sequence; an issued one is voided, never removed.
+      if (cur.type !== "quote" && cur.status !== "DRAFT" && biz?.vatEnabled) {
+        throw creditError(409, "VAT_ISSUED_LOCKED", "An issued VAT invoice can be voided, not deleted.");
+      }
+      await prisma.invoice.delete({ where: { id: cur.id } });
+    });
     res.json({ ok: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to delete invoice" });
+    return sendCreditError(res, err, "Failed to delete invoice");
   }
 });
 

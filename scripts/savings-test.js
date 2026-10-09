@@ -593,7 +593,9 @@ section("9. savings rows are left out of reports and kept in the ledger, AML win
 
 const hasExclusion = (text) => /NOT_SAVINGS/.test(text) || /purpose:\s*null/.test(text);
 const REPORTING = [
-  { file: "src/utils/insightsEngine.js", minPrisma: 6, minRaw: 1 },
+  // Income and expense totals come from the books rule (checked below); what
+  // is left here are the per-category and per-product breakdowns.
+  { file: "src/utils/insightsEngine.js", minPrisma: 2, minRaw: 0 },
   { file: "src/utils/monthlyReport.js", minPrisma: 4, minRaw: 0 },
   { file: "src/routes/admin.js", minPrisma: 2, minRaw: 0 },
   { file: "src/utils/snapshots.js", minPrisma: 1, minRaw: 0 },
@@ -629,6 +631,17 @@ test("monthlyReport.js: the partial-match remainder predicate also excludes savi
   const src = read("src/utils/monthlyReport.js");
   const rem = fnBody(src, "const remainderWhere = (type, date) => ({");
   assert.ok(/NOT_SAVINGS/.test(rem), "remainderWhere lacks NOT_SAVINGS");
+});
+
+test("insightsEngine.js: income and expense totals are the books rule, which counts no savings row", () => {
+  const src = read("src/utils/insightsEngine.js");
+  assert.ok(/booksForInstants\(businessId, range\.start, range\.end\)/.test(src), "totals do not come from booksForInstants");
+  const books = require("../src/utils/books");
+  for (const purpose of ["savings_deposit", "savings_withdrawal", "savings_interest", "savings_fee"]) {
+    for (const type of ["income", "expense"]) {
+      assert.strictEqual(books.bankCountedAmount({ type, amount: 100, purpose }), 0, `${type} ${purpose}`);
+    }
+  }
 });
 
 test("insightsEngine.js: the balance intent reports spendable and names the reserve", () => {

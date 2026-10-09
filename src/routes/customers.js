@@ -148,6 +148,22 @@ router.delete("/:id", validateIdParam, async (req, res) => {
     if (customer.userId !== req.user.id)
       return res.status(403).json({ error: "Forbidden" });
 
+    // Books rule: a customer's repayments are counted sales, a credit sale's
+    // debt is what counts it when paid, and a bank transfer applied to their
+    // debt points at them. Deleting the customer would take all of that with
+    // it (the debts cascade), so it is refused once money is attached.
+    const [repaid, creditSales, transfers] = await Promise.all([
+      prisma.debtPayment.count({ where: { debt: { customerId: customer.id } } }),
+      prisma.debt.count({ where: { customerId: customer.id, saleId: { not: null } } }),
+      prisma.transaction.count({ where: { matchedCustomerId: customer.id } }),
+    ]);
+    if (repaid || creditSales || transfers) {
+      return res.status(409).json({
+        error: "This customer has repayments or credit sales in your books, so they can't be deleted.",
+        code: "CUSTOMER_HAS_PAYMENTS",
+      });
+    }
+
     await prisma.customer.delete({ where: { id: req.params.id } });
     res.json({ message: "Deleted" });
   } catch (err) {
@@ -189,8 +205,11 @@ router.post("/:id/debts", async (req, res) => {
 
 // POST /customers/:id/debts/:debtId/payment — record a payment on a specific debt
 router.post("/:id/debts/:debtId/payment", async (req, res) => {
-  const { amount, note = "" } = req.body;
-  if (!amount) return res.status(400).json({ error: "amount required" });
+  const { note = "" } = req.body;
+  const amount = Math.round(Number(req.body.amount) * 100) / 100;
+  if (!(amount > 0) || !Number.isFinite(amount)) {
+    return res.status(400).json({ error: "amount required", code: "BAD_AMOUNT" });
+  }
 
   try {
     const customer = await prisma.customer.findUnique({
@@ -200,36 +219,51 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
 
-    // SECURITY: the debt must belong to the customer we just authorised.
-    // Looking it up by id alone let an attacker with one owned customer write
-    // payments against — and settle — another merchant's debt.
-    const debt = await prisma.debt.findFirst({
-      where: { id: req.params.debtId, customerId: customer.id },
-    });
-    if (!debt) return res.status(404).json({ error: "Debt not found" });
-
-    const newPaidAmount = Math.min(
-      debt.paidAmount + Number(amount),
-      debt.amount,
+    // Books rule: every repayment is a counted sale, so it is never more than
+    // the debt still owes, and the payment and the debt change together. Under
+    // the business lock (the owner's id for customers with no business) so two
+    // phones settling the same debt cannot both pay it.
+    const lockKey = customer.businessId || customer.userId;
+    const updated = await prisma.withBusinessLock(lockKey, () =>
+      prisma.$transaction(async (px) => {
+        // SECURITY: the debt must belong to the customer we just authorised.
+        // Looking it up by id alone let an attacker with one owned customer
+        // write payments against — and settle — another merchant's debt.
+        const debt = await px.debt.findFirst({
+          where: { id: req.params.debtId, customerId: customer.id },
+        });
+        if (!debt) throw Object.assign(new Error("Debt not found"), { status: 404 });
+        const remaining = Math.round((debt.amount - debt.paidAmount) * 100) / 100;
+        if (!(remaining > 0)) {
+          throw Object.assign(new Error("This debt is already paid."), { status: 409, code: "DEBT_PAID" });
+        }
+        if (amount > remaining + 0.005) {
+          throw Object.assign(new Error("That is more than the customer owes on this debt."), {
+            status: 400, code: "EXCEEDS_DEBT", remaining,
+          });
+        }
+        await px.debtPayment.create({
+          data: { debtId: debt.id, amount, note: note || "", date: new Date() },
+        });
+        const paidAmount = Math.min(debt.amount, Math.round((debt.paidAmount + amount) * 100) / 100);
+        await px.debt.update({
+          where: { id: debt.id },
+          data: { paidAmount, paid: paidAmount >= debt.amount - 0.005 },
+        });
+        const debts = await px.debt.findMany({ where: { customerId: customer.id } });
+        const totalOwed = debts.reduce((sum, d) => sum + Math.max(0, d.amount - d.paidAmount), 0);
+        return px.customer.update({
+          where: { id: customer.id },
+          data: { totalOwed },
+          include: { debts: { include: { payments: true } } },
+        });
+      }),
     );
-
-    await prisma.debtPayment.create({
-      data: {
-        debtId: req.params.debtId,
-        amount: Number(amount),
-        note: note || "",
-        date: new Date(),
-      },
-    });
-
-    await prisma.debt.update({
-      where: { id: req.params.debtId },
-      data: { paidAmount: newPaidAmount, paid: newPaidAmount >= debt.amount },
-    });
-
-    const updated = await recalcAndSaveOwed(req.params.id);
     res.json(updated);
   } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message, code: err.code, remaining: err.remaining });
+    }
     console.error(err);
     res.status(500).json({ error: "Failed to record payment" });
   }

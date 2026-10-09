@@ -132,11 +132,18 @@ function vatSettings(v) {
   return { enabled, rate, inclusive: !(v && v.inclusive === false) };
 }
 
-// VAT inside an amount the merchant recorded (a manual sale, an unexplained
-// credit, a debt repayment). Inclusive: amount × r / (100 + r). Exclusive: the
-// amount is net, so nothing is inside it.
+// VAT inside an amount the merchant RECORDED as a sale (a manual sale, credit
+// given on the customer screen). Inclusive: amount × r / (100 + r).
+// Exclusive: the recorded amount is net, so nothing is inside it.
 function vatInside(amount, vat) {
   if (!vat.enabled || !(vat.rate > 0) || !vat.inclusive) return 0;
+  return round2((num(amount) * vat.rate) / (100 + vat.rate));
+}
+
+// VAT inside money RECEIVED (a transfer nothing explains, a debt repayment):
+// what a customer pays always includes the VAT, whatever the recording mode.
+function vatInsideReceived(amount, vat) {
+  if (!vat.enabled || !(vat.rate > 0)) return 0;
   return round2((num(amount) * vat.rate) / (100 + vat.rate));
 }
 
@@ -197,6 +204,10 @@ function computeBooks(input, opts) {
     creditGiven: emptyLines(), // sold view: debts with no sale row
     unexplained: emptyLines(), // sold view: credits linked to nothing
     awaitingPayment: emptyLines(), // paid view: credit sales not yet paid (info)
+    // Paid view, info: credit sales with no debt tracking them (recorded
+    // before the rule, or with no customer). They still count on the sale
+    // date, inside "recorded"; this line says how much of it that is.
+    creditUnlinked: emptyLines(),
   };
   const E = {
     recorded: emptyLines(),
@@ -212,6 +223,7 @@ function computeBooks(input, opts) {
       addTo(L.awaitingPayment, a, 0);
       continue;
     }
+    if (basis === "paid" && s.isCredit) addTo(L.creditUnlinked, a, 0);
     addTo(L.recorded, a, vatInside(a, vat));
   }
 
@@ -230,7 +242,7 @@ function computeBooks(input, opts) {
     const a = bankCountedAmount(tx);
     if (!(a > 0)) continue;
     if (isIn) {
-      if (basis === "paid") addTo(L.bank, a, vatInside(a, vat));
+      if (basis === "paid") addTo(L.bank, a, vatInsideReceived(a, vat));
       else addTo(L.unexplained, a, 0);
     } else {
       addTo(E.bank, a, 0);
@@ -242,6 +254,9 @@ function computeBooks(input, opts) {
     const status = lower(inv.status);
     if (type === "quote") continue;
     if (basis === "paid") {
+      // A void document's payments are reversed with it. (Since the rule, a
+      // document with payments cannot be voided; this covers older voids.)
+      if (status === "void") continue;
       for (const p of inv.payments || []) {
         if (!inRange(p.date, from, to)) continue;
         const signed = paymentSalesAmount(p);
@@ -258,8 +273,10 @@ function computeBooks(input, opts) {
       else addTo(L.invoiced, num(inv.total), num(inv.taxAmount));
     }
     if (type === "invoice" && inv.writtenOffAt && inRange(inv.writtenOffAt, from, to)) {
+      // The whole unpaid balance is lost, VAT included: Nigeria gives no VAT
+      // relief on bad debts, so the VAT is still owed although never received.
       const w = num(inv.writtenOffAmount);
-      if (w > 0) addTo(E.badDebts, w - vatShareOfDocument(w, inv), 0);
+      if (w > 0) addTo(E.badDebts, w, 0);
     }
   }
 
@@ -268,7 +285,7 @@ function computeBooks(input, opts) {
       for (const p of d.payments || []) {
         if (!inRange(p.date, from, to)) continue;
         const a = num(p.amount);
-        addTo(L.debtPayments, a, vatInside(a, vat));
+        addTo(L.debtPayments, a, vatInsideReceived(a, vat));
       }
     } else if (!d.saleId && inRange(d.date, from, to)) {
       const a = num(d.amount);
@@ -370,20 +387,41 @@ function vatReturn(input, month, vatOpts) {
   let invoiceCount = 0;
   let creditVat = 0;
   let creditCount = 0;
+  let advanceVat = 0;
+  let advanceCount = 0;
   for (const inv of invoices) {
     const type = lower(inv.type) || "invoice";
     const status = lower(inv.status);
     if (type === "quote" || ISSUED_EXCLUDED.includes(status)) continue;
-    if (!inRange(inv.issueDate, from, to)) continue;
     if (type === "credit_note") {
+      if (!inRange(inv.issueDate, from, to)) continue;
       creditVat += num(inv.taxAmount);
       creditCount += 1;
-    } else {
-      invoicesVat += num(inv.taxAmount);
-      invoicesNet += num(inv.total) - num(inv.taxAmount);
-      invoiceCount += 1;
+      continue;
     }
+    // The tax point is the earliest of invoice, delivery or payment: money
+    // received BEFORE the invoice date carries its share of the VAT into the
+    // month it arrived, and the invoice's month keeps the rest.
+    const issued = dayKey(inv.issueDate);
+    let early = 0;
+    for (const p of inv.payments || []) {
+      const kind = paymentKind(p);
+      if (kind !== "in" && kind !== "bank" && kind !== "presumed_bank") continue;
+      const paid = dayKey(p.date);
+      if (!paid || !issued || paid >= issued) continue;
+      const share = vatShareOfDocument(num(p.amount), inv);
+      early += share;
+      if (inRange(p.date, from, to)) {
+        advanceVat += share;
+        advanceCount += 1;
+      }
+    }
+    if (!inRange(inv.issueDate, from, to)) continue;
+    invoicesVat += Math.max(0, num(inv.taxAmount) - early);
+    invoicesNet += num(inv.total) - num(inv.taxAmount);
+    invoiceCount += 1;
   }
+  invoicesVat += advanceVat;
   // A recorded amount carries VAT inside it (inclusive) or on top (exclusive).
   const vatOf = (amount) => {
     if (!vat.enabled || !(vat.rate > 0)) return 0;
@@ -413,12 +451,92 @@ function vatReturn(input, month, vatOpts) {
     deadline: vatDeadline(month),
     rate: vat.rate,
     invoices: { vat: round2(invoicesVat), net: round2(invoicesNet), count: invoiceCount },
+    // Of which: VAT on payments received before their invoice was issued.
+    advance: { vat: round2(advanceVat), count: advanceCount },
     sales: { vat: round2(salesVat), count: salesCount },
     creditNotes: { vat: round2(-creditVat), count: creditCount },
     output,
     inputEstimate: round2(inputVat),
     payable: round2(output - inputVat),
   };
+}
+
+// One row per counted amount, under either view: summing the income rows gives
+// computeBooks' gross sales and the expense rows its expenses, so charts and
+// breakdowns (by day, channel, customer, category) agree with the totals.
+// Rows keep the source record's fields (description, channel, customerId,
+// recordedByName...) where it has them.
+function bookRows(input, basis) {
+  const view = basis === "sold" ? "sold" : "paid";
+  const rows = [];
+  const day = (d) => dayKey(d);
+  const debts = (input && input.debts) || [];
+  const salesWithDebt = new Set(debts.filter((d) => d.saleId).map((d) => d.saleId));
+
+  for (const s of (input && input.sales) || []) {
+    if (view === "paid" && s.isCredit && salesWithDebt.has(s.id)) continue;
+    rows.push(Object.assign({}, s, { type: "income", amount: num(s.amount), date: day(s.date) }));
+  }
+  for (const e of (input && input.expenses) || []) {
+    rows.push(Object.assign({}, e, { type: "expense", amount: num(e.amount), date: day(e.date) }));
+  }
+  for (const tx of (input && input.bankRows) || []) {
+    const isIn = lower(tx.type) === "income";
+    if (isIn && tx.purpose === PURPOSES.SUPPLIER_REFUND) {
+      rows.push(Object.assign({}, tx, { type: "expense", amount: -num(tx.amount), category: "supplier_refund", date: day(tx.date) }));
+      continue;
+    }
+    if (view === "sold" && isIn) continue; // "not yet explained", outside sales
+    const a = bankCountedAmount(tx);
+    if (a > 0) rows.push(Object.assign({}, tx, { type: isIn ? "income" : "expense", amount: a, date: day(tx.date) }));
+  }
+  for (const inv of (input && input.invoices) || []) {
+    const type = lower(inv.type) || "invoice";
+    if (type === "quote") continue;
+    const status = lower(inv.status);
+    if (view === "paid") {
+      if (status === "void") continue;
+      for (const p of inv.payments || []) {
+        const signed = paymentSalesAmount(p);
+        if (!signed) continue;
+        rows.push({
+          id: `ip_${p.id}`, type: "income", amount: signed, date: day(p.date),
+          description: inv.invoiceNumber, customerId: inv.customerId || null,
+          channel: "invoice", source: "invoice_payment",
+        });
+      }
+      continue;
+    }
+    if (ISSUED_EXCLUDED.includes(status)) continue;
+    rows.push({
+      id: `doc_${inv.id}`, type: "income",
+      amount: type === "credit_note" ? -num(inv.total) : num(inv.total),
+      date: day(inv.issueDate), description: inv.invoiceNumber,
+      customerId: inv.customerId || null, channel: "invoice", source: "invoice",
+    });
+    if (type === "invoice" && inv.writtenOffAt && num(inv.writtenOffAmount) > 0) {
+      rows.push({
+        id: `bad_${inv.id}`, type: "expense", amount: num(inv.writtenOffAmount),
+        date: day(inv.writtenOffAt), description: inv.invoiceNumber, category: "bad_debt", source: "write_off",
+      });
+    }
+  }
+  for (const d of debts) {
+    if (view === "paid") {
+      for (const p of d.payments || []) {
+        rows.push({
+          id: `dp_${p.id}`, type: "income", amount: num(p.amount), date: day(p.date),
+          customerId: d.customerId || null, channel: "credit_repaid", source: "debt_payment",
+        });
+      }
+    } else if (!d.saleId) {
+      rows.push({
+        id: `debt_${d.id}`, type: "income", amount: num(d.amount), date: day(d.date),
+        description: d.note, customerId: d.customerId || null, source: "debt",
+      });
+    }
+  }
+  return rows;
 }
 
 // A credit linked to nothing and not marked as something else: what the
@@ -450,8 +568,10 @@ module.exports = {
   isUnexplainedCredit,
   vatSettings,
   vatInside,
+  vatInsideReceived,
   vatShareOfDocument,
   computeBooks,
+  bookRows,
   receivables,
   vatDeadline,
   vatReturn,

@@ -201,6 +201,110 @@ check("VAT return: invoice date, credit note month, deadline the 21st", () => {
   eq(B.vatDeadline("2026-12"), "2027-01-21");
 });
 
+check("money received carries VAT even when sales are recorded net (exclusive)", () => {
+  const vat = { enabled: true, rate: 7.5, inclusive: false };
+  const r = paid({
+    sales: [{ amount: 10000, date: "2026-10-01" }],
+    bankRows: [{ type: "income", amount: 10750, date: "2026-10-02" }],
+    debts: [{ amount: 2150, date: "2026-09-01", payments: [{ amount: 2150, date: "2026-10-03" }] }],
+  }, { vat });
+  eq(r.sales.lines.recorded.vat, 0);
+  eq(r.sales.lines.bank.vat, 750);
+  eq(r.sales.lines.debtPayments.vat, 150);
+  eq(B.vatInsideReceived(10750, B.vatSettings({ enabled: false })), 0);
+});
+check("a write-off is bad debt at the full unpaid amount, VAT included", () => {
+  const r = sold({
+    invoices: [{ type: "invoice", status: "SENT", issueDate: "2026-09-02", total: 10750, taxAmount: 750, amountPaid: 0,
+      writtenOffAt: "2026-10-20", writtenOffAmount: 10750, payments: [] }],
+  }, { vat: { enabled: true, rate: 7.5 } });
+  eq(r.expenses.lines.badDebts.gross, 10750);
+  eq(r.expenses.total, 10750);
+});
+check("VAT return: money received before the invoice date is taxed in its own month", () => {
+  const inv = {
+    type: "invoice", status: "PARTIAL", issueDate: "2026-11-05", total: 10750, taxAmount: 750, amountPaid: 5375,
+    payments: [
+      { amount: 5375, method: "cash", date: "2026-10-20" },
+      { amount: 100, method: "credit_note", date: "2026-10-21" }, // settlement: not money
+    ],
+  };
+  const vat = { enabled: true, rate: 7.5 };
+  const oct = B.vatReturn({ invoices: [inv] }, "2026-10", vat);
+  eq(oct.advance.vat, 375);
+  eq(oct.advance.count, 1);
+  eq(oct.invoices.vat, 375);
+  eq(oct.output, 375);
+  const nov = B.vatReturn({ invoices: [inv] }, "2026-11", vat);
+  eq(nov.invoices.vat, 375);
+  eq(nov.advance.vat, 0);
+  const sameDay = B.vatReturn({ invoices: [{ ...inv, payments: [{ amount: 5375, method: "cash", date: "2026-11-05" }] }] }, "2026-11", vat);
+  eq(sameDay.invoices.vat, 750);
+  eq(sameDay.advance.vat, 0);
+});
+
+console.log("\nVoid documents and older credit sales");
+check("a void invoice's payments do not count when paid", () => {
+  const r = paid({ invoices: [{ type: "invoice", status: "VOID", total: 900, payments: [{ amount: 900, method: "cash", date: "2026-10-03" }] }] });
+  eq(r.sales.total, 0);
+});
+check("a credit sale with no debt is named on its own info line", () => {
+  const r = paid({ sales: [{ id: "s2", amount: 7000, date: "2026-10-01", isCredit: true }, { id: "s3", amount: 500, date: "2026-10-01" }] });
+  eq(r.sales.lines.creditUnlinked.gross, 7000);
+  eq(r.sales.lines.recorded.gross, 7500);
+  eq(r.sales.total, 7500);
+});
+
+console.log("\nRows agree with totals");
+const mixed = {
+  sales: [
+    { id: "s1", amount: 1000, date: "2026-10-01" },
+    { id: "s2", amount: 2000, date: "2026-10-02", isCredit: true },
+    { id: "s3", amount: 400, date: "2026-10-03", isCredit: true },
+    { id: "s4", amount: 999, date: "2026-11-01" },
+  ],
+  expenses: [{ id: "e1", amount: 300, date: "2026-10-04" }],
+  bankRows: [
+    { id: "b1", type: "income", amount: 5000, date: "2026-10-05" },
+    { id: "b2", type: "income", amount: 6000, date: "2026-10-05", matchedInvoiceId: "i1", matchedAmount: 4000 },
+    { id: "b3", type: "income", amount: 700, date: "2026-10-06", purpose: "supplier_refund" },
+    { id: "b4", type: "income", amount: 800, date: "2026-10-06", purpose: "owner_money" },
+    { id: "b5", type: "expense", amount: 250, date: "2026-10-07" },
+  ],
+  invoices: [
+    { id: "i1", type: "invoice", status: "PAID", issueDate: "2026-10-02", total: 4300, taxAmount: 300, customerId: "c1",
+      payments: [{ id: "p1", amount: 4000, method: "bank", transactionId: "b2", date: "2026-10-05" }, { id: "p2", amount: 300, method: "cash", date: "2026-10-06" }] },
+    { id: "i2", type: "invoice", status: "SENT", issueDate: "2026-10-08", total: 2000, taxAmount: 0, customerId: "c2",
+      writtenOffAt: "2026-10-30", writtenOffAmount: 2000, payments: [] },
+    { id: "i3", type: "invoice", status: "VOID", issueDate: "2026-10-08", total: 50, payments: [{ id: "p3", amount: 50, method: "cash", date: "2026-10-08" }] },
+    { id: "n1", type: "credit_note", status: "PAID", issueDate: "2026-10-09", total: 500, taxAmount: 0, customerId: "c1",
+      payments: [{ id: "p4", amount: 500, method: "refund_cash", date: "2026-10-09" }] },
+  ],
+  debts: [
+    { id: "d1", saleId: "s2", customerId: "c3", amount: 2000, date: "2026-10-02", payments: [{ id: "q1", amount: 1500, date: "2026-10-10" }] },
+    { id: "d2", customerId: "c4", amount: 600, date: "2026-10-11", payments: [{ id: "q2", amount: 600, date: "2026-10-12" }] },
+  ],
+};
+for (const basis of ["paid", "sold"]) {
+  check(`${basis}: income rows sum to gross sales, expense rows to expenses`, () => {
+    const r = B.computeBooks(mixed, { ...M, basis });
+    const rows = B.bookRows(mixed, basis).filter((x) => B.inRange(x.date, M.from, M.to));
+    const sum = (type) => B.round2(rows.filter((x) => x.type === type).reduce((s, x) => s + x.amount, 0));
+    eq(sum("income"), r.sales.gross);
+    eq(sum("expense"), r.expenses.total);
+  });
+}
+check("invoice and debt payment rows name the customer and the channel", () => {
+  const rows = B.bookRows(mixed, "paid");
+  const ip = rows.find((x) => x.id === "ip_p2");
+  eq(ip.customerId, "c1");
+  eq(ip.channel, "invoice");
+  const dp = rows.find((x) => x.id === "dp_q1");
+  eq(dp.customerId, "c3");
+  eq(dp.channel, "credit_repaid");
+  eq(rows.some((x) => x.id === "ip_p3"), false); // void
+});
+
 console.log("\nReceivables");
 check("owed to you: open invoices (not written off) + unpaid debts", () => {
   const r = B.receivables({

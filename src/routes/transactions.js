@@ -271,6 +271,12 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
           throw matchError(403, "FORBIDDEN", "Forbidden");
         if (sale.matchedTransactionId)
           throw matchError(409, "SALE_ALREADY_MATCHED", "That sale is already matched to another transfer.");
+        // A sale on credit whose debt tracks it counts when its debt is paid
+        // (books rule). Matching the transfer to the SALE would count it
+        // nowhere and leave the debt open: it must pay the debt instead.
+        if (sale.isCredit && (await px.debt.count({ where: { saleId: sale.id } }))) {
+          throw matchError(409, "CREDIT_SALE_HAS_DEBT", "This sale was on credit. Apply the transfer to the customer's debt instead.");
+        }
 
         const updatedTx = await px.transaction.update({
           where: { id: tx.id },
@@ -531,6 +537,10 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
               amount: payment,
               note: `Bank transfer: ${tx.description || ""}`.trim(),
               transactionId: tx.id,
+              // Repaid when the money arrived, not when it was matched: the
+              // books count it on this date (it was counted as an unexplained
+              // credit in this same period until now).
+              date: tx.date,
             },
           });
           remaining -= payment;
@@ -694,6 +704,52 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     res.json({ matched: false, ...result });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to unmatch");
+  }
+});
+
+// POST /transactions/:id/link-debt-payment  { debtPaymentId }
+// A repayment recorded by hand on the customer screen that actually arrived
+// as this transfer: link the two, so the money counts once (the repayment
+// carries it; the credit is marked as applied to that customer's debt).
+router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async (req, res) => {
+  try {
+    const debtPaymentId = req.body && req.body.debtPaymentId ? String(req.body.debtPaymentId) : null;
+    if (!debtPaymentId) return res.status(400).json({ error: "debtPaymentId required", code: "PAYMENT_REQUIRED" });
+    const pre = await loadMatchableCredit(req, res);
+    if (!pre) return;
+
+    const result = await prisma.withBusinessLock(pre.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
+          throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
+        const payment = await px.debtPayment.findUnique({
+          where: { id: debtPaymentId },
+          include: { debt: { include: { customer: { select: { id: true, userId: true, businessId: true } } } } },
+        });
+        const customer = payment && payment.debt && payment.debt.customer;
+        if (!payment || !customer || customer.userId !== getTargetUserId(req) ||
+            (customer.businessId && customer.businessId !== tx.businessId)) {
+          throw matchError(404, "PAYMENT_NOT_FOUND", "Repayment not found.");
+        }
+        if (payment.transactionId) throw matchError(409, "ALREADY_LINKED", "This repayment is already linked.");
+        if (Number(payment.amount) > Number(tx.amount) + 0.005) {
+          throw matchError(400, "EXCEEDS_TRANSFER", "The repayment is more than the transfer.");
+        }
+        await px.debtPayment.update({ where: { id: payment.id }, data: { transactionId: tx.id, date: tx.date } });
+        return px.transaction.update({
+          where: { id: tx.id },
+          data: { matchedCustomerId: customer.id, matchedAmount: Number(payment.amount) },
+        });
+      }),
+    );
+    audit({
+      req, action: "TX_LINK_DEBT_PAYMENT", resourceType: "transaction", resourceId: pre.id,
+      metadata: { debtPaymentId },
+    }).catch(() => {});
+    res.json({ transaction: result });
+  } catch (err) {
+    respondMatchFailure(res, err, "Failed to link the repayment");
   }
 });
 

@@ -120,6 +120,23 @@ check("finds the invoice whose balance arrived, and only unexplained credits", (
   assert.strictEqual(q.looksPaid[0].invoice.id, "i3");
   assert.deepStrictEqual(q.looksPaid[0].credits.map((c) => c.id).sort(), ["c2", "c5"]);
 });
+check("recorded twice: a hand payment and a credit of the same amount within 3 days", () => {
+  const tx = [
+    ...input.bankRows,
+    { id: "c6", type: "income", amount: 4000, date: "2026-10-05", source: "transaction" }, // p2 (cash, 10-03)
+    { id: "c7", type: "income", amount: 4000, date: "2026-10-10", source: "transaction" }, // 7 days: no
+    { id: "c8", type: "income", amount: 1000, date: "2026-10-07", source: "transaction" }, // dp2 (10-06)
+  ];
+  const voided = { id: "i9", type: "invoice", status: "void", total: 4000, payments: [{ id: "p9", amount: 4000, method: "cash", date: "2026-10-05" }] };
+  const q = reviewQueue({
+    transactions: tx,
+    invoices: [...input.invoices, voided],
+    customers: [{ id: "k9", name: "X", transactions: input.debts }],
+  });
+  assert.deepStrictEqual(q.recordedTwice.map((x) => `${x.payment.id}:${x.credits.map((c) => c.id).join("+")}`), ["p2:c6"]);
+  assert.deepStrictEqual(q.repaidTwice.map((x) => `${x.payment.id}:${x.credits.map((c) => c.id).join("+")}`), ["dp2:c8"]);
+  assert.strictEqual(q.repaidTwice[0].customer.id, "k9");
+});
 check("ranking: exact amount and the payer's name first", () => {
   const credit = { amount: 4000, date: "2026-10-05", senderName: "OBI CHIKA" };
   const ranked = rankInvoicesForCredit(credit, input.invoices);

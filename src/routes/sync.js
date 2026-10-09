@@ -400,40 +400,39 @@ async function processOp(op, userId, userName, accountType) {
         where: { id: data.debtId, customerId: customer.id },
       });
       if (debt) {
-        const alreadyRecorded = await prisma.debtPayment.findUnique({
-          where: { id: data.id },
-        });
-        if (!alreadyRecorded) {
-          await prisma.debtPayment.create({
-            data: {
-              id: data.id,
-              debtId: data.debtId,
-              amount: Number(data.amount),
-              note: data.note || "",
-              date: new Date(data.date),
-            },
-          });
-          const newPaid = Math.min(
-            debt.paidAmount + Number(data.amount),
-            debt.amount,
-          );
-          await prisma.debt.update({
-            where: { id: data.debtId },
-            data: { paidAmount: newPaid, paid: newPaid >= debt.amount },
-          });
-          // Recalculate totalOwed
-          const debts = await prisma.debt.findMany({
-            where: { customerId: data.customerId },
-          });
-          const totalOwed = debts.reduce(
-            (sum, d) => sum + Math.max(0, d.amount - d.paidAmount),
-            0,
-          );
-          await prisma.customer.update({
-            where: { id: data.customerId },
-            data: { totalOwed },
-          });
-        }
+        // Books rule: a repayment is a counted sale, so it is never more than
+        // the debt still owes (a stale phone replaying it would otherwise count
+        // money that never arrived), and it is written with the debt in one
+        // transaction under the business lock.
+        const lockKey = customer.businessId || customer.userId;
+        await prisma.withBusinessLock(lockKey, () =>
+          prisma.$transaction(async (px) => {
+            const alreadyRecorded = await px.debtPayment.findUnique({ where: { id: data.id } });
+            if (alreadyRecorded) return;
+            const fresh = await px.debt.findUnique({ where: { id: debt.id } });
+            const remaining = Math.round((fresh.amount - fresh.paidAmount) * 100) / 100;
+            const amount = Math.min(Math.round(Number(data.amount) * 100) / 100, remaining);
+            if (!(amount > 0)) return; // already paid: nothing left to record
+            const when = new Date(data.date);
+            await px.debtPayment.create({
+              data: {
+                id: data.id,
+                debtId: fresh.id,
+                amount,
+                note: data.note || "",
+                date: Number.isNaN(when.getTime()) ? new Date() : when,
+              },
+            });
+            const newPaid = Math.min(fresh.amount, Math.round((fresh.paidAmount + amount) * 100) / 100);
+            await px.debt.update({
+              where: { id: fresh.id },
+              data: { paidAmount: newPaid, paid: newPaid >= fresh.amount - 0.005 },
+            });
+            const debts = await px.debt.findMany({ where: { customerId: data.customerId } });
+            const totalOwed = debts.reduce((sum, d) => sum + Math.max(0, d.amount - d.paidAmount), 0);
+            await px.customer.update({ where: { id: data.customerId }, data: { totalOwed } });
+          }),
+        );
       }
       break;
     }

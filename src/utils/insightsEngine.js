@@ -22,11 +22,12 @@
  * parser pieces (normalize/parseTimeRange/parseQuestion/matchIntent) for tests.
  */
 
+const { AsyncLocalStorage } = require("async_hooks");
 const prisma = require("./db");
 // Savings rows (a deposit to the merchant's own pot, its return, interest) are
 // not trade: every income/expense predicate below carries this exclusion.
 const { NOT_SAVINGS } = require("../config/moneySources");
-const { booksFor } = require("./booksData");
+const { booksForInstants } = require("./booksData");
 
 // ── Money formatting ─────────────────────────────────────────────────────────
 const CURRENCY_SYMBOLS = {
@@ -843,88 +844,61 @@ function nearestIntent(text) {
 }
 
 // ── Query layer ──────────────────────────────────────────────────────────────
-// Manual bookkeeping lives in Sales/Expense; Transaction holds bank movement.
-// Income = all Sales + bank credits NOT matched to a sale or a debt (both ids null,
-// so a recorded sale that was paid by transfer isn't double-counted).
-// [start, end) instants → the Lagos days the books rule reads.
-function rangeDays(range) {
-  const day = (d) => new Date(d.getTime() + 60 * 60 * 1000).toISOString().slice(0, 10);
-  return { from: day(range.start), to: day(new Date(range.end.getTime() - 1)) };
-}
-
+// Every total here is the books rule (utils/books.js) over exactly [start,
+// end): booksForInstants cuts the dated rows and the payments to those
+// instants, so "the same point last week" partway through a day is exact.
+// Income counts invoice and debt payments and refunds, each naira once, like
+// the app's Reports and the emails.
 function lineCount(lines) {
   return Object.values(lines).reduce((n, l) => n + l.count, 0);
 }
 
+// One question can ask for the same span several times (the total, the count,
+// a breakdown): within one request the books are read once per span. Never
+// across requests, so a sale recorded a second ago is in the next answer.
+const spanStore = new AsyncLocalStorage();
+function span(businessId, range) {
+  const cache = spanStore.getStore();
+  const key = `${businessId}|${range.start.getTime()}|${range.end.getTime()}`;
+  if (cache && cache.has(key)) return cache.get(key);
+  const value = booksForInstants(businessId, range.start, range.end);
+  if (cache) cache.set(key, value);
+  return value;
+}
+const perRequest = (fn) => (...args) => spanStore.run(new Map(), () => fn(...args));
+
 async function sumIncome(businessId, range, channel) {
-  // Sales by the books rule (utils/books.js), the same figure the app's
-  // Reports show: invoice and debt payments and refunds included, each naira
-  // once. Per-channel questions keep the channel split below.
+  const got = await span(businessId, range);
+  if (!got) return { total: 0, count: 0 };
   if (!channel) {
-    const b = await booksFor(businessId, rangeDays(range));
-    if (b) return { total: b.sales.total, count: lineCount(b.sales.lines) - b.sales.lines.awaitingPayment.count };
+    const L = got.books.sales.lines;
+    // awaitingPayment is not counted; creditUnlinked is part of "recorded".
+    return { total: got.books.sales.total, count: lineCount(L) - L.awaitingPayment.count - L.creditUnlinked.count };
   }
-  const date = { gte: range.start, lt: range.end };
-  const [sales, bank, remainder] = await Promise.all([
-    prisma.sales.aggregate({
-      where: { businessId, date, ...(channel ? { channel } : {}) },
-      _sum: { amount: true },
-      _count: { _all: true },
-    }),
-    prisma.transaction.aggregate({
-      where: { businessId, type: "income", date, matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, ...NOT_SAVINGS, ...(channel ? { channel } : {}) },
-      _sum: { amount: true },
-      _count: { _all: true },
-    }),
-    sumMatchedRemainder(businessId, "income", date, channel),
-  ]);
-  return {
-    total: Number(sales._sum.amount || 0) + Number(bank._sum.amount || 0) + remainder,
-    count: sales._count._all + bank._count._all,
-  };
+  const rows = got.rows.filter((r) => r.type === "income" && r.channel === channel);
+  return { total: Math.round(rows.reduce((t, r) => t + r.amount, 0) * 100) / 100, count: rows.length };
 }
 
-// Expenses = recorded Expense rows + bank money-out (transfers, bills).
 async function sumExpenses(businessId, range) {
-  const books = await booksFor(businessId, rangeDays(range));
-  if (books) return { total: books.expenses.total, count: lineCount(books.expenses.lines) };
-  const date = { gte: range.start, lt: range.end };
-  const [exp, bank, remainder] = await Promise.all([
-    prisma.expense.aggregate({ where: { businessId, date }, _sum: { amount: true }, _count: { _all: true } }),
-    prisma.transaction.aggregate({
-      where: { businessId, type: "expense", matchedExpenseId: null, date, ...NOT_SAVINGS },
-      _sum: { amount: true },
-      _count: { _all: true },
-    }),
-    sumMatchedRemainder(businessId, "expense", date),
-  ]);
-  return {
-    total: Number(exp._sum.amount || 0) + Number(bank._sum.amount || 0) + remainder,
-    count: exp._count._all + bank._count._all,
-  };
+  const got = await span(businessId, range);
+  if (!got) return { total: 0, count: 0 };
+  return { total: got.books.expenses.total, count: lineCount(got.books.expenses.lines) };
 }
 
-// Partial matches: a matched bank row is excluded from the sums above because
-// the Sales/Expense/DebtPayment rows carry that money — but when the match
-// accounted for LESS than the row (a ₦5,000 credit that paid a ₦3,000 debt),
-// the unmatched remainder is still real money and must stay in the totals.
-// Rows matched before matchedAmount existed carry NULL = treated as fully
-// matched, which is exactly the old behavior.
-async function sumMatchedRemainder(businessId, type, date, channel) {
-  const agg = await prisma.transaction.aggregate({
-    where: {
-      businessId, type, date,
-      matchedAmount: { not: null },
-      ...NOT_SAVINGS,
-      ...(type === "income"
-        ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }, { matchedInvoiceId: { not: null } }] }
-        : { matchedExpenseId: { not: null } }),
-      ...(channel ? { channel } : {}),
-    },
-    _sum: { amount: true, matchedAmount: true },
-  });
-  const rem = Number(agg._sum.amount || 0) - Number(agg._sum.matchedAmount || 0);
-  return rem > 0 ? Math.round(rem * 100) / 100 : 0;
+// Income rows of a span grouped by a key (channel, customer, weekday...).
+async function incomeBy(businessId, range, keyOf) {
+  const got = await span(businessId, range);
+  const out = new Map();
+  for (const r of (got && got.rows) || []) {
+    if (r.type !== "income") continue;
+    const k = keyOf(r);
+    if (k == null) continue;
+    const cur = out.get(k) || { amount: 0, count: 0 };
+    cur.amount += r.amount;
+    cur.count += 1;
+    out.set(k, cur);
+  }
+  return out;
 }
 
 // Merge {key → amount} maps from several groupBy sweeps.
@@ -1067,13 +1041,13 @@ const HANDLERS = {
   },
 
   async top_customers({ business, range }) {
-    const rows = await prisma.sales.groupBy({
-      by: ["customerId"],
-      where: { businessId: business.id, customerId: { not: null }, date: { gte: range.start, lt: range.end } },
-      _sum: { amount: true },
-      _count: { _all: true },
-    });
-    const top = rows.sort((a, b) => (b._sum.amount || 0) - (a._sum.amount || 0)).slice(0, 3);
+    // Sales, invoice payments and debt repayments by customer (books rule).
+    const byCust = await incomeBy(business.id, range, (r) => r.customerId || null);
+    const top = [...byCust.entries()]
+      .map(([customerId, v]) => ({ customerId, _sum: { amount: Math.round(v.amount * 100) / 100 }, _count: { _all: v.count } }))
+      .filter((t) => t._sum.amount > 0)
+      .sort((a, b) => b._sum.amount - a._sum.amount)
+      .slice(0, 3);
     if (top.length === 0) return { answer: `No customer sales recorded ${range.label}. Record sales with a customer attached to see this.` };
     const customers = await prisma.customer.findMany({
       where: { id: { in: top.map((t) => t.customerId) } },
@@ -1123,23 +1097,11 @@ const HANDLERS = {
   },
 
   async channels({ business, range }) {
-    const date = { gte: range.start, lt: range.end };
-    const [salesRows, bankRows] = await Promise.all([
-      prisma.sales.groupBy({
-        by: ["channel"],
-        where: { businessId: business.id, date },
-        _sum: { amount: true },
-      }),
-      prisma.transaction.groupBy({
-        by: ["channel"],
-        where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, date, ...NOT_SAVINGS },
-        _sum: { amount: true },
-      }),
-    ]);
-    const byCh = mergeSums(new Map(), salesRows, (r) => r.channel || "unspecified");
-    mergeSums(byCh, bankRows, (r) => r.channel || "unspecified");
+    // Every counted naira by channel (books rule): invoice payments show as
+    // "invoice", debt repayments as "credit_repaid".
+    const byCh = await incomeBy(business.id, range, (r) => r.channel || "unspecified");
     const named = [...byCh.entries()]
-      .map(([channel, amount]) => ({ channel, amount }))
+      .map(([channel, v]) => ({ channel, amount: Math.round(v.amount * 100) / 100 }))
       .filter((r) => r.amount > 0)
       .sort((a, b) => b.amount - a.amount);
     if (named.length === 0) return { answer: `No income recorded ${range.label}.` };
@@ -1232,23 +1194,11 @@ const HANDLERS = {
     const r = hadExplicitRange ? range : { start: new Date(Date.now() - 30 * 86400000), end: new Date(), label: "the last 30 days" };
     // DB-side weekday aggregation (WAT shift = +1 hour) over both income
     // sources, so large ranges aren't sampled arbitrarily.
-    const grouped = await prisma.$queryRaw`
-      SELECT EXTRACT(DOW FROM ("date" + interval '1 hour'))::int AS dow,
-             SUM(amount)::float8 AS total
-      FROM (
-        SELECT "date", amount FROM "Sales"
-        WHERE "businessId" = ${business.id} AND "date" >= ${r.start} AND "date" < ${r.end}
-        UNION ALL
-        SELECT "date", amount FROM "Transaction"
-        WHERE "businessId" = ${business.id} AND type = 'income'
-          AND "matchedSaleId" IS NULL AND "matchedCustomerId" IS NULL AND "matchedInvoiceId" IS NULL AND "purpose" IS NULL
-          AND "date" >= ${r.start} AND "date" < ${r.end}
-      ) t
-      GROUP BY 1
-    `;
-    if (grouped.length === 0) return { answer: `No income recorded in ${r.label}.` };
+    // Every counted naira (books rule), by the weekday of its Lagos day.
+    const byDow = await incomeBy(business.id, r, (row) => new Date(`${row.date}T12:00:00Z`).getUTCDay());
+    if (byDow.size === 0) return { answer: `No income recorded in ${r.label}.` };
     const byDay = new Array(7).fill(0);
-    for (const g of grouped) byDay[g.dow] = g.total || 0;
+    for (const [dow, v] of byDow) byDay[dow] = Math.round(v.amount * 100) / 100;
     const bestIdx = byDay.indexOf(Math.max(...byDay));
     const name = WEEKDAYS[bestIdx][0].toUpperCase() + WEEKDAYS[bestIdx].slice(1);
     return {
@@ -1562,11 +1512,9 @@ async function answerForCustomer(parsed, business, cust) {
     };
   }
   // income / count scoped to this customer's sales
-  const agg = await prisma.sales.aggregate({
-    where: { businessId: business.id, customerId: cust.id, date: { gte: parsed.range.start, lt: parsed.range.end } },
-    _sum: { amount: true },
-    _count: { _all: true },
-  });
+  // Sales, invoice payments and debt repayments from this customer (books rule).
+  const mine = (await incomeBy(business.id, parsed.range, (r) => (r.customerId === cust.id ? "me" : null))).get("me");
+  const agg = { _sum: { amount: mine ? Math.round(mine.amount * 100) / 100 : 0 }, _count: { _all: mine ? mine.count : 0 } };
   const total = Number(agg._sum.amount || 0);
   if (agg._count._all === 0) {
     return { answer: `No sales to ${cust.name} recorded ${parsed.range.label}.`, data: { customer: cust.name, total: 0, count: 0 } };
@@ -1688,7 +1636,7 @@ async function generateInsightCards(business) {
   };
   const cards = [];
 
-  const [inc, prevInc, expRows, bankExpRows, low, topDebtor, chRows, bankChRows] = await Promise.all([
+  const [inc, prevInc, expRows, bankExpRows, low, topDebtor, byChannel] = await Promise.all([
     sumIncome(business.id, thisMonth, null),
     sumIncome(business.id, lastMonth, null),
     prisma.expense.groupBy({
@@ -1711,16 +1659,7 @@ async function generateInsightCards(business) {
       orderBy: { totalOwed: "desc" },
       select: { name: true, totalOwed: true },
     }),
-    prisma.sales.groupBy({
-      by: ["channel"],
-      where: { businessId: business.id, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end } },
-      _sum: { amount: true },
-    }),
-    prisma.transaction.groupBy({
-      by: ["channel"],
-      where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end }, ...NOT_SAVINGS },
-      _sum: { amount: true },
-    }),
+    incomeBy(business.id, thisMonth, (r) => r.channel || null),
   ]);
 
   const delta = pctDelta(inc.total, prevInc.total);
@@ -1763,10 +1702,8 @@ async function generateInsightCards(business) {
     });
   }
 
-  const byCh = mergeSums(new Map(), chRows, (r) => r.channel);
-  mergeSums(byCh, bankChRows, (r) => r.channel);
-  const topCh = [...byCh.entries()]
-    .map(([channel, amount]) => ({ channel, amount }))
+  const topCh = [...byChannel.entries()]
+    .map(([channel, v]) => ({ channel, amount: Math.round(v.amount * 100) / 100 }))
     .sort((a, b) => b.amount - a.amount)[0];
   if (topCh && topCh.amount > 0) {
     cards.push({
@@ -1780,8 +1717,8 @@ async function generateInsightCards(business) {
 }
 
 module.exports = {
-  answerQuestion,
-  generateInsightCards,
+  answerQuestion: perRequest(answerQuestion),
+  generateInsightCards: perRequest(generateInsightCards),
   SUGGESTIONS,
   // pure pieces exported for unit tests
   normalize,

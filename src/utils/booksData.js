@@ -2,7 +2,7 @@
 // (utils/books.js). Every server total of sales, expenses or profit goes
 // through booksFor, so the emails, Insights and the app agree.
 const prisma = require("./db");
-const { computeBooks, receivables, vatReturn } = require("./books");
+const { computeBooks, receivables, vatReturn, bookRows } = require("./books");
 
 // "YYYY-MM-DD" (Lagos) → the instant that day starts / ends.
 function lagosStart(day) {
@@ -23,8 +23,14 @@ function dateWhere(from, to) {
 // Records the rule needs. Invoices and debts are loaded whole (with their
 // payments) because a payment in the period can belong to an older document;
 // they are few per business.
-async function loadBooksInput(businessId, { from, to } = {}, db = prisma) {
-  const date = dateWhere(from, to);
+//
+// Either Lagos days ({ from, to }, inclusive "YYYY-MM-DD") or exact instants
+// ({ start, end } Dates, end exclusive). With instants the dated rows AND the
+// payments are cut to [start, end), so a partial day ("the same point last
+// week") is exact; pass the result to computeBooks without from/to.
+async function loadBooksInput(businessId, { from, to, start, end } = {}, db = prisma) {
+  const byInstant = start instanceof Date && end instanceof Date;
+  const date = byInstant ? { gte: start, lt: end } : dateWhere(from, to);
   const biz = await db.business.findUnique({
     where: { id: businessId },
     select: { id: true, userId: true, vatEnabled: true, vatRate: true, vatInclusive: true },
@@ -50,22 +56,39 @@ async function loadBooksInput(businessId, { from, to } = {}, db = prisma) {
     db.invoice.findMany({
       where: { businessId },
       select: {
-        id: true, type: true, status: true, issueDate: true, total: true,
-        taxAmount: true, amountPaid: true, writtenOffAt: true, writtenOffAmount: true,
-        payments: { select: { amount: true, method: true, date: true, transactionId: true } },
+        id: true, type: true, status: true, issueDate: true, total: true, customerId: true,
+        invoiceNumber: true, taxAmount: true, amountPaid: true, writtenOffAt: true, writtenOffAmount: true,
+        payments: { select: { id: true, amount: true, method: true, date: true, transactionId: true } },
       },
     }),
+    // This business's customers, and the owner's customers with no business
+    // yet: the app shows those in every business, so the books do too.
     db.debt.findMany({
-      where: { customer: { businessId } },
+      where: { customer: { OR: [{ businessId }, { businessId: null, userId: biz.userId }] } },
       select: {
-        amount: true, paidAmount: true, paid: true, date: true, saleId: true,
-        payments: { select: { amount: true, date: true } },
+        id: true, customerId: true, amount: true, paidAmount: true, paid: true, date: true, saleId: true, note: true,
+        payments: { select: { id: true, amount: true, date: true, transactionId: true } },
       },
     }),
   ]);
+  if (byInstant) {
+    const within = (d) => d >= start && d < end;
+    for (const inv of invoices) inv.payments = inv.payments.filter((p) => within(p.date));
+    for (const d of debts) d.payments = d.payments.filter((p) => within(p.date));
+  }
   return {
     vat: { enabled: biz.vatEnabled, rate: biz.vatRate, inclusive: biz.vatInclusive },
     input: { sales, expenses, bankRows, invoices, debts },
+  };
+}
+
+// The "when paid" books and rows for an exact [start, end) span (Insights).
+async function booksForInstants(businessId, start, end, db = prisma) {
+  const loaded = await loadBooksInput(businessId, { start, end }, db);
+  if (!loaded) return null;
+  return {
+    books: computeBooks(loaded.input, { basis: "paid", vat: loaded.vat }),
+    rows: bookRows(loaded.input, "paid"),
   };
 }
 
@@ -77,13 +100,15 @@ async function booksFor(businessId, { from, to, basis = "paid" } = {}, db = pris
 
 // Open balances right now: what customers owe and what is owed to them.
 async function receivablesFor(businessId, db = prisma) {
+  const biz = await db.business.findUnique({ where: { id: businessId }, select: { userId: true } });
+  if (!biz) return null;
   const [invoices, debts] = await Promise.all([
     db.invoice.findMany({
       where: { businessId, type: { in: ["invoice", "credit_note"] } },
       select: { type: true, status: true, total: true, amountPaid: true, writtenOffAt: true },
     }),
     db.debt.findMany({
-      where: { customer: { businessId }, paid: false },
+      where: { customer: { OR: [{ businessId }, { businessId: null, userId: biz.userId }] }, paid: false },
       select: { amount: true, paidAmount: true, paid: true },
     }),
   ]);
@@ -104,4 +129,4 @@ async function vatReturnFor(businessId, month, db = prisma) {
   return vatReturn(loaded.input, month, loaded.vat);
 }
 
-module.exports = { loadBooksInput, booksFor, receivablesFor, vatReturnFor, lagosStart, lagosEnd, monthEnd };
+module.exports = { loadBooksInput, booksFor, booksForInstants, receivablesFor, vatReturnFor, lagosStart, lagosEnd, monthEnd };
