@@ -220,7 +220,7 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
 
     // Auto-reconcile: if exactly one open invoice matches the credited amount
     // within the last 90 days, record a payment and recalc status.
-    await tryMatchInvoice(biz, amount, reference).catch((err) =>
+    await tryMatchInvoice(biz, amount, reference, { transactionId: txn?.id }).catch((err) =>
       console.warn(`[reconcile] invoice match failed for ${biz.name}: ${err.message}`),
     );
 

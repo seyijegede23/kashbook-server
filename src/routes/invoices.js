@@ -11,6 +11,8 @@ const {
   normalizeManualNumber,
   numberTaken,
 } = require("../utils/invoiceNumber");
+const { vatDeadline, round2 } = require("../utils/books");
+const { sameMoney } = require("../utils/money");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -69,6 +71,8 @@ async function readDetailFields(body, targetUserId) {
   }
   if ("orderNumber" in body) out.orderNumber = cleanText(body.orderNumber, 50);
   if ("subject" in body) out.subject = cleanText(body.subject, 250);
+  // The tax authority's reference for this invoice (NRS e-invoicing IRN).
+  if ("irn" in body) out.irn = cleanText(body.irn, 80);
   if ("salespersonId" in body) {
     out.salespersonId = null;
     out.salespersonName = null;
@@ -90,6 +94,27 @@ async function readDetailFields(body, targetUserId) {
   return out;
 }
 
+// Document totals. The discount comes off before tax: VAT is charged on what
+// the customer actually pays (mirrored in CreateInvoiceScreen).
+function invoiceTotals({ items = [], taxRate = 0, discountType, discountValue = 0 }) {
+  const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
+  let discountAmount = 0;
+  if (discountType === "percent") {
+    discountAmount = subtotal * ((Number(discountValue) || 0) / 100);
+  } else if (discountType === "fixed") {
+    discountAmount = Number(discountValue) || 0;
+  }
+  discountAmount = Math.min(Math.max(0, discountAmount), subtotal);
+  const taxAmount = round2((subtotal - discountAmount) * ((Number(taxRate) || 0) / 100));
+  const total = round2(Math.max(0, subtotal - discountAmount + taxAmount));
+  return { subtotal: round2(subtotal), discountAmount: round2(discountAmount), taxAmount, total };
+}
+
+const VAT_AUTO_NUMBERING = {
+  error: "VAT invoices are numbered in sequence automatically.",
+  code: "VAT_AUTO_NUMBERING",
+};
+
 function getTargetUserId(req) {
   return req.user.accountType === "staff" ? req.user.employerId : req.user.id;
 }
@@ -97,6 +122,16 @@ function getTargetUserId(req) {
 async function ownsBusiness(req, businessId) {
   const userId = getTargetUserId(req);
   return prisma.business.findFirst({ where: { id: businessId, userId } });
+}
+
+// VAT-registered businesses may void an issued document only until that
+// month's return is due (the 21st of the next month); after that the
+// correction is a credit note, which reduces VAT in its own month.
+function vatPeriodOpen(issueDate) {
+  const month = String(issueDate || "").slice(0, 7);
+  if (!/^\d{4}-\d{2}$/.test(month)) return true;
+  const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
+  return today < vatDeadline(month);
 }
 
 function calcStatus(invoice) {
@@ -229,24 +264,19 @@ router.post("/", authMiddleware, async (req, res) => {
       });
     }
 
-    const details = await readDetailFields(req.body, userId);
-    const resolvedCustomerId = await resolveCustomerId(req.body, businessId, userId);
     // invoice | quote | credit_note. A credit note is a credit TO the customer:
     // no payment terms and no due date.
     const docType = type === "quote" || type === "credit_note" ? type : "invoice";
     const isCredit = docType === "credit_note";
+    if (manualNumber && biz.vatEnabled && docType !== "quote") {
+      return res.status(409).json(VAT_AUTO_NUMBERING);
+    }
+
+    const details = await readDetailFields(req.body, userId);
+    const resolvedCustomerId = await resolveCustomerId(req.body, businessId, userId);
     if (isCredit) details.paymentTerms = null;
 
-    // Calculate totals
-    const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
-    const taxAmount = subtotal * ((Number(taxRate) || 0) / 100);
-    let discountAmount = 0;
-    if (discountType === "percent") {
-      discountAmount = subtotal * ((Number(discountValue) || 0) / 100);
-    } else if (discountType === "fixed") {
-      discountAmount = Number(discountValue) || 0;
-    }
-    const total = Math.max(0, subtotal + taxAmount - discountAmount);
+    const { subtotal, taxAmount, discountAmount, total } = invoiceTotals({ items, taxRate, discountType, discountValue });
 
     // Choosing the number and writing the invoice happen under the business
     // lock, the same one the recurring runner and Instagram orders hold while
@@ -336,6 +366,7 @@ router.patch("/numbering", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Numbering is auto or manual.", code: "BAD_MODE" });
     }
     if (mode === "manual") {
+      if (biz.vatEnabled) return res.status(409).json(VAT_AUTO_NUMBERING);
       const updated = await prisma.business.update({
         where: { id: biz.id },
         data: { [series.mode]: "manual" },
@@ -404,6 +435,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "Access denied" });
     if (existing.status === "VOID" || existing.status === "PAID")
       return res.status(400).json({ error: "Cannot edit a PAID or VOID invoice" });
+    if (existing.writtenOffAt) {
+      return res.status(409).json({ error: "This invoice was written off. Undo the write-off first.", code: "WRITTEN_OFF" });
+    }
 
     const {
       customerId,
@@ -418,23 +452,23 @@ router.put("/:id", authMiddleware, async (req, res) => {
       template,
     } = req.body;
 
-    const subtotal = items.reduce((sum, it) => sum + (Number(it.quantity) || 1) * (Number(it.rate) || 0), 0);
-    const taxAmount = subtotal * ((Number(taxRate) || 0) / 100);
-    let discountAmount = 0;
-    if (discountType === "percent") {
-      discountAmount = subtotal * ((Number(discountValue) || 0) / 100);
-    } else if (discountType === "fixed") {
-      discountAmount = Number(discountValue) || 0;
-    }
-    const total = Math.max(0, subtotal + taxAmount - discountAmount);
+    const { subtotal, taxAmount, discountAmount, total } = invoiceTotals({ items, taxRate, discountType, discountValue });
 
-    // A credit note cannot shrink below the credit already used from it.
+    // A credit note cannot shrink below the credit already used from it, nor
+    // an invoice below what has been paid on it.
     const isCredit = existing.type === "credit_note";
     if (isCredit && total + 0.005 < (existing.amountPaid || 0)) {
       return res.status(400).json({
         error: "This credit note has credit in use; its total cannot go below that.",
         code: "CREDIT_BELOW_USED",
         used: existing.amountPaid,
+      });
+    }
+    if (!isCredit && total + 0.005 < (existing.amountPaid || 0)) {
+      return res.status(400).json({
+        error: "Payments on this invoice are more than that total.",
+        code: "TOTAL_BELOW_PAID",
+        paid: existing.amountPaid,
       });
     }
 
@@ -466,6 +500,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
         if (existing.status !== "DRAFT") {
           return res.status(400).json({ error: "Only a draft's number can be changed.", code: "NUMBER_LOCKED" });
         }
+        const owner = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
+        if (owner?.vatEnabled && existing.type !== "quote") return res.status(409).json(VAT_AUTO_NUMBERING);
         newNumber = n;
       }
     }
@@ -563,8 +599,19 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
         return res.status(409).json({ error: "Credit has been applied to this invoice.", code: "CREDITS_APPLIED" });
       }
     }
-    if (newStatus === "DRAFT" && (existing.amountPaid || 0) > 0) {
+    if ((newStatus === "DRAFT" || newStatus === "VOID") && (existing.amountPaid || 0) > 0) {
+      // Books rule: an invoice is voided only before any payment. Money that
+      // came in stays counted; correct the sale with a credit note instead.
       return res.status(409).json({ error: "Payments are recorded on this document.", code: "PAYMENTS_RECORDED" });
+    }
+    if (newStatus === "VOID" && existing.status !== "DRAFT") {
+      const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
+      if (biz?.vatEnabled && !vatPeriodOpen(existing.issueDate)) {
+        return res.status(409).json({
+          error: "That month's VAT return is due or filed. Issue a credit note instead.",
+          code: "VAT_PERIOD_CLOSED",
+        });
+      }
     }
 
     const invoice = await prisma.invoice.update({
@@ -580,11 +627,57 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
 });
 
 // ── POST /invoices/:id/payments ───────────────────────────────────────────────
+// Payment methods a merchant records on an invoice. "transfer" is a transfer
+// into ANOTHER bank account (KashBook cannot see it, so the payment carries the
+// sale); "bank" is money that landed in the business's KashBook account and
+// must name that credit (transactionId), which then stops counting on its own.
+const PAYMENT_METHODS = ["cash", "transfer", "card", "cheque", "other", "bank"];
+
+// Status after a payment lands or is undone. DRAFT stays a draft only when
+// nothing has been paid; anything paid is out in the world.
+function statusAfter(inv, amountPaid) {
+  if (amountPaid >= round2(inv.total) && inv.total > 0) return "PAID";
+  if (amountPaid > 0) return inv.dueDate && inv.dueDate < lagosToday() ? "OVERDUE" : "PARTIAL";
+  if (inv.status === "DRAFT") return "DRAFT";
+  return inv.dueDate && inv.dueDate < lagosToday() ? "OVERDUE" : "SENT";
+}
+
+// A NUBAN credit this business may use to pay invoices: an incoming bank row
+// not matched to a sale or debt and not marked as something else. Returns the
+// part not yet used by other invoice payments.
+async function linkableCredit(px, transactionId, businessId) {
+  const tx = await px.transaction.findUnique({ where: { id: String(transactionId) } });
+  if (!tx || tx.businessId !== businessId) {
+    throw creditError(404, "TRANSACTION_NOT_FOUND", "That bank payment was not found.");
+  }
+  if (tx.type !== "income") {
+    throw creditError(400, "NOT_INCOMING", "Pick money that came in.");
+  }
+  if (tx.purpose || tx.matchedSaleId || tx.matchedCustomerId) {
+    throw creditError(409, "TRANSACTION_TAKEN", "That bank payment is already explained.");
+  }
+  const used = tx.matchedInvoiceId ? Number(tx.matchedAmount || 0) : 0;
+  return { tx, remaining: round2(Number(tx.amount) - used) };
+}
+
 router.post("/:id/payments", authMiddleware, async (req, res) => {
   try {
-    const { amount, method = "cash", note, date } = req.body;
-    if (!amount || Number(amount) <= 0)
-      return res.status(400).json({ error: "Valid amount required" });
+    const body = req.body || {};
+    const amount = toMoney(body.amount);
+    const method = String(body.method || "cash").toLowerCase();
+    if (!(amount > 0)) return res.status(400).json({ error: "Valid amount required", code: "BAD_AMOUNT" });
+    if (!PAYMENT_METHODS.includes(method)) {
+      return res.status(400).json({ error: "Unknown payment method.", code: "BAD_METHOD" });
+    }
+    if (method === "bank" && !body.transactionId) {
+      return res.status(400).json({
+        error: "Pick the bank payment that paid this invoice.",
+        code: "TRANSACTION_REQUIRED",
+      });
+    }
+    const when = body.date ? new Date(body.date) : new Date();
+    if (Number.isNaN(when.getTime())) return res.status(400).json({ error: "Invalid date", code: "BAD_DATE" });
+    const note = body.note ? String(body.note).trim().slice(0, 200) || null : null;
 
     const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
@@ -595,59 +688,183 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
     if (existing.type === "credit_note")
       return res.status(403).json({ error: "A credit note is used by applying it to an invoice or recording a refund.", code: "CREDIT_NOTE_NO_PAYMENT" });
     if (existing.status === "VOID")
-      return res.status(400).json({ error: "Cannot record payment on a VOID invoice" });
+      return res.status(400).json({ error: "Cannot record payment on a VOID invoice", code: "INVOICE_VOID" });
 
     // Serialize payments per business so two concurrent posts can't both read a
-    // stale amountPaid and overpay / lose an update. Re-read inside the lock.
-    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
-      const inv = await prisma.invoice.findUnique({ where: { id: req.params.id } });
-      const outstanding = Math.max(0, inv.total - inv.amountPaid);
-      if (outstanding <= 0) {
-        const e = new Error("This invoice is already paid in full.");
-        e.status = 400;
-        throw e;
-      }
-      if (Number(amount) > outstanding) {
-        const e = new Error(`Payment exceeds outstanding balance of ${outstanding.toFixed(2)}.`);
-        e.status = 400;
-        throw e;
-      }
+    // stale amountPaid and overpay / lose an update. Re-read inside the lock;
+    // the payment, the invoice and the credit's link commit together.
+    const invoice = await prisma.withBusinessLock(existing.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const inv = await px.invoice.findUnique({ where: { id: req.params.id } });
+        if (inv.writtenOffAt) {
+          throw creditError(409, "WRITTEN_OFF", "This invoice was written off. Undo the write-off first.");
+        }
+        const outstanding = round2(Math.max(0, inv.total - inv.amountPaid));
+        if (outstanding <= 0) throw creditError(400, "PAID_IN_FULL", "This invoice is already paid in full.");
+        if (amount > outstanding + 0.005) {
+          throw creditError(
+            400, "EXCEEDS_BALANCE",
+            `Payment exceeds outstanding balance of ${outstanding.toFixed(2)}.`, { outstanding },
+          );
+        }
 
-      const paymentDate = date ? new Date(date) : new Date();
-      await prisma.invoicePayment.create({
-        data: {
-          invoiceId: req.params.id,
-          amount: Number(amount),
-          method,
-          note: note || null,
-          date: paymentDate,
-        },
-      });
+        let tx = null;
+        if (method === "bank") {
+          const credit = await linkableCredit(px, body.transactionId, inv.businessId);
+          tx = credit.tx;
+          if ((tx.currency || "NGN") !== (inv.currency || "NGN")) {
+            throw creditError(409, "CURRENCY_MISMATCH", "That bank payment is in a different currency.");
+          }
+          if (amount > credit.remaining + 0.005) {
+            throw creditError(400, "EXCEEDS_TRANSFER", "That is more than is left of the bank payment.", {
+              remaining: credit.remaining,
+            });
+          }
+        }
 
-      const newAmountPaid = inv.amountPaid + Number(amount);
-      // Lagos date, matching the overdue recalculation above.
-      const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
-      let newStatus;
-      if (newAmountPaid >= inv.total) {
-        newStatus = "PAID";
-      } else if (inv.dueDate && inv.dueDate < today) {
-        newStatus = "OVERDUE";
-      } else {
-        newStatus = "PARTIAL";
-      }
-
-      return prisma.invoice.update({
-        where: { id: req.params.id },
-        data: { amountPaid: newAmountPaid, status: newStatus },
-        include: INCLUDE,
-      });
-    });
+        await px.invoicePayment.create({
+          data: {
+            invoiceId: inv.id,
+            amount,
+            method,
+            note,
+            // A payment into the KashBook account happened when the credit landed.
+            date: tx ? tx.date : when,
+            transactionId: tx ? tx.id : null,
+          },
+        });
+        if (tx) {
+          await px.transaction.update({
+            where: { id: tx.id },
+            data: {
+              matchedInvoiceId: tx.matchedInvoiceId || inv.id,
+              matchedAmount: round2(Number(tx.matchedInvoiceId ? tx.matchedAmount || 0 : 0) + amount),
+            },
+          });
+        }
+        const paid = sameMoney(outstanding, amount) ? round2(inv.total) : round2(inv.amountPaid + amount);
+        return px.invoice.update({
+          where: { id: inv.id },
+          data: { amountPaid: paid, status: statusAfter(inv, paid) },
+          include: INCLUDE,
+        });
+      }),
+    );
 
     res.status(201).json(formatInvoice(invoice));
   } catch (err) {
-    if (err.status === 400) return res.status(400).json({ error: err.message });
+    return sendCreditError(res, err, "Failed to record payment");
+  }
+});
+
+// DELETE /invoices/:id/payments/:paymentId — undo one payment or refund.
+// Money received comes off the invoice (a linked bank credit is freed and
+// counts on its own again); a refund goes back onto the credit note (a linked
+// debit is freed). Credit applied from a credit note is not undone here.
+router.delete("/:id/payments/:paymentId", authMiddleware, async (req, res) => {
+  try {
+    const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: "Invoice not found" });
+    if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
+
+    const updated = await prisma.withBusinessLock(existing.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const inv = await px.invoice.findUnique({ where: { id: existing.id } });
+        const p = await px.invoicePayment.findUnique({ where: { id: String(req.params.paymentId) } });
+        if (!p || p.invoiceId !== inv.id) throw creditError(404, "PAYMENT_NOT_FOUND", "Payment not found.");
+        const m = String(p.method || "").toLowerCase();
+        if (m === "credit_note" || m === "credit_applied") {
+          throw creditError(409, "CREDIT_SETTLEMENT", "Credit from a credit note can't be undone here.");
+        }
+        if (inv.writtenOffAt) {
+          throw creditError(409, "WRITTEN_OFF", "This invoice was written off. Undo the write-off first.");
+        }
+        if (inv.status === "VOID") throw creditError(409, "INVOICE_VOID", "This document is void.");
+
+        await px.invoicePayment.delete({ where: { id: p.id } });
+        if (p.transactionId) {
+          const tx = await px.transaction.findUnique({ where: { id: p.transactionId } });
+          if (tx && m === "refund_bank") {
+            if (tx.purpose === "customer_refund") {
+              await px.transaction.update({ where: { id: tx.id }, data: { purpose: null } });
+            }
+          } else if (tx && tx.matchedInvoiceId) {
+            const left = round2(Number(tx.matchedAmount || 0) - Number(p.amount));
+            let nextInvoice = tx.matchedInvoiceId;
+            if (left > 0.005 && tx.matchedInvoiceId === inv.id) {
+              const other = await px.invoicePayment.findFirst({
+                where: { transactionId: tx.id },
+                select: { invoiceId: true },
+              });
+              nextInvoice = other ? other.invoiceId : null;
+            }
+            await px.transaction.update({
+              where: { id: tx.id },
+              data:
+                left > 0.005 && nextInvoice
+                  ? { matchedInvoiceId: nextInvoice, matchedAmount: left }
+                  : { matchedInvoiceId: null, matchedAmount: null },
+            });
+          }
+        }
+        const paid = round2(Math.max(0, inv.amountPaid - Number(p.amount)));
+        const status =
+          inv.type === "credit_note"
+            ? paid >= round2(inv.total) ? "PAID" : paid > 0 ? "PARTIAL" : "SENT"
+            : statusAfter(inv, paid);
+        return px.invoice.update({ where: { id: inv.id }, data: { amountPaid: paid, status }, include: INCLUDE });
+      }),
+    );
+    res.json(formatInvoice(updated));
+  } catch (err) {
+    return sendCreditError(res, err, "Failed to undo payment");
+  }
+});
+
+// POST /invoices/:id/write-off — give up on what an open invoice still owes.
+// DELETE /invoices/:id/write-off — take that back.
+router.post("/:id/write-off", authMiddleware, async (req, res) => {
+  try {
+    const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: "Invoice not found" });
+    if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
+    if ((existing.type || "invoice") !== "invoice") {
+      return res.status(400).json({ error: "Only an invoice can be written off.", code: "NOT_AN_INVOICE" });
+    }
+    const updated = await prisma.withBusinessLock(existing.businessId, async () => {
+      const inv = await prisma.invoice.findUnique({ where: { id: existing.id } });
+      if (inv.writtenOffAt) throw creditError(409, "WRITTEN_OFF", "This invoice is already written off.");
+      if (!OPEN_STATUSES.includes(inv.status)) {
+        throw creditError(409, "INVOICE_NOT_OPEN", "That invoice is not waiting for payment.");
+      }
+      const left = round2(inv.total - inv.amountPaid);
+      if (!(left > 0)) throw creditError(400, "PAID_IN_FULL", "This invoice is already paid in full.");
+      return prisma.invoice.update({
+        where: { id: inv.id },
+        data: { writtenOffAt: new Date(), writtenOffAmount: left },
+        include: INCLUDE,
+      });
+    });
+    res.json(formatInvoice(updated));
+  } catch (err) {
+    return sendCreditError(res, err, "Failed to write off");
+  }
+});
+
+router.delete("/:id/write-off", authMiddleware, async (req, res) => {
+  try {
+    const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: "Invoice not found" });
+    if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
+    const updated = await prisma.invoice.update({
+      where: { id: existing.id },
+      data: { writtenOffAt: null, writtenOffAmount: null },
+      include: INCLUDE,
+    });
+    res.json(formatInvoice(updated));
+  } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to record payment" });
+    res.status(500).json({ error: "Failed to undo the write-off" });
   }
 });
 
@@ -657,7 +874,10 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
 // transaction, so two taps (or two phones) cannot spend the same credit twice.
 
 const OPEN_STATUSES = ["SENT", "PARTIAL", "OVERDUE"];
-const REFUND_METHODS = ["cash", "transfer", "card", "cheque", "other"];
+// "transfer" = from another bank account; "bank" = from the KashBook account,
+// naming the debit (transactionId) so it leaves expenses (books rule: a refund
+// lowers sales, it is never an expense).
+const REFUND_METHODS = ["cash", "transfer", "card", "cheque", "other", "bank"];
 const toMoney = (v) => Math.round(Number(v) * 100) / 100;
 
 function creditError(status, code, error, extra = {}) {
@@ -696,7 +916,7 @@ router.post("/:id/apply-credit", authMiddleware, async (req, res) => {
       if (!OPEN_STATUSES.includes(cn.status)) {
         throw creditError(409, "CREDIT_NOT_OPEN", "This credit note is not open.");
       }
-      if (!OPEN_STATUSES.includes(inv.status)) {
+      if (!OPEN_STATUSES.includes(inv.status) || inv.writtenOffAt) {
         throw creditError(409, "INVOICE_NOT_OPEN", "That invoice is not waiting for payment.");
       }
       // Credit belongs to one customer and can only pay that customer's invoices.
@@ -743,9 +963,10 @@ router.post("/:id/apply-credit", authMiddleware, async (req, res) => {
   }
 });
 
-// POST /invoices/:id/refund  { amount, method, note?, date? }  (:id = the credit note)
-// Records money given back to the customer. Like invoice payments, it is a
-// record on the document; it does not write to the sales or expense books.
+// POST /invoices/:id/refund  { amount, method, note?, date?, transactionId? }
+// (:id = the credit note). Records money given back to the customer. Books
+// rule: the refund lowers sales on its date; when it left the KashBook account
+// (method "bank") the debit is marked customer_refund so it is not an expense.
 router.post("/:id/refund", authMiddleware, async (req, res) => {
   try {
     const body = req.body || {};
@@ -754,6 +975,9 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
     if (!(amount > 0)) return res.status(400).json({ error: "Enter an amount.", code: "BAD_AMOUNT" });
     if (!REFUND_METHODS.includes(method)) {
       return res.status(400).json({ error: "Unknown refund method.", code: "BAD_METHOD" });
+    }
+    if (method === "bank" && !body.transactionId) {
+      return res.status(400).json({ error: "Pick the transfer that paid the refund.", code: "TRANSACTION_REQUIRED" });
     }
     const when = body.date ? new Date(body.date) : new Date();
     if (Number.isNaN(when.getTime())) return res.status(400).json({ error: "Invalid date", code: "BAD_DATE" });
@@ -775,23 +999,41 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
         throw creditError(400, "EXCEEDS_CREDIT", "That is more than the credit left.", { remaining });
       }
       const cnUsed = toMoney(cn.amountPaid + amount);
-      const [, row] = await prisma.$transaction([
-        prisma.invoicePayment.create({
+      return prisma.$transaction(async (px) => {
+        let debit = null;
+        if (method === "bank") {
+          debit = await px.transaction.findUnique({ where: { id: String(body.transactionId) } });
+          if (!debit || debit.businessId !== cn.businessId) {
+            throw creditError(404, "TRANSACTION_NOT_FOUND", "That transfer was not found.");
+          }
+          if (debit.type === "income") throw creditError(400, "NOT_OUTGOING", "Pick money that went out.");
+          if (debit.purpose || debit.matchedExpenseId) {
+            throw creditError(409, "TRANSACTION_TAKEN", "That transfer is already explained.");
+          }
+          // One record per naira: the whole transfer is the refund.
+          if (!sameMoney(Number(debit.amount), amount)) {
+            throw creditError(400, "AMOUNT_MISMATCH", "The refund must equal the transfer.", {
+              transferAmount: Number(debit.amount),
+            });
+          }
+          await px.transaction.update({ where: { id: debit.id }, data: { purpose: "customer_refund" } });
+        }
+        await px.invoicePayment.create({
           data: {
             invoiceId: cn.id,
             amount,
             method: `refund_${method}`,
             note: body.note ? String(body.note).trim().slice(0, 200) || null : null,
-            date: when,
+            date: debit ? debit.date : when,
+            transactionId: debit ? debit.id : null,
           },
-        }),
-        prisma.invoice.update({
+        });
+        return px.invoice.update({
           where: { id: cn.id },
           data: { amountPaid: cnUsed, status: cnUsed >= toMoney(cn.total) ? "PAID" : "PARTIAL" },
           include: INCLUDE,
-        }),
-      ]);
-      return row;
+        });
+      });
     });
 
     res.status(201).json(formatInvoice(updated));
@@ -869,6 +1111,18 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       const applied = await prisma.creditApplication.count({ where: { invoiceId: existing.id } });
       if (applied) {
         return res.status(409).json({ error: "Credit has been applied to this invoice.", code: "CREDITS_APPLIED" });
+      }
+    }
+    // Payments counted in sales go with the invoice if it is deleted, so a paid
+    // invoice stays; undo its payments first, or correct it with a credit note.
+    if ((existing.amountPaid || 0) > 0) {
+      return res.status(409).json({ error: "Payments are recorded on this document.", code: "PAYMENTS_RECORDED" });
+    }
+    if (existing.type !== "quote" && existing.status !== "DRAFT") {
+      const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
+      // VAT invoices are numbered in sequence; an issued one is voided, never removed.
+      if (biz?.vatEnabled) {
+        return res.status(409).json({ error: "An issued VAT invoice can be voided, not deleted.", code: "VAT_ISSUED_LOCKED" });
       }
     }
 

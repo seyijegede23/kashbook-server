@@ -1,0 +1,107 @@
+// Loads one business's records for a period and runs the books rule over them
+// (utils/books.js). Every server total of sales, expenses or profit goes
+// through booksFor, so the emails, Insights and the app agree.
+const prisma = require("./db");
+const { computeBooks, receivables, vatReturn } = require("./books");
+
+// "YYYY-MM-DD" (Lagos) → the instant that day starts / ends.
+function lagosStart(day) {
+  return new Date(`${day}T00:00:00.000+01:00`);
+}
+function lagosEnd(day) {
+  return new Date(`${day}T23:59:59.999+01:00`);
+}
+
+function dateWhere(from, to) {
+  if (!from && !to) return undefined;
+  const w = {};
+  if (from) w.gte = lagosStart(from);
+  if (to) w.lte = lagosEnd(to);
+  return w;
+}
+
+// Records the rule needs. Invoices and debts are loaded whole (with their
+// payments) because a payment in the period can belong to an older document;
+// they are few per business.
+async function loadBooksInput(businessId, { from, to } = {}, db = prisma) {
+  const date = dateWhere(from, to);
+  const biz = await db.business.findUnique({
+    where: { id: businessId },
+    select: { id: true, userId: true, vatEnabled: true, vatRate: true, vatInclusive: true },
+  });
+  if (!biz) return null;
+  const [sales, expenses, bankRows, invoices, debts] = await Promise.all([
+    db.sales.findMany({
+      where: { businessId, ...(date ? { date } : {}) },
+      select: { id: true, amount: true, date: true, isCredit: true },
+    }),
+    db.expense.findMany({
+      where: { businessId, ...(date ? { date } : {}) },
+      select: { id: true, amount: true, date: true },
+    }),
+    db.transaction.findMany({
+      where: { businessId, ...(date ? { date } : {}) },
+      select: {
+        id: true, type: true, amount: true, date: true, purpose: true,
+        matchedSaleId: true, matchedCustomerId: true, matchedExpenseId: true,
+        matchedInvoiceId: true, matchedAmount: true,
+      },
+    }),
+    db.invoice.findMany({
+      where: { businessId },
+      select: {
+        id: true, type: true, status: true, issueDate: true, total: true,
+        taxAmount: true, amountPaid: true, writtenOffAt: true, writtenOffAmount: true,
+        payments: { select: { amount: true, method: true, date: true, transactionId: true } },
+      },
+    }),
+    db.debt.findMany({
+      where: { customer: { businessId } },
+      select: {
+        amount: true, paidAmount: true, paid: true, date: true, saleId: true,
+        payments: { select: { amount: true, date: true } },
+      },
+    }),
+  ]);
+  return {
+    vat: { enabled: biz.vatEnabled, rate: biz.vatRate, inclusive: biz.vatInclusive },
+    input: { sales, expenses, bankRows, invoices, debts },
+  };
+}
+
+async function booksFor(businessId, { from, to, basis = "paid" } = {}, db = prisma) {
+  const loaded = await loadBooksInput(businessId, { from, to }, db);
+  if (!loaded) return null;
+  return computeBooks(loaded.input, { from, to, basis, vat: loaded.vat });
+}
+
+// Open balances right now: what customers owe and what is owed to them.
+async function receivablesFor(businessId, db = prisma) {
+  const [invoices, debts] = await Promise.all([
+    db.invoice.findMany({
+      where: { businessId, type: { in: ["invoice", "credit_note"] } },
+      select: { type: true, status: true, total: true, amountPaid: true, writtenOffAt: true },
+    }),
+    db.debt.findMany({
+      where: { customer: { businessId }, paid: false },
+      select: { amount: true, paidAmount: true, paid: true },
+    }),
+  ]);
+  return receivables({ invoices, debts });
+}
+
+function monthEnd(month) {
+  const [y, m] = month.split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${month}-${String(last).padStart(2, "0")}`;
+}
+
+async function vatReturnFor(businessId, month, db = prisma) {
+  const from = `${month}-01`;
+  const to = monthEnd(month);
+  const loaded = await loadBooksInput(businessId, { from, to }, db);
+  if (!loaded) return null;
+  return vatReturn(loaded.input, month, loaded.vat);
+}
+
+module.exports = { loadBooksInput, booksFor, receivablesFor, vatReturnFor, lagosStart, lagosEnd, monthEnd };

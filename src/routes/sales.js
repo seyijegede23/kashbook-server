@@ -10,6 +10,13 @@ router.use(auth);
 const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
 
+// Customer.totalOwed is the cached sum of what their unpaid debts still owe.
+async function refreshTotalOwed(px, customerId) {
+  const debts = await px.debt.findMany({ where: { customerId }, select: { amount: true, paidAmount: true } });
+  const owed = debts.reduce((s, d) => s + Math.max(0, d.amount - d.paidAmount), 0);
+  await px.customer.update({ where: { id: customerId }, data: { totalOwed: Math.round(owed * 100) / 100 } });
+}
+
 // GET /sales?from=&to=&limit=&businessId=
 router.get("/", async (req, res) => {
   try {
@@ -89,22 +96,46 @@ router.post("/", validateSale, async (req, res) => {
       if (!owned) return res.status(403).json({ error: "Forbidden" });
     }
 
-    const sale = await prisma.sales.create({
-      data: {
-        userId: getTargetUserId(req),
-        businessId: businessId || null,
-        customerId: customerId || null,
-        amount: Number(amount),
-        paymentMethod,
-        isCredit,
-        notes: notes || null,
-        channel: normalizeChannel(channel),
-        date: date ? new Date(date) : new Date(),
-        recordedBy: req.user.id,
-        recordedByName: req.user.name,
-      },
+    const ownerId = getTargetUserId(req);
+    // Sold on credit to a known customer: open that customer's debt for it in
+    // the same transaction. Books rule: the sale then counts when the customer
+    // pays (through the debt's payments), not on the day it was recorded.
+    const creditCustomer =
+      isCredit && customerId
+        ? await prisma.customer.findFirst({ where: { id: String(customerId), userId: ownerId }, select: { id: true } })
+        : null;
+
+    const { sale, debt } = await prisma.$transaction(async (px) => {
+      const sale = await px.sales.create({
+        data: {
+          userId: ownerId,
+          businessId: businessId || null,
+          customerId: customerId || null,
+          amount: Number(amount),
+          paymentMethod,
+          isCredit,
+          notes: notes || null,
+          channel: normalizeChannel(channel),
+          date: date ? new Date(date) : new Date(),
+          recordedBy: req.user.id,
+          recordedByName: req.user.name,
+        },
+      });
+      if (!creditCustomer) return { sale, debt: null };
+      const debt = await px.debt.create({
+        data: {
+          customerId: creditCustomer.id,
+          amount: Number(amount),
+          note: notes || "",
+          date: sale.date,
+          saleId: sale.id,
+        },
+        include: { payments: true },
+      });
+      await refreshTotalOwed(px, creditCustomer.id);
+      return { sale, debt };
     });
-    res.status(201).json(sale);
+    res.status(201).json({ ...sale, debt });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to create sale" });
@@ -120,15 +151,35 @@ router.patch("/:id", validateIdParam, async (req, res) => {
     if (!sale) return res.status(404).json({ error: "Sale not found" });
     if (sale.userId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
     const { amount, notes, paymentMethod, date, channel } = req.body;
-    const updated = await prisma.sales.update({
-      where: { id: req.params.id },
-      data: {
-        ...(amount !== undefined && { amount: Number(amount) }),
-        ...(notes !== undefined && { notes }),
-        ...(paymentMethod !== undefined && { paymentMethod }),
-        ...(date !== undefined && { date: new Date(date) }),
-        ...(channel !== undefined && { channel: normalizeChannel(channel) }),
-      },
+    const debt = await prisma.debt.findFirst({ where: { saleId: sale.id } });
+    if (debt && amount !== undefined && Number(amount) !== Number(sale.amount) && debt.paidAmount > 0) {
+      return res.status(409).json({
+        error: "The customer has paid part of this credit sale. Its amount is fixed.",
+        code: "CREDIT_SALE_PAID",
+      });
+    }
+    const updated = await prisma.$transaction(async (px) => {
+      const row = await px.sales.update({
+        where: { id: req.params.id },
+        data: {
+          ...(amount !== undefined && { amount: Number(amount) }),
+          ...(notes !== undefined && { notes }),
+          ...(paymentMethod !== undefined && { paymentMethod }),
+          ...(date !== undefined && { date: new Date(date) }),
+          ...(channel !== undefined && { channel: normalizeChannel(channel) }),
+        },
+      });
+      if (debt && (amount !== undefined || date !== undefined)) {
+        await px.debt.update({
+          where: { id: debt.id },
+          data: {
+            ...(amount !== undefined && { amount: Number(amount), paid: debt.paidAmount >= Number(amount) }),
+            ...(date !== undefined && { date: new Date(date) }),
+          },
+        });
+        await refreshTotalOwed(px, debt.customerId);
+      }
+      return row;
     });
     res.json(updated);
   } catch (err) {
@@ -148,8 +199,23 @@ router.delete("/:id", validateIdParam, async (req, res) => {
     if (sale.userId !== req.user.id)
       return res.status(403).json({ error: "Forbidden" });
 
-    await prisma.sales.delete({ where: { id: req.params.id } });
-    res.json({ message: "Deleted" });
+    // A credit sale and its debt go together. Once the customer has paid some
+    // of it, those payments are counted sales, so the sale stays.
+    const debt = await prisma.debt.findFirst({ where: { saleId: sale.id } });
+    if (debt && debt.paidAmount > 0) {
+      return res.status(409).json({
+        error: "The customer has paid part of this credit sale, so it can't be deleted.",
+        code: "CREDIT_SALE_PAID",
+      });
+    }
+    await prisma.$transaction(async (px) => {
+      if (debt) {
+        await px.debt.delete({ where: { id: debt.id } });
+        await refreshTotalOwed(px, debt.customerId);
+      }
+      await px.sales.delete({ where: { id: req.params.id } });
+    });
+    res.json({ message: "Deleted", debtId: debt ? debt.id : null });
   } catch (err) {
     res.status(500).json({ error: "Failed to delete sale" });
   }

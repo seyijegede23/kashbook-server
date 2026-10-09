@@ -802,7 +802,9 @@ router.post("/", async (req, res) => {
       // so it never actually fired.
       require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
       require("../utils/waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
-      require("../utils/invoiceMatch").tryMatchInvoice(biz, amount, sessionId || reference || "").catch(() => {});
+      require("../utils/invoiceMatch")
+        .tryMatchInvoice(biz, amount, sessionId || reference || "", { transactionId: createdRow?.id })
+        .catch(() => {});
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
@@ -896,8 +898,9 @@ router.post("/", async (req, res) => {
       const narration = attrs.reason || "";
       const description = buildInboundDescription({ sender, narration, reference });
 
+      let bookRow;
       try {
-        await prisma.transaction.create({
+        bookRow = await prisma.transaction.create({
           data: {
             businessId: destBiz.id,
             userId: destBiz.userId,
@@ -936,7 +939,9 @@ router.post("/", async (req, res) => {
       // invoice (fire-and-forget).
       require("../utils/igPaymentMatch").tryMatchIgPayment(destBiz, amount).catch(() => {});
       require("../utils/waPaymentMatch").tryMatchWaPayment(destBiz, amount).catch(() => {});
-      require("../utils/invoiceMatch").tryMatchInvoice(destBiz, amount, dbReference).catch(() => {});
+      require("../utils/invoiceMatch")
+        .tryMatchInvoice(destBiz, amount, dbReference, { transactionId: bookRow?.id })
+        .catch(() => {});
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(destBiz.id, Number(amount) || 0); } catch { /* noop */ }

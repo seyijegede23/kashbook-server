@@ -41,7 +41,9 @@ router.get("/i/:token", async (req, res) => {
     const qrDataUrl = await buildQrDataUrl(shareUrl);
 
     const html = buildInvoiceHtml({
-      invoice,
+      // The document builder speaks the app's lower-case statuses; the raw row
+      // is upper-case, which made paid or void invoices past due read Overdue.
+      invoice: { ...invoice, status: String(invoice.status || "").toLowerCase() },
       business,
       customer,
       payment,

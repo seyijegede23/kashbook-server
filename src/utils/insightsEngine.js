@@ -26,6 +26,7 @@ const prisma = require("./db");
 // Savings rows (a deposit to the merchant's own pot, its return, interest) are
 // not trade: every income/expense predicate below carries this exclusion.
 const { NOT_SAVINGS } = require("../config/moneySources");
+const { booksFor } = require("./booksData");
 
 // ── Money formatting ─────────────────────────────────────────────────────────
 const CURRENCY_SYMBOLS = {
@@ -845,7 +846,24 @@ function nearestIntent(text) {
 // Manual bookkeeping lives in Sales/Expense; Transaction holds bank movement.
 // Income = all Sales + bank credits NOT matched to a sale or a debt (both ids null,
 // so a recorded sale that was paid by transfer isn't double-counted).
+// [start, end) instants → the Lagos days the books rule reads.
+function rangeDays(range) {
+  const day = (d) => new Date(d.getTime() + 60 * 60 * 1000).toISOString().slice(0, 10);
+  return { from: day(range.start), to: day(new Date(range.end.getTime() - 1)) };
+}
+
+function lineCount(lines) {
+  return Object.values(lines).reduce((n, l) => n + l.count, 0);
+}
+
 async function sumIncome(businessId, range, channel) {
+  // Sales by the books rule (utils/books.js), the same figure the app's
+  // Reports show: invoice and debt payments and refunds included, each naira
+  // once. Per-channel questions keep the channel split below.
+  if (!channel) {
+    const b = await booksFor(businessId, rangeDays(range));
+    if (b) return { total: b.sales.total, count: lineCount(b.sales.lines) - b.sales.lines.awaitingPayment.count };
+  }
   const date = { gte: range.start, lt: range.end };
   const [sales, bank, remainder] = await Promise.all([
     prisma.sales.aggregate({
@@ -854,7 +872,7 @@ async function sumIncome(businessId, range, channel) {
       _count: { _all: true },
     }),
     prisma.transaction.aggregate({
-      where: { businessId, type: "income", date, matchedSaleId: null, matchedCustomerId: null, ...NOT_SAVINGS, ...(channel ? { channel } : {}) },
+      where: { businessId, type: "income", date, matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, ...NOT_SAVINGS, ...(channel ? { channel } : {}) },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -868,6 +886,8 @@ async function sumIncome(businessId, range, channel) {
 
 // Expenses = recorded Expense rows + bank money-out (transfers, bills).
 async function sumExpenses(businessId, range) {
+  const books = await booksFor(businessId, rangeDays(range));
+  if (books) return { total: books.expenses.total, count: lineCount(books.expenses.lines) };
   const date = { gte: range.start, lt: range.end };
   const [exp, bank, remainder] = await Promise.all([
     prisma.expense.aggregate({ where: { businessId, date }, _sum: { amount: true }, _count: { _all: true } }),
@@ -897,7 +917,7 @@ async function sumMatchedRemainder(businessId, type, date, channel) {
       matchedAmount: { not: null },
       ...NOT_SAVINGS,
       ...(type === "income"
-        ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }] }
+        ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }, { matchedInvoiceId: { not: null } }] }
         : { matchedExpenseId: { not: null } }),
       ...(channel ? { channel } : {}),
     },
@@ -1069,7 +1089,15 @@ const HANDLERS = {
     // have is invoice line items (name + amount).
     const rows = await prisma.invoiceItem.groupBy({
       by: ["name"],
-      where: { invoice: { businessId: business.id, createdAt: { gte: range.start, lt: range.end }, status: { not: "VOID" } } },
+      // Issued invoices only: quotes, drafts, voids and credit notes are not sales.
+      where: {
+        invoice: {
+          businessId: business.id,
+          type: "invoice",
+          createdAt: { gte: range.start, lt: range.end },
+          status: { notIn: ["VOID", "DRAFT"] },
+        },
+      },
       _sum: { amount: true },
       _count: { _all: true },
     });
@@ -1104,7 +1132,7 @@ const HANDLERS = {
       }),
       prisma.transaction.groupBy({
         by: ["channel"],
-        where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, date, ...NOT_SAVINGS },
+        where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, date, ...NOT_SAVINGS },
         _sum: { amount: true },
       }),
     ]);
@@ -1123,7 +1151,7 @@ const HANDLERS = {
     const open = await prisma.invoice.findMany({
       // Invoices only: a sent quote is not owed, and a credit note is owed TO
       // the customer. (Before credit notes this also counted sent quotes.)
-      where: { businessId: business.id, type: "invoice", status: { in: ["SENT", "PARTIAL", "OVERDUE"] } },
+      where: { businessId: business.id, type: "invoice", status: { in: ["SENT", "PARTIAL", "OVERDUE"] }, writtenOffAt: null },
       select: { total: true, amountPaid: true, dueDate: true },
     });
     if (open.length === 0) return { answer: "No unpaid invoices — everything is settled. ✅" };
@@ -1213,7 +1241,7 @@ const HANDLERS = {
         UNION ALL
         SELECT "date", amount FROM "Transaction"
         WHERE "businessId" = ${business.id} AND type = 'income'
-          AND "matchedSaleId" IS NULL AND "matchedCustomerId" IS NULL AND "purpose" IS NULL
+          AND "matchedSaleId" IS NULL AND "matchedCustomerId" IS NULL AND "matchedInvoiceId" IS NULL AND "purpose" IS NULL
           AND "date" >= ${r.start} AND "date" < ${r.end}
       ) t
       GROUP BY 1
@@ -1690,7 +1718,7 @@ async function generateInsightCards(business) {
     }),
     prisma.transaction.groupBy({
       by: ["channel"],
-      where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end }, ...NOT_SAVINGS },
+      where: { businessId: business.id, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, channel: { not: null }, date: { gte: thisMonth.start, lt: thisMonth.end }, ...NOT_SAVINGS },
       _sum: { amount: true },
     }),
   ]);

@@ -611,11 +611,14 @@ for (const { file, minPrisma, minRaw } of REPORTING) {
   });
 }
 
-test("dailyReport.js: the per-type groupBy over prisma.transaction carries NOT_SAVINGS", () => {
+// Since 2026-10-09 the daily report totals through the books rule, which counts
+// nothing for a bank row that carries a purpose (savings rows included).
+test("dailyReport.js: totals come from booksFor, and the books rule drops purpose rows", () => {
   const src = read("src/utils/dailyReport.js");
-  const calls = transactionCalls(src).filter((c) => c.method === "groupBy");
-  assert.ok(calls.length >= 1, "no prisma.transaction.groupBy in dailyReport");
-  for (const c of calls) assert.ok(hasExclusion(c.arg), `dailyReport groupBy at line ${c.line} lacks NOT_SAVINGS`);
+  assert.ok(/booksFor\(/.test(src), "dailyReport does not use booksFor");
+  assert.strictEqual(transactionCalls(src).length, 0, "dailyReport queries bank rows directly again");
+  const { bankCountedAmount } = require("../src/utils/books");
+  assert.strictEqual(bankCountedAmount({ type: "expense", amount: 100, purpose: "savings_fee" }), 0);
 });
 
 test("monthlyReport.js: the partial-match remainder predicate also excludes savings rows", () => {

@@ -88,8 +88,9 @@ async function recordFincraInboundCredit(d, source = "fincra") {
     hasName: !!senderName,
   };
   const narration = d.description || d.narration || "";
+  let created;
   try {
-    await prisma.transaction.create({
+    created = await prisma.transaction.create({
       data: {
         businessId: biz.id,
         userId: biz.userId,
@@ -154,7 +155,7 @@ async function recordFincraInboundCredit(d, source = "fincra") {
   // numeric equality. Known limitation: `amount` here is fee-NET, invoices
   // are gross — Fincra credits with a fee won't auto-match (acceptable while
   // Fincra is dormant; revisit with amount+fee if it wakes).
-  require("./invoiceMatch").tryMatchInvoice(biz, amount, reference, { currency }).catch(() => {});
+  require("./invoiceMatch").tryMatchInvoice(biz, amount, reference, { currency, transactionId: created?.id }).catch(() => {});
   return { recorded: true, businessId: biz.id, amount, currency };
 }
 

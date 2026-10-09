@@ -29,22 +29,21 @@ async function sendDailyReports() {
   });
   if (businesses.length === 0) return { users: 0 };
 
-  // Today's totals, one query for all businesses. Savings movements are the
-  // merchant's own money changing pocket, not money in or out.
-  const { NOT_SAVINGS } = require("../config/moneySources");
-  const grouped = await prisma.transaction.groupBy({
-    by: ["businessId", "type"],
-    where: { businessId: { in: businesses.map((b) => b.id) }, date: { gte: since }, ...NOT_SAVINGS },
-    _sum: { amount: true },
-    _count: { _all: true },
-  });
+  // Today's sales and expenses by the books rule (utils/books.js): recorded
+  // sales and expenses, invoice and debt payments, refunds and bank rows, each
+  // naira once. It used to read bank rows only, so a day of recorded sales
+  // still got the "no entries" nudge.
+  const { booksFor } = require("./booksData");
+  const today = new Date(since.getTime() + WAT_OFFSET_MS).toISOString().slice(0, 10);
   const statsByBusiness = new Map();
-  for (const g of grouped) {
-    const s = statsByBusiness.get(g.businessId) || { income: 0, expense: 0, count: 0 };
-    if (g.type === "income") s.income += Number(g._sum.amount || 0);
-    else if (g.type === "expense") s.expense += Number(g._sum.amount || 0);
-    s.count += g._count._all;
-    statsByBusiness.set(g.businessId, s);
+  for (const b of businesses) {
+    const books = await booksFor(b.id, { from: today, to: today });
+    if (!books) continue;
+    let count = 0;
+    for (const line of Object.values(books.sales.lines)) count += line.count;
+    for (const line of Object.values(books.expenses.lines)) count += line.count;
+    if (count === 0) continue;
+    statsByBusiness.set(b.id, { income: books.sales.total, expense: books.expenses.total, count });
   }
 
   // Group businesses per owner so each user gets exactly one push.
@@ -81,7 +80,7 @@ async function sendDailyReports() {
       jobs.push({
         userId,
         title: "Today's business summary 📊",
-        body: `${inStr} in · ${outStr} out · ${count} transaction${count === 1 ? "" : "s"}${scope}.`,
+        body: `${inStr} sales · ${outStr} expenses · ${count} entr${count === 1 ? "y" : "ies"}${scope}.`,
       });
     }
   }

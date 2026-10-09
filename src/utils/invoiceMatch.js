@@ -17,7 +17,11 @@ const { sameMoney } = require("./money");
 const { pushTo } = require("./pushNotification");
 const { recalcInvoiceStatus } = require("./invoiceStatus");
 
-async function tryMatchInvoice(biz, amount, reference, { currency } = {}) {
+// transactionId: the bank credit just booked. The payment links it and the
+// credit is marked as having paid the invoice (books rule: the payment carries
+// the sale, the credit stops counting), so the credit can no longer be matched
+// to a sale or debt as well. Without it (old callers) nothing is linked.
+async function tryMatchInvoice(biz, amount, reference, { currency, transactionId } = {}) {
   if (!biz?.id || !(Number(amount) > 0)) return;
   // Currency guard: FCY credits (Fincra USD/GHS) must never settle an NGN
   // invoice on numeric equality alone. Callers that know the credit's
@@ -35,6 +39,7 @@ async function tryMatchInvoice(biz, amount, reference, { currency } = {}) {
         // the auto-matcher must not settle them either.
         type: "invoice",
         status: { in: ["SENT", "PARTIAL", "OVERDUE"] },
+        writtenOffAt: null,
         issueDate: { gte: ninetyDaysAgo },
       },
       select: {
@@ -60,24 +65,50 @@ async function tryMatchInvoice(biz, amount, reference, { currency } = {}) {
       dueDate: inv.dueDate,
       status: inv.status,
     });
-    // One $transaction: the payment row and the invoice totals commit or fail
-    // together — a crash between two autocommitted writes would leave an
-    // orphan payment with the balance unchanged, and the next same-amount
-    // credit would settle the invoice a second time.
-    await prisma.$transaction([
-      prisma.invoicePayment.create({
+    // One $transaction: the payment row, the invoice totals and the credit's
+    // link commit or fail together — a crash between autocommitted writes
+    // would leave an orphan payment with the balance unchanged, and the next
+    // same-amount credit would settle the invoice a second time.
+    const linked = await prisma.$transaction(async (px) => {
+      let tx = null;
+      if (transactionId) {
+        tx = await px.transaction.findUnique({
+          where: { id: transactionId },
+          select: {
+            id: true, businessId: true, type: true, date: true, purpose: true,
+            matchedSaleId: true, matchedCustomerId: true, matchedInvoiceId: true,
+          },
+        });
+        // Already explained some other way (the merchant was quicker): leave it.
+        if (
+          !tx || tx.businessId !== biz.id || tx.type !== "income" || tx.purpose ||
+          tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId
+        ) {
+          return false;
+        }
+      }
+      await px.invoicePayment.create({
         data: {
           invoiceId: inv.id,
           amount,
           method: "bank",
           note: `NUBAN transfer · ${reference}`,
+          ...(tx ? { transactionId: tx.id, date: tx.date } : {}),
         },
-      }),
-      prisma.invoice.update({
+      });
+      await px.invoice.update({
         where: { id: inv.id },
         data: { amountPaid: newAmountPaid, status: newStatus },
-      }),
-    ]);
+      });
+      if (tx) {
+        await px.transaction.update({
+          where: { id: tx.id },
+          data: { matchedInvoiceId: inv.id, matchedAmount: Number(amount) },
+        });
+      }
+      return true;
+    });
+    if (!linked) return null;
     return { inv, newStatus };
   });
 

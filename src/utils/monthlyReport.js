@@ -13,6 +13,7 @@
 
 const prisma = require("./db");
 const { NOT_SAVINGS } = require("../config/moneySources");
+const { booksFor } = require("./booksData");
 const { renderEmail, txnRow, escHtml } = require("./emailLayout");
 const { getTransport } = require("./transactionEmail");
 
@@ -162,6 +163,27 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   }
   for (const s of stats.values()) s.cats.sort((a, b) => b.amount - a.amount);
 
+  // Money in, money out and VAT come from the books rule (utils/books.js), the
+  // same one the app's Reports use: invoice payments, debt repayments and
+  // refunds count too, and every naira once. The group-bys above still give
+  // the entry count and the expense categories.
+  const dayOf = (d) => new Date(d.getTime() + WAT_OFFSET_MS).toISOString().slice(0, 10);
+  const thisDays = { from: dayOf(range.start), to: dayOf(new Date(range.end.getTime() - 1)) };
+  const prevDays = { from: dayOf(prev.start), to: dayOf(new Date(prev.end.getTime() - 1)) };
+  for (const b of businesses) {
+    const [now, before] = await Promise.all([booksFor(b.id, thisDays), booksFor(b.id, prevDays)]);
+    if (!now) continue;
+    const L = now.sales.lines;
+    const extra = L.invoicePayments.count + L.debtPayments.count + L.refunds.count;
+    if (!stats.has(b.id) && !extra && !now.sales.total && !now.expenses.total) continue;
+    const s = get(b.id);
+    s.income = now.sales.total;
+    s.expense = now.expenses.total;
+    s.vat = now.vatEnabled ? now.sales.vat : 0;
+    s.count += extra;
+    s.prevIncome = before ? before.sales.total : 0;
+  }
+
   // Group active businesses per owner.
   const byUser = new Map();
   for (const b of businesses) {
@@ -190,12 +212,10 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   return { range, users };
 }
 
-// Estimated VAT on the month's income, honouring the business's inclusive flag.
-function estimatedVat(b, income) {
-  if (!b.vatEnabled || !income) return null;
-  const r = (Number(b.vatRate) > 0 ? Number(b.vatRate) : 7.5) / 100;
-  const vat = b.vatInclusive === false ? income * r : income * (r / (1 + r));
-  return vat > 0 ? vat : null;
+// VAT inside the month's sales (books rule), when the business charges VAT.
+function estimatedVat(b, stats) {
+  if (!b.vatEnabled) return null;
+  return stats.vat > 0 ? stats.vat : null;
 }
 
 const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
@@ -215,7 +235,7 @@ function businessSection({ business, stats }, isFirst) {
     momRow = txnRow("Income vs last month", `${arrow} ${Math.abs(delta).toFixed(0)}%`);
   }
 
-  const vat = estimatedVat(business, stats.income);
+  const vat = estimatedVat(business, stats);
   const topCats = stats.cats.slice(0, 3)
     .map((c) => `${c.category} ${money(c.amount, cur)}`)
     .join(" · ");
@@ -227,8 +247,8 @@ function businessSection({ business, stats }, isFirst) {
 <p class="kb-amount" style="margin:0 0 4px 0;font-family:${FONT};font-size:30px;font-weight:800;letter-spacing:-0.5px;line-height:1.1;"><span style="color:${accent};">${escHtml(netStr)}</span></p>
 <p class="kb-faint" style="margin:0 0 14px 0;font-family:${FONT};font-size:13px;color:#A1A1AA;">net profit</p>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-${txnRow("Money in", `+${money(stats.income, cur)}`)}
-${txnRow("Money out", `−${money(stats.expense, cur)}`)}
+${txnRow("Sales (counted when paid)", `+${money(stats.income, cur)}`)}
+${txnRow("Expenses", `−${money(stats.expense, cur)}`)}
 ${txnRow("Transactions", String(stats.count))}
 ${momRow}
 ${vat != null ? txnRow("VAT (estimated)", money(vat, cur)) : ""}

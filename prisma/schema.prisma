@@ -549,8 +549,14 @@ model Debt {
   note       String        @default("")
   date       DateTime      @default(now())
   payments   DebtPayment[]
+  // The credit Sales row this debt was opened for ("sold on credit"), when it
+  // came from Add Sale. Books rule: that sale counts when the customer pays,
+  // through the DebtPayments, not on the sale date. Bare scalar like
+  // DebtPayment.transactionId.
+  saleId     String?
 
   @@index([customerId, paid])
+  @@index([saleId])
 }
 
 model DebtPayment {
@@ -692,6 +698,10 @@ model Transaction {
   // recorded from this debit. Expense aggregates exclude debits carrying this,
   // exactly as income aggregates exclude matched credits.
   matchedExpenseId  String?
+  // A credit that paid one or more invoices: the first invoice it paid. The
+  // InvoicePayment rows carrying transactionId = this row are the full list,
+  // and matchedAmount is their sum, so a larger credit's remainder still counts.
+  matchedInvoiceId  String?
   // How much of this bank row the match actually accounted for (sale amount,
   // debt applied, expense recorded) — always ≤ amount. Scalar totals add the
   // unmatched remainder (amount − matchedAmount) back in, so a ₦5,000 credit
@@ -722,11 +732,13 @@ model Transaction {
   // records what the PROVIDER called it, so a row can always be traced back to
   // the source event without parsing the description.
   providerTxnId     String?
-  // Why this bank row exists when it is NOT trade. Today only "savings_fee":
-  // the early-withdrawal charge swept to KashBook's fee account when a
-  // merchant breaks a flexible savings lock. Set only by server money paths.
-  // Reporting aggregates exclude rows carrying a purpose (config/moneySources
-  // NOT_SAVINGS); the ledger balance keeps them, because the money moved.
+  // Why this bank row exists when it is NOT trade (utils/books.js PURPOSES):
+  // "savings_fee" (savings early-withdrawal charge), "customer_refund" (a
+  // debit that paid a credit-note refund; the refund lowers sales instead), or
+  // a credit the merchant marked as not income: "cash_deposit", "own_transfer",
+  // "owner_money", "loan", "supplier_refund" (this one lowers expenses).
+  // Set only by server routes. Reporting aggregates exclude rows carrying a
+  // purpose; the ledger balance keeps them, because the money moved.
   purpose           String?
   currency          String    @default("NGN") // base currency at time of record; per-business default
   flagSeverity      String? // null | "low" | "medium" | "high"
@@ -1056,6 +1068,13 @@ model Invoice {
   subject        String?
   salespersonId  String? // the owner or one of their staff; no FK on purpose
   salespersonName String? // copied at save time so the document keeps it
+  // Invoices only: the unpaid balance the merchant gave up on. Stays a sale in
+  // the "when sold" view and adds a bad-debt expense there on writtenOffAt;
+  // the invoice is closed (no payments, not "owed to you").
+  writtenOffAt     DateTime?
+  writtenOffAmount Float?
+  // The tax authority's invoice reference (NRS e-invoicing IRN), when issued.
+  irn            String?
   items          InvoiceItem[]
   payments       InvoicePayment[]
   shareLink      InvoiceShareLink?
@@ -1112,6 +1131,12 @@ model InvoicePayment {
   note      String?
   date      DateTime @default(now())
   createdAt DateTime @default(now())
+  // The bank row this payment is: the NUBAN credit that paid the invoice
+  // (method "bank") or the debit that paid a credit-note refund
+  // (method "refund_bank"). Bare scalar, like DebtPayment.transactionId.
+  transactionId String?
+
+  @@index([transactionId])
 }
 
 model InvoiceShareLink {

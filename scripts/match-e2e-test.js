@@ -264,12 +264,12 @@ async function wipe() {
     const stamped = await prisma.debtPayment.count({ where: { transactionId: c4.id } });
     assert.strictEqual(stamped, 2, "every payment must carry the credit's id or unmatch can't find it");
   });
-  await test("debt-matched credit: applied slice leaves income, remainder STAYS", async () => {
-    // Two rules in one flow. (a) matchedCustomerId excludes like matchedSaleId
-    // does — before that fix a debt-matched credit still counted. (b) only the
-    // APPLIED slice is excluded: a credit bigger than the debt leaves a
-    // remainder of real money, which used to vanish from income entirely
-    // (matchedAmount is what puts it back).
+  await test("debt-matched credit: counted once, the debt payment carries the applied slice", async () => {
+    // Books rule (2026-10-09): a debt repayment is a sale on the day it is
+    // paid, carried by the DebtPayment. So the credit itself counts only the
+    // remainder its match did not use (matchedAmount puts that back), and the
+    // total does not move when the credit is applied to the debt.
+    const { bankCountedAmount } = require("../src/utils/books");
     const before = await income();
     const cX = await credit(123456);
     assert.strictEqual(await income(), before + 123456);
@@ -279,8 +279,9 @@ async function wipe() {
     assert.ok(applied > 0 && applied < 123456, "scenario needs a partial application");
     const tx = await prisma.transaction.findUnique({ where: { id: cX.id } });
     assert.strictEqual(Number(tx.matchedAmount), applied, "matchedAmount must record the applied slice");
-    assert.strictEqual(await income(), before + 123456 - applied,
-      "only the applied slice may leave income — the remainder is real money");
+    assert.strictEqual(bankCountedAmount(tx), 123456 - applied, "the credit keeps only its remainder");
+    assert.strictEqual(await income(), before + 123456,
+      "the applied slice moved to the debt payment; nothing counted twice or lost");
     const u = await DEL(`/transactions/${cX.id}/match`, tOwner);
     assert.strictEqual(u.status, 200);
     const txAfter = await prisma.transaction.findUnique({ where: { id: cX.id } });

@@ -5,6 +5,7 @@ const { requirePermission } = require("../middleware/requirePermission");
 const { normalizeChannel } = require("../utils/salesChannel");
 const { isBankLedgerRow, isSavingsRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
+const { CREDIT_OUTCOMES } = require("../utils/books");
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
 // match endpoints, so "Match to Sale or Debt" silently 404'd and reverted.
@@ -134,7 +135,7 @@ router.patch("/:id", async (req, res) => {
     // under an existing match would make the remainder go negative and cancel
     // other rows' legitimate remainders inside summed aggregates. Unmatch
     // first, then edit.
-    if (amount !== undefined && (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedExpenseId)) {
+    if (amount !== undefined && (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedExpenseId || tx.matchedInvoiceId)) {
       return res.status(409).json({
         error: "This transaction is matched to a record. Unmatch it before changing the amount.",
         code: "MATCHED_ROW_AMOUNT_LOCKED",
@@ -225,7 +226,12 @@ async function loadMatchableCredit(req, res) {
     res.status(409).json({ error: "This is money returning from your savings, not a customer payment.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
     return null;
   }
-  if (tx.matchedSaleId || tx.matchedCustomerId) {
+  // Marked as not income (cash already recorded, own transfer, a loan...).
+  if (tx.purpose) {
+    res.status(409).json({ error: "This transfer is marked as not a sale. Clear that first.", code: "MARKED_NOT_INCOME" });
+    return null;
+  }
+  if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId) {
     res.status(409).json({ error: "This transfer is already matched. Unmatch it first.", code: "ALREADY_MATCHED" });
     return null;
   }
@@ -257,7 +263,7 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
         // Re-check both sides under the lock. Two phones matching at once each
         // pass the outer read; only one may pass here.
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         const sale = await px.sales.findUnique({ where: { id: saleId } });
         if (!sale) throw matchError(404, "SALE_NOT_FOUND", "Sale not found");
@@ -354,7 +360,7 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
     const result = await prisma.withBusinessLock(pre.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
 
         const sale = await px.sales.create({
@@ -415,6 +421,11 @@ async function loadMatchableDebit(req, res) {
     res.status(409).json({ error: "This is a transfer into your savings, not an expense.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
     return null;
   }
+  // A refund to a customer lowers sales; it is never an expense too.
+  if (tx.purpose) {
+    res.status(409).json({ error: "This transfer paid a customer refund.", code: "MARKED_NOT_EXPENSE" });
+    return null;
+  }
   if (tx.matchedExpenseId) {
     res.status(409).json({ error: "This transfer is already recorded as an expense. Unmatch it first.", code: "ALREADY_MATCHED" });
     return null;
@@ -438,7 +449,7 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
     const result = await prisma.withBusinessLock(pre.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedExpenseId)
+        if (tx.matchedExpenseId || tx.purpose)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already recorded as an expense.");
 
         const expense = await px.expense.create({
@@ -494,7 +505,7 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
         // old handler never looked at matchedCustomerId, so calling it twice
         // paid the debt down twice.
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
 
         const unpaidDebts = await px.debt.findMany({
@@ -576,7 +587,7 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     if (!tx0) return res.status(404).json({ error: "Transaction not found" });
     if (!(await ownsBusiness(req, tx0.businessId)))
       return res.status(403).json({ error: "Forbidden" });
-    if (!tx0.matchedSaleId && !tx0.matchedCustomerId && !tx0.matchedExpenseId)
+    if (!tx0.matchedSaleId && !tx0.matchedCustomerId && !tx0.matchedExpenseId && !tx0.matchedInvoiceId)
       return res.json({ matched: false }); // idempotent no-op
 
     const result = await prisma.withBusinessLock(tx0.businessId, () =>
@@ -631,9 +642,42 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
           }).catch(() => null); // customer deleted since — labels still clear below
         }
 
+        // Invoices this credit paid: their payments come off, and the credit
+        // counts on its own again (books rule: one record per naira).
+        if (tx.matchedInvoiceId) {
+          const payments = await px.invoicePayment.findMany({ where: { transactionId: tx.id } });
+          out.invoices = [];
+          for (const p of payments) {
+            const inv = await px.invoice.findUnique({ where: { id: p.invoiceId } });
+            if (!inv) continue;
+            if (inv.writtenOffAt) {
+              throw matchError(409, "WRITTEN_OFF", `${inv.invoiceNumber} was written off. Undo the write-off first.`);
+            }
+            await px.invoicePayment.delete({ where: { id: p.id } });
+            const paid = Math.max(0, Math.round((inv.amountPaid - Number(p.amount)) * 100) / 100);
+            const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
+            const overdue = inv.dueDate && inv.dueDate < today;
+            const status =
+              inv.status === "VOID" ? "VOID"
+                : paid >= inv.total && inv.total > 0 ? "PAID"
+                : paid > 0 ? (overdue ? "OVERDUE" : "PARTIAL")
+                : overdue ? "OVERDUE" : "SENT";
+            out.invoices.push(
+              await px.invoice.update({
+                where: { id: inv.id },
+                data: { amountPaid: paid, status },
+                include: { items: true, payments: { orderBy: { date: "asc" } }, customer: { select: { id: true, name: true, phone: true } } },
+              }),
+            );
+          }
+        }
+
         out.transaction = await px.transaction.update({
           where: { id: tx.id },
-          data: { matchedSaleId: null, matchedCustomerId: null, matchedExpenseId: null, matchedAmount: null },
+          data: {
+            matchedSaleId: null, matchedCustomerId: null, matchedExpenseId: null,
+            matchedInvoiceId: null, matchedAmount: null,
+          },
         });
         return out;
       }),
@@ -650,6 +694,47 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     res.json({ matched: false, ...result });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to unmatch");
+  }
+});
+
+// POST /transactions/:id/classify  { purpose }
+// What an incoming transfer was when it was not a sale: cash already recorded
+// and now banked, money from the owner's other account, the owner's own money,
+// a loan, or a refund from a supplier. Books rule: none of these is income
+// (a supplier refund lowers expenses); { purpose: null } takes it back.
+router.post("/:id/classify", requirePermission("canViewBalance"), async (req, res) => {
+  try {
+    const raw = (req.body || {}).purpose;
+    const purpose = raw === null || raw === "" ? null : String(raw);
+    if (purpose !== null && !CREDIT_OUTCOMES.includes(purpose)) {
+      return res.status(400).json({ error: "Unknown choice.", code: "BAD_PURPOSE" });
+    }
+    const tx0 = await prisma.transaction.findUnique({ where: { id: req.params.id } });
+    if (!tx0) return res.status(404).json({ error: "Transaction not found" });
+    if (!(await ownsBusiness(req, tx0.businessId))) return res.status(403).json({ error: "Forbidden" });
+    if (tx0.type !== "income") {
+      return res.status(400).json({ error: "Only money that came in can be marked.", code: "NOT_INCOMING" });
+    }
+
+    const updated = await prisma.withBusinessLock(tx0.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
+        if (tx.purpose && !CREDIT_OUTCOMES.includes(tx.purpose)) {
+          throw matchError(409, "PURPOSE_LOCKED", "This transfer can't be changed here.");
+        }
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId) {
+          throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched. Unmatch it first.");
+        }
+        return px.transaction.update({ where: { id: tx.id }, data: { purpose } });
+      }),
+    );
+    audit({
+      req, action: "TX_CLASSIFY", resourceType: "transaction", resourceId: tx0.id,
+      metadata: { from: tx0.purpose || null, to: purpose },
+    }).catch(() => {});
+    res.json({ transaction: updated });
+  } catch (err) {
+    respondMatchFailure(res, err, "Failed to update the transfer");
   }
 });
 
