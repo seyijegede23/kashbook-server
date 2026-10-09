@@ -205,7 +205,7 @@ router.patch("/:id", async (req, res) => {
   // yesterday's ₦500,000 of sales would read as $500,000 today, and a business
   // that passed AML checks under one set of limits would be judged under another.
   // A country move means a new business, not an edit.
-  const { name, emoji, color, customCategories, vatEnabled, vatRate, vatInclusive } = req.body;
+  const { name, emoji, color, customCategories, vatEnabled, vatRate, vatInclusive, taxId } = req.body;
   if (req.body?.country !== undefined || req.body?.baseCurrency !== undefined || req.body?.currency !== undefined) {
     return res.status(400).json({
       code: "COUNTRY_IMMUTABLE",
@@ -256,6 +256,11 @@ router.patch("/:id", async (req, res) => {
     if (emoji !== undefined) data.emoji = emoji;
     if (color !== undefined) data.color = color;
     if (vatEnabled !== undefined) data.vatEnabled = !!vatEnabled;
+    // TIN printed on VAT invoices (books rule, Oct 2026).
+    if (taxId !== undefined) {
+      const tin = taxId === null ? "" : String(taxId).trim().slice(0, 40);
+      data.taxId = tin || null;
+    }
     if (vatInclusive !== undefined) data.vatInclusive = !!vatInclusive;
     if (vatRate !== undefined) {
       // null clears the override (falls back to the country rate); otherwise

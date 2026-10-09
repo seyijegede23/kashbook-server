@@ -336,7 +336,11 @@ test("the app's matchedCredit.js lists exactly [\"savings_fee\"] and skips savin
   assert.ok(m, "the app's matchedCredit.js must export SAVINGS_PURPOSES");
   assert.deepStrictEqual(JSON.parse(m[1].replace(/'/g, '"')), ["savings_fee"]);
   assert.ok(/export const isSavingsRow/.test(client), "the app must export isSavingsRow");
-  assert.ok(/isExcludedFromReports[\s\S]*isSavingsRow\(t\)/.test(client), "report sums must drop savings rows");
+  // Since the books rule (2026-10-09) report sums go through books.computeBooks,
+  // whose bankCountedAmount counts nothing for a row with any purpose.
+  assert.ok(/bankCountedAmount/.test(client), "the app's bank-row amounts must come from the books rule");
+  const { bankCountedAmount } = require("../src/utils/books");
+  assert.strictEqual(bankCountedAmount({ type: "expense", amount: 50, purpose: "savings_fee" }), 0, "report sums must drop savings rows");
   assert.ok(!/savings_deposit|savings_withdrawal|savings_interest/.test(client), "the app must not know the dead purposes");
 });
 
