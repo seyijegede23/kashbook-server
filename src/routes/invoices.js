@@ -15,6 +15,8 @@ const { vatDeadline, round2 } = require("../utils/books");
 const { sameMoney } = require("../utils/money");
 const { audit } = require("../utils/audit");
 const { recordLink } = require("../utils/paymentLinks");
+const { PAYMENT_TERMS: PAYMENT_TERM_CODES } = require("../utils/paymentTerms");
+const { snapshotFor } = require("../utils/customerFields");
 
 // Money that enters or leaves the books through an invoice leaves a trail:
 // who recorded, undid or wrote off what. Fire and forget, like the bank routes.
@@ -24,10 +26,7 @@ function logMoney(req, action, invoiceId, metadata) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const PAYMENT_TERMS = new Set([
-  "due_on_receipt", "net_15", "net_30", "net_45", "net_60",
-  "due_end_of_month", "due_end_of_next_month", "custom",
-]);
+const PAYMENT_TERMS = new Set(PAYMENT_TERM_CODES);
 
 function cleanText(v, max) {
   if (v === null || v === undefined) return null;
@@ -298,6 +297,8 @@ router.post("/", authMiddleware, async (req, res) => {
     const details = await readDetailFields(req.body, userId);
     const resolvedCustomerId = await resolveCustomerId(req.body, businessId, userId);
     if (isCredit) details.paymentTerms = null;
+    // The customer's addresses and TIN as they are now, kept on the document.
+    const snapshot = await snapshotFor(prisma, resolvedCustomerId);
 
     const { subtotal, taxAmount, discountAmount, total } = invoiceTotals({ items, taxRate, discountType, discountValue });
 
@@ -340,6 +341,7 @@ router.post("/", authMiddleware, async (req, res) => {
           terms: terms || null,
           template,
           ...details,
+          ...snapshot,
           items: {
             create: items.map((it) => ({
               name: it.name,
@@ -506,6 +508,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
     const details = await readDetailFields(req.body, getTargetUserId(req));
     if (isCredit && "paymentTerms" in details) details.paymentTerms = null;
     const resolvedCustomerId = await resolveCustomerId(req.body, existing.businessId, getTargetUserId(req));
+    // Saving the document again takes the customer's addresses and TIN as they
+    // are now (an issued VAT document never gets here: it is locked above).
+    const snapshot = await snapshotFor(prisma, resolvedCustomerId);
 
     // "Save and send" from the editor moves a draft to SENT. Nothing else can
     // change status here: payments and voiding have their own routes.
@@ -556,6 +561,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
           ...statusPatch,
           ...(newNumber ? { invoiceNumber: newNumber } : {}),
           customerId: resolvedCustomerId,
+          ...snapshot,
           issueDate: issueDate || existing.issueDate,
           dueDate: isCredit ? null : dueDate || null,
           subtotal,
@@ -1190,10 +1196,12 @@ router.post("/:id/convert-to-invoice", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "Only a quote can be converted." });
 
     const invoiceNumber = await allocateInvoiceNumber(prisma, existing.businessId, "invoice");
+    // The new invoice carries the customer's addresses and TIN as they are now.
+    const snapshot = await snapshotFor(prisma, existing.customerId);
 
     const invoice = await prisma.invoice.update({
       where: { id: req.params.id },
-      data: { type: "invoice", invoiceNumber, status: "DRAFT" },
+      data: { type: "invoice", invoiceNumber, status: "DRAFT", ...snapshot },
       include: INCLUDE,
     });
     res.json(formatInvoice(invoice));

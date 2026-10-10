@@ -519,12 +519,27 @@ model Customer {
   user            User      @relation(fields: [userId], references: [id])
   businessId      String?
   business        Business? @relation(fields: [businessId], references: [id])
-  name            String
-  phone           String?
+  name            String // the display name (invoices, lists, reminders)
+  phone           String? // the mobile number: WhatsApp, reminders, duplicate check
   totalOwed       Float     @default(0)
   reminderEnabled Boolean   @default(false)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+  // The Add Contact form (2026-10-10). All optional; see utils/customerFields.js.
+  customerType    String? // "business" | "individual"
+  salutation      String?
+  firstName       String?
+  lastName        String?
+  companyName     String?
+  email           String?
+  workPhone       String? // the form's "Phone"; `phone` is its "Mobile"
+  website         String?
+  taxId           String? // the customer's TIN, copied onto their invoices
+  paymentTerms    String? // default terms for new invoices (never "custom")
+  billingAddress  Json? // { attention, street1, street2, city, state, postalCode, country, phone }
+  shippingAddress Json?
+  contactPersons  Json? // [{ id, salutation, firstName, lastName, email, phone, designation }]
+  notes           String? // private remarks, never printed
 
   debts             Debt[]
   sales             Sales[]
@@ -1075,6 +1090,12 @@ model Invoice {
   writtenOffAmount Float?
   // The tax authority's invoice reference (NRS e-invoicing IRN), when issued.
   irn            String?
+  // The customer's addresses and TIN as they were when this document was
+  // saved (utils/customerFields.js customerSnapshot): a later edit to the
+  // customer never rewrites an issued document.
+  billingAddress  Json?
+  shippingAddress Json?
+  customerTaxId   String?
   items          InvoiceItem[]
   payments       InvoicePayment[]
   shareLink      InvoiceShareLink?

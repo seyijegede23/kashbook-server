@@ -9,6 +9,7 @@
  * Path A — Instagram Login (graph.instagram.com). See docs/INSTAGRAM_API_SPEC.md.
  */
 const router = require("express").Router();
+const { snapshotFor } = require("../utils/customerFields");
 const auth = require("../middleware/auth");
 const { requirePermission } = require("../middleware/requirePermission");
 const prisma = require("../utils/db");
@@ -732,6 +733,7 @@ router.post("/conversations/:id/create-invoice", async (req, res) => {
     const ownerUserId = ownerId(req);
     const result = await prisma.withBusinessLock(business.id, async () => {
       const customer = await resolveIgCustomer(business, convo, ownerUserId, { create: true });
+      const snapshot = await snapshotFor(prisma, customer.id);
       const invoiceNumber = await allocateInvoiceNumber(prisma, business.id, "invoice");
       const invoice = await prisma.invoice.create({
         data: {
@@ -740,6 +742,7 @@ router.post("/conversations/:id/create-invoice", async (req, res) => {
           issueDate: new Date().toISOString().slice(0, 10),
           currency: business.baseCurrency || "NGN",
           subtotal: amount, total: amount,
+          ...snapshot,
           items: { create: [{ name: description, quantity: 1, rate: amount, amount }] },
         },
       });

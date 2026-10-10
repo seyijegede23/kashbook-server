@@ -8,6 +8,7 @@
 // Per-rule try/catch: one bad rule never halts the batch. Never throws.
 
 const crypto = require("crypto");
+const { customerSnapshot } = require("./customerFields");
 const prisma = require("./db");
 const { computeNextDue } = require("./recurringSchedule");
 const { allocateInvoiceNumber } = require("./invoiceNumber");
@@ -24,7 +25,8 @@ async function processRecurringInvoices(now = new Date()) {
     const due = await prisma.recurringInvoice.findMany({
       where: { active: true, nextDue: { lte: now } },
       include: {
-        customer: { select: { id: true, name: true } },
+        // The addresses and TIN are copied onto each invoice (customerSnapshot).
+        customer: { select: { id: true, name: true, billingAddress: true, shippingAddress: true, taxId: true } },
         business: { select: { id: true, name: true, userId: true, country: true, baseCurrency: true } },
       },
       take: 500,
@@ -61,6 +63,7 @@ async function processRecurringInvoices(now = new Date()) {
               currency: rule.business.baseCurrency || "NGN",
               subtotal: rule.amount,
               total: rule.amount,
+              ...customerSnapshot(rule.customer),
               items: { create: [{ name: rule.description, quantity: 1, rate: rule.amount, amount: rule.amount }] },
             },
           });

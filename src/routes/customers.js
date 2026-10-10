@@ -2,6 +2,7 @@ const router = require("express").Router();
 const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { validateCustomer, validateIdParam } = require("../middleware/validate");
+const { readCustomerFields, normalizePhone } = require("../utils/customerFields");
 
 router.use(auth);
 
@@ -41,13 +42,44 @@ router.get("/", async (req, res) => {
   }
 });
 
-// POST /customers
+const WITH_DEBTS = { debts: { include: { payments: true } } };
+
+function sendFieldError(res, err) {
+  return res.status(err.status).json({ error: err.message, code: err.code, field: err.field, ...(err.extra || {}) });
+}
+
+// The owner's customer that already has this mobile number (the duplicate
+// check is per owner, across their businesses: @@unique([userId, phone])).
+function duplicatePhone(res, existing) {
+  return res.status(409).json({
+    error: `${existing ? existing.name : "Another customer"} already uses this number.`,
+    code: "DUPLICATE_PHONE",
+    field: "phone",
+    customer: existing || null,
+  });
+}
+
+// POST /customers — a new customer, from the Add Contact form or the older
+// one-line add. `name` is the display name and `phone` the mobile number; the
+// other details are optional (utils/customerFields.js).
+// A mobile number one of the owner's customers already has is refused (409
+// DUPLICATE_PHONE, with that customer). Before, the upsert renamed that
+// customer and moved it, debts and all, into this business.
 router.post("/", validateCustomer, async (req, res) => {
   const { name, phone, reminderEnabled = false, businessId } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
 
   const userId = getTargetUserId(req);
-  const trimmedPhone = phone?.trim() || null;
+  let details;
+  let mobile;
+  try {
+    details = readCustomerFields(req.body);
+    mobile = normalizePhone(phone);
+  } catch (e) {
+    if (e.status) return sendFieldError(res, e);
+    console.error(e);
+    return res.status(500).json({ error: "Failed to create customer" });
+  }
 
   try {
     if (businessId) {
@@ -57,35 +89,33 @@ router.post("/", validateCustomer, async (req, res) => {
       if (!owned) return res.status(403).json({ error: "Forbidden" });
     }
 
-    let customer;
-    if (trimmedPhone) {
-      // Use upsert so a duplicate phone returns the existing customer instead of crashing
-      customer = await prisma.customer.upsert({
-        where: { userId_phone: { userId, phone: trimmedPhone } },
-        update: { name: name.trim(), businessId: businessId || null, reminderEnabled },
-        create: {
-          userId,
-          businessId: businessId || null,
-          name: name.trim(),
-          phone: trimmedPhone,
-          reminderEnabled,
-        },
-        include: { debts: { include: { payments: true } } },
+    if (mobile) {
+      const existing = await prisma.customer.findUnique({
+        where: { userId_phone: { userId, phone: mobile } },
+        include: WITH_DEBTS,
       });
-    } else {
-      customer = await prisma.customer.create({
-        data: {
-          userId,
-          businessId: businessId || null,
-          name: name.trim(),
-          phone: null,
-          reminderEnabled,
-        },
-        include: { debts: { include: { payments: true } } },
-      });
+      if (existing) return duplicatePhone(res, existing);
     }
+    const customer = await prisma.customer.create({
+      data: {
+        userId,
+        businessId: businessId || null,
+        name: name.trim(),
+        phone: mobile,
+        reminderEnabled: reminderEnabled === true,
+        ...details,
+      },
+      include: WITH_DEBTS,
+    });
     res.status(201).json(customer);
   } catch (err) {
+    if (err.code === "P2002" && mobile) {
+      // Created a moment ago by another request with the same number.
+      const existing = await prisma.customer
+        .findUnique({ where: { userId_phone: { userId, phone: mobile } }, include: WITH_DEBTS })
+        .catch(() => null);
+      return duplicatePhone(res, existing);
+    }
     console.error(err);
     res.status(500).json({ error: "Failed to create customer" });
   }
@@ -107,29 +137,50 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// PATCH /customers/:id
+// PATCH /customers/:id — the Edit Customer form. Only the fields sent change;
+// the owner, the business and the balance are never taken from the body.
 router.patch("/:id", async (req, res) => {
-  const { name, phone, reminderEnabled } = req.body;
+  const body = req.body || {};
+  let customer;
+  const data = {};
   try {
-    const customer = await prisma.customer.findUnique({
+    customer = await prisma.customer.findUnique({
       where: { id: req.params.id },
     });
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
 
-    const data = {};
-    if (name !== undefined) data.name = name.trim();
-    if (phone !== undefined) data.phone = phone.trim();
-    if (reminderEnabled !== undefined) data.reminderEnabled = reminderEnabled;
+    try {
+      Object.assign(data, readCustomerFields(body));
+      if ("name" in body) {
+        const n = typeof body.name === "string" ? body.name.trim().slice(0, 120) : "";
+        if (!n) {
+          return res.status(400).json({ error: "Enter a display name.", code: "NAME_REQUIRED", field: "name" });
+        }
+        data.name = n;
+      }
+      if ("phone" in body) data.phone = normalizePhone(body.phone);
+      if ("reminderEnabled" in body) data.reminderEnabled = body.reminderEnabled === true;
+    } catch (e) {
+      if (e.status) return sendFieldError(res, e);
+      throw e;
+    }
 
     const updated = await prisma.customer.update({
-      where: { id: req.params.id },
+      where: { id: customer.id },
       data,
-      include: { debts: { include: { payments: true } } },
+      include: WITH_DEBTS,
     });
     res.json(updated);
   } catch (err) {
+    if (err.code === "P2002" && customer && data.phone) {
+      const other = await prisma.customer
+        .findUnique({ where: { userId_phone: { userId: customer.userId, phone: data.phone } } })
+        .catch(() => null);
+      return duplicatePhone(res, other);
+    }
+    console.error(err);
     res.status(500).json({ error: "Failed to update customer" });
   }
 });

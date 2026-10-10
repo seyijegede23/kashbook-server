@@ -244,6 +244,32 @@ const PAYMENT_TERMS_LABELS = {
   due_end_of_next_month: "Due end of next month",
 };
 
+// The customer's address as printed lines: attention, the street lines, then
+// "City, State Postal code", the country and the address phone. Addresses and
+// the customer's TIN come from the copy the document kept when it was saved
+// (invoice.billingAddress / shippingAddress / customerTaxId), never the live
+// customer, so a later edit to the customer does not rewrite it.
+function addressLines(a) {
+  if (!a || typeof a !== "object") return [];
+  const place = [a.city, [a.state, a.postalCode].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return [a.attention ? `Attn: ${a.attention}` : "", a.street1, a.street2, place, a.country, a.phone].filter(Boolean);
+}
+
+const SUB_LINE = 'style="color:#6B7280;font-size:13px;"';
+
+function billToBlock(invoice, customer) {
+  if (!customer?.name) return "";
+  const lines = addressLines(invoice.billingAddress).filter((l) => l !== customer.phone);
+  const sub = [customer.phone, ...lines, invoice.customerTaxId ? `TIN: ${invoice.customerTaxId}` : ""].filter(Boolean);
+  return `<div class="meta-block" style="flex:1;"><label>Bill To</label><p>${esc(customer.name)}</p>${sub.map((l) => `<p ${SUB_LINE}>${esc(l)}</p>`).join("")}</div>`;
+}
+
+function shipToBlock(invoice) {
+  const lines = addressLines(invoice.shippingAddress);
+  if (!lines.length) return "";
+  return `<div class="meta-block" style="flex:1;"><label>Ship To</label>${lines.map((l, i) => (i === 0 ? `<p>${esc(l)}</p>` : `<p ${SUB_LINE}>${esc(l)}</p>`)).join("")}</div>`;
+}
+
 function metaBlocks(invoice, customer, liveStatus) {
   const isQuote = invoice.type === "quote";
   const isCredit = invoice.type === "credit_note";
@@ -270,7 +296,7 @@ function metaBlocks(invoice, customer, liveStatus) {
       `<div style="${LABEL}">${esc(label)}</div><div style="${VALUE}${color ? `color:${color};font-weight:700;` : ""}">${esc(value)}</div>`)
     .join("");
   return `
-    ${customer?.name ? `<div class="meta-block" style="flex:1;"><label>Bill To</label><p>${esc(customer.name)}</p>${customer.phone ? `<p style="color:#6B7280;font-size:13px;">${esc(customer.phone)}</p>` : ""}</div>` : ""}
+    ${billToBlock(invoice, customer)}${shipToBlock(invoice)}
     <div class="meta-list" style="display:grid;grid-template-columns:auto auto;column-gap:24px;row-gap:6px;align-content:start;margin-left:auto;">${list}</div>`;
 }
 
@@ -333,7 +359,7 @@ function notesFooter(invoice, footer, bizName) {
 }
 
 const SHARED_PAY_STYLES = `
-  tr,.item-card,.summary-row,.pay-card,.pay-hero,.pay-plain,.totals,.notes-section,.subject-line{break-inside:avoid;page-break-inside:avoid;}
+  tr,.item-card,.summary-row,.pay-card,.pay-hero,.pay-plain,.totals,.notes-section,.subject-line,.meta-block{break-inside:avoid;page-break-inside:avoid;}
   .pay-card .pay-title,.pay-plain .pay-title,.pay-hero .pay-title{font-size:10px;font-weight:800;color:#6B7280;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px;display:flex;align-items:center;}
   .pay-hero .pay-title{color:rgba(255,255,255,0.85);}
   .pay-hero .pay-row{color:#fff;}.pay-hero .pay-label{color:rgba(255,255,255,0.7);}
