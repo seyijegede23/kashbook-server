@@ -139,7 +139,13 @@ function checkRegistrationDate(dateStr) {
   const d = new Date(dateStr);
   if (Number.isNaN(d.getTime())) return { ok: false, code: "REGDATE_INVALID" };
   const now = new Date();
-  if (d > now) return { ok: false, code: "REGDATE_FUTURE" };
+  // A calendar day ("YYYY-MM-DD", what the app sends) is in the future only
+  // when it is after today in Lagos. new Date() reads it as UTC midnight, which
+  // is 01:00 in Lagos, so today was refused between 00:00 and 01:00. A full
+  // timestamp (older app builds) keeps the instant comparison.
+  const lagosToday = new Date(now.getTime() + 60 * 60 * 1000).toISOString().slice(0, 10);
+  const future = /^\d{4}-\d{2}-\d{2}$/.test(String(dateStr)) ? String(dateStr) > lagosToday : d > now;
+  if (future) return { ok: false, code: "REGDATE_FUTURE" };
   const ageYears = (now - d) / (365.2425 * 24 * 3600 * 1000);
   if (ageYears > 200) return { ok: false, code: "REGDATE_UNREALISTIC" };
   return { ok: true, ageYears };
