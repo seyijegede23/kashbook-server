@@ -59,22 +59,33 @@ function duplicatePhone(res, existing) {
   });
 }
 
-// POST /customers — a new customer, from the Add Contact form or the older
-// one-line add. `name` is the display name and `phone` the mobile number; the
-// other details are optional (utils/customerFields.js).
-// A mobile number one of the owner's customers already has is refused (409
-// DUPLICATE_PHONE, with that customer). Before, the upsert renamed that
-// customer and moved it, debts and all, into this business.
+// POST /customers — a new customer. `name` is the display name and `phone`
+// the mobile number; the other details are optional (utils/customerFields.js).
+// Two callers, two contracts:
+//   - the Add Customer form sends onDuplicate: "refuse". A mobile number one of
+//     the owner's customers already has is refused (409 DUPLICATE_PHONE, with
+//     that customer) and a number that is not one is a 400.
+//   - an older app, still running until its update applies, gets what it always
+//     got: the customer who has that number (201), so the copy it saved on the
+//     phone lines up with a real customer, and a number it typed oddly stored
+//     as typed. Unlike the old upsert, that customer comes back unchanged:
+//     never renamed, never moved (debts and all) into another business.
 router.post("/", validateCustomer, async (req, res) => {
   const { name, phone, reminderEnabled = false, businessId } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
 
   const userId = getTargetUserId(req);
+  const refuse = req.body.onDuplicate === "refuse";
   let details;
   let mobile;
   try {
     details = readCustomerFields(req.body);
-    mobile = normalizePhone(phone);
+    try {
+      mobile = normalizePhone(phone);
+    } catch (e) {
+      if (refuse || !e.status) throw e;
+      mobile = typeof phone === "string" ? phone.trim().slice(0, 30) || null : null;
+    }
   } catch (e) {
     if (e.status) return sendFieldError(res, e);
     console.error(e);
@@ -94,7 +105,7 @@ router.post("/", validateCustomer, async (req, res) => {
         where: { userId_phone: { userId, phone: mobile } },
         include: WITH_DEBTS,
       });
-      if (existing) return duplicatePhone(res, existing);
+      if (existing) return refuse ? duplicatePhone(res, existing) : res.status(201).json(existing);
     }
     const customer = await prisma.customer.create({
       data: {
@@ -114,6 +125,7 @@ router.post("/", validateCustomer, async (req, res) => {
       const existing = await prisma.customer
         .findUnique({ where: { userId_phone: { userId, phone: mobile } }, include: WITH_DEBTS })
         .catch(() => null);
+      if (!refuse && existing) return res.status(201).json(existing);
       return duplicatePhone(res, existing);
     }
     console.error(err);

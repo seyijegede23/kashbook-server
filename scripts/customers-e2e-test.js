@@ -102,6 +102,7 @@ const uniq = (n) => `+23480${String(Date.now()).slice(-6)}${n}`;
   };
   const full = {
     businessId: biz.id,
+    onDuplicate: "refuse", // the Add Customer form's contract
     name: "Acme Stores Ltd",
     phone: uniq(1),
     customerType: "business",
@@ -142,7 +143,7 @@ const uniq = (n) => `+23480${String(Date.now()).slice(-6)}${n}`;
       eq(acme.totalOwed, 0);
     });
     await test("bad email, phone, website and contact person are refused with their field", async () => {
-      const base = { businessId: biz.id, name: "X" };
+      const base = { businessId: biz.id, name: "X", onDuplicate: "refuse" };
       const e = await call("POST", "/customers", T, { ...base, email: "not-an-email" });
       eq(e.status, 400); eq(e.body.code, "BAD_EMAIL"); eq(e.body.field, "email");
       const p = await call("POST", "/customers", T, { ...base, phone: "call me" });
@@ -167,10 +168,14 @@ const uniq = (n) => `+23480${String(Date.now()).slice(-6)}${n}`;
       const r = await call("POST", "/customers", T, { businessId: biz.id, name: "Walk-in Bola", phone: "0809 123 4567" });
       eq(r.status, 201); eq(r.body.phone, "08091234567"); eq(r.body.email, null);
     });
+    await test("an older app's odd number is stored as typed, not refused", async () => {
+      const r = await call("POST", "/customers", T, { businessId: biz.id, name: "Two Numbers", phone: "0803 111 0000/0805 2" });
+      eq(r.status, 201, JSON.stringify(r.body)); eq(r.body.phone, "0803 111 0000/0805 2");
+    });
 
     section("Duplicate mobile number");
     await test("refused with the customer who has it, who is left untouched", async () => {
-      const r = await call("POST", "/customers", T, { businessId: biz2.id, name: "Impostor", phone: full.phone });
+      const r = await call("POST", "/customers", T, { businessId: biz2.id, name: "Impostor", phone: full.phone, onDuplicate: "refuse" });
       eq(r.status, 409); eq(r.body.code, "DUPLICATE_PHONE"); eq(r.body.customer.id, acme.id);
       const still = await prisma.customer.findUnique({ where: { id: acme.id } });
       eq(still.name, "Acme Stores Ltd", "not renamed");
@@ -178,8 +183,13 @@ const uniq = (n) => `+23480${String(Date.now()).slice(-6)}${n}`;
     });
     await test("the same number typed with spaces is the same number", async () => {
       const spaced = full.phone.replace(/^(\+\d{4})(\d{3})/, "$1 $2 ");
-      const r = await call("POST", "/customers", T, { businessId: biz.id, name: "Spaced", phone: spaced });
+      const r = await call("POST", "/customers", T, { businessId: biz.id, name: "Spaced", phone: spaced, onDuplicate: "refuse" });
       eq(r.status, 409); eq(r.body.code, "DUPLICATE_PHONE");
+    });
+    await test("an older app gets the customer who has the number back, unchanged", async () => {
+      const r = await call("POST", "/customers", T, { businessId: biz2.id, name: "Old App Ada", phone: full.phone });
+      eq(r.status, 201); eq(r.body.id, acme.id);
+      eq(r.body.name, "Acme Stores Ltd", "not renamed"); eq(r.body.businessId, biz.id, "not moved");
     });
 
     section("Edit");
