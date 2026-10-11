@@ -226,6 +226,18 @@ router.delete("/:id", validateIdParam, async (req, res) => {
         code: "CUSTOMER_HAS_PAYMENTS",
       });
     }
+    // Issued invoices, quotes and credit notes, and recurring rules, would lose
+    // their customer for good (the link is set to null). Drafts may go.
+    const [documents, rules] = await Promise.all([
+      prisma.invoice.count({ where: { customerId: customer.id, status: { not: "DRAFT" } } }),
+      prisma.recurringInvoice.count({ where: { customerId: customer.id } }),
+    ]);
+    if (documents || rules) {
+      return res.status(409).json({
+        error: "This customer has invoices or a recurring invoice, so they can't be deleted.",
+        code: "CUSTOMER_HAS_DOCUMENTS",
+      });
+    }
 
     await prisma.customer.delete({ where: { id: req.params.id } });
     res.json({ message: "Deleted" });

@@ -103,5 +103,75 @@ check("cleaning keeps a leading + and the digits", () => {
   deq(cleanPhone("0803-123-4567"), "08031234567");
 });
 
+// ── The customer screens' numbers (src/utils/customerSummary.js) ──────────────
+const CS = load(path.join(APP, "src/utils/customerSummary.js"));
+const ada = {
+  id: "c1", name: "Ada Stores", salutation: "Mrs.", firstName: "Ada", lastName: "Obi", totalDebt: 3000,
+  createdAt: "2026-09-01T10:00:00.000Z",
+  transactions: [
+    { id: "d1", amount: 5000, paidAmount: 2000, date: "2026-09-10", note: "Rice on credit",
+      payments: [{ id: "p1", amount: 2000, date: "2026-09-20", note: "" }] },
+    // Settled before payments were recorded one by one: no payment rows.
+    { id: "d2", amount: 1000, paidAmount: 1000, paid: true, date: "2026-08-01", note: "Old credit", payments: [] },
+  ],
+};
+const docs = [
+  { id: "i1", customerId: "c1", type: "invoice", status: "partial", invoiceNumber: "INV-1", issueDate: "2026-09-15",
+    total: 10000, amountPaid: 6000, payments: [
+      { id: "ip1", amount: 4000, method: "cash", date: "2026-09-16" },
+      { id: "ip2", amount: 2000, method: "credit_note", date: "2026-09-18" },
+    ] },
+  { id: "i2", customerId: "c1", type: "invoice", status: "sent", invoiceNumber: "INV-2", issueDate: "2026-10-02",
+    total: 1500, amountPaid: 0, writtenOffAt: "2026-10-05T09:00:00.000Z", writtenOffAmount: 1500, payments: [] },
+  { id: "i3", customerId: "c1", type: "invoice", status: "draft", invoiceNumber: "INV-3", issueDate: "2026-10-03", total: 999, amountPaid: 0, payments: [] },
+  { id: "n1", customerId: "c1", type: "credit_note", status: "partial", invoiceNumber: "CN-1", issueDate: "2026-09-17",
+    total: 3000, amountPaid: 2000, payments: [{ id: "cp1", amount: 2000, method: "credit_applied", date: "2026-09-18" }] },
+  { id: "x1", customerId: "someone-else", type: "invoice", status: "sent", invoiceNumber: "INV-9", issueDate: "2026-09-15", total: 777, amountPaid: 0, payments: [] },
+];
+const sales = [
+  { id: "s1", customerId: "c1", source: "sale", amount: 2500, date: "2026-09-12", description: "Beans" },
+  { id: "s2", customerId: "c9", source: "sale", amount: 900, date: "2026-09-12" },
+];
+
+console.log("\nCustomer screens");
+check("the person to talk to, else the display name", () => {
+  deq(CS.primaryName(ada), "Mrs. Ada Obi");
+  deq(CS.primaryName({ name: "Bola Ventures" }), "Bola Ventures");
+});
+check("receivables = the credit book + open invoices (not drafts, not written off, not others')", () => {
+  deq(CS.receivablesOf(ada, docs), 3000 + 4000);
+});
+check("credits = what is left on open credit notes", () => deq(CS.creditsOf(ada, docs), 1000));
+check("payments received: repayments (one for a debt settled in one go) and money-in invoice payments", () => {
+  const p = CS.paymentsOf(ada, docs);
+  deq(p.map((x) => `${x.kind}:${x.amount}:${x.date}`), ["repayment:2000:2026-09-20", "invoice:4000:2026-09-16", "repayment:1000:2026-08-01"]);
+});
+check("the statement's closing balance is what they owe today", () => {
+  const st = CS.statementOf(ada, docs, "2000-01-01", "2099-12-31");
+  deq(st.opening, 0);
+  deq(st.closing, CS.receivablesOf(ada, docs));
+});
+check("a period's opening balance carries what came before it", () => {
+  const st = CS.statementOf(ada, docs, "2026-09-15", "2026-09-30");
+  // Before 15 Sep: 1,000 old credit settled (0) + 5,000 rice credit = 5,000.
+  deq(st.opening, 5000);
+  deq(st.charged, 10000);
+  deq(st.paid, 4000 + 2000 + 2000);
+  deq(st.closing, 5000 + 10000 - 8000);
+  deq(st.lines[0].kind, "invoice");
+});
+check("open items: unpaid credit and invoices with a balance", () => {
+  deq(CS.outstandingOf(ada, docs).map((o) => `${o.kind}:${o.left}`), ["credit:3000", "invoice:4000"]);
+});
+check("activity: newest first, the customer being added in its place by date", () => {
+  const a = CS.activityOf(ada, { transactions: sales, invoices: docs });
+  deq(a[0].kind, "writeOff");
+  const at = a.findIndex((e) => e.kind === "created");
+  deq(a.slice(0, at).every((e) => e.date >= "2026-09-01"), true, "newer events first");
+  deq(a.slice(at + 1).every((e) => e.date <= "2026-09-01"), true, "older ones after");
+  deq(a.some((e) => e.key === "s_s2"), false, "another customer's sale");
+  deq(a.filter((e) => e.kind === "invoicePayment").length, 1, "credit applied is not a payment");
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

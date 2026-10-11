@@ -540,6 +540,7 @@ model Customer {
   shippingAddress Json?
   contactPersons  Json? // [{ id, salutation, firstName, lastName, email, phone, designation }]
   notes           String? // private remarks, never printed
+  inactiveAt      DateTime? // marked inactive (More menu); null = active
 
   debts             Debt[]
   sales             Sales[]

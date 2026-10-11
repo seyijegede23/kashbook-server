@@ -123,6 +123,8 @@ function readCustomerFields(body) {
   if (has("shippingAddress")) out.shippingAddress = address(b.shippingAddress, "shippingAddress");
   if (has("contactPersons")) out.contactPersons = contactPersons(b.contactPersons);
   if (has("notes")) out.notes = text(b.notes, 1000);
+  // Mark inactive / active again (the customer page's More menu).
+  if (has("inactive")) out.inactiveAt = b.inactive === true ? new Date() : null;
   for (const k of JSON_FIELDS) if (k in out && out[k] === null) out[k] = Prisma.DbNull;
   return out;
 }

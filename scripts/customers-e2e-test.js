@@ -224,6 +224,13 @@ const uniq = (n) => `+23480${String(Date.now()).slice(-6)}${n}`;
       const r = await call("PATCH", `/customers/${other.body.id}`, T, { phone: full.phone });
       eq(r.status, 409); eq(r.body.code, "DUPLICATE_PHONE"); eq(r.body.customer.id, acme.id);
     });
+    await test("a customer can be marked inactive and active again", async () => {
+      const off = await call("PATCH", `/customers/${acme.id}`, T, { inactive: true });
+      eq(off.status, 200); eq(typeof off.body.inactiveAt, "string", "inactiveAt set");
+      eq(off.body.notes, "Pays on the 10th", "nothing else changes");
+      const on = await call("PATCH", `/customers/${acme.id}`, T, { inactive: false });
+      eq(on.status, 200); eq(on.body.inactiveAt, null);
+    });
     await test("another owner's customer can't be edited", async () => {
       const rival = await prisma.user.create({
         data: { email: `rival-${tag}@t.local`, password: "x", firstName: "R", lastName: "V", businessName: "R", country: "NG", currency: "NGN", accountType: "OWNER" },
@@ -326,6 +333,41 @@ const uniq = (n) => `+23480${String(Date.now()).slice(-6)}${n}`;
       assert.ok(page.text.includes("1 New Road"), "address missing");
       assert.ok(!page.text.includes("Pays on the 10th"), "notes leaked");
       assert.ok(!page.text.includes("tunde@acme.ng"), "email leaked");
+    });
+
+    section("Delete");
+    await test("a customer with issued invoices is refused, and stays", async () => {
+      const r = await call("DELETE", `/customers/${acme.id}`, T);
+      eq(r.status, 409, JSON.stringify(r.body)); eq(r.body.code, "CUSTOMER_HAS_DOCUMENTS");
+      assert.ok(await prisma.customer.findUnique({ where: { id: acme.id } }), "still there");
+    });
+    await test("a customer with only a recurring rule is refused", async () => {
+      const c = await call("POST", "/customers", T, { businessId: biz.id, name: "Rule Only" });
+      await prisma.recurringInvoice.create({
+        data: {
+          userId: owner.id, businessId: biz.id, customerId: c.body.id, description: "Monthly",
+          amount: 500, frequency: "monthly", nextDue: new Date(Date.now() + 86400000),
+        },
+      });
+      const r = await call("DELETE", `/customers/${c.body.id}`, T);
+      eq(r.status, 409); eq(r.body.code, "CUSTOMER_HAS_DOCUMENTS");
+    });
+    await test("a customer with only a draft goes, the draft kept without them", async () => {
+      const c = await call("POST", "/customers", T, { businessId: biz.id, name: "Draft Only" });
+      const d = await call("POST", "/invoices", T, {
+        businessId: biz.id, customerId: c.body.id, issueDate: today, status: "DRAFT",
+        items: [{ name: "Maybe", quantity: 1, rate: 100 }],
+      });
+      eq(d.status, 201, JSON.stringify(d.body));
+      const r = await call("DELETE", `/customers/${c.body.id}`, T);
+      eq(r.status < 300, true, JSON.stringify(r.body));
+      eq(await prisma.customer.findUnique({ where: { id: c.body.id } }), null, "gone");
+      eq((await prisma.invoice.findUnique({ where: { id: d.body.id } })).customerId, null, "draft kept");
+    });
+    await test("a customer with nothing goes; deleting again is 404", async () => {
+      const c = await call("POST", "/customers", T, { businessId: biz.id, name: "Nothing" });
+      eq((await call("DELETE", `/customers/${c.body.id}`, T)).status < 300, true);
+      eq((await call("DELETE", `/customers/${c.body.id}`, T)).status, 404);
     });
   } finally {
     server.close();
