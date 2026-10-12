@@ -13,7 +13,12 @@ const { audit } = require("../utils/audit");
 router.use(auth);
 
 // ── Ownership check ──────────────────────────────────────────────────────────
+// An id, never a filter: `businessId[in][]=...` arrives as an object, which
+// Prisma would read as a filter that matches the caller's own business while
+// the scoped queries below then read other businesses too (server.js's
+// idGuard refuses it first; this holds even without it).
 async function ownsBusiness(userId, businessId) {
+  if (typeof businessId !== "string" || !businessId) return false;
   const biz = await prisma.business.findFirst({ where: { id: businessId, userId } });
   return !!biz;
 }
@@ -26,7 +31,7 @@ async function ownsBusiness(userId, businessId) {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   const { businessId, since } = req.query;
-  if (!businessId) return res.status(400).json({ error: "businessId required" });
+  if (!businessId || typeof businessId !== "string") return res.status(400).json({ error: "businessId required" });
   const targetUserId =
     req.user.accountType === "staff" ? req.user.employerId : req.user.id;
   if (!(await ownsBusiness(targetUserId, businessId)))
@@ -140,7 +145,7 @@ router.get("/", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/pull", async (req, res) => {
   const { businessId } = req.query;
-  if (!businessId) return res.status(400).json({ error: "businessId required" });
+  if (!businessId || typeof businessId !== "string") return res.status(400).json({ error: "businessId required" });
   if (!(await ownsBusiness(req.user.id, businessId)))
     return res.status(403).json({ error: "Forbidden" });
 

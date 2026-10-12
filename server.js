@@ -279,6 +279,11 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Ids and query values are plain strings: `businessId[not]=x` (or the same as
+// a JSON object) would otherwise reach Prisma as a filter and widen a query to
+// other merchants' rows. See src/middleware/idGuard.js.
+app.use(require("./src/middleware/idGuard").idGuard);
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // OTP endpoints — tightest limit (each sends an SMS)
