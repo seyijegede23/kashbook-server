@@ -200,6 +200,10 @@ model Business {
   vatEnabled                 Boolean   @default(false)
   vatRate                    Float?
   vatInclusive               Boolean   @default(true)
+  // Chart of accounts (2026-10-11): the day the books start (opening balances
+  // are as at the start of it) and the month the financial year starts.
+  openingBalanceDate         String?
+  fiscalYearStartMonth       Int       @default(1)
   createdAt                  DateTime  @default(now())
   updatedAt                  DateTime  @updatedAt
 
@@ -232,6 +236,8 @@ model Business {
   salaryPayments        SalaryPayment[]
   savingsPots           SavingsPot[]
   savingsMovements      SavingsMovement[]
+  ledgerAccounts        LedgerAccount[]
+  openingBalances       OpeningBalance[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -544,6 +550,7 @@ model Customer {
 
   debts             Debt[]
   sales             Sales[]
+  expenses          Expense[]
   transactions      Transaction[]
   invoices          Invoice[]
   igConversations   IgConversation[]
@@ -590,8 +597,15 @@ model DebtPayment {
   // scalar, no @relation: a Transaction can be deleted with its business while
   // the payment history survives, and an FK would forbid that.
   transactionId String?
+  // Chart of accounts: how it was paid (cash, transfer, pos...), the account the
+  // money went into when picked, and when it was recorded (NULL on older rows).
+  method           String?
+  depositAccountId String?
+  depositAccount   LedgerAccount? @relation("DebtPaymentDeposit", fields: [depositAccountId], references: [id], onDelete: SetNull)
+  createdAt        DateTime?      @default(now())
 
   @@index([transactionId])
+  @@index([depositAccountId])
 }
 
 model Payable {
@@ -664,11 +678,21 @@ model Sales {
   date                 DateTime  @default(now())
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
+  // Chart of accounts: the income account (null = Sales), the account the
+  // money went into (null = by payment method), and the app's retry key.
+  accountId            String?
+  account              LedgerAccount? @relation("SaleAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  depositAccountId     String?
+  depositAccount       LedgerAccount? @relation("SaleDeposit", fields: [depositAccountId], references: [id], onDelete: SetNull)
+  clientRef            String?
 
+  @@unique([businessId, clientRef])
   @@index([userId, businessId])
   @@index([businessId, date])
   @@index([businessId, updatedAt])
   @@index([businessId, channel])
+  @@index([accountId])
+  @@index([depositAccountId])
 }
 
 model Expense {
@@ -690,10 +714,53 @@ model Expense {
   matchedTransactionId String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+  // Chart of accounts: the account the money was spent on (null = the
+  // category's account), the account it was paid from (null = by method), and
+  // the app's retry key.
+  accountId            String?
+  account              LedgerAccount? @relation("ExpenseAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  paidThroughAccountId String?
+  paidThroughAccount   LedgerAccount? @relation("ExpensePaidThrough", fields: [paidThroughAccountId], references: [id], onDelete: SetNull)
+  clientRef            String?
+  // Zoho-style details (2026-10-12): the supplier's receipt or invoice number
+  // (100 characters at most), the customer the cost was for (it shows on their
+  // page and changes no total), up to 5 receipts kept privately on Cloudinary
+  // ([{ id, name, mime, size, uploadedAt, publicId, resourceType }]; clients
+  // never get publicId or resourceType: utils/expenseView.js), and the lines of
+  // an itemized expense (amount = their sum, accountId null, category = the
+  // first line's, so older app versions still show it whole).
+  reference            String?
+  customerId           String?
+  customer             Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  attachments          Json?
+  items                ExpenseItem[]
 
+  @@unique([businessId, clientRef])
   @@index([userId, businessId])
   @@index([businessId, date])
   @@index([businessId, updatedAt])
+  @@index([accountId])
+  @@index([paidThroughAccountId])
+  @@index([customerId])
+}
+
+// One line of an itemized expense (Zoho's "Itemize"). The books rule counts an
+// itemized expense line by line, each by its own account: a line on equipment,
+// rent paid ahead, a loan repaid or drawings is not spending.
+model ExpenseItem {
+  id          String         @id @default(uuid())
+  expenseId   String
+  expense     Expense        @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  accountId   String?
+  account     LedgerAccount? @relation("ExpenseItemAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  category    String         @default("other") // the account's categorySlug, else "other" (like Expense.category)
+  description String?
+  amount      Float
+  position    Int            @default(0) // the order the merchant entered the lines in
+  createdAt   DateTime       @default(now())
+
+  @@index([expenseId])
+  @@index([accountId])
 }
 
 model Transaction {
@@ -764,6 +831,11 @@ model Transaction {
   // the fee is its own field. Zero for everything that isn't an external transfer.
   fee               Float     @default(0)
   feeBreakdown      Json? // { nip, stampDuty, platform }
+  // Chart of accounts: the account the merchant explained this row with (an
+  // income or expense account, or one on the balance sheet). Null = by purpose,
+  // payroll / auto-debit reference, or unexplained (utils/chart.js).
+  accountId         String?
+  account           LedgerAccount? @relation("TransactionAccount", fields: [accountId], references: [id], onDelete: SetNull)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
@@ -774,6 +846,7 @@ model Transaction {
   @@index([businessId, updatedAt])
   @@index([complianceStatus, flagSeverity])
   @@index([businessId, channel])
+  @@index([accountId])
 }
 
 // Idempotency ledger for inbound Anchor webhooks. We insert the provider event
@@ -996,10 +1069,17 @@ model RecurringExpense {
   consecutiveFailures Int       @default(0)
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
+  // Chart of accounts: copied onto every expense the rule records.
+  accountId            String?
+  account              LedgerAccount? @relation("RecurringAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  paidThroughAccountId String?
+  paidThroughAccount   LedgerAccount? @relation("RecurringPaidThrough", fields: [paidThroughAccountId], references: [id], onDelete: SetNull)
 
   @@index([userId, active])
   @@index([nextDue, active])
   @@index([active, autoSend])
+  @@index([accountId])
+  @@index([paidThroughAccountId])
 }
 
 model OtpCode {
@@ -1121,6 +1201,11 @@ model InvoiceItem {
   quantity    Float   @default(1)
   rate        Float   @default(0)
   amount      Float   @default(0)
+  // Chart of accounts: the income account this line counts as (null = Sales).
+  accountId   String?
+  account     LedgerAccount? @relation("InvoiceItemAccount", fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([accountId])
 }
 
 // Credit from a credit note (an Invoice with type "credit_note") applied to an
@@ -1157,8 +1242,12 @@ model InvoicePayment {
   // (method "bank") or the debit that paid a credit-note refund
   // (method "refund_bank"). Bare scalar, like DebtPayment.transactionId.
   transactionId String?
+  // Chart of accounts: the account the money went into (null = by method).
+  depositAccountId String?
+  depositAccount   LedgerAccount? @relation("InvoicePaymentDeposit", fields: [depositAccountId], references: [id], onDelete: SetNull)
 
   @@index([transactionId])
+  @@index([depositAccountId])
 }
 
 model InvoiceShareLink {
@@ -1555,4 +1644,68 @@ model SalaryPayment {
   @@index([ownerId, status])
   @@index([status, expiresAt])
   @@index([businessId, status])
+}
+
+// ── Chart of accounts (2026-10-11) ───────────────────────────────────────────
+// Zoho Books' accounts, adapted for a Nigerian shop: types, the default chart
+// and the rules for records without an account are in utils/chart.js. The
+// ledger is derived from the records (utils/ledger.js); nothing posts here.
+model LedgerAccount {
+  id           String          @id @default(uuid())
+  businessId   String
+  business     Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type         String // chart.js ACCOUNT_TYPES (CHECK constraint in the migration)
+  name         String
+  nameKey      String // lower(trim(name)): names are unique per business
+  code         String?
+  codeKey      String? // lower(trim(code)): codes are unique per business when set
+  description  String?
+  systemKey    String? // an account the books post to by themselves (chart.js SYS)
+  categorySlug String? // the expense category this account stands for
+  seed         String? // the default chart key the app translates the name by; null once renamed
+  parentId     String?
+  parent       LedgerAccount?  @relation("SubAccounts", fields: [parentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  children     LedgerAccount[] @relation("SubAccounts")
+  inactiveAt   DateTime?
+  createdById  String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  sales                    Sales[]            @relation("SaleAccount")
+  salesDeposited           Sales[]            @relation("SaleDeposit")
+  expenses                 Expense[]          @relation("ExpenseAccount")
+  expensesPaidThrough      Expense[]          @relation("ExpensePaidThrough")
+  expenseItems             ExpenseItem[]      @relation("ExpenseItemAccount")
+  transactions             Transaction[]      @relation("TransactionAccount")
+  recurringExpenses        RecurringExpense[] @relation("RecurringAccount")
+  recurringPaidThrough     RecurringExpense[] @relation("RecurringPaidThrough")
+  invoiceItems             InvoiceItem[]      @relation("InvoiceItemAccount")
+  invoicePaymentsDeposited InvoicePayment[]   @relation("InvoicePaymentDeposit")
+  debtPaymentsDeposited    DebtPayment[]      @relation("DebtPaymentDeposit")
+  openingBalances          OpeningBalance[]
+
+  @@unique([businessId, systemKey])
+  @@unique([businessId, categorySlug])
+  @@unique([businessId, codeKey])
+  @@unique([businessId, nameKey])
+  @@index([parentId])
+}
+
+// What an account held at the start of Business.openingBalanceDate (a debit or
+// a credit, never both). The ledger posts the difference from what the records
+// already put there, against Opening Balance Adjustments.
+model OpeningBalance {
+  id          String        @id @default(uuid())
+  businessId  String
+  business    Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  accountId   String
+  account     LedgerAccount @relation(fields: [accountId], references: [id], onDelete: NoAction)
+  debit       Float         @default(0)
+  credit      Float         @default(0)
+  updatedById String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([businessId, accountId])
+  @@index([accountId])
 }

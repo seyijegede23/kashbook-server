@@ -9,6 +9,8 @@ const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { isBankLedgerRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
+const { accountsFor, publicAccount } = require("../utils/ledgerData");
+const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
 
 router.use(auth);
 
@@ -38,6 +40,13 @@ router.get("/", async (req, res) => {
     return res.status(403).json({ error: "Forbidden" });
 
   try {
+    // The cursor the app sends back as `since` on its next pull, taken BEFORE
+    // the reads. A record changed after its table was read but before this
+    // reply is then newer than the cursor, so the next pull carries it; a
+    // cursor taken after the reads would be newer than that record, and no
+    // pull would ever send it. A record changed between the cursor and its
+    // table's read comes twice, which the app's upserts by id take as one.
+    const syncedAt = new Date().toISOString();
     const sinceDate = since ? new Date(since) : null;
     const userScope = { userId: targetUserId, businessId };
     const businessScope = { businessId };
@@ -57,8 +66,11 @@ router.get("/", async (req, res) => {
           orderBy,
           take: txCap,
         }),
+        // With an itemized expense's lines, in their order: the app shows and
+        // edits them. Receipts come with the row (publicExpense below).
         prisma.expense.findMany({
           where: { ...userScope, ...incremental },
+          include: EXPENSE_INCLUDE,
           orderBy,
           take: txCap,
         }),
@@ -94,6 +106,9 @@ router.get("/", async (req, res) => {
           orderBy: { nextDue: "asc" },
         }),
       ]);
+    // The chart of accounts, whole on every pull (a business has well under
+    // a hundred): every member picks accounts, nobody gets amounts from it.
+    const accounts = await accountsFor(businessId);
 
     // THE BULK PULL IS A PERMISSION SURFACE, not just a cache warm-up.
     //
@@ -121,17 +136,19 @@ router.get("/", async (req, res) => {
     const canSeeDebts = req.user.permissions?.canManagePayables === true;
     res.json({
       sales,
-      expenses,
+      // A receipt's storage keys never leave the server (utils/expenseView.js).
+      expenses: expenses.map(publicExpense),
       transactions: canSeeBank ? transactions : [],
       customers,
       inventory,
       debts: canSeeDebts ? debts : [],
       invoices,
       recurring: isOwner ? recurring : [],
+      accounts: accounts.map(publicAccount),
       // Told, not silently emptied — the client can distinguish "no bank
       // activity" from "not yours to see" instead of rendering a confident zero.
       bankWithheld: !canSeeBank,
-      syncedAt: new Date().toISOString(),
+      syncedAt,
     });
   } catch (err) {
     console.error("Sync failed:", err);

@@ -11,6 +11,7 @@ const { computeLedgerBalance } = require("../utils/ledgerBalance");
 const { getSpendableBalance } = require("../utils/savingsReserve");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { runPreTransferChecks, MONEY_OUT_SOURCES } = require("../utils/amlChecks");
+const { toKobo, twoDecimals } = require("../utils/money");
 const { staffSpendLast24h, decideStaffCap, APPROVAL_TTL_MS } = require("../utils/staffTransferCap");
 const { randomUUID } = require("crypto");
 const { audit } = require("../utils/audit");
@@ -339,7 +340,7 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
   const actorId = req.user.id;
   const ownerId = ownerIdOf(req);
 
-  const { businessId, accountNumber, bankCode, amount, narration, accountName, bankName, pin, otp, idempotencyKey } = req.body;
+  const { businessId, accountNumber, bankCode, amount: sentAmount, narration, accountName, bankName, pin, otp, idempotencyKey } = req.body;
   // Client-supplied idempotency key → a STABLE payout reference so a retry after a
   // timed-out-but-succeeded send hits the existing-reference short-circuit instead
   // of a second real disburse. Keep the "kbtf_" prefix (the money-out reconcile
@@ -349,16 +350,22 @@ router.post("/send", requirePermission("canTransfer", { auditDenials: true }), a
   // Empty after sanitizing (a degenerate/punctuation-only key) → fall back to a
   // fresh random ref, so it can't collide across all of a user's sends.
   const idempotentRef = idemSanitized ? `kbtf_${idemSanitized}` : undefined;
-  if (!businessId || !accountNumber || !bankCode || !amount)
+  if (!businessId || !accountNumber || !bankCode || !sentAmount)
     return res.status(400).json({ error: "Missing required fields" });
-  if (isNaN(amount) || Number(amount) <= 0)
+  if (isNaN(sentAmount) || Number(sentAmount) <= 0)
     return res.status(400).json({ error: "Invalid amount" });
   // Money is 2-decimal. Anchor rounds to kobo when sending (Math.round(amount*100)),
   // so a sub-kobo amount would leave the bank at one value and be BOOKED at
   // another — a permanent ledger-vs-bank divergence. Reject rather than silently
-  // round, so the client and the ledger always agree on what was sent.
-  if (Math.round(Number(amount) * 100) !== Number(amount) * 100)
+  // round, so the client and the ledger always agree on what was sent. The
+  // test is money.twoDecimals: `Math.round(n * 100) !== n * 100` refused about
+  // one kobo amount in eight (2500.55 * 100 is 250054.99999999997 in floating
+  // point), so ₦2,500.55 could not be sent.
+  if (!twoDecimals(Number(sentAmount)))
     return res.status(400).json({ error: "Amount cannot have more than 2 decimal places" });
+  // Exactly the kobo Anchor sends, from here on: what the row books is what
+  // left the bank, with no float noise from the client's own arithmetic.
+  const amount = toKobo(sentAmount) / 100;
 
   // Require a valid transaction PIN before processing.
   const pinCheck = await verifyTransactionPin(req.user.id, pin);

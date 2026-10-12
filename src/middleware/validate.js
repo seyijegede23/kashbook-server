@@ -15,9 +15,10 @@ function checkResult(req, res, next) {
 
 // ── Reusable field validators ─────────────────────────────────────────────────
 
-// amount: required, finite positive number
-const amountField = (field = "amount") =>
-  body(field)
+// amount: required, finite positive number. With `when`, only for the requests
+// it returns true for (express-validator skips the rest of the chain).
+const amountField = (field = "amount", when) =>
+  (when ? body(field).if(when) : body(field))
     .exists({ checkNull: true })
     .withMessage(`${field} is required`)
     .isFloat({ min: 0.01 })
@@ -66,8 +67,13 @@ const validateSale = [
   checkResult,
 ];
 
+// An itemized expense's amount is the sum of its lines (routes/expenses.js
+// works it out and ignores any amount sent), so a request that sends lines
+// need not send one.
+const sendsNoLines = (_value, { req }) => !(Array.isArray(req.body && req.body.items) && req.body.items.length > 0);
+
 const validateExpense = [
-  amountField("amount"),
+  amountField("amount", sendsNoLines),
   dateField("date"),
   notesField("notes"),
   checkResult,

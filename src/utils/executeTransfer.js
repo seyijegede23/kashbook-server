@@ -15,6 +15,11 @@
 //
 // Throws on Anchor / balance errors; returns { reference, route, transactionId }
 // on success.
+//
+// It books no `purpose` on the row (scripts/savings-test.js holds it to that):
+// a caller that keeps one in step with the account it passes, for older app
+// copies that read only the purpose, writes it on the returned row itself
+// (utils/recurringExpenseRunner.js).
 
 const prisma = require("./db");
 const anchor = require("./anchor");
@@ -50,6 +55,12 @@ async function executeTransfer({
   // resets to zero-spent on every send.
   recordedBy = null,
   recordedByName = null,
+  // What the money was for, when the caller already knows (a scheduled
+  // auto-debit whose rule names an account): written on the row as POST
+  // /transactions/:id/categorize writes it, so the books and the ledger count
+  // the debit by that account (utils/books.js, utils/ledger.js). See the
+  // header for what this function leaves to its caller.
+  accountId = null,
 } = {}) {
   const bankingId = business?.providerAccountId || business?.anchorAccountId;
   if (!business || !bankingId) {
@@ -141,6 +152,9 @@ async function executeTransfer({
   // Anchor's own id for the movement, stored as providerTxnId so the row can
   // always be traced back to the provider event without parsing the description.
   let providerTransferId = null;
+  // Whether our fee reached KashBook's fee account: null when there is no sweep
+  // (nothing changes), false only when Anchor definitely refused it.
+  let feeCollected = null;
 
   if (internalDest) {
     resolvedName = resolvedName || internalDest.virtualAccountName || internalDest.name;
@@ -210,6 +224,7 @@ async function executeTransfer({
     // The user's transfer already succeeded — a failed collection must NOT
     // fail it. Log + audit warn instead; reconciled manually.
     if (fee > 0) {
+      feeCollected = true;
       try {
         await anchor.createBookTransfer({
           fromAccountId: business.anchorAccountId,
@@ -219,6 +234,12 @@ async function executeTransfer({
           reference: `${ref}_fee`,
         });
       } catch (feeErr) {
+        // A definite rejection (Anchor did not act) means our fee never left
+        // the account, so it is not booked as a charge. Anything else (a
+        // timeout, a 5xx) may have moved it: the full fee stays booked, the
+        // safe side for the balance, and the audit row flags it for review.
+        const s = Number(feeErr?.httpStatus || feeErr?.status || 0);
+        if ([400, 401, 403, 404, 422].includes(s)) feeCollected = false;
         console.error(`[executeTransfer] fee collection failed for ${ref}:`, feeErr.message);
         await audit({
           req,
@@ -226,7 +247,7 @@ async function executeTransfer({
           resourceType: "business",
           resourceId: business.id,
           severity: "warn",
-          metadata: { reference: ref, fee, error: feeErr.message },
+          metadata: { reference: ref, fee, error: feeErr.message, booked: feeCollected },
         });
       }
     }
@@ -265,9 +286,14 @@ async function executeTransfer({
         flagSeverity: amlCheck.maxSeverity || null,
         complianceStatus: amlCheck.maxSeverity ? "flagged" : "clean",
         // Booked fee = our fee + the bank-debited stamp duty, so the ledger
-        // matches the account's true movement (only OUR fee gets swept below).
-        fee: totalCost,
-        feeBreakdown: feeBreakdown || undefined,
+        // matches the account's true movement (only OUR fee gets swept above).
+        // A sweep Anchor definitely refused moved nothing: book only the rest.
+        // It is also a Bank Fees and Charges expense in the books.
+        fee: feeCollected === false ? Math.max(0, Math.round((totalCost - fee) * 100) / 100) : totalCost,
+        feeBreakdown: feeBreakdown
+          ? { ...feeBreakdown, ...(feeCollected === false ? { platformUncollected: true } : {}) }
+          : undefined,
+        accountId: accountId || null,
       },
     });
   } catch (bookErr) {

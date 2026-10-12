@@ -593,10 +593,14 @@ section("9. savings rows are left out of reports and kept in the ledger, AML win
 
 const hasExclusion = (text) => /NOT_SAVINGS/.test(text) || /purpose:\s*null/.test(text);
 const REPORTING = [
-  // Income and expense totals come from the books rule (checked below); what
-  // is left here are the per-category and per-product breakdowns.
-  { file: "src/utils/insightsEngine.js", minPrisma: 2, minRaw: 0 },
-  { file: "src/utils/monthlyReport.js", minPrisma: 4, minRaw: 0 },
+  // Since 2026-10-12 every Insights money figure comes from the books rule
+  // (totals, and the expense breakdowns by account through
+  // spendingByAccount), which counts no savings row (checked below). None is
+  // required here any more; one that comes back must still carry NOT_SAVINGS.
+  { file: "src/utils/insightsEngine.js", minPrisma: 0, minRaw: 0 },
+  // The month's top expenses come from the books rule's rows since 2026-10-12
+  // (insightsEngine.spendingByAccount); three bank aggregates remain.
+  { file: "src/utils/monthlyReport.js", minPrisma: 3, minRaw: 0 },
   { file: "src/routes/admin.js", minPrisma: 2, minRaw: 0 },
   { file: "src/utils/snapshots.js", minPrisma: 1, minRaw: 0 },
 ];
@@ -618,10 +622,12 @@ for (const { file, minPrisma, minRaw } of REPORTING) {
 }
 
 // Since 2026-10-09 the daily report totals through the books rule, which counts
-// nothing for a bank row that carries a purpose (savings rows included).
-test("dailyReport.js: totals come from booksFor, and the books rule drops purpose rows", () => {
+// nothing for a bank row that carries a purpose (savings rows included): through
+// booksFor, or (since 2026-10-12, to count the day's records from the same
+// input) computeBooks over loadBooksInput, which is what booksFor does.
+test("dailyReport.js: totals come from the books rule, and the books rule drops purpose rows", () => {
   const src = read("src/utils/dailyReport.js");
-  assert.ok(/booksFor\(/.test(src), "dailyReport does not use booksFor");
+  assert.ok(/booksFor\(/.test(src) || (/computeBooks\(/.test(src) && /loadBooksInput\(/.test(src)), "dailyReport does not total through the books rule");
   assert.strictEqual(transactionCalls(src).length, 0, "dailyReport queries bank rows directly again");
   const { bankCountedAmount } = require("../src/utils/books");
   assert.strictEqual(bankCountedAmount({ type: "expense", amount: 100, purpose: "savings_fee" }), 0);

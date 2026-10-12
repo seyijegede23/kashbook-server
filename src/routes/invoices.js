@@ -17,6 +17,51 @@ const { audit } = require("../utils/audit");
 const { recordLink } = require("../utils/paymentLinks");
 const { PAYMENT_TERMS: PAYMENT_TERM_CODES } = require("../utils/paymentTerms");
 const { snapshotFor } = require("../utils/customerFields");
+const { assertAccountUsable } = require("../utils/ledgerData");
+
+// The chart of accounts (2026-10-11): each line may name the income account it
+// counts as (null = Sales; Sales Returns on a credit note). Checked once per
+// distinct account before the document is written. `kept` holds the accounts
+// the document's lines name already (an edit): those are taken as they are,
+// even one the owner has since made inactive, so the document still saves and
+// the line keeps counting where it did. Only an account new to the document
+// is checked.
+async function checkLineAccounts(businessId, items, isStaff, kept = new Set()) {
+  const ids = [...new Set((items || []).map((it) => it && it.accountId).filter(Boolean).map(String))];
+  for (const id of ids) {
+    if (kept.has(id)) continue;
+    await assertAccountUsable(businessId, id, "income", { isStaff });
+  }
+}
+
+// A document's lines as they are saved now (an edit), with the account each
+// one counts as. Those accounts are the `kept` of checkLineAccounts.
+async function savedLinesOf(invoiceId) {
+  return prisma.invoiceItem.findMany({ where: { invoiceId }, select: { name: true, accountId: true } });
+}
+
+// An older app version (from before the chart of accounts) sends its lines
+// with no `accountId` key at all, while the app now sends one on every line,
+// null for Sales (AppContext withLineAccounts). Written as sent, that older
+// edit would put every line back on Sales (Sales Returns on a credit note).
+// So an edit whose lines carry no key leaves each line counting where it did:
+// a line takes the account of the saved line with the same name, the first
+// one not taken yet, so lines that share a name keep theirs in order. Lines
+// are matched by name only, since that app can remove a line (the rest move
+// up) or change a price. A line it added or renamed counts as Sales, the only
+// choice that app had. Only an `accountId` sent as null moves a line back.
+function keepLineAccounts(items, saved) {
+  const hasKey = (it) => it && typeof it === "object" && "accountId" in it;
+  if (!Array.isArray(items) || items.some(hasKey)) return items;
+  const key = (name) => String(name ?? "").trim().toLowerCase();
+  const pool = saved.map((l) => ({ key: key(l.name), accountId: l.accountId, taken: false }));
+  return items.map((it) => {
+    const same = it && pool.find((l) => !l.taken && l.key === key(it.name));
+    if (!same) return it;
+    same.taken = true;
+    return { ...it, accountId: same.accountId };
+  });
+}
 
 // Money that enters or leaves the books through an invoice leaves a trail:
 // who recorded, undid or wrote off what. Fire and forget, like the bank routes.
@@ -305,8 +350,11 @@ router.post("/", authMiddleware, async (req, res) => {
     // Choosing the number and writing the invoice happen under the business
     // lock, the same one the recurring runner and Instagram orders hold while
     // they number theirs, so a typed number and an automatic one can never land
-    // on the same value.
+    // on the same value. An account merge or delete takes it too
+    // (routes/ledger.js), so every account a line names is checked under it and
+    // is still there when the invoice is written.
     const invoice = await prisma.withBusinessLock(businessId, async () => {
+      await checkLineAccounts(businessId, items, req.user.accountType === "staff");
       let invoiceNumber;
       if (manualNumber) {
         if (await numberTaken(prisma, businessId, manualNumber)) {
@@ -349,6 +397,7 @@ router.post("/", authMiddleware, async (req, res) => {
               quantity: Number(it.quantity) || 1,
               rate: Number(it.rate) || 0,
               amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
+              accountId: it.accountId ? String(it.accountId) : null,
             })),
           },
         },
@@ -358,8 +407,8 @@ router.post("/", authMiddleware, async (req, res) => {
 
     res.status(201).json(formatInvoice(invoice));
   } catch (err) {
-    if (err.status === 409) {
-      return res.status(409).json({ error: err.message, code: err.code, number: err.number });
+    if (err.status && err.code) {
+      return res.status(err.status).json({ error: err.message, code: err.code, number: err.number });
     }
     console.error(err);
     res.status(500).json({ error: "Failed to create invoice" });
@@ -542,59 +591,68 @@ router.put("/:id", authMiddleware, async (req, res) => {
       }
     }
 
-    // The duplicate check runs before anything is written, and under the
-    // business lock when the number changes, like a create.
-    const writeUpdate = async () => {
+    // Checked and written under the business lock. A create numbers under it,
+    // and an account merge or delete takes it too (routes/ledger.js), so a new
+    // number is still free and every account a line names is still there when
+    // the lines are written. The saved lines are read under it as well: they
+    // say which accounts the document has already. The lines are replaced
+    // after every check, in one transaction, so a refusal or a failed write
+    // leaves the old ones.
+    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+      const saved = await savedLinesOf(existing.id);
+      const lines = keepLineAccounts(items, saved);
+      const kept = new Set(saved.map((l) => l.accountId).filter(Boolean));
+      await checkLineAccounts(existing.businessId, lines, req.user.accountType === "staff", kept);
       if (newNumber && (await numberTaken(prisma, existing.businessId, newNumber, existing.id))) {
         throw Object.assign(new Error(`${newNumber} is already used.`), {
           status: 409, code: "NUMBER_IN_USE", number: newNumber,
         });
       }
 
-      // Replace all items
-      await prisma.invoiceItem.deleteMany({ where: { invoiceId: req.params.id } });
+      return prisma.$transaction(async (px) => {
+        // Replace all items
+        await px.invoiceItem.deleteMany({ where: { invoiceId: req.params.id } });
 
-      return prisma.invoice.update({
-        where: { id: req.params.id },
-        data: {
-          ...details,
-          ...statusPatch,
-          ...(newNumber ? { invoiceNumber: newNumber } : {}),
-          customerId: resolvedCustomerId,
-          ...snapshot,
-          issueDate: issueDate || existing.issueDate,
-          dueDate: isCredit ? null : dueDate || null,
-          subtotal,
-          taxRate: Number(taxRate) || 0,
-          taxAmount,
-          discountType: discountType || null,
-          discountValue: Number(discountValue) || 0,
-          discountAmount,
-          total,
-          notes: notes || null,
-          terms: terms || null,
-          template: template || existing.template,
-          items: {
-            create: items.map((it) => ({
-              name: it.name,
-              description: it.description || null,
-              quantity: Number(it.quantity) || 1,
-              rate: Number(it.rate) || 0,
-              amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
-            })),
+        return px.invoice.update({
+          where: { id: req.params.id },
+          data: {
+            ...details,
+            ...statusPatch,
+            ...(newNumber ? { invoiceNumber: newNumber } : {}),
+            customerId: resolvedCustomerId,
+            ...snapshot,
+            issueDate: issueDate || existing.issueDate,
+            dueDate: isCredit ? null : dueDate || null,
+            subtotal,
+            taxRate: Number(taxRate) || 0,
+            taxAmount,
+            discountType: discountType || null,
+            discountValue: Number(discountValue) || 0,
+            discountAmount,
+            total,
+            notes: notes || null,
+            terms: terms || null,
+            template: template || existing.template,
+            items: {
+              create: lines.map((it) => ({
+                name: it.name,
+                description: it.description || null,
+                quantity: Number(it.quantity) || 1,
+                rate: Number(it.rate) || 0,
+                amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
+                accountId: it.accountId ? String(it.accountId) : null,
+              })),
+            },
           },
-        },
-        include: INCLUDE,
+          include: INCLUDE,
+        });
       });
-    };
-    const invoice = newNumber
-      ? await prisma.withBusinessLock(existing.businessId, writeUpdate)
-      : await writeUpdate();
+    });
 
     res.json(formatInvoice(invoice));
   } catch (err) {
-    if (err.status === 409) {
-      return res.status(409).json({ error: err.message, code: err.code, number: err.number });
+    if (err.status && err.code) {
+      return res.status(err.status).json({ error: err.message, code: err.code, number: err.number });
     }
     console.error(err);
     res.status(500).json({ error: "Failed to update invoice" });
@@ -684,8 +742,10 @@ function statusAfter(inv, amountPaid) {
 }
 
 // A NUBAN credit this business may use to pay invoices: an incoming bank row
-// not matched to a sale or debt and not marked as something else. Returns the
-// part not yet used by other invoice payments.
+// not matched to a sale or debt, not marked as something else, and not
+// explained with an account (money in on an income account keeps no purpose,
+// and is income on that account already). Returns the part not yet used by
+// other invoice payments.
 async function linkableCredit(px, transactionId, businessId) {
   const tx = await px.transaction.findUnique({ where: { id: String(transactionId) } });
   if (!tx || tx.businessId !== businessId) {
@@ -694,7 +754,7 @@ async function linkableCredit(px, transactionId, businessId) {
   if (tx.type !== "income") {
     throw creditError(400, "NOT_INCOMING", "Pick money that came in.");
   }
-  if (tx.purpose || tx.matchedSaleId || tx.matchedCustomerId) {
+  if (tx.purpose || tx.accountId || tx.matchedSaleId || tx.matchedCustomerId) {
     throw creditError(409, "TRANSACTION_TAKEN", "That bank payment is already explained.");
   }
   const used = tx.matchedInvoiceId ? Number(tx.matchedAmount || 0) : 0;
@@ -734,9 +794,15 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
 
     // Serialize payments per business so two concurrent posts can't both read a
     // stale amountPaid and overpay / lose an update. Re-read inside the lock;
-    // the payment, the invoice and the credit's link commit together.
+    // the payment, the invoice and the credit's link commit together. The
+    // account the money went into is checked under the lock too, which an
+    // account merge or delete also takes (routes/ledger.js), so it is still
+    // there when the payment is saved with it.
     const invoice = await prisma.withBusinessLock(existing.businessId, () =>
       prisma.$transaction(async (px) => {
+        const deposit = method === "bank"
+          ? null
+          : await assertAccountUsable(existing.businessId, body.depositAccountId, "money", { isStaff: req.user.accountType === "staff" }, px);
         const inv = await px.invoice.findUnique({ where: { id: req.params.id } });
         if (inv.writtenOffAt) {
           throw creditError(409, "WRITTEN_OFF", "This invoice was written off. Undo the write-off first.");
@@ -773,6 +839,7 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
             // A payment into the KashBook account happened when the credit landed.
             date: tx ? tx.date : when,
             transactionId: tx ? tx.id : null,
+            depositAccountId: deposit ? deposit.id : null,
           },
         });
         if (tx) {
@@ -1116,7 +1183,9 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
             throw creditError(404, "TRANSACTION_NOT_FOUND", "That transfer was not found.");
           }
           if (debit.type === "income") throw creditError(400, "NOT_OUTGOING", "Pick money that went out.");
-          if (debit.purpose || debit.matchedExpenseId) {
+          // Already explained: marked, recorded as an expense, or explained
+          // with an account (money out on an expense account keeps no purpose).
+          if (debit.purpose || debit.accountId || debit.matchedExpenseId) {
             throw creditError(409, "TRANSACTION_TAKEN", "That transfer is already explained.");
           }
           // One record per naira: the whole transfer is the refund.

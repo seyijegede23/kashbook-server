@@ -239,7 +239,11 @@ app.use(
 // compresses about five to one; on mobile data that is the difference
 // between a launch that feels instant and one that does not.
 app.use(compression());
-app.use(express.json({ limit: "10mb" }));
+// Receipts and KYB documents arrive as base64 in the JSON body. The upload
+// guard allows 8 MB a file, and base64 makes that about a third larger
+// (about 10.7 MB), so the body limit sits above it with room for the rest of
+// the request. A body over it is answered with a 413 below.
+app.use(express.json({ limit: "12mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use((_req, res, next) => {
   res.setHeader("ngrok-skip-browser-warning", "1");
@@ -314,7 +318,26 @@ app.use("/transactions", apiLimiter);
 app.use("/instagram", apiLimiter);
 app.use("/whatsapp", apiLimiter);
 app.use("/savings", apiLimiter);
+app.use("/ledger", apiLimiter);
 app.use("/admin-api", authLimiter);
+
+// The chart of accounts' ledger is derived from the records and cached a
+// minute per business (utils/ledgerData.js). A write that succeeds on any
+// route that changes records clears its owner's cached ledgers at once.
+{
+  const { invalidateOwner } = require("./src/utils/ledgerData");
+  const { ownerIdOf } = require("./src/utils/scope");
+  const ledgerWrites = ["/sales", "/expenses", "/transactions", "/invoices", "/customers", "/business-debts",
+    "/recurring-expenses", "/recurring-invoices", "/payroll", "/transfers", "/businesses", "/sync", "/ledger", "/instagram"];
+  app.use(ledgerWrites, (req, res, next) => {
+    if (req.method !== "GET") {
+      res.on("finish", () => {
+        if (res.statusCode < 400 && req.user) invalidateOwner(ownerIdOf(req));
+      });
+    }
+    next();
+  });
+}
 
 app.use("/auth", authRoutes);
 // FCY (EUR) accounts hang off /businesses/:id/foreign-accounts. Mounted
@@ -346,6 +369,8 @@ app.use("/whatsapp", whatsappRoutes);
 // Savings pots (owner only). Creation and deposits are behind SAVINGS_ENABLED;
 // reads and withdrawals always work so money is never trapped by the switch.
 app.use("/savings", require("./src/routes/savings"));
+// The chart of accounts and the books it reads (2026-10-11).
+app.use("/ledger", require("./src/routes/ledger"));
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.
@@ -389,6 +414,12 @@ app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 Sentry.setupExpressErrorHandler(app);
 
 app.use((err, req, res, _next) => {
+  // A body over a parser's limit (a file too big to upload) is the sender's
+  // to fix, not a fault here: say so instead of a 500.
+  if (err && err.type === "entity.too.large") {
+    console.warn(`[body] ${req.method} ${req.originalUrl} refused: over the ${err.limit} byte limit`);
+    return res.status(413).json({ error: "That file is too large. Choose one under 8 MB.", code: "PAYLOAD_TOO_LARGE" });
+  }
   console.error(err);
   res.status(500).json({ error: "Internal server error" });
 });

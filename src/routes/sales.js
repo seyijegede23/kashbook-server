@@ -3,12 +3,26 @@ const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { validateSale, validateIdParam } = require("../middleware/validate");
 const { normalizeChannel } = require("../utils/salesChannel");
+const { assertAccountUsable, invalidateLedger } = require("../utils/ledgerData");
 
 router.use(auth);
 
 // Helper to resolve the correct business owner ID
 const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
+
+// A refusal as the app reads it: { error, code }, plus the field it is about
+// when it names one (an account the sale names is refused as accountId or
+// depositAccountId: utils/ledgerData.js accountError), and anything else it
+// carries for the app, such as a line (`extra`).
+function sendRefusal(res, err) {
+  return res.status(err.status).json({
+    error: err.message,
+    code: err.code,
+    ...(err.field ? { field: err.field } : {}),
+    ...(err.extra || {}),
+  });
+}
 
 // Customer.totalOwed is the cached sum of what their unpaid debts still owe.
 async function refreshTotalOwed(px, customerId) {
@@ -85,8 +99,12 @@ router.post("/", validateSale, async (req, res) => {
     date,
     businessId,
     channel,
+    accountId,
+    depositAccountId,
+    clientRef,
   } = req.body;
   if (!amount) return res.status(400).json({ error: "amount required" });
+  const ref = clientRef ? String(clientRef).slice(0, 80) : null;
 
   try {
     if (businessId) {
@@ -96,56 +114,88 @@ router.post("/", validateSale, async (req, res) => {
       if (!owned) return res.status(403).json({ error: "Forbidden" });
     }
 
+    // A create the app retried (the first one timed out after it was saved)
+    // gets the first one back instead of a second sale.
+    if (businessId && ref) {
+      const prior = await prisma.sales.findFirst({ where: { businessId, clientRef: ref } });
+      if (prior) return res.status(200).json({ ...prior, debt: null });
+    }
+    const isStaff = req.user.accountType === "staff";
     const ownerId = getTargetUserId(req);
-    // Sold on credit to a known customer: open that customer's debt for it in
-    // the same transaction. Books rule: the sale then counts when the customer
-    // pays (through the debt's payments), not on the day it was recorded.
-    // The customer must be this business's (or one with no business yet):
-    // another business's customer would carry the debt into its books.
-    const creditCustomer =
-      isCredit && customerId
-        ? await prisma.customer.findFirst({
-            where: {
-              id: String(customerId),
-              userId: ownerId,
-              ...(businessId ? { OR: [{ businessId }, { businessId: null }] } : {}),
-            },
-            select: { id: true },
-          })
+    // Checked and saved under the business lock, which an account merge or
+    // delete also takes (routes/ledger.js), so every account checked here is
+    // still there when the sale is saved with it (as POST /expenses does).
+    const lockedForBusiness = (fn) => (businessId ? prisma.withBusinessLock(businessId, fn) : fn());
+    const { sale, debt } = await lockedForBusiness(async () => {
+      // The chart of accounts: what the sale counts as (an income account, Sales
+      // when none) and where the money went (by payment method when none). A
+      // refusal names the field, so the app knows which of the two to leave out.
+      const account = businessId
+        ? await assertAccountUsable(businessId, accountId, "income", { isStaff, field: "accountId" })
+        : null;
+      const deposit = businessId
+        ? await assertAccountUsable(businessId, depositAccountId, "money", { isStaff, field: "depositAccountId" })
         : null;
 
-    const { sale, debt } = await prisma.$transaction(async (px) => {
-      const sale = await px.sales.create({
-        data: {
-          userId: ownerId,
-          businessId: businessId || null,
-          customerId: customerId || null,
-          amount: Number(amount),
-          paymentMethod,
-          isCredit,
-          notes: notes || null,
-          channel: normalizeChannel(channel),
-          date: date ? new Date(date) : new Date(),
-          recordedBy: req.user.id,
-          recordedByName: req.user.name,
-        },
+      // Sold on credit to a known customer: open that customer's debt for it in
+      // the same transaction. Books rule: the sale then counts when the customer
+      // pays (through the debt's payments), not on the day it was recorded.
+      // The customer must be this business's (or one with no business yet):
+      // another business's customer would carry the debt into its books.
+      const creditCustomer =
+        isCredit && customerId
+          ? await prisma.customer.findFirst({
+              where: {
+                id: String(customerId),
+                userId: ownerId,
+                ...(businessId ? { OR: [{ businessId }, { businessId: null }] } : {}),
+              },
+              select: { id: true },
+            })
+          : null;
+
+      return prisma.$transaction(async (px) => {
+        const sale = await px.sales.create({
+          data: {
+            userId: ownerId,
+            businessId: businessId || null,
+            customerId: customerId || null,
+            amount: Number(amount),
+            paymentMethod,
+            isCredit,
+            notes: notes || null,
+            channel: normalizeChannel(channel),
+            date: date ? new Date(date) : new Date(),
+            recordedBy: req.user.id,
+            recordedByName: req.user.name,
+            accountId: account ? account.id : null,
+            depositAccountId: deposit ? deposit.id : null,
+            clientRef: ref,
+          },
+        });
+        if (!creditCustomer) return { sale, debt: null };
+        const debt = await px.debt.create({
+          data: {
+            customerId: creditCustomer.id,
+            amount: Number(amount),
+            note: notes || "",
+            date: sale.date,
+            saleId: sale.id,
+          },
+          include: { payments: true },
+        });
+        await refreshTotalOwed(px, creditCustomer.id);
+        return { sale, debt };
       });
-      if (!creditCustomer) return { sale, debt: null };
-      const debt = await px.debt.create({
-        data: {
-          customerId: creditCustomer.id,
-          amount: Number(amount),
-          note: notes || "",
-          date: sale.date,
-          saleId: sale.id,
-        },
-        include: { payments: true },
-      });
-      await refreshTotalOwed(px, creditCustomer.id);
-      return { sale, debt };
     });
+    if (businessId) invalidateLedger(businessId);
     res.status(201).json({ ...sale, debt });
   } catch (err) {
+    if (err?.code === "P2002" && ref && businessId) {
+      const prior = await prisma.sales.findFirst({ where: { businessId, clientRef: ref } });
+      if (prior) return res.status(200).json({ ...prior, debt: null });
+    }
+    if (err && err.status) return sendRefusal(res, err);
     console.error(err);
     res.status(500).json({ error: "Failed to create sale" });
   }
@@ -159,18 +209,23 @@ router.patch("/:id", validateIdParam, async (req, res) => {
     const sale0 = await prisma.sales.findUnique({ where: { id: req.params.id } });
     if (!sale0) return res.status(404).json({ error: "Sale not found" });
     if (sale0.userId !== req.user.id) return res.status(403).json({ error: "Forbidden" });
-    const { amount, notes, paymentMethod, date, channel } = req.body;
+    const { amount, notes, paymentMethod, date, channel, accountId, depositAccountId } = req.body;
     if (amount !== undefined && !(Number(amount) > 0)) {
       return res.status(400).json({ error: "Enter an amount.", code: "BAD_AMOUNT" });
     }
-
     // Books rule: a sale on credit with a customer has a debt that counts it
     // when paid. Changing the amount, the date or credit <-> paid keeps the
     // two in step; the paid part of a credit sale is fixed. A sale matched to
     // a bank transfer keeps the transfer's matchedAmount in step too. All of
-    // it under the business lock, re-read inside.
-    const updated = await prisma.withBusinessLock(sale0.businessId || sale0.userId, () =>
-      prisma.$transaction(async (px) => {
+    // it under the business lock, re-read inside. The accounts are checked
+    // under the lock too: an account merge or delete (routes/ledger.js) takes
+    // it, so an account checked here is still there when the sale is saved.
+    const updated = await prisma.withBusinessLock(sale0.businessId || sale0.userId, async () => {
+      const account = accountId !== undefined && sale0.businessId
+        ? await assertAccountUsable(sale0.businessId, accountId, "income", { field: "accountId" }) : undefined;
+      const deposit = depositAccountId !== undefined && sale0.businessId
+        ? await assertAccountUsable(sale0.businessId, depositAccountId, "money", { field: "depositAccountId" }) : undefined;
+      return prisma.$transaction(async (px) => {
         const sale = await px.sales.findUnique({ where: { id: sale0.id } });
         const debt = await px.debt.findFirst({ where: { saleId: sale.id } });
         const newAmount = amount !== undefined ? Number(amount) : Number(sale.amount);
@@ -193,6 +248,8 @@ router.patch("/:id", validateIdParam, async (req, res) => {
             ...(paymentMethod !== undefined && { paymentMethod, isCredit: toCredit }),
             ...(date !== undefined && { date: new Date(date) }),
             ...(channel !== undefined && { channel: normalizeChannel(channel) }),
+            ...(account !== undefined && { accountId: account ? account.id : null }),
+            ...(deposit !== undefined && { depositAccountId: deposit ? deposit.id : null }),
           },
         });
         if (debt && !toCredit) {
@@ -236,11 +293,12 @@ router.patch("/:id", validateIdParam, async (req, res) => {
           }
         }
         return row;
-      }),
-    );
+      });
+    });
+    if (sale0.businessId) invalidateLedger(sale0.businessId);
     res.json(updated);
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ error: err.message, code: err.code });
+    if (err.status) return sendRefusal(res, err);
     console.error(err);
     res.status(500).json({ error: "Failed to update sale" });
   }
@@ -287,9 +345,10 @@ router.delete("/:id", validateIdParam, async (req, res) => {
         await px.sales.delete({ where: { id: fresh.id } });
       }),
     );
+    if (sale.businessId) invalidateLedger(sale.businessId);
     res.json({ message: "Deleted", debtId });
   } catch (err) {
-    if (err.status) return res.status(err.status).json({ error: err.message, code: err.code });
+    if (err.status) return sendRefusal(res, err);
     console.error(err);
     res.status(500).json({ error: "Failed to delete sale" });
   }

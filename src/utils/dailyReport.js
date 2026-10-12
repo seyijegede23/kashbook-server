@@ -11,8 +11,21 @@
 const prisma = require("./db");
 const { pushTo } = require("./pushNotification");
 const { formatAmountForBusiness } = require("../config/amlLimits");
+const { bookEvents, computeBooks } = require("./books");
 
 const WAT_OFFSET_MS = 60 * 60 * 1000; // UTC+1, fixed
+
+// How many records the day's figures come from: each record once, however
+// many amounts it adds (the lines of a split expense, a transfer and its fee,
+// a credit sale with no debt, which a line notes beside the sale), and an
+// expense the books leave on the balance sheet (equipment, a loan repaid),
+// which was still recorded today.
+function entriesOf(input, opts) {
+  const records = new Set();
+  for (const ev of bookEvents(input, opts).events) records.add(ev.src.rec);
+  for (const e of input.expenses || []) if (!e.foreignCurrency) records.add(e);
+  return records.size;
+}
 
 function startOfTodayLagos(now = new Date()) {
   const lagos = new Date(now.getTime() + WAT_OFFSET_MS);
@@ -31,18 +44,18 @@ async function sendDailyReports() {
 
   // Today's sales and expenses by the books rule (utils/books.js): recorded
   // sales and expenses, invoice and debt payments, refunds and bank rows, each
-  // naira once. It used to read bank rows only, so a day of recorded sales
-  // still got the "no entries" nudge.
-  const { booksFor } = require("./booksData");
+  // naira once, as booksFor counts them. It used to read bank rows only, so a
+  // day of recorded sales still got the "no entries" nudge.
+  const { loadBooksInput } = require("./booksData");
   const today = new Date(since.getTime() + WAT_OFFSET_MS).toISOString().slice(0, 10);
   const statsByBusiness = new Map();
   for (const b of businesses) {
-    const books = await booksFor(b.id, { from: today, to: today });
-    if (!books) continue;
-    let count = 0;
-    for (const line of Object.values(books.sales.lines)) count += line.count;
-    for (const line of Object.values(books.expenses.lines)) count += line.count;
+    const loaded = await loadBooksInput(b.id, { from: today, to: today });
+    if (!loaded) continue;
+    const opts = { from: today, to: today, basis: "paid", vat: loaded.vat };
+    const count = entriesOf(loaded.input, opts);
     if (count === 0) continue;
+    const books = computeBooks(loaded.input, opts);
     statsByBusiness.set(b.id, { income: books.sales.total, expense: books.expenses.total, count });
   }
 
@@ -98,4 +111,4 @@ async function sendDailyReports() {
   return { users: jobs.length };
 }
 
-module.exports = { sendDailyReports };
+module.exports = { sendDailyReports, entriesOf };

@@ -1,5 +1,7 @@
 const router = require("express").Router();
 const prisma = require("../utils/db");
+const chart = require("../utils/chart");
+const { assertAccountUsable, accountsFor } = require("../utils/ledgerData");
 const auth = require("../middleware/auth");
 const { requirePermission } = require("../middleware/requirePermission");
 const { normalizeChannel } = require("../utils/salesChannel");
@@ -7,6 +9,9 @@ const { isBankLedgerRow, isSavingsRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
 const { CREDIT_OUTCOMES } = require("../utils/books");
 const { recordLink, linkedFrom } = require("../utils/paymentLinks");
+const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
+const { cleanReference, expenseCustomerId } = require("../utils/expenseFields");
+const { destroyReceipts } = require("../utils/receiptStorage");
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
 // match endpoints, so "Match to Sale or Debt" silently 404'd and reverted.
@@ -193,6 +198,8 @@ router.delete("/:id", async (req, res) => {
 //   * income rows only — matching an OUTBOUND transfer is meaningless
 //   * one match per credit, 409 on a second attempt, re-checked INSIDE the
 //     business lock (the outer check is UX; the inner one is the guarantee)
+//   * a credit already explained, by a purpose or by an account from the
+//     chart of accounts, is never matched as well (checked in both places)
 //   * all writes in one prisma.$transaction — the old handlers used
 //     Promise.all and loose sequential writes, which could half-apply
 // ═════════════════════════════════════════════════════════════════════════
@@ -227,9 +234,16 @@ async function loadMatchableCredit(req, res) {
     res.status(409).json({ error: "This is money returning from your savings, not a customer payment.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
     return null;
   }
-  // Marked as not income (cash already recorded, own transfer, a loan...).
-  if (tx.purpose) {
-    res.status(409).json({ error: "This transfer is marked as not a sale. Clear that first.", code: "MARKED_NOT_INCOME" });
+  // Marked as not income (cash already recorded, own transfer, a loan...), or
+  // explained with an account (money in on an income account keeps no
+  // purpose). Either way it is explained, and a match would count it twice.
+  if (tx.purpose || tx.accountId) {
+    res.status(409).json({
+      error: tx.accountId
+        ? "This transfer is explained with an account. Clear that first."
+        : "This transfer is marked as not a sale. Clear that first.",
+      code: "MARKED_NOT_INCOME",
+    });
     return null;
   }
   if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId) {
@@ -242,13 +256,49 @@ async function loadMatchableCredit(req, res) {
 const debtTotalOwed = (debts) =>
   debts.reduce((s, d) => s + Math.max(0, d.amount - d.paidAmount), 0);
 
-// Translate a coded matchError into a response; 500 for anything else.
+// Translate a coded matchError into a response; 500 for anything else. An
+// expense detail refused by utils/expenseFields.js also says which field.
 function respondMatchFailure(res, err, fallback) {
   if (err && err.status && err.code) {
-    return res.status(err.status).json({ error: err.message, code: err.code });
+    return res.status(err.status).json({ error: err.message, code: err.code, ...(err.field ? { field: err.field } : {}) });
   }
   console.error(`[transactions] ${fallback}:`, err);
   return res.status(500).json({ error: fallback });
+}
+
+// The owner's stake (chart of accounts, 2026-10-12). Equity accounts, the
+// owner's own money put in or taken out, are the owner's to use
+// (utils/ledgerData.js assertAccountUsable), and what the owner filed there is
+// the owner's to change: staff may neither move nor clear it, whether it was
+// filed by an account or by a purpose. A purpose stands for the account the
+// ledger books it on (utils/chart.js PURPOSE_ACCOUNT); the ones that stand for
+// an equity account are read from the chart, so the two never disagree.
+// Today that is the owner's money.
+const OWNER_ONLY_PURPOSES = Object.keys(chart.PURPOSE_ACCOUNT).filter((purpose) => {
+  const sys = chart.DEFAULT_CHART.find((a) => a.sys === chart.PURPOSE_ACCOUNT[purpose]);
+  return !!sys && chart.classOf(sys.type) === "equity";
+});
+const OWNERS_STAKE_REFUSAL = "The owner filed this as their own money. Only the business owner can change it.";
+
+// Whether a bank row sits in the owner's stake: the account it names when it
+// names one, else the account its purpose stands for, as the ledger books it
+// (utils/chart.js bankRowAccount). Read under the business lock on the row as
+// it is then, so an owner's change a moment earlier counts.
+async function inOwnersStake(px, tx) {
+  if (tx.accountId) {
+    const acc = await px.ledgerAccount.findUnique({ where: { id: tx.accountId }, select: { type: true } });
+    if (acc) return chart.classOf(acc.type) === "equity";
+  }
+  return OWNER_ONLY_PURPOSES.includes(tx.purpose);
+}
+
+// Whether an expense is filed in the owner's stake (the owner's drawings), as
+// a whole or on one of its lines. Only the owner can file one there.
+async function expenseInOwnersStake(px, expense) {
+  const ids = [expense.accountId, ...(expense.items || []).map((it) => it.accountId)].filter(Boolean);
+  if (!ids.length) return false;
+  const accs = await px.ledgerAccount.findMany({ where: { id: { in: ids } }, select: { type: true } });
+  return accs.some((a) => chart.classOf(a.type) === "equity");
 }
 
 // POST /transactions/:id/match  { saleId } — link to an EXISTING sale.
@@ -264,7 +314,7 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
         // Re-check both sides under the lock. Two phones matching at once each
         // pass the outer read; only one may pass here.
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         const sale = await px.sales.findUnique({ where: { id: saleId } });
         if (!sale) throw matchError(404, "SALE_NOT_FOUND", "Sale not found");
@@ -351,12 +401,13 @@ const clampText = (s, max) => (typeof s === "string" ? s.trim().slice(0, max) : 
 // reporting period as the money); the AMOUNT may be composed in the full Add
 // form but is capped at the transfer (see resolveCappedAmount).
 router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req, res) => {
-  const { channel, customerId } = req.body || {};
+  const { channel, customerId, accountId } = req.body || {};
   const description = clampText((req.body || {}).description, 500);
   try {
     const pre = await loadMatchableCredit(req, res);
     if (!pre) return;
     const { amount, remainder } = resolveCappedAmount(req.body || {}, pre);
+    const account = await assertAccountUsable(pre.businessId, accountId, "income", { isStaff: req.user.accountType === "staff" });
 
     if (customerId) {
       const customer = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -367,7 +418,7 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
     const result = await prisma.withBusinessLock(pre.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
 
         const sale = await px.sales.create({
@@ -386,6 +437,7 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
             recordedBy: req.user.id,
             recordedByName: req.user.name,
             matchedTransactionId: tx.id,
+            accountId: account ? account.id : null,
           },
         });
         const updatedTx = await px.transaction.update({
@@ -428,9 +480,16 @@ async function loadMatchableDebit(req, res) {
     res.status(409).json({ error: "This is a transfer into your savings, not an expense.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
     return null;
   }
-  // A refund to a customer lowers sales; it is never an expense too.
-  if (tx.purpose) {
-    res.status(409).json({ error: "This transfer paid a customer refund.", code: "MARKED_NOT_EXPENSE" });
+  // A refund to a customer lowers sales; it is never an expense too. Nor is a
+  // transfer explained with an account (money out on an expense account keeps
+  // no purpose): it is explained already, and an expense would explain it twice.
+  if (tx.purpose || tx.accountId) {
+    res.status(409).json({
+      error: tx.accountId
+        ? "This transfer is explained with an account. Clear that first."
+        : "This transfer paid a customer refund.",
+      code: "MARKED_NOT_EXPENSE",
+    });
     return null;
   }
   if (tx.matchedExpenseId) {
@@ -440,23 +499,56 @@ async function loadMatchableDebit(req, res) {
   return tx;
 }
 
-// POST /transactions/:id/create-expense  { amount?, description?, category? }
+// POST /transactions/:id/create-expense
+//   { amount?, description?, category?, accountId?, reference?, customerId? }
 // The outbound mirror: tap a transfer you SENT and record what it paid for.
 // Same cap rule, same lock + in-lock re-check, same exclusion consequence —
 // the bank debit stops counting in expense aggregates because the categorised
-// Expense row now carries that money.
+// Expense row now carries that money. The supplier's reference and the
+// customer the cost was for are checked as POST /expenses checks them
+// (utils/expenseFields.js); lines are not taken here. Staff file only under a
+// category the chart already has (anything else is Other Expenses), because
+// only the owner adds accounts.
 router.post("/:id/create-expense", requirePermission("canViewBalance"), async (req, res) => {
   const description = clampText((req.body || {}).description, 500);
-  const category = clampText((req.body || {}).category, 40).toLowerCase() || "other";
+  const category0 = clampText((req.body || {}).category, 40).toLowerCase() || "other";
+  const isStaff = req.user.accountType === "staff";
   try {
     const pre = await loadMatchableDebit(req, res);
     if (!pre) return;
     const { amount, remainder } = resolveCappedAmount(req.body || {}, pre);
+    const reference = cleanReference((req.body || {}).reference);
+    const customerId = await expenseCustomerId(getTargetUserId(req), pre.businessId, (req.body || {}).customerId);
+    // A category no account stands for becomes an account the next time the
+    // chart is read (utils/ledgerData.js ensureChart), and only the owner adds
+    // to the chart (routes/ledger.js). So for staff the chart is set up first:
+    // its first set-up turns every category in use into an account, and would
+    // take the staff member's text along. Before the business lock, because
+    // setting the chart up takes a lock of its own and nesting two would hold
+    // two connections (utils/db.js).
+    if (isStaff) await accountsFor(pre.businessId);
 
-    const result = await prisma.withBusinessLock(pre.businessId, () =>
-      prisma.$transaction(async (px) => {
+    const result = await prisma.withBusinessLock(pre.businessId, async () => {
+      // Checked under the lock an account merge or delete also takes
+      // (routes/ledger.js), so the account is still there when the expense
+      // is saved with it.
+      const account = await assertAccountUsable(pre.businessId, (req.body || {}).accountId, "expense", { isStaff });
+      // The account's own category when it stands for one, so older app
+      // versions file the expense in the same place.
+      let category = account && account.categorySlug ? account.categorySlug : category0;
+      // Staff: the category of an active account that stands for what they
+      // sent, else Other Expenses. Never a new account, and never a default
+      // the owner deleted or rested. Read under the lock for the same reason.
+      if (isStaff && !(account && account.categorySlug)) {
+        const known = await prisma.ledgerAccount.findFirst({
+          where: { businessId: pre.businessId, categorySlug: chart.canonicalSlug(category0), inactiveAt: null },
+          select: { categorySlug: true },
+        });
+        category = known ? known.categorySlug : "other";
+      }
+      return prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedExpenseId || tx.purpose)
+        if (tx.matchedExpenseId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already recorded as an expense.");
 
         const expense = await px.expense.create({
@@ -472,21 +564,27 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
             notes: description || tx.description || "Bank transfer",
             date: tx.date,
             matchedTransactionId: tx.id,
+            accountId: account ? account.id : null,
+            reference: reference || null,
+            customerId: customerId || null,
           },
+          include: EXPENSE_INCLUDE,
         });
         const updatedTx = await px.transaction.update({
           where: { id: tx.id },
           data: { matchedExpenseId: expense.id, matchedAmount: amount },
         });
         return { expense, transaction: updatedTx };
-      }),
-    );
+      });
+    });
 
     audit({
       req, action: "TX_MATCH_CREATE_EXPENSE", resourceType: "transaction", resourceId: pre.id,
-      metadata: { expenseId: result.expense.id, amount, remainder, category },
+      metadata: { expenseId: result.expense.id, amount, remainder, category: result.expense.category },
     }).catch(() => {});
-    res.status(201).json({ ...result, remainder });
+    // As every expense response: lines ([] here) and receipts without their
+    // storage keys (utils/expenseView.js).
+    res.status(201).json({ ...result, expense: publicExpense(result.expense), remainder });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to record expense from transfer");
   }
@@ -515,7 +613,7 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
         // old handler never looked at matchedCustomerId, so calling it twice
         // paid the debt down twice.
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
 
         const unpaidDebts = await px.debt.findMany({
@@ -600,6 +698,9 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
 router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res) => {
   const deleteSale = req.query.deleteSale === "true";
   const deleteExpense = req.query.deleteExpense === "true";
+  // The receipts of an expense this undo deletes. Kept out of `out`, which is
+  // sent to the client: their storage keys never leave the server.
+  let deletedReceipts = null;
   try {
     const tx0 = await prisma.transaction.findUnique({ where: { id: req.params.id } });
     if (!tx0) return res.status(404).json({ error: "Transaction not found" });
@@ -622,10 +723,27 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
         // — the user asked to separate them); deleteExpense removes it, the
         // undo for create-expense.
         if (tx.matchedExpenseId) {
-          const expense = await px.expense.findUnique({ where: { id: tx.matchedExpenseId } });
+          const expense = await px.expense.findUnique({
+            where: { id: tx.matchedExpenseId },
+            include: { items: { select: { accountId: true } } },
+          });
+          // An expense filed in the owner's stake (drawings), whole or on a
+          // line, only the owner could record. Unlinking it or deleting it is
+          // the owner's too, as changing a bank row filed there is.
+          if (expense && req.user.accountType === "staff" && (await expenseInOwnersStake(px, expense))) {
+            throw matchError(403, "OWNER_ONLY", OWNERS_STAKE_REFUSAL);
+          }
+          // Receipts are the owner's to add and remove (routes/expenses.js),
+          // and deleting the expense removes them for good: staff may undo an
+          // expense recorded from a transfer only while it has none.
+          if (expense && deleteExpense && req.user.accountType === "staff" &&
+              Array.isArray(expense.attachments) && expense.attachments.length) {
+            throw matchError(403, "OWNER_ONLY", "This expense has receipts. Only the business owner can delete it.");
+          }
           if (expense && deleteExpense) {
             await px.expense.delete({ where: { id: expense.id } });
             out.expenseDeleted = true;
+            deletedReceipts = expense.attachments;
           } else if (expense) {
             await px.expense.update({ where: { id: expense.id }, data: { matchedTransactionId: null } });
           }
@@ -736,6 +854,9 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
         saleDeleted: result.saleDeleted, expenseDeleted: result.expenseDeleted,
       },
     }).catch(() => {});
+    // A deleted expense's receipts leave Cloudinary once the undo has
+    // committed, as on DELETE /expenses/:id: best effort, never failing it.
+    if (result.expenseDeleted) destroyReceipts(deletedReceipts, `expense deleted by unmatching ${tx0.id}`);
     res.json({ matched: false, ...result });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to unmatch");
@@ -756,7 +877,7 @@ router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async
     const result = await prisma.withBusinessLock(pre.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose)
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         const payment = await px.debtPayment.findUnique({
           where: { id: debtPaymentId },
@@ -793,13 +914,22 @@ router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async
 // What an incoming transfer was when it was not a sale: cash already recorded
 // and now banked, money from the owner's other account, the owner's own money,
 // a loan, or a refund from a supplier. Books rule: none of these is income
-// (a supplier refund lowers expenses); { purpose: null } takes it back.
+// (a supplier refund lowers expenses); { purpose: null } takes it back. The
+// owner's money is the owner's to say: staff may not mark a credit so, nor
+// change one the owner filed in the owner's stake (403 OWNER_ONLY), as on
+// POST /:id/categorize.
 router.post("/:id/classify", requirePermission("canViewBalance"), async (req, res) => {
   try {
     const raw = (req.body || {}).purpose;
     const purpose = raw === null || raw === "" ? null : String(raw);
     if (purpose !== null && !CREDIT_OUTCOMES.includes(purpose)) {
       return res.status(400).json({ error: "Unknown choice.", code: "BAD_PURPOSE" });
+    }
+    const isStaff = req.user.accountType === "staff";
+    // The ledger books the owner's money on Owner's Equity, an account staff
+    // may not use (POST /:id/categorize refuses it to them too).
+    if (isStaff && OWNER_ONLY_PURPOSES.includes(purpose)) {
+      return res.status(403).json({ error: "Only the business owner can mark this as the owner's money.", code: "OWNER_ONLY" });
     }
     const tx0 = await prisma.transaction.findUnique({ where: { id: req.params.id } });
     if (!tx0) return res.status(404).json({ error: "Transaction not found" });
@@ -817,12 +947,73 @@ router.post("/:id/classify", requirePermission("canViewBalance"), async (req, re
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId) {
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched. Unmatch it first.");
         }
-        return px.transaction.update({ where: { id: tx.id }, data: { purpose } });
+        // Staff never change what the owner filed in the owner's stake, and
+        // clearing it is a change too.
+        if (isStaff && (await inOwnersStake(px, tx))) throw matchError(403, "OWNER_ONLY", OWNERS_STAKE_REFUSAL);
+        return px.transaction.update({ where: { id: tx.id }, data: { purpose, accountId: null } });
       }),
     );
     audit({
       req, action: "TX_CLASSIFY", resourceType: "transaction", resourceId: tx0.id,
       metadata: { from: tx0.purpose || null, to: purpose },
+    }).catch(() => {});
+    res.json({ transaction: updated });
+  } catch (err) {
+    respondMatchFailure(res, err, "Failed to update the transfer");
+  }
+});
+
+// POST /transactions/:id/categorize  { accountId | null }
+// Chart of accounts (2026-10-11): explain a bank row with any account, as in
+// Zoho. What it then counts as follows the account (utils/books.js): an
+// income account is income, an expense account spending (or, on money in, a
+// refund that lowers it), a balance-sheet account nothing (the owner's money,
+// a loan, equipment, drawings, a move between accounts). The purpose is kept
+// in step so an older app copy, which reads only the purpose, counts the row
+// the same way. null clears it. Staff may not use an equity account
+// (utils/ledgerData.js assertAccountUsable), nor move or clear a row the owner
+// filed in the owner's stake (403 OWNER_ONLY).
+const PURPOSE_FOR_ACCOUNT = {
+  [chart.SYS.CASH]: "cash_deposit",
+  [chart.SYS.OTHER_BANK]: "own_transfer",
+  [chart.SYS.OWNER_EQUITY]: "owner_money",
+  [chart.SYS.LOANS]: "loan",
+};
+router.post("/:id/categorize", requirePermission("canViewBalance"), async (req, res) => {
+  try {
+    const tx0 = await prisma.transaction.findUnique({ where: { id: req.params.id } });
+    if (!tx0) return res.status(404).json({ error: "Transaction not found" });
+    if (!(await ownsBusiness(req, tx0.businessId))) return res.status(403).json({ error: "Forbidden" });
+    const isIn = tx0.type === "income";
+    const isStaff = req.user.accountType === "staff";
+    const raw = (req.body || {}).accountId;
+    const account = await assertAccountUsable(tx0.businessId, raw, isIn ? "credit" : "debit", { isStaff });
+    const cls = account ? chart.classOf(account.type) : null;
+    let purpose = null;
+    if (cls === "expense" && isIn) purpose = "supplier_refund";
+    else if (cls && !chart.isProfitClass(cls)) purpose = (isIn && PURPOSE_FOR_ACCOUNT[account.systemKey]) || "account";
+    if (cls === "income" && !isIn) {
+      return res.status(400).json({ error: "Money that went out can't be income.", code: "ACCOUNT_NOT_ALLOWED" });
+    }
+
+    const updated = await prisma.withBusinessLock(tx0.businessId, () =>
+      prisma.$transaction(async (px) => {
+        const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
+        if (tx.purpose && !CREDIT_OUTCOMES.includes(tx.purpose) && tx.purpose !== "account") {
+          throw matchError(409, "PURPOSE_LOCKED", "This transfer can't be changed here.");
+        }
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.matchedExpenseId) {
+          throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched. Unmatch it first.");
+        }
+        // Whatever staff send, null included, a row the owner filed in the
+        // owner's stake stays as the owner left it.
+        if (isStaff && (await inOwnersStake(px, tx))) throw matchError(403, "OWNER_ONLY", OWNERS_STAKE_REFUSAL);
+        return px.transaction.update({ where: { id: tx.id }, data: { accountId: account ? account.id : null, purpose } });
+      }),
+    );
+    audit({
+      req, action: "TX_CATEGORIZE", resourceType: "transaction", resourceId: tx0.id,
+      metadata: { from: tx0.accountId || null, to: account ? account.id : null, purpose },
     }).catch(() => {});
     res.json({ transaction: updated });
   } catch (err) {

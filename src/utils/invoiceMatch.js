@@ -75,13 +75,15 @@ async function tryMatchInvoice(biz, amount, reference, { currency, transactionId
         tx = await px.transaction.findUnique({
           where: { id: transactionId },
           select: {
-            id: true, businessId: true, type: true, date: true, purpose: true,
+            id: true, businessId: true, type: true, date: true, purpose: true, accountId: true,
             matchedSaleId: true, matchedCustomerId: true, matchedInvoiceId: true,
           },
         });
-        // Already explained some other way (the merchant was quicker): leave it.
+        // Already explained some other way (the merchant was quicker): marked,
+        // explained with an account (an income account keeps no purpose), or
+        // matched. Leave it.
         if (
-          !tx || tx.businessId !== biz.id || tx.type !== "income" || tx.purpose ||
+          !tx || tx.businessId !== biz.id || tx.type !== "income" || tx.purpose || tx.accountId ||
           tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId
         ) {
           return false;

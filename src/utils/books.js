@@ -12,7 +12,8 @@
 //   - an invoice payment: cash, card, cheque, another bank, or a NUBAN credit
 //     linked to it (the credit then stops counting, its remainder still does);
 //   - a debt repayment (credit sales count when the customer pays);
-//   - a NUBAN credit linked to nothing (counted as sales until explained);
+//   - a NUBAN credit linked to nothing (counted as sales until explained as
+//     something else; one explained as income has a line of its own);
 //   minus refunds to customers (contra-sales, never an expense).
 // "When sold" counts documents instead: recorded sales, issued invoices, minus
 // credit notes, plus credit given on the customer screen; bank credits linked
@@ -167,6 +168,31 @@ function addTo(line, amount, vat) {
   line.count += 1;
 }
 
+// The lines each view adds up; the others are information beside a total.
+const COUNTED_LINES = {
+  paid: {
+    sales: ["recorded", "invoicePayments", "debtPayments", "bank", "bankIncome", "refunds"],
+    expenses: ["recorded", "bank", "supplierRefunds", "bankCharges"],
+  },
+  sold: {
+    sales: ["recorded", "invoiced", "creditNotes", "creditGiven", "bankIncome"],
+    expenses: ["recorded", "bank", "supplierRefunds", "badDebts", "bankCharges"],
+  },
+};
+
+// The class ("asset", "liability", "equity", "income", "expense") and type of
+// a record's own account, from input.accounts ({ [id]: { cls, type } }, built
+// by the loaders from the chart). null when the record names no account, or
+// one this input does not know: such a record counts as it always has.
+function accountOf(accounts, id) {
+  if (!id || !accounts) return null;
+  return accounts[id] || null;
+}
+
+function isBalanceSheetClass(cls) {
+  return cls === "asset" || cls === "liability" || cls === "equity";
+}
+
 // input: {
 //   sales:    [{ amount, date, isCredit, id }]          recorded sales
 //   expenses: [{ amount, date }]                         recorded expenses
@@ -175,10 +201,29 @@ function addTo(line, amount, vat) {
 //                writtenOffAt, writtenOffAmount, payments: [{ amount, method,
 //                date, transactionId }] }]
 //   debts:    [{ amount, paidAmount, paid, date, saleId, payments: [{ amount, date }] }]
+//   accounts: { [accountId]: { cls, type } }   the chart, for records that name an account
 // }
+// Since the chart of accounts (2026-10-11), records may also carry:
+//   accountId        the account the merchant picked (expenses, bank rows)
+//   fee              a bank debit's transfer fee: a bank charge, in both views
+//   foreignCurrency  set by the loaders on rows not in the business's currency:
+//                    left out of the naira books entirely
+// Since Zoho-style expenses (2026-10-12), an expense may carry its lines:
+//   expenses[].items: [{ id, accountId, category, amount }]
+//                    an itemized expense (its amount is their sum): it counts
+//                    line by line on the expense's date, each line by its own
+//                    account; an empty list is a whole expense
 // opts: { from, to ("YYYY-MM-DD", inclusive, either may be empty),
 //         basis: "paid" | "sold", vat: { enabled, rate, inclusive } }
-function computeBooks(input, opts) {
+//
+// One event per amount a line adds, in the order the lines add them:
+// { side: "sales" | "expenses", line, gross, vat, day, src }. computeBooks
+// folds the events into its lines, and the ledger (server/src/utils/ledger.js)
+// turns the same events into its profit-and-loss entries, so a total and the
+// accounts behind it can never disagree. `src` names the record carrying the
+// amount ({ kind, rec, pay, doc, debt, item }; item: the line of an itemized
+// expense) so the ledger can find its accounts.
+function bookEvents(input, opts) {
   const o = opts || {};
   const basis = o.basis === "sold" ? "sold" : "paid";
   const vat = vatSettings(o.vat);
@@ -189,63 +234,87 @@ function computeBooks(input, opts) {
   const bankRows = (input && input.bankRows) || [];
   const invoices = (input && input.invoices) || [];
   const debts = (input && input.debts) || [];
+  // allDates: every record whatever its date (bookRows), else the period.
+  const inPeriod = (d) => (o.allDates ? true : inRange(d, from, to));
 
   // A credit sale counts when it is paid only when a debt tracks its payment.
   const salesWithDebt = new Set(debts.filter((d) => d.saleId).map((d) => d.saleId));
 
-  const L = {
-    recorded: emptyLines(), // recorded sales (paid view: not those awaiting a debt)
-    invoicePayments: emptyLines(),
-    debtPayments: emptyLines(),
-    bank: emptyLines(), // NUBAN credits linked to nothing (paid view)
-    refunds: emptyLines(), // negative
-    invoiced: emptyLines(), // sold view
-    creditNotes: emptyLines(), // sold view, negative
-    creditGiven: emptyLines(), // sold view: debts with no sale row
-    unexplained: emptyLines(), // sold view: credits linked to nothing
-    awaitingPayment: emptyLines(), // paid view: credit sales not yet paid (info)
-    // Paid view, info: credit sales with no debt tracking them (recorded
-    // before the rule, or with no customer). They still count on the sale
-    // date, inside "recorded"; this line says how much of it that is.
-    creditUnlinked: emptyLines(),
-  };
-  const E = {
-    recorded: emptyLines(),
-    bank: emptyLines(),
-    supplierRefunds: emptyLines(), // negative
-    badDebts: emptyLines(), // sold view
+  const accounts = input && input.accounts;
+
+  const events = [];
+  const add = (side, line, gross, vatPart, day, src) => {
+    events.push({ side, line, gross: num(gross), vat: num(vatPart), day: dayKey(day), src });
   };
 
   for (const s of sales) {
-    if (!inRange(s.date, from, to)) continue;
+    if (s.foreignCurrency || !inPeriod(s.date)) continue;
     const a = num(s.amount);
+    const src = { kind: "sale", rec: s };
     if (basis === "paid" && s.isCredit && salesWithDebt.has(s.id)) {
-      addTo(L.awaitingPayment, a, 0);
+      add("sales", "awaitingPayment", a, 0, s.date, src);
       continue;
     }
-    if (basis === "paid" && s.isCredit) addTo(L.creditUnlinked, a, 0);
-    addTo(L.recorded, a, vatInside(a, vat));
+    if (basis === "paid" && s.isCredit) add("sales", "creditUnlinked", a, 0, s.date, src);
+    add("sales", "recorded", a, vatInside(a, vat), s.date, src);
   }
 
   for (const e of expenses) {
-    if (!inRange(e.date, from, to)) continue;
-    addTo(E.recorded, num(e.amount), 0);
+    if (e.foreignCurrency || !inPeriod(e.date)) continue;
+    // An itemized expense counts line by line, every line on the expense's
+    // date, by the same rule as a whole one: a line on something the business
+    // now owns or owes counts nowhere, the rest is spending.
+    if (Array.isArray(e.items) && e.items.length) {
+      for (const line of e.items) {
+        const lineAcc = accountOf(accounts, line.accountId);
+        if (lineAcc && lineAcc.cls !== "expense") continue;
+        add("expenses", "recorded", num(line.amount), 0, e.date, { kind: "expense", rec: e, item: line });
+      }
+      continue;
+    }
+    // Spent on something the business now owns or owes (equipment, rent paid
+    // ahead, a loan repaid, the owner's drawings): it moves to that account on
+    // the balance sheet and is not an expense, as in Zoho.
+    const acc = accountOf(accounts, e.accountId);
+    if (acc && acc.cls !== "expense") continue;
+    add("expenses", "recorded", num(e.amount), 0, e.date, { kind: "expense", rec: e });
   }
 
   for (const tx of bankRows) {
-    if (!inRange(tx.date, from, to)) continue;
+    if (tx.foreignCurrency || !inPeriod(tx.date)) continue;
     const isIn = lower(tx.type) === "income";
-    if (isIn && tx.purpose === PURPOSES.SUPPLIER_REFUND) {
-      addTo(E.supplierRefunds, -num(tx.amount), 0);
+    const src = { kind: "bank", rec: tx };
+    // A transfer's fee left the account too: a bank charge, whatever the
+    // transfer itself was (a sale's refund, a supplier, the owner's own).
+    if (!isIn && num(tx.fee) > 0) {
+      add("expenses", "bankCharges", num(tx.fee), 0, tx.date, { kind: "fee", rec: tx });
+    }
+    if (!isIn && tx.purpose === PURPOSES.SAVINGS_FEE) {
+      add("expenses", "bankCharges", num(tx.amount), 0, tx.date, src);
       continue;
     }
+    // The account the merchant explained the row with decides what it is.
+    const acc = accountOf(accounts, tx.accountId);
+    if (isIn && (tx.purpose === PURPOSES.SUPPLIER_REFUND || (acc && acc.cls === "expense"))) {
+      add("expenses", "supplierRefunds", -num(tx.amount), 0, tx.date, src);
+      continue;
+    }
+    // Explained as something on the balance sheet (the owner's money, a loan,
+    // equipment, drawings): not trade, counted nowhere.
+    if (acc && acc.cls !== (isIn ? "income" : "expense")) continue;
     const a = bankCountedAmount(tx);
     if (!(a > 0)) continue;
     if (isIn) {
-      if (basis === "paid") addTo(L.bank, a, vatInsideReceived(a, vat));
-      else addTo(L.unexplained, a, 0);
+      // Interest and other non-trade income carry no VAT.
+      const v = acc && acc.type === "other_income" ? 0 : vatInsideReceived(a, vat);
+      // A credit the merchant called income has its own line in both views.
+      // One nothing explains counts as sales when paid ("bank") and waits
+      // outside sales when sold ("unexplained").
+      if (acc) add("sales", "bankIncome", a, v, tx.date, src);
+      else if (basis === "paid") add("sales", "bank", a, v, tx.date, src);
+      else add("sales", "unexplained", a, 0, tx.date, src);
     } else {
-      addTo(E.bank, a, 0);
+      add("expenses", "bank", a, 0, tx.date, src);
     }
   }
 
@@ -258,51 +327,82 @@ function computeBooks(input, opts) {
       // document with payments cannot be voided; this covers older voids.)
       if (status === "void") continue;
       for (const p of inv.payments || []) {
-        if (!inRange(p.date, from, to)) continue;
+        if (!inPeriod(p.date)) continue;
         const signed = paymentSalesAmount(p);
         if (!signed) continue;
         const v = vatShareOfDocument(Math.abs(signed), inv) * Math.sign(signed);
-        if (signed < 0) addTo(L.refunds, signed, v);
-        else addTo(L.invoicePayments, signed, v);
+        const src = { kind: "invoicePayment", rec: p, doc: inv };
+        if (signed < 0) add("sales", "refunds", signed, v, p.date, src);
+        else add("sales", "invoicePayments", signed, v, p.date, src);
       }
       continue;
     }
     if (ISSUED_EXCLUDED.includes(status)) continue;
-    if (inRange(inv.issueDate, from, to)) {
-      if (type === "credit_note") addTo(L.creditNotes, -num(inv.total), -num(inv.taxAmount));
-      else addTo(L.invoiced, num(inv.total), num(inv.taxAmount));
+    if (inPeriod(inv.issueDate)) {
+      const src = { kind: "document", rec: inv, doc: inv };
+      if (type === "credit_note") add("sales", "creditNotes", -num(inv.total), -num(inv.taxAmount), inv.issueDate, src);
+      else add("sales", "invoiced", num(inv.total), num(inv.taxAmount), inv.issueDate, src);
     }
-    if (type === "invoice" && inv.writtenOffAt && inRange(inv.writtenOffAt, from, to)) {
+    if (type === "invoice" && inv.writtenOffAt && inPeriod(inv.writtenOffAt)) {
       // The whole unpaid balance is lost, VAT included: Nigeria gives no VAT
       // relief on bad debts, so the VAT is still owed although never received.
       const w = num(inv.writtenOffAmount);
-      if (w > 0) addTo(E.badDebts, w, 0);
+      if (w > 0) add("expenses", "badDebts", w, 0, inv.writtenOffAt, { kind: "writeOff", rec: inv, doc: inv });
     }
   }
 
   for (const d of debts) {
     if (basis === "paid") {
       for (const p of d.payments || []) {
-        if (!inRange(p.date, from, to)) continue;
+        if (!inPeriod(p.date)) continue;
         // A repayment settles a debt recorded like a sale (net when VAT is
         // added on top), so its VAT follows the recording mode, as the sale's
         // would have if it had been paid on the spot.
         const a = num(p.amount);
-        addTo(L.debtPayments, a, vatInside(a, vat));
+        add("sales", "debtPayments", a, vatInside(a, vat), p.date, { kind: "debtPayment", rec: p, debt: d });
       }
-    } else if (!d.saleId && inRange(d.date, from, to)) {
+    } else if (!d.saleId && inPeriod(d.date)) {
       const a = num(d.amount);
-      addTo(L.creditGiven, a, vatInside(a, vat));
+      add("sales", "creditGiven", a, vatInside(a, vat), d.date, { kind: "debt", rec: d, debt: d });
     }
   }
 
-  const salesLines =
-    basis === "paid"
-      ? ["recorded", "invoicePayments", "debtPayments", "bank", "refunds"]
-      : ["recorded", "invoiced", "creditNotes", "creditGiven"];
+  return { basis, vat, from, to, events };
+}
+
+function computeBooks(input, opts) {
+  const { basis, vat, from, to, events } = bookEvents(input, opts);
+
+  const L = {
+    recorded: emptyLines(), // recorded sales (paid view: not those awaiting a debt)
+    invoicePayments: emptyLines(),
+    debtPayments: emptyLines(),
+    bank: emptyLines(), // paid view: NUBAN credits (or what a match left) nothing explains
+    refunds: emptyLines(), // negative
+    invoiced: emptyLines(), // sold view
+    creditNotes: emptyLines(), // sold view, negative
+    creditGiven: emptyLines(), // sold view: debts with no sale row
+    unexplained: emptyLines(), // sold view: credits linked to nothing
+    bankIncome: emptyLines(), // both views: credits the merchant called income
+    awaitingPayment: emptyLines(), // paid view: credit sales not yet paid (info)
+    // Paid view, info: credit sales with no debt tracking them (recorded
+    // before the rule, or with no customer). They still count on the sale
+    // date, inside "recorded"; this line says how much of it that is.
+    creditUnlinked: emptyLines(),
+  };
+  const E = {
+    recorded: emptyLines(),
+    bank: emptyLines(),
+    supplierRefunds: emptyLines(), // negative
+    badDebts: emptyLines(), // sold view
+    bankCharges: emptyLines(), // transfer fees (and a savings break fee)
+  };
+
+  for (const ev of events) addTo((ev.side === "sales" ? L : E)[ev.line], ev.gross, ev.vat);
+
   let gross = 0;
   let vatTotal = 0;
-  for (const k of salesLines) {
+  for (const k of COUNTED_LINES[basis].sales) {
     gross += L[k].gross;
     vatTotal += L[k].vat;
   }
@@ -310,9 +410,8 @@ function computeBooks(input, opts) {
   vatTotal = round2(vatTotal);
   const salesTotal = round2(vat.enabled ? gross - vatTotal : gross);
 
-  const expenseLines = basis === "paid" ? ["recorded", "bank", "supplierRefunds"] : ["recorded", "bank", "supplierRefunds", "badDebts"];
   let expensesTotal = 0;
-  for (const k of expenseLines) expensesTotal += E[k].gross;
+  for (const k of COUNTED_LINES[basis].expenses) expensesTotal += E[k].gross;
   expensesTotal = round2(expensesTotal);
 
   return {
@@ -377,7 +476,8 @@ function vatDeadline(month) {
 }
 
 // Output VAT for one month, dated by supply: invoices on their issue date,
-// recorded sales on their date, credit notes reduce their own month.
+// recorded sales on their date, credit notes reduce their own month. Sales and
+// expenses in another currency are left out, as the books rule leaves them out.
 function vatReturn(input, month, vatOpts) {
   const vat = vatSettings(vatOpts);
   const from = `${month}-01`;
@@ -433,7 +533,7 @@ function vatReturn(input, month, vatOpts) {
   let salesVat = 0;
   let salesCount = 0;
   for (const s of sales) {
-    if (!inRange(s.date, from, to)) continue;
+    if (s.foreignCurrency || !inRange(s.date, from, to)) continue;
     salesVat += vatOf(s.amount);
     salesCount += 1;
   }
@@ -443,10 +543,25 @@ function vatReturn(input, month, vatOpts) {
     salesVat += vatOf(d.amount);
     salesCount += 1;
   }
+  // Input VAT, an estimate: the VAT inside what the books rule counts as
+  // spending, plus equipment bought (the Nigeria Tax Act 2025, s.156(5), lets a
+  // business claim the VAT on fixed assets used for taxable supplies). Never a
+  // VAT payment, a loan repaid, drawings or an advance: none of them is a
+  // purchase. An itemized expense counts line by line, each line by its own
+  // account, as the rule counts it; a record with no account, or one this input
+  // does not know, counts whole.
+  const accounts = input && input.accounts;
+  const claimable = (acc) => !acc || acc.cls === "expense" || acc.type === "fixed_asset";
   let inputVat = 0;
   for (const e of expenses) {
-    if (!inRange(e.date, from, to)) continue;
-    inputVat += vat.enabled && vat.rate > 0 ? (num(e.amount) * vat.rate) / (100 + vat.rate) : 0;
+    if (e.foreignCurrency || !inRange(e.date, from, to)) continue;
+    let bought = 0;
+    if (Array.isArray(e.items) && e.items.length) {
+      for (const line of e.items) if (claimable(accountOf(accounts, line.accountId))) bought += num(line.amount);
+    } else if (claimable(accountOf(accounts, e.accountId))) {
+      bought = num(e.amount);
+    }
+    inputVat += vat.enabled && vat.rate > 0 ? (bought * vat.rate) / (100 + vat.rate) : 0;
   }
   const output = round2(invoicesVat + salesVat - creditVat);
   return {
@@ -468,84 +583,76 @@ function vatReturn(input, month, vatOpts) {
 // computeBooks' gross sales and the expense rows its expenses, so charts and
 // breakdowns (by day, channel, customer, category) agree with the totals.
 // Rows keep the source record's fields (description, channel, customerId,
-// recordedByName...) where it has them.
+// recordedByName...) where it has them. Built from the same events as the
+// totals, every date included. A counted line of an itemized expense is a row
+// of its own (id "<expense>:<line>", expenseId, itemId), with the line's
+// account and category.
 function bookRows(input, basis) {
   const view = basis === "sold" ? "sold" : "paid";
+  const counted = COUNTED_LINES[view];
   const rows = [];
-  const day = (d) => dayKey(d);
-  const debts = (input && input.debts) || [];
-  const salesWithDebt = new Set(debts.filter((d) => d.saleId).map((d) => d.saleId));
-
-  for (const s of (input && input.sales) || []) {
-    if (view === "paid" && s.isCredit && salesWithDebt.has(s.id)) continue;
-    rows.push(Object.assign({}, s, { type: "income", amount: num(s.amount), date: day(s.date) }));
-  }
-  for (const e of (input && input.expenses) || []) {
-    rows.push(Object.assign({}, e, { type: "expense", amount: num(e.amount), date: day(e.date) }));
-  }
-  for (const tx of (input && input.bankRows) || []) {
-    const isIn = lower(tx.type) === "income";
-    if (isIn && tx.purpose === PURPOSES.SUPPLIER_REFUND) {
-      rows.push(Object.assign({}, tx, { type: "expense", amount: -num(tx.amount), category: "supplier_refund", date: day(tx.date) }));
-      continue;
-    }
-    if (view === "sold" && isIn) continue; // "not yet explained", outside sales
-    const a = bankCountedAmount(tx);
-    if (a > 0) rows.push(Object.assign({}, tx, { type: isIn ? "income" : "expense", amount: a, date: day(tx.date) }));
-  }
-  for (const inv of (input && input.invoices) || []) {
-    const type = lower(inv.type) || "invoice";
-    if (type === "quote") continue;
-    const status = lower(inv.status);
-    if (view === "paid") {
-      if (status === "void") continue;
-      for (const p of inv.payments || []) {
-        const signed = paymentSalesAmount(p);
-        if (!signed) continue;
-        rows.push({
-          id: `ip_${p.id}`, type: "income", amount: signed, date: day(p.date),
-          description: inv.invoiceNumber, customerId: inv.customerId || null,
-          channel: "invoice", source: "invoice_payment",
-        });
-      }
-      continue;
-    }
-    if (ISSUED_EXCLUDED.includes(status)) continue;
-    rows.push({
-      id: `doc_${inv.id}`, type: "income",
-      amount: type === "credit_note" ? -num(inv.total) : num(inv.total),
-      date: day(inv.issueDate), description: inv.invoiceNumber,
-      customerId: inv.customerId || null, channel: "invoice", source: "invoice",
-    });
-    if (type === "invoice" && inv.writtenOffAt && num(inv.writtenOffAmount) > 0) {
+  for (const ev of bookEvents(input, { basis: view, allDates: true }).events) {
+    if (!(ev.side === "sales" ? counted.sales : counted.expenses).includes(ev.line)) continue;
+    const { kind, rec, doc, debt, item } = ev.src;
+    const type = ev.side === "sales" ? "income" : "expense";
+    if (kind === "expense" && item) {
+      rows.push(Object.assign({}, rec, {
+        type, amount: ev.gross, date: ev.day, id: `${rec.id}:${item.id}`, expenseId: rec.id, itemId: item.id,
+        accountId: item.accountId, category: item.category || rec.category,
+      }));
+    } else if (kind === "sale" || kind === "expense") {
+      rows.push(Object.assign({}, rec, { type, amount: ev.gross, date: ev.day }));
+    } else if (kind === "bank") {
+      const label =
+        ev.line === "supplierRefunds" ? "supplier_refund" : ev.line === "bankCharges" ? "bank_charges" : null;
+      rows.push(
+        Object.assign({}, rec, label
+          ? { type, amount: ev.gross, category: label, date: ev.day }
+          : { type, amount: ev.gross, date: ev.day }),
+      );
+    } else if (kind === "fee") {
       rows.push({
-        id: `bad_${inv.id}`, type: "expense", amount: num(inv.writtenOffAmount),
-        date: day(inv.writtenOffAt), description: inv.invoiceNumber, category: "bad_debt", source: "write_off",
+        id: `fee_${rec.id}`, type, amount: ev.gross, date: ev.day,
+        description: rec.description || "", category: "bank_charges", source: "fee",
       });
-    }
-  }
-  for (const d of debts) {
-    if (view === "paid") {
-      for (const p of d.payments || []) {
-        rows.push({
-          id: `dp_${p.id}`, type: "income", amount: num(p.amount), date: day(p.date),
-          customerId: d.customerId || null, channel: "credit_repaid", source: "debt_payment",
-        });
-      }
-    } else if (!d.saleId) {
+    } else if (kind === "invoicePayment") {
       rows.push({
-        id: `debt_${d.id}`, type: "income", amount: num(d.amount), date: day(d.date),
-        description: d.note, customerId: d.customerId || null, source: "debt",
+        id: `ip_${rec.id}`, type, amount: ev.gross, date: ev.day,
+        description: doc.invoiceNumber, customerId: doc.customerId || null,
+        channel: "invoice", source: "invoice_payment",
+      });
+    } else if (kind === "document") {
+      rows.push({
+        id: `doc_${rec.id}`, type, amount: ev.gross,
+        date: ev.day, description: rec.invoiceNumber,
+        customerId: rec.customerId || null, channel: "invoice", source: "invoice",
+      });
+    } else if (kind === "writeOff") {
+      rows.push({
+        id: `bad_${rec.id}`, type, amount: ev.gross,
+        date: ev.day, description: rec.invoiceNumber, category: "bad_debt", source: "write_off",
+      });
+    } else if (kind === "debtPayment") {
+      rows.push({
+        id: `dp_${rec.id}`, type, amount: ev.gross, date: ev.day,
+        customerId: debt.customerId || null, channel: "credit_repaid", source: "debt_payment",
+      });
+    } else if (kind === "debt") {
+      rows.push({
+        id: `debt_${rec.id}`, type, amount: ev.gross, date: ev.day,
+        description: rec.note, customerId: rec.customerId || null, source: "debt",
       });
     }
   }
   return rows;
 }
 
-// A credit linked to nothing and not marked as something else: what the
-// "Unmatched" filter and the review queue show.
+// A credit linked to nothing and not explained some other way, by a purpose
+// or by an account: what the "Unmatched" filter and the review queue show. A
+// credit explained with an income account keeps no purpose (the categorize
+// route), so its account alone says what it was.
 function isUnexplainedCredit(tx) {
-  return lower(tx.type) === "income" && !tx.purpose && !isCreditMatched(tx);
+  return lower(tx.type) === "income" && !tx.purpose && !tx.accountId && !isCreditMatched(tx);
 }
 
 // ── exports (everything above this line is identical in src/utils/books.js) ──
@@ -573,6 +680,8 @@ module.exports = {
   vatInside,
   vatInsideReceived,
   vatShareOfDocument,
+  COUNTED_LINES,
+  bookEvents,
   computeBooks,
   bookRows,
   receivables,

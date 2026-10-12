@@ -9,6 +9,9 @@
 //   * unmatch leaving the debt payments applied
 //   * a matched credit double-counting in income
 //   * staff without canViewBalance reaching the bank ledger through this door
+//   * a transfer explained with an account being matched as well (counted twice)
+//   * staff marking a credit as the owner's own money, or moving, clearing or
+//     unlinking what the owner filed there (the owner's stake is the owner's)
 //
 //   TEST_DATABASE_URL=postgresql://... node scripts/match-e2e-test.js
 
@@ -34,6 +37,7 @@ const bcrypt = require("@node-rs/bcrypt");
 const prisma = require("../src/utils/db");
 const { signToken } = require("../src/utils/jwt");
 const { sumIncome, sumExpenses } = require("../src/utils/insightsEngine");
+const { ensureChart } = require("../src/utils/ledgerData");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -496,6 +500,295 @@ async function wipe() {
     const tx = await prisma.transaction.findUnique({ where: { id: d3.id } });
     assert.strictEqual(tx.matchedExpenseId, null);
     await prisma.expense.delete({ where: { id: exp.id } }); // tidy for later sums
+  });
+
+  // ══ 6d. EXPLAINED WITH AN ACCOUNT ══════════════════════════════════════
+  // Chart of accounts (2026-10-12): a transfer the merchant explained with an
+  // account is explained. Money in on an income account (and money out on an
+  // expense account) keeps no purpose, so the account itself must refuse a
+  // match, as a purpose does: matching it too would explain the naira twice.
+  section("6d. explained with an account");
+  await ensureChart(biz.id);
+  const accountBySeed = (seed) => prisma.ledgerAccount.findFirst({ where: { businessId: biz.id, seed } });
+  const incomeAcc = await accountBySeed("general_income");
+  const rentAcc = await accountBySeed("rent");
+  const categorize = (id, accountId) => POST(`/transactions/${id}/categorize`, tOwner, { accountId });
+  const explainedCredit = async (amount) => {
+    const c = await credit(amount);
+    const r = await categorize(c.id, incomeAcc.id);
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.strictEqual(r.body.transaction.accountId, incomeAcc.id);
+    assert.strictEqual(r.body.transaction.purpose, null, "an income account keeps no purpose");
+    return c;
+  };
+  const newSale = (amount) =>
+    prisma.sales.create({ data: { userId: owner.id, businessId: biz.id, amount, paymentMethod: "transfer", date: new Date() } });
+  // The repayment recorded by hand in section 6, which a credit could carry.
+  const handRepayment = () =>
+    prisma.debtPayment.findFirst({ where: { transactionId: null, debt: { customerId: customer.id } } });
+
+  await test("a credit on an income account can't be matched, made a sale, or applied to a debt", async () => {
+    const c = await explainedCredit(1200);
+    const s = await newSale(1200);
+    const salesBefore = await prisma.sales.count({ where: { businessId: biz.id } });
+    const owedBefore = (await prisma.customer.findUnique({ where: { id: customer.id } })).totalOwed;
+    assert.ok(owedBefore > 0, "the customer must owe something, or match-debt would refuse for that");
+    for (const [p, b] of [["match", { saleId: s.id }], ["create-sale", {}], ["match-debt", { customerId: customer.id }]]) {
+      const r = await POST(`/transactions/${c.id}/${p}`, tOwner, b);
+      assert.strictEqual(r.status, 409, `${p}: ${JSON.stringify(r.body)}`);
+      assert.strictEqual(r.body.code, "MARKED_NOT_INCOME", p);
+      // An older app shows this text as it is: it names what explains the row.
+      assert.ok(/explained with an account/.test(r.body.error), `${p}: ${r.body.error}`);
+    }
+    const tx = await prisma.transaction.findUnique({ where: { id: c.id } });
+    assert.strictEqual(tx.accountId, incomeAcc.id, "the account stays");
+    assert.ok(!tx.matchedSaleId && !tx.matchedCustomerId && tx.matchedAmount === null, "nothing linked");
+    assert.strictEqual((await prisma.sales.findUnique({ where: { id: s.id } })).matchedTransactionId, null);
+    assert.strictEqual(await prisma.sales.count({ where: { businessId: biz.id } }), salesBefore, "no sale made");
+    assert.strictEqual((await prisma.customer.findUnique({ where: { id: customer.id } })).totalOwed, owedBefore, "the debt did not move");
+    await prisma.sales.delete({ where: { id: s.id } });
+  });
+  await test("…nor linked to a repayment recorded by hand", async () => {
+    const c = await explainedCredit(500);
+    const dp = await handRepayment();
+    assert.ok(dp && Number(dp.amount) <= 500, "need a hand-recorded repayment the credit could carry");
+    const r = await POST(`/transactions/${c.id}/link-debt-payment`, tOwner, { debtPaymentId: dp.id });
+    assert.strictEqual(r.status, 409, JSON.stringify(r.body));
+    assert.strictEqual(r.body.code, "MARKED_NOT_INCOME");
+    assert.strictEqual((await prisma.debtPayment.findUnique({ where: { id: dp.id } })).transactionId, null);
+    assert.strictEqual((await prisma.transaction.findUnique({ where: { id: c.id } })).matchedCustomerId, null);
+  });
+  await test("taking the account off makes the credit matchable again", async () => {
+    const c = await explainedCredit(1300);
+    const s = await newSale(1300);
+    assert.strictEqual((await POST(`/transactions/${c.id}/match`, tOwner, { saleId: s.id })).status, 409);
+    const u = await categorize(c.id, null);
+    assert.strictEqual(u.status, 200, JSON.stringify(u.body));
+    assert.strictEqual(u.body.transaction.accountId, null);
+    const r = await POST(`/transactions/${c.id}/match`, tOwner, { saleId: s.id });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    await DEL(`/transactions/${c.id}/match`, tOwner);
+    await prisma.sales.delete({ where: { id: s.id } });
+  });
+  await test("a debit on an expense account can't be recorded as an expense as well", async () => {
+    const d = await debit(2200);
+    const r0 = await categorize(d.id, rentAcc.id);
+    assert.strictEqual(r0.status, 200, JSON.stringify(r0.body));
+    assert.strictEqual(r0.body.transaction.purpose, null, "an expense account keeps no purpose");
+    const before = await prisma.expense.count({ where: { businessId: biz.id } });
+    const r = await POST(`/transactions/${d.id}/create-expense`, tOwner, { category: "rent" });
+    assert.strictEqual(r.status, 409, JSON.stringify(r.body));
+    assert.strictEqual(r.body.code, "MARKED_NOT_EXPENSE");
+    assert.ok(/explained with an account/.test(r.body.error), r.body.error);
+    assert.strictEqual(await prisma.expense.count({ where: { businessId: biz.id } }), before, "no expense made");
+    const tx = await prisma.transaction.findUnique({ where: { id: d.id } });
+    assert.strictEqual(tx.matchedExpenseId, null);
+    assert.strictEqual(tx.accountId, rentAcc.id, "the account stays");
+  });
+  // Two phones at once, one explaining a transfer with an account and the
+  // other linking it. Both pass the checks made before the business lock, so
+  // only the check under the lock can refuse whichever comes second. To make
+  // that order certain, the test holds the lock (taken as utils/db.js takes
+  // it) while the two requests queue for it, then lets go: Postgres hands the
+  // lock on in queue order.
+  const lockWaiters = async () => {
+    const rows = await prisma.$queryRawUnsafe(
+      `SELECT count(*)::int AS n FROM pg_locks
+        WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1
+          AND classid::bigint = ((hashtextextended($1, 0) >> 32) & 4294967295)
+          AND objid::bigint = (hashtextextended($1, 0) & 4294967295)`,
+      biz.id,
+    );
+    return rows[0].n;
+  };
+  const untilWaiting = async (n) => {
+    for (let i = 0; i < 600; i++) {
+      if ((await lockWaiters()) >= n) return;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(`expected ${n} requests waiting for the business lock`);
+  };
+  const inQueueOrder = async (first, second) => {
+    let a;
+    let b;
+    await prisma.withBusinessLock(biz.id, async () => {
+      a = first();
+      await untilWaiting(1);
+      b = second();
+      await untilWaiting(2);
+    });
+    return Promise.all([a, b]);
+  };
+  await test("an account and a link at the same moment: the second in the lock's queue is refused", async () => {
+    const dp = await handRepayment();
+    assert.ok(dp, "need the hand-recorded repayment");
+    // [route, the bank row, the account that explains it, the route's body]
+    const routes = [
+      ["match", credit, incomeAcc, async () => ({ saleId: (await newSale(500)).id })],
+      ["create-sale", credit, incomeAcc, async () => ({ customerId: customer.id })],
+      ["match-debt", credit, incomeAcc, async () => ({ customerId: customer.id })],
+      ["link-debt-payment", credit, incomeAcc, async () => ({ debtPaymentId: dp.id })],
+      ["create-expense", debit, rentAcc, async () => ({ customerId: customer.id })],
+    ];
+    const undo = { "create-sale": "?deleteSale=true", "create-expense": "?deleteExpense=true" };
+    const isLinked = (tx) => !!(tx.matchedSaleId || tx.matchedCustomerId || tx.matchedExpenseId);
+    for (const [p, row, account, bodyFor] of routes) {
+      // The account first: the link passed its outer check while nothing
+      // explained the row, so the check under the lock must refuse it.
+      const r1 = await row(500);
+      const body1 = await bodyFor();
+      const [explain1, link1] = await inQueueOrder(
+        () => categorize(r1.id, account.id),
+        () => POST(`/transactions/${r1.id}/${p}`, tOwner, body1),
+      );
+      const tx1 = await prisma.transaction.findUnique({ where: { id: r1.id } });
+      // Undo first, so a failed check below leaves the debt as it was.
+      if (isLinked(tx1)) await DEL(`/transactions/${r1.id}/match${undo[p] || ""}`, tOwner);
+      assert.strictEqual(explain1.status, 200, `${p}, account first: ${JSON.stringify(explain1.body)}`);
+      assert.ok(!isLinked(tx1), `${p}: the transfer was explained AND linked`);
+      assert.strictEqual(link1.status, 409, `${p}, account first: the link answered ${link1.status}`);
+      assert.strictEqual(link1.body.code, "ALREADY_MATCHED", p);
+
+      // The link first: the account is refused under the lock in turn.
+      const r2 = await row(500);
+      const body2 = await bodyFor();
+      const [link2, explain2] = await inQueueOrder(
+        () => POST(`/transactions/${r2.id}/${p}`, tOwner, body2),
+        () => categorize(r2.id, account.id),
+      );
+      const tx2 = await prisma.transaction.findUnique({ where: { id: r2.id } });
+      if (isLinked(tx2)) await DEL(`/transactions/${r2.id}/match${undo[p] || ""}`, tOwner);
+      assert.ok(link2.status >= 200 && link2.status < 300, `${p}, link first: ${JSON.stringify(link2.body)}`);
+      assert.strictEqual(tx2.accountId, null, `${p}: the transfer was linked AND explained`);
+      assert.strictEqual(explain2.status, 409, `${p}, link first: the account answered ${explain2.status}`);
+      assert.strictEqual(explain2.body.code, "ALREADY_MATCHED", p);
+    }
+  });
+
+  // ══ 6e. THE OWNER'S STAKE ══════════════════════════════════════════════
+  // The owner's own money in (Owner's Equity, Share Capital) and out
+  // (Drawings) is the owner's to file, whether by an account or by the
+  // purpose "owner_money", and what the owner filed there is the owner's to
+  // change: staff get 403 OWNER_ONLY and nothing moves. The owner still can,
+  // and staff still explain everything else.
+  section("6e. the owner's stake is the owner's");
+  const [drawingsAcc, equityAcc, loansAcc, salesAcc, shareAcc] = await Promise.all(
+    ["drawings", "owners_equity", "loans", "sales", "share_capital"].map(accountBySeed),
+  );
+  const rowOf = (id) => prisma.transaction.findUnique({ where: { id } });
+  const refused = (r, what) => {
+    assert.strictEqual(r.status, 403, `${what}: ${JSON.stringify(r.body)}`);
+    assert.strictEqual(r.body.code, "OWNER_ONLY", what);
+  };
+  const classify = (id, token, purpose) => POST(`/transactions/${id}/classify`, token, { purpose });
+  const categorizeAs = (id, token, accountId) => POST(`/transactions/${id}/categorize`, token, { accountId });
+
+  await test("staff can't mark a credit as the owner's money; the owner can", async () => {
+    const c = await credit(50000);
+    const before = await income();
+    refused(await classify(c.id, tStaffYes, "owner_money"), "staff");
+    const row = await rowOf(c.id);
+    assert.deepStrictEqual([row.purpose, row.accountId], [null, null], "nothing written");
+    assert.strictEqual(await income(), before, "still a sale");
+    const noBank = await classify(c.id, tStaffNo, "owner_money");
+    assert.strictEqual(noBank.body.code, "PERMISSION_DENIED", "staff without bank access are refused first");
+    const ok = await classify(c.id, tOwner, "owner_money");
+    assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
+    assert.strictEqual(ok.body.transaction.purpose, "owner_money");
+  });
+  await test("the owner's drawings on a debit: staff can't move or clear them; the owner can", async () => {
+    const d = await debit(80000);
+    assert.strictEqual((await categorizeAs(d.id, tOwner, drawingsAcc.id)).status, 200);
+    const before = await expenses();
+    refused(await categorizeAs(d.id, tStaffYes, rentAcc.id), "staff: Rent");
+    refused(await categorizeAs(d.id, tStaffYes, null), "staff: clear");
+    const row = await rowOf(d.id);
+    assert.deepStrictEqual([row.accountId, row.purpose], [drawingsAcc.id, "account"], "still the owner's drawings");
+    assert.strictEqual(await expenses(), before, "still not spending");
+    const ok = await categorizeAs(d.id, tOwner, rentAcc.id);
+    assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
+    assert.strictEqual((await categorizeAs(d.id, tOwner, null)).status, 200, "the owner clears it");
+  });
+  await test("the owner's money on Owner's Equity: staff can't classify, recategorize or clear it; the owner can", async () => {
+    const c = await credit(300000);
+    const set = await categorizeAs(c.id, tOwner, equityAcc.id);
+    assert.strictEqual(set.body.transaction.purpose, "owner_money", JSON.stringify(set.body));
+    const before = await income();
+    refused(await classify(c.id, tStaffYes, null), "staff: classify none");
+    refused(await classify(c.id, tStaffYes, "loan"), "staff: classify a loan");
+    refused(await categorizeAs(c.id, tStaffYes, loansAcc.id), "staff: Loans");
+    refused(await categorizeAs(c.id, tStaffYes, salesAcc.id), "staff: Sales");
+    refused(await categorizeAs(c.id, tStaffYes, null), "staff: clear");
+    const row = await rowOf(c.id);
+    assert.deepStrictEqual([row.accountId, row.purpose], [equityAcc.id, "owner_money"], "as the owner left it");
+    assert.strictEqual(await income(), before, "still not a sale");
+    const ok = await classify(c.id, tOwner, null);
+    assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
+    assert.deepStrictEqual([ok.body.transaction.purpose, ok.body.transaction.accountId], [null, null], "the owner takes it back");
+  });
+  await test("the owner's money by purpose alone: staff can't clear it or explain it otherwise; the owner can", async () => {
+    const c = await credit(70000);
+    assert.strictEqual((await classify(c.id, tOwner, "owner_money")).status, 200);
+    const before = await income();
+    refused(await classify(c.id, tStaffYes, null), "staff: classify none");
+    refused(await categorizeAs(c.id, tStaffYes, null), "staff: clear");
+    refused(await categorizeAs(c.id, tStaffYes, incomeAcc.id), "staff: income");
+    assert.strictEqual((await rowOf(c.id)).purpose, "owner_money");
+    assert.strictEqual(await income(), before, "still not a sale");
+    assert.strictEqual((await categorizeAs(c.id, tOwner, incomeAcc.id)).status, 200, "the owner calls it income");
+  });
+  await test("Share Capital and an auto-debit on Drawings are the owner's too; staff still explain and clear the rest", async () => {
+    const c = await credit(1000);
+    assert.strictEqual((await categorizeAs(c.id, tOwner, shareAcc.id)).body.transaction.purpose, "account");
+    refused(await categorizeAs(c.id, tStaffYes, incomeAcc.id), "staff: Share Capital to income");
+    const auto = await debit(2000, { reference: `kashbook_rec_me2e_${Date.now()}_1`, accountId: drawingsAcc.id, purpose: "account" });
+    refused(await categorizeAs(auto.id, tStaffYes, rentAcc.id), "staff: the auto-debit's drawings to Rent");
+    const mine = await credit(20000);
+    assert.strictEqual((await classify(mine.id, tStaffYes, "loan")).status, 200, "staff: a loan");
+    assert.strictEqual((await classify(mine.id, tStaffYes, null)).status, 200, "staff: clear the loan");
+    assert.strictEqual((await categorizeAs(mine.id, tStaffYes, incomeAcc.id)).status, 200, "staff: income");
+    assert.strictEqual((await categorizeAs(mine.id, tStaffYes, null)).status, 200, "staff: clear the income");
+    const out = await debit(3000);
+    assert.strictEqual((await categorizeAs(out.id, tStaffYes, rentAcc.id)).status, 200, "staff: Rent");
+    assert.strictEqual((await categorizeAs(out.id, tStaffYes, loansAcc.id)).status, 200, "staff: Loans");
+    assert.strictEqual((await categorizeAs(out.id, tStaffYes, null)).status, 200, "staff: clear");
+    refused(await categorizeAs(out.id, tStaffYes, drawingsAcc.id), "staff never file drawings themselves");
+  });
+  await test("the owner's drawings recorded from a transfer: staff can't unlink or delete them; the owner can", async () => {
+    const d = await debit(250000);
+    const made = await POST(`/transactions/${d.id}/create-expense`, tOwner, { accountId: drawingsAcc.id });
+    assert.strictEqual(made.status, 201, JSON.stringify(made.body));
+    const before = await expenses();
+    refused(await DEL(`/transactions/${d.id}/match`, tStaffYes), "staff: unlink");
+    refused(await DEL(`/transactions/${d.id}/match?deleteExpense=true`, tStaffYes), "staff: delete");
+    assert.strictEqual((await rowOf(d.id)).matchedExpenseId, made.body.expense.id, "still recorded");
+    assert.ok(await prisma.expense.findUnique({ where: { id: made.body.expense.id } }), "the expense is kept");
+    assert.strictEqual(await expenses(), before, "still not spending");
+    // A line on Drawings is enough.
+    const d2 = await debit(9000);
+    const split = await prisma.expense.create({
+      data: {
+        userId: owner.id, businessId: biz.id, paymentMethod: "transfer", date: new Date(), amount: 9000, category: "rent", matchedTransactionId: d2.id,
+        items: { create: [
+          { accountId: rentAcc.id, category: "rent", amount: 4000, position: 0 },
+          { accountId: drawingsAcc.id, category: "other", amount: 5000, position: 1 },
+        ] },
+      },
+    });
+    await prisma.transaction.update({ where: { id: d2.id }, data: { matchedExpenseId: split.id, matchedAmount: 9000 } });
+    refused(await DEL(`/transactions/${d2.id}/match`, tStaffYes), "staff: unlink an expense with a drawings line");
+    // Staff still undo an expense of their own on spending.
+    const d3 = await debit(1500);
+    assert.strictEqual((await POST(`/transactions/${d3.id}/create-expense`, tStaffYes, { accountId: rentAcc.id })).status, 201);
+    const undo = await DEL(`/transactions/${d3.id}/match?deleteExpense=true`, tStaffYes);
+    assert.strictEqual(undo.status, 200, JSON.stringify(undo.body));
+    assert.strictEqual(undo.body.expenseDeleted, true);
+    // The owner can.
+    assert.strictEqual((await DEL(`/transactions/${d2.id}/match`, tOwner)).status, 200, "the owner unlinks");
+    const u = await DEL(`/transactions/${d.id}/match?deleteExpense=true`, tOwner);
+    assert.strictEqual(u.status, 200, JSON.stringify(u.body));
+    assert.strictEqual(u.body.expenseDeleted, true);
+    await prisma.expense.delete({ where: { id: split.id } });
   });
 
   // ══ 7. TENANCY ═════════════════════════════════════════════════════════

@@ -1,7 +1,11 @@
 // Invoice details end to end (2026-10-07): payment terms, order number,
 // subject, salesperson, the numbering gear, typed-name customers, and the
-// draft → sent move on edit. Real invoice routes over HTTP against a real
-// Postgres; only the login check is stood in (x-test-user header).
+// draft → sent move on edit. Since the chart of accounts (2026-10-12): an
+// invoice whose line names an account the owner later made inactive still
+// saves, and only an account new to the document is checked; an older app's
+// edit (lines with no accountId) keeps each line's account. Real invoice
+// (and ledger) routes over HTTP against a real Postgres; only the login check
+// is stood in (x-test-user header).
 //
 //   TEST_DATABASE_URL='postgresql://postgres:<pw>@localhost:5432/kashbook_invoice_e2e' \
 //     node scripts/invoice-details-e2e-test.js
@@ -52,6 +56,9 @@ require.cache[authPath] = {
 
 const express = require("express");
 const invoicesRouter = require("../src/routes/invoices");
+const ledgerRouter = require("../src/routes/ledger");
+const { invalidateOwner } = require("../src/utils/ledgerData");
+const { ownerIdOf } = require("../src/utils/scope");
 const { processRecurringInvoices } = require("../src/utils/recurringInvoiceRunner");
 
 let passed = 0;
@@ -69,7 +76,13 @@ function check(name, cond, detail) {
 async function main() {
   const app = express();
   app.use(express.json());
+  // As server.js does: a successful write clears the owner's cached ledgers.
+  app.use((req, res, next) => {
+    if (req.method !== "GET") res.on("finish", () => res.statusCode < 400 && req.user && invalidateOwner(ownerIdOf(req)));
+    next();
+  });
   app.use("/invoices", invoicesRouter);
+  app.use("/ledger", ledgerRouter);
   const server = app.listen(0);
   const base = `http://127.0.0.1:${server.address().port}`;
   const call = async (method, p, userId, body) => {
@@ -444,6 +457,164 @@ async function main() {
     }
     check("a business with applied credit can still be deleted", bizGone);
     check("its credit links went with it", (await prisma.creditApplication.count({ where: { businessId: tmpBiz.id } })) === 0);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log("\nA line's account the owner later makes inactive");
+    // A line may name the income account it counts as. An inactive account
+    // stays off new documents and new lines, but a document whose line already
+    // has it must still save: that line keeps counting where it did.
+    const newIncome = async (name) =>
+      (await call("POST", "/ledger/accounts", owner.id, { businessId: biz.id, type: "income", name })).body;
+    const catering = await newIncome("Catering");
+    const hire = await newIncome("Event Hire");
+    const training = await newIncome("Training Fees");
+    check("three income accounts of the owner's own", !!(catering?.id && hire?.id && training?.id), [catering, hire, training]);
+    const lines = (accountId, rate = 5000) => [
+      { name: "Catering", quantity: 1, rate, accountId },
+      { name: "Rice", quantity: 2, rate: 1500 },
+    ];
+    const lineOf = (doc) => (doc?.items || []).find((i) => i.name === "Catering");
+    const used = await create(owner.id, { customerId: bola.id, items: lines(catering.id), status: "sent" });
+    const unused = await create(owner.id, { customerId: bola.id, items, status: "sent" });
+    check("a line names the account", used.status === 201 && lineOf(used.body)?.accountId === catering.id, [used.status, used.body?.code]);
+    const rest1 = await call("PATCH", `/ledger/accounts/${catering.id}`, owner.id, { inactive: true });
+    const rest2 = await call("PATCH", `/ledger/accounts/${hire.id}`, owner.id, { inactive: true });
+    check("the owner makes two of the accounts inactive", rest1.body?.inactive === true && rest2.body?.inactive === true, [rest1.status, rest1.body?.code, rest2.status]);
+
+    const fresh = await create(owner.id, { customerId: bola.id, items: lines(catering.id) });
+    check("a new invoice can't name an inactive account", fresh.status === 400 && fresh.body?.code === "ACCOUNT_NOT_ALLOWED", [fresh.status, fresh.body]);
+    const keep = await call("PUT", `/invoices/${used.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07", items: lines(catering.id, 6000), notes: "Price agreed",
+    });
+    check("the invoice already using it still saves, its line keeping the account",
+      keep.status === 200 && keep.body?.total === 9000 && keep.body?.notes === "Price agreed" && lineOf(keep.body)?.accountId === catering.id,
+      [keep.status, keep.body?.code, keep.body?.total, lineOf(keep.body)?.accountId]);
+    const keepStaff = await call("PUT", `/invoices/${used.body?.id}`, staff.id, {
+      customerId: bola.id, issueDate: "2026-10-07", items: lines(catering.id, 6500),
+    });
+    check("staff can save it too", keepStaff.status === 200 && lineOf(keepStaff.body)?.accountId === catering.id, [keepStaff.status, keepStaff.body?.code]);
+    const pl = await call("GET", `/ledger/reports/profit-and-loss?businessId=${biz.id}&basis=sold&from=2026-10-01&to=2026-10-31`, owner.id);
+    const cateringRow = (pl.body?.income || []).find((r) => r.accountId === catering.id);
+    check("and the line still counts on that account (when sold)", pl.status === 200 && cateringRow?.amount === 6500, [pl.status, cateringRow]);
+
+    const takeUp = await call("PUT", `/invoices/${unused.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-07", items: lines(catering.id) });
+    check("an invoice that never had it can't take it up", takeUp.status === 400 && takeUp.body?.code === "ACCOUNT_NOT_ALLOWED", [takeUp.status, takeUp.body]);
+    const unusedLines = await prisma.invoiceItem.findMany({ where: { invoiceId: unused.body?.id } });
+    check("and that refusal writes nothing", unusedLines.length === 1 && unusedLines[0].name === "Rice" && unusedLines[0].accountId === null, unusedLines.map((i) => [i.name, i.accountId]));
+    const second = await call("PUT", `/invoices/${used.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07",
+      items: [...lines(catering.id, 6500), { name: "Chairs", quantity: 1, rate: 1000, accountId: hire.id }],
+    });
+    check("a second inactive account, new to the invoice, is refused", second.status === 400 && second.body?.code === "ACCOUNT_NOT_ALLOWED", [second.status, second.body]);
+    const otherChart = await call("GET", `/ledger/accounts?businessId=${otherBiz.id}`, other.id);
+    const otherIncome = (otherChart.body?.accounts || []).find((a) => a.type === "income" && !a.system);
+    const foreignAcc = await call("PUT", `/invoices/${used.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07", items: [...lines(catering.id, 6500), { name: "Chairs", quantity: 1, rate: 1000, accountId: otherIncome?.id }],
+    });
+    check("another business's account is refused", !!otherIncome && foreignAcc.status === 400 && foreignAcc.body?.code === "ACCOUNT_NOT_FOUND", [otherIncome?.id, foreignAcc.status, foreignAcc.body]);
+    const usedLines = await prisma.invoiceItem.findMany({ where: { invoiceId: used.body?.id } });
+    check("the refusals left the invoice as it was", usedLines.length === 2 && usedLines.some((i) => i.accountId === catering.id && i.rate === 6500), usedLines.map((i) => [i.name, i.rate, i.accountId]));
+    const moved = await call("PUT", `/invoices/${used.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-07", items: lines(training.id, 6500) });
+    check("the line can move to an active account", moved.status === 200 && lineOf(moved.body)?.accountId === training.id, [moved.status, moved.body?.code]);
+    const back = await call("PUT", `/invoices/${used.body?.id}`, owner.id, { customerId: bola.id, issueDate: "2026-10-07", items: lines(catering.id, 6500) });
+    check("once no line has it, the inactive account is new again and refused", back.status === 400 && back.body?.code === "ACCOUNT_NOT_ALLOWED", [back.status, back.body]);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    console.log("\nAn older app's edit keeps each line's account");
+    // An app from before the chart of accounts sends its lines with no
+    // accountId key at all. Each line then keeps the account of the saved line
+    // with the same name, the first one not taken yet (routes/invoices.js
+    // keepLineAccounts); a line it added or renamed counts as Sales, the only
+    // choice that app had. The app now sends accountId on every line, null for
+    // Sales, so only an explicit null moves a line back.
+    const DELIVERY = await newIncome("Delivery Fees");
+    const CHAIRS = await newIncome("Chair Hire");
+    const COACHING = await newIncome("Coaching");
+    check("three more income accounts", !!(DELIVERY?.id && CHAIRS?.id && COACHING?.id), [DELIVERY, CHAIRS, COACHING]);
+    const labelOf = { [DELIVERY?.id]: "DELIVERY", [CHAIRS?.id]: "CHAIRS", [COACHING?.id]: "COACHING" };
+    // Each line as [name, rate, account], in a set (the order lines come back in is not the point).
+    const accountsOf = (doc) =>
+      JSON.stringify((doc?.items || []).map((i) => [i.name, i.rate, i.accountId ? labelOf[i.accountId] || i.accountId : null]).sort());
+    const rowsOf = (rows) => JSON.stringify([...rows].sort());
+    const oldApp = (userId, id, oldLines, extra = {}) =>
+      call("PUT", `/invoices/${id}`, userId, { customerId: bola.id, issueDate: "2026-10-07", items: oldLines, ...extra });
+
+    const mixed = await create(owner.id, {
+      customerId: bola.id,
+      items: [
+        { name: "Delivery", quantity: 1, rate: 2000, accountId: DELIVERY?.id },
+        { name: "Chairs", quantity: 2, rate: 500, accountId: CHAIRS?.id },
+        { name: "Rice", quantity: 2, rate: 1500, accountId: null },
+      ],
+    });
+    check("an invoice with a line on each account and one on Sales", mixed.status === 201, [mixed.status, mixed.body?.code]);
+    const due = await oldApp(staff.id, mixed.body?.id, [
+      { name: "Delivery", quantity: 1, rate: 2500 }, { name: "Chairs", quantity: 2, rate: 500 }, { name: "Rice", quantity: 2, rate: 1500 },
+    ], { dueDate: "2026-10-30" });
+    check("a due date and a price change keep every line's account",
+      due.status === 200 && accountsOf(due.body) === rowsOf([["Delivery", 2500, "DELIVERY"], ["Chairs", 500, "CHAIRS"], ["Rice", 1500, null]]),
+      [due.status, due.body?.code, accountsOf(due.body)]);
+    const dropMiddle = await oldApp(staff.id, mixed.body?.id, [
+      { name: "Delivery", quantity: 1, rate: 2500 }, { name: "Rice", quantity: 2, rate: 1500 },
+    ]);
+    check("removing the middle line moves no account onto another line",
+      dropMiddle.status === 200 && accountsOf(dropMiddle.body) === rowsOf([["Delivery", 2500, "DELIVERY"], ["Rice", 1500, null]]),
+      [dropMiddle.status, accountsOf(dropMiddle.body)]);
+    const renamed = await oldApp(staff.id, mixed.body?.id, [
+      { name: "  delivery ", quantity: 1, rate: 2500 }, { name: "Rice bag", quantity: 2, rate: 1500 }, { name: "Tables", quantity: 1, rate: 700 },
+    ]);
+    check("a name differing only in case or spaces keeps its account; renamed and added lines are Sales",
+      renamed.status === 200 &&
+        accountsOf(renamed.body) === rowsOf([["  delivery ", 2500, "DELIVERY"], ["Rice bag", 1500, null], ["Tables", 700, null]]),
+      [renamed.status, accountsOf(renamed.body)]);
+
+    const twins = await create(owner.id, {
+      customerId: bola.id,
+      items: [
+        { name: "Delivery", quantity: 1, rate: 2000, accountId: DELIVERY?.id },
+        { name: "Delivery", quantity: 1, rate: 300, accountId: COACHING?.id },
+      ],
+    });
+    // The lines as the route reads them back, sent in that order by the older app.
+    const twinLines = await prisma.invoiceItem.findMany({ where: { invoiceId: twins.body?.id }, select: { name: true, rate: true } });
+    const bothBack = await oldApp(staff.id, twins.body?.id, twinLines.map((l) => ({ name: l.name, quantity: 1, rate: l.rate })));
+    check("lines sharing a name keep their own accounts",
+      bothBack.status === 200 && accountsOf(bothBack.body) === rowsOf([["Delivery", 2000, "DELIVERY"], ["Delivery", 300, "COACHING"]]),
+      [bothBack.status, accountsOf(bothBack.body)]);
+    const oneBack = await oldApp(staff.id, twins.body?.id, [{ name: "Delivery", quantity: 1, rate: 999 }]);
+    check("one line of a shared name sent back keeps one of their accounts",
+      oneBack.status === 200 && oneBack.body?.items?.length === 1 && [DELIVERY?.id, COACHING?.id].includes(oneBack.body?.items?.[0]?.accountId),
+      [oneBack.status, accountsOf(oneBack.body)]);
+
+    const hired = await create(owner.id, { customerId: bola.id, items: [{ name: "Chairs", quantity: 1, rate: 1000, accountId: CHAIRS?.id }], status: "sent" });
+    const chairsOff = await call("PATCH", `/ledger/accounts/${CHAIRS?.id}`, owner.id, { inactive: true });
+    const staffOld = await oldApp(staff.id, hired.body?.id, [{ name: "Chairs", quantity: 1, rate: 1200 }]);
+    check("an older app's staff edit keeps a line on an account made inactive since",
+      chairsOff.status === 200 && staffOld.status === 200 && accountsOf(staffOld.body) === rowsOf([["Chairs", 1200, "CHAIRS"]]),
+      [chairsOff.status, staffOld.status, staffOld.body?.code, accountsOf(staffOld.body)]);
+    const newAfter = await call("PUT", `/invoices/${hired.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07", items: [{ name: "Chairs", quantity: 1, rate: 1200, accountId: CHAIRS?.id }],
+    });
+    check("and the app now can still save it as it is",
+      newAfter.status === 200 && accountsOf(newAfter.body) === rowsOf([["Chairs", 1200, "CHAIRS"]]), [newAfter.status, newAfter.body?.code]);
+    await call("PATCH", `/ledger/accounts/${CHAIRS?.id}`, owner.id, { inactive: false });
+
+    const current = await create(owner.id, {
+      customerId: bola.id,
+      items: [{ name: "Delivery", quantity: 1, rate: 2000, accountId: DELIVERY?.id }, { name: "Rice", quantity: 1, rate: 100, accountId: null }],
+    });
+    const toSales = await call("PUT", `/invoices/${current.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07",
+      items: [{ name: "Delivery", quantity: 1, rate: 2000, accountId: null }, { name: "Rice", quantity: 1, rate: 100, accountId: null }],
+    });
+    check("from the app now, an explicit null moves a line back to Sales",
+      toSales.status === 200 && accountsOf(toSales.body) === rowsOf([["Delivery", 2000, null], ["Rice", 100, null]]), [toSales.status, accountsOf(toSales.body)]);
+    const toOther = await call("PUT", `/invoices/${current.body?.id}`, owner.id, {
+      customerId: bola.id, issueDate: "2026-10-07",
+      items: [{ name: "Delivery", quantity: 1, rate: 2000, accountId: COACHING?.id }, { name: "Rice", quantity: 1, rate: 100, accountId: null }],
+    });
+    check("and a line moves to another active account",
+      toOther.status === 200 && accountsOf(toOther.body) === rowsOf([["Delivery", 2000, "COACHING"], ["Rice", 100, null]]), [toOther.status, accountsOf(toOther.body)]);
   } finally {
     server.close();
     // Scratch rows: remove what this run made so it can run again cleanly.

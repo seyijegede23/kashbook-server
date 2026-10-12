@@ -492,6 +492,18 @@ const send = (amount, over = {}) =>
     const r = await send(1_000);
     assert.strictEqual(r.status, 200);
   });
+  await test("an amount in naira and kobo is sent as typed (₦2,500.55); a third decimal is refused", async () => {
+    // 2500.55 * 100 is 250054.99999999997 in floating point: the old check
+    // refused about one kobo amount in eight.
+    const r = await send(2_500.55);
+    assert.strictEqual(r.status, 200, `expected send, got ${r.status} ${JSON.stringify(r.body)}`);
+    const tx = await prisma.transaction.findFirst({
+      where: { businessId: biz.id, type: "expense" }, orderBy: { createdAt: "desc" },
+    });
+    assert.strictEqual(tx.amount, 2500.55, "booked to the kobo");
+    const bad = await send(10.005);
+    assert.strictEqual(bad.status, 400);
+  });
 
   // ══ 4. APPROVAL QUEUE ══════════════════════════════════════════════════════
   section("4. the approval queue");

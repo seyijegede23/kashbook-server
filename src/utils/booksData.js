@@ -3,6 +3,7 @@
 // through booksFor, so the emails, Insights and the app agree.
 const prisma = require("./db");
 const { computeBooks, receivables, vatReturn, bookRows } = require("./books");
+const { classOf } = require("./chart");
 
 // "YYYY-MM-DD" (Lagos) → the instant that day starts / ends.
 function lagosStart(day) {
@@ -33,19 +34,32 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
   const date = byInstant ? { gte: start, lt: end } : dateWhere(from, to);
   const biz = await db.business.findUnique({
     where: { id: businessId },
-    select: { id: true, userId: true, vatEnabled: true, vatRate: true, vatInclusive: true },
+    select: { id: true, userId: true, baseCurrency: true, vatEnabled: true, vatRate: true, vatInclusive: true },
   });
   if (!biz) return null;
-  const [sales, expenses, bankRows, invoices, debts] = await Promise.all([
+  const [sales, expenses, bankRows, invoices, debts, accounts] = await Promise.all([
     db.sales.findMany({
       where: { businessId, ...(date ? { date } : {}) },
       // channel and customerId: Insights breaks sales down by them (bookRows
-      // carries every field selected here).
-      select: { id: true, amount: true, date: true, isCredit: true, channel: true, customerId: true },
+      // carries every field selected here). The rest is for the ledger.
+      select: {
+        id: true, amount: true, date: true, isCredit: true, channel: true, customerId: true,
+        currency: true, paymentMethod: true, matchedTransactionId: true, accountId: true, depositAccountId: true,
+        // notes: the memo its ledger entry shows on account statements.
+        notes: true,
+      },
     }),
     db.expense.findMany({
       where: { businessId, ...(date ? { date } : {}) },
-      select: { id: true, amount: true, date: true, category: true },
+      select: {
+        id: true, amount: true, date: true, category: true,
+        currency: true, paymentMethod: true, matchedTransactionId: true, accountId: true, paidThroughAccountId: true,
+        // notes: the memo its ledger entries show on account statements (every
+        // line's, when it is itemized).
+        notes: true,
+        // An itemized expense counts line by line, each by its own account.
+        items: { select: { id: true, accountId: true, category: true, amount: true }, orderBy: { position: "asc" } },
+      },
     }),
     db.transaction.findMany({
       where: { businessId, ...(date ? { date } : {}) },
@@ -53,6 +67,8 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
         id: true, type: true, amount: true, date: true, purpose: true, channel: true, customerId: true,
         matchedSaleId: true, matchedCustomerId: true, matchedExpenseId: true,
         matchedInvoiceId: true, matchedAmount: true,
+        fee: true, accountId: true, currency: true, source: true, paymentMethod: true,
+        category: true, reference: true, description: true,
       },
     }),
     db.invoice.findMany({
@@ -60,7 +76,11 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
       select: {
         id: true, type: true, status: true, issueDate: true, total: true, customerId: true,
         invoiceNumber: true, taxAmount: true, amountPaid: true, writtenOffAt: true, writtenOffAmount: true,
-        payments: { select: { id: true, amount: true, method: true, date: true, transactionId: true } },
+        subtotal: true, discountAmount: true,
+        items: { select: { id: true, amount: true, accountId: true } },
+        payments: {
+          select: { id: true, amount: true, method: true, date: true, transactionId: true, depositAccountId: true },
+        },
       },
     }),
     // This business's customers, and the owner's customers with no business
@@ -69,8 +89,17 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
       where: { customer: { OR: [{ businessId }, { businessId: null, userId: biz.userId }] } },
       select: {
         id: true, customerId: true, amount: true, paidAmount: true, paid: true, date: true, saleId: true, note: true,
-        payments: { select: { id: true, amount: true, date: true, transactionId: true } },
+        payments: {
+          // note: the repayment's memo on account statements (the debt's when it has none).
+          select: {
+            id: true, amount: true, date: true, transactionId: true, method: true, depositAccountId: true, note: true,
+          },
+        },
       },
+    }),
+    db.ledgerAccount.findMany({
+      where: { businessId },
+      select: { id: true, type: true, systemKey: true, categorySlug: true },
     }),
   ]);
   if (byInstant) {
@@ -78,19 +107,36 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
     for (const inv of invoices) inv.payments = inv.payments.filter((p) => within(p.date));
     for (const d of debts) d.payments = d.payments.filter((p) => within(p.date));
   }
+  // The naira books count naira: rows in another currency are flagged and the
+  // books rule leaves them out (a €100 credit is not ₦100).
+  const base = biz.baseCurrency || "NGN";
+  for (const list of [sales, expenses, bankRows]) {
+    for (const r of list) if (r.currency && r.currency !== base) r.foreignCurrency = true;
+  }
   return {
     vat: { enabled: biz.vatEnabled, rate: biz.vatRate, inclusive: biz.vatInclusive },
-    input: { sales, expenses, bankRows, invoices, debts },
+    baseCurrency: base,
+    chart: accounts,
+    input: { sales, expenses, bankRows, invoices, debts, accounts: accountClasses(accounts) },
   };
 }
 
-// The "when paid" books and rows for an exact [start, end) span (Insights).
+// The chart as the books rule reads it: { [accountId]: { cls, type } }.
+function accountClasses(accounts) {
+  const out = {};
+  for (const a of accounts || []) out[a.id] = { cls: classOf(a.type), type: a.type };
+  return out;
+}
+
+// The "when paid" books and rows for an exact [start, end) span (Insights),
+// with the input they came from (a breakdown tells bank rows apart by it).
 async function booksForInstants(businessId, start, end, db = prisma) {
   const loaded = await loadBooksInput(businessId, { start, end }, db);
   if (!loaded) return null;
   return {
     books: computeBooks(loaded.input, { basis: "paid", vat: loaded.vat }),
     rows: bookRows(loaded.input, "paid"),
+    input: loaded.input,
   };
 }
 
@@ -131,4 +177,6 @@ async function vatReturnFor(businessId, month, db = prisma) {
   return vatReturn(loaded.input, month, loaded.vat);
 }
 
-module.exports = { loadBooksInput, booksFor, booksForInstants, receivablesFor, vatReturnFor, lagosStart, lagosEnd, monthEnd };
+module.exports = {
+  loadBooksInput, accountClasses, booksFor, booksForInstants, receivablesFor, vatReturnFor, lagosStart, lagosEnd, monthEnd,
+};

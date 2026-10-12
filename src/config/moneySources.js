@@ -38,6 +38,18 @@ function isBankLedgerRow(tx) {
   return tx.paymentMethod === "bank" && tx.category === "transfer";
 }
 
+// The rows computeRawLedger (utils/ledgerBalance.js) sums for one currency,
+// as a predicate: provider money through the account, every credit in, and
+// transfers out (their fees too). The chart of accounts' KashBook Account is
+// posted from exactly these rows (utils/ledger.js), so it equals the bank
+// ledger at any date. Keep this in step with computeRawLedger's where-clauses.
+function isLedgerBankRow(tx, currency = "NGN") {
+  if (!tx || tx.paymentMethod !== "bank" || !PROVIDER_SOURCES.includes(tx.source)) return false;
+  if ((tx.currency || "NGN") !== currency) return false;
+  if (tx.type === "income") return true;
+  return tx.type === "expense" && tx.category === "transfer";
+}
+
 // ── Savings rows ─────────────────────────────────────────────────────────────
 // A bank row whose `purpose` is set was created by the savings feature. Today
 // that is only "savings_fee": the early-withdrawal charge swept to KashBook's
@@ -59,4 +71,6 @@ function isSavingsRow(tx) {
   return !!(tx && tx.purpose && SAVINGS_PURPOSES.includes(tx.purpose));
 }
 
-module.exports = { PROVIDER_SOURCES, isBankLedgerRow, SAVINGS_PURPOSES, NOT_SAVINGS, SQL_NOT_SAVINGS, isSavingsRow };
+module.exports = {
+  PROVIDER_SOURCES, isBankLedgerRow, isLedgerBankRow, SAVINGS_PURPOSES, NOT_SAVINGS, SQL_NOT_SAVINGS, isSavingsRow,
+};

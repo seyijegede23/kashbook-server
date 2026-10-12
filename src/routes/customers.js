@@ -3,6 +3,11 @@ const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { validateCustomer, validateIdParam } = require("../middleware/validate");
 const { readCustomerFields, normalizePhone } = require("../utils/customerFields");
+const { assertAccountUsable } = require("../utils/ledgerData");
+
+// How a customer paid back credit (chart of accounts, 2026-10-11): the money
+// lands in the account its method stands for unless one is picked.
+const REPAYMENT_METHODS = ["cash", "transfer", "pos", "card", "cheque", "other"];
 
 router.use(auth);
 
@@ -285,6 +290,11 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
   if (!(amount > 0) || !Number.isFinite(amount)) {
     return res.status(400).json({ error: "amount required", code: "BAD_AMOUNT" });
   }
+  // Older app versions send no method: those repayments stay "not recorded".
+  const method = req.body.method == null || req.body.method === "" ? null : String(req.body.method).toLowerCase();
+  if (method && !REPAYMENT_METHODS.includes(method)) {
+    return res.status(400).json({ error: "Unknown payment method.", code: "BAD_METHOD" });
+  }
 
   try {
     const customer = await prisma.customer.findUnique({
@@ -293,6 +303,12 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
+    // Where the money went, when picked (a customer with no business has no chart).
+    const deposit = customer.businessId
+      ? await assertAccountUsable(customer.businessId, req.body.depositAccountId, "money", {
+          isStaff: req.user.accountType === "staff",
+        })
+      : null;
 
     // Books rule: every repayment is a counted sale, so it is never more than
     // the debt still owes, and the payment and the debt change together. Under
@@ -318,7 +334,10 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
           });
         }
         await px.debtPayment.create({
-          data: { debtId: debt.id, amount, note: note || "", date: new Date() },
+          data: {
+            debtId: debt.id, amount, note: note || "", date: new Date(), method,
+            depositAccountId: deposit ? deposit.id : null,
+          },
         });
         const paidAmount = Math.min(debt.amount, Math.round((debt.paidAmount + amount) * 100) / 100);
         // Compare-and-set: match-debt locks on the transfer's business,

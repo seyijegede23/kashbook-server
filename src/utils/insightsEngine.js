@@ -24,10 +24,11 @@
 
 const { AsyncLocalStorage } = require("async_hooks");
 const prisma = require("./db");
-// Savings rows (a deposit to the merchant's own pot, its return, interest) are
-// not trade: every income/expense predicate below carries this exclusion.
-const { NOT_SAVINGS } = require("../config/moneySources");
+// Every total and breakdown below is the books rule (utils/books.js), which
+// already leaves out what is not trade (savings rows, the owner's money, a
+// loan, equipment bought).
 const { booksForInstants } = require("./booksData");
+const chart = require("./chart");
 
 // ── Money formatting ─────────────────────────────────────────────────────────
 const CURRENCY_SYMBOLS = {
@@ -880,10 +881,87 @@ async function sumIncome(businessId, range, channel) {
   return { total: Math.round(gross * netShare(got) * 100) / 100, count: rows.length };
 }
 
+// The record a spending row belongs to: an itemized expense is one expense
+// however many of its lines count (each counted line is a row of its own, with
+// its expenseId), and a transfer's fee is part of that transfer (books.bookRows
+// names a fee row "fee_<transfer id>").
+function spendingRecordOf(r) {
+  if (r.source === "fee") return String(r.id).replace(/^fee_/, "");
+  return r.expenseId || r.id;
+}
+
 async function sumExpenses(businessId, range) {
   const got = await span(businessId, range);
   if (!got) return { total: 0, count: 0 };
-  return { total: got.books.expenses.total, count: lineCount(got.books.expenses.lines) };
+  const records = new Set(got.rows.filter((r) => r.type === "expense").map(spendingRecordOf));
+  return { total: got.books.expenses.total, count: records.size };
+}
+
+// The business's chart (each account with its name) and its recurring
+// expenses, read once per request like the books.
+function chartOf(businessId) {
+  const cache = spanStore.getStore();
+  const key = `chart|${businessId}`;
+  if (cache && cache.has(key)) return cache.get(key);
+  const value = Promise.all([
+    prisma.ledgerAccount.findMany({
+      where: { businessId },
+      select: { id: true, name: true, type: true, systemKey: true, categorySlug: true },
+    }),
+    prisma.recurringExpense.findMany({ where: { businessId }, select: { id: true, category: true, accountId: true } }),
+  ]).then(([accounts, rules]) => ({ C: chart.indexChart(accounts), recurring: new Map(rules.map((r) => [r.id, r])) }));
+  if (cache) cache.set(key, value);
+  return value;
+}
+
+// The account a spending row counts in, exactly as the ledger books it
+// (utils/ledger.js). A bank row (`tx`, as loaded): a credit here is a supplier
+// refund (the spending account it names, else Cost of Goods Sold), a savings
+// break fee is Bank Fees and Charges, any other debit its own account, else
+// its default (its purpose, payroll, an auto-debit's rule, else Unexplained
+// Bank Payments). A transfer fee is Bank Fees and Charges, a write-off Bad
+// Debt; an expense, or a line of one, the account it names, else its
+// category's. null while the business has no chart.
+function spendingAccount(row, tx, { C, recurring }) {
+  if (tx) {
+    const own = chart.explicitAccount(C, tx.accountId);
+    if (String(tx.type).toLowerCase() === "income") {
+      return own && chart.classOf(own.type) === "expense" ? own : chart.sysAccount(C, chart.SYS.COGS);
+    }
+    if (tx.purpose === "savings_fee") return chart.sysAccount(C, chart.SYS.BANK_CHARGES);
+    return chart.bankRowAccount(C, tx, "paid", recurring);
+  }
+  if (row.source === "fee") return chart.sysAccount(C, chart.SYS.BANK_CHARGES);
+  if (row.source === "write_off") return chart.sysAccount(C, chart.SYS.BAD_DEBT);
+  return chart.explicitAccount(C, row.accountId) || chart.expenseAccount(C, { category: row.category });
+}
+
+// The books rule's spending rows grouped by the account each counts in:
+// [{ category, accountId, amount }], `category` being the label shown (the
+// account's name, or the row's category while the business has no chart).
+// bankRows: the input's bank rows, which the rows came from. ctx: { C, recurring }.
+function groupSpending(rows, bankRows, ctx) {
+  const bank = new Map((bankRows || []).map((t) => [t.id, t]));
+  const groups = new Map();
+  for (const r of rows || []) {
+    if (r.type !== "expense") continue;
+    const acc = spendingAccount(r, bank.get(r.id), ctx);
+    const label = acc ? acc.name : r.category || "other";
+    const key = acc ? acc.id : `category:${label}`;
+    const g = groups.get(key) || { category: label, accountId: acc ? acc.id : null, amount: 0 };
+    g.amount += r.amount;
+    groups.set(key, g);
+  }
+  return [...groups.values()].map((g) => ({ ...g, amount: Math.round(g.amount * 100) / 100 }));
+}
+
+// What a span's spending went on, by account: a split expense counts line by
+// line, and equipment, rent paid ahead, a loan repaid or drawings are not
+// spending at all.
+async function spendingByAccount(businessId, range) {
+  const [got, ctx] = await Promise.all([span(businessId, range), chartOf(businessId)]);
+  if (!got) return [];
+  return groupSpending(got.rows, got.input && got.input.bankRows, ctx);
 }
 
 // Rows carry what was received (VAT inside, for a VAT business); the totals
@@ -910,15 +988,6 @@ async function incomeBy(businessId, range, keyOf) {
     out.set(k, cur);
   }
   return out;
-}
-
-// Merge {key → amount} maps from several groupBy sweeps.
-function mergeSums(target, rows, keyOf) {
-  for (const r of rows) {
-    const key = keyOf(r);
-    target.set(key, (target.get(key) || 0) + Number(r._sum.amount || 0)); // Number(): Transaction _sum is Decimal
-  }
-  return target;
 }
 
 function pctDelta(cur, prev) {
@@ -964,23 +1033,7 @@ const HANDLERS = {
   },
 
   async expense_breakdown({ business, range }) {
-    const date = { gte: range.start, lt: range.end };
-    const [expRows, bankRows] = await Promise.all([
-      prisma.expense.groupBy({
-        by: ["category"],
-        where: { businessId: business.id, date },
-        _sum: { amount: true },
-      }),
-      prisma.transaction.groupBy({
-        by: ["category"],
-        where: { businessId: business.id, type: "expense", matchedExpenseId: null, date, ...NOT_SAVINGS },
-        _sum: { amount: true },
-      }),
-    ]);
-    const byCat = mergeSums(new Map(), expRows, (r) => r.category || "other");
-    mergeSums(byCat, bankRows, (r) => r.category || "other");
-    const top = [...byCat.entries()]
-      .map(([category, amount]) => ({ category, amount }))
+    const top = (await spendingByAccount(business.id, range))
       .filter((r) => r.amount > 0)
       .sort((a, b) => b.amount - a.amount)
       .slice(0, 4);
@@ -1647,19 +1700,10 @@ async function generateInsightCards(business) {
   };
   const cards = [];
 
-  const [inc, prevInc, expRows, bankExpRows, low, topDebtor, byChannel] = await Promise.all([
+  const [inc, prevInc, spending, low, topDebtor, byChannel] = await Promise.all([
     sumIncome(business.id, thisMonth, null),
     sumIncome(business.id, lastMonth, null),
-    prisma.expense.groupBy({
-      by: ["category"],
-      where: { businessId: business.id, date: { gte: thisMonth.start, lt: thisMonth.end } },
-      _sum: { amount: true },
-    }),
-    prisma.transaction.groupBy({
-      by: ["category"],
-      where: { businessId: business.id, type: "expense", matchedExpenseId: null, date: { gte: thisMonth.start, lt: thisMonth.end }, ...NOT_SAVINGS },
-      _sum: { amount: true },
-    }),
+    spendingByAccount(business.id, thisMonth),
     prisma.$queryRaw`
       SELECT name, quantity FROM "InventoryItem"
       WHERE "businessId" = ${business.id} AND quantity <= "lowStockAlert"
@@ -1684,11 +1728,7 @@ async function generateInsightCards(business) {
     });
   }
 
-  const byCat = mergeSums(new Map(), expRows, (r) => r.category || "other");
-  mergeSums(byCat, bankExpRows, (r) => r.category || "other");
-  const topExp = [...byCat.entries()]
-    .map(([category, amount]) => ({ category, amount }))
-    .sort((a, b) => b.amount - a.amount)[0];
+  const topExp = [...spending].sort((a, b) => b.amount - a.amount)[0];
   if (topExp && topExp.amount > 0) {
     cards.push({
       icon: "wallet",
@@ -1747,7 +1787,11 @@ module.exports = {
   extractPersonName,
   nearestIntent,
   // the aggregates themselves, so the match e2e asserts the exclusion rules
-  // (a matched credit or debit counts ONCE) against the real query, not a copy
+  // (a matched credit or debit counts ONCE) against the real query, not a copy,
+  // and the ledger's tests that spending by account ties out to the ledger
   sumIncome,
   sumExpenses,
+  spendingRecordOf,
+  spendingByAccount,
+  groupSpending,
 };

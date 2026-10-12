@@ -3,7 +3,7 @@
 //   node scripts/books-test.js
 const assert = require("assert");
 const B = require("../src/utils/books");
-const { build, APP } = require("./sync-books-mirror");
+const { FILES, buildFile } = require("./sync-books-mirror");
 const fs = require("fs");
 
 let passed = 0;
@@ -328,10 +328,13 @@ check("Date objects are read in Lagos time", () => {
 });
 
 console.log("\nMirror");
-check("the app's src/utils/books.js is the server file, ES-module exports", () => {
-  const have = fs.readFileSync(APP, "utf8").replace(/\r\n/g, "\n");
-  assert.ok(have === build(), "out of date: run node scripts/sync-books-mirror.js");
-});
+// Every shared module the sync script writes: the books rule and the chart.
+for (const f of FILES) {
+  check(`the app's src/utils/${f.name} is the server file, ES-module exports`, () => {
+    const have = fs.existsSync(f.app) ? fs.readFileSync(f.app, "utf8").replace(/\r\n/g, "\n") : "";
+    assert.ok(have === buildFile(f), "out of date: run node scripts/sync-books-mirror.js");
+  });
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

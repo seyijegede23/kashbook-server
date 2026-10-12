@@ -23,8 +23,28 @@ const { audit } = require("./audit");
 const { pushTo } = require("./pushNotification");
 const { getThresholds, formatAmountForBusiness } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
+const chart = require("./chart");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// What an auto-debit was for, written on its bank row as POST
+// /transactions/:id/categorize writes it: the rule's account, and purpose
+// "account" when that account is on the balance sheet (a loan repaid, the
+// owner's drawings), so the books leave the debit out of spending and the
+// ledger posts it to that account; spending counts as it always has. A rule
+// that names no account (or one gone from the chart) leaves the row to the
+// rule's category (utils/chart.js bankRowAccount).
+async function ruleAccountOnRow(rec, businessId) {
+  if (!rec.accountId) return { accountId: null, purpose: null };
+  const acc = await prisma.ledgerAccount.findFirst({
+    where: { id: rec.accountId, businessId },
+    select: { id: true, type: true },
+  });
+  const cls = acc ? chart.classOf(acc.type) : null;
+  if (cls === "expense") return { accountId: acc.id, purpose: null };
+  if (cls && !chart.isProfitClass(cls)) return { accountId: acc.id, purpose: "account" };
+  return { accountId: null, purpose: null };
+}
 
 async function processRecurringExpenses({ now = new Date() } = {}) {
   const due = await prisma.recurringExpense.findMany({
@@ -59,6 +79,9 @@ async function processRecurringExpenses({ now = new Date() } = {}) {
             paymentMethod: rec.paymentMethod,
             notes: rec.notes,
             date: now,
+            // The rule's accounts, when it names them (chart of accounts).
+            accountId: rec.accountId || null,
+            paidThroughAccountId: rec.paidThroughAccountId || null,
           },
         });
         createdExpenses++;
@@ -183,13 +206,15 @@ async function runAutoDebit(rec, now) {
 
   // 2. Deterministic reference for idempotency.
   const reference = `kashbook_rec_${rec.id}_${new Date(rec.nextDue).getTime()}`;
+  // The rule's account goes on the bank row with the money (chart of accounts).
+  const booking = await ruleAccountOnRow(rec, business.id);
 
   // 3. Execute the transfer UNDER the per-business advisory lock — the same lock
   // the interactive /send holds (routes/transfers.js). Without it a cron auto-debit
   // and a manual send (or two auto-debits) could both read computeLedgerBalance
   // before either books its expense, both pass the gate, and overdraw the pool.
   try {
-    await prisma.withBusinessLock(business.id, () =>
+    const sent = await prisma.withBusinessLock(business.id, () =>
       executeTransfer({
         business,
         userId: rec.userId,
@@ -205,8 +230,17 @@ async function runAutoDebit(rec, now) {
         amlCheck,
         req: null,
         notify: true,
+        accountId: booking.accountId,
       }),
     );
+    // The purpose in step with the account, for an older app copy that reads
+    // only the purpose (the books and the ledger read the account, already on
+    // the row). The money has moved: a failure here is logged, never the run's.
+    if (booking.purpose && sent && sent.transactionId) {
+      await prisma.transaction
+        .update({ where: { id: sent.transactionId }, data: { purpose: booking.purpose } })
+        .catch((e) => console.error(`[recurring] ${rec.id}: purpose not written on ${sent.transactionId}:`, e.message));
+    }
 
     await prisma.recurringExpense.update({
       where: { id: rec.id },

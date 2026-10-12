@@ -54,7 +54,9 @@ async function uploadFcyDocs(docs = {}) {
       public_id: `${kind}_${crypto.randomUUID()}`,
       overwrite: false,
       resource_type: meta.resourceType,
-      image_metadata: false, // strip EXIF/GPS from a photographed document
+      // Only keeps the file's metadata out of Cloudinary's reply; the stored
+      // document keeps any EXIF/GPS it came with.
+      image_metadata: false,
       type: "private",
       access_mode: "authenticated",
     });

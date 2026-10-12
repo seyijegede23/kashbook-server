@@ -179,6 +179,8 @@ router.post("/", async (req, res) => {
       },
       include: { customCategories: true },
     });
+    // Its chart of accounts, ready for the first expense.
+    await require("../utils/ledgerData").ensureChart(biz.id).catch((e) => console.error("[businesses] chart:", e.message));
     res.status(201).json(publicBusiness(biz));
   } catch (err) {
     // DB unique-index backstop (race across devices/requests) → friendly dup error.
@@ -287,6 +289,11 @@ router.patch("/:id", async (req, res) => {
       data,
       include: { customCategories: true },
     });
+    // An older app adds a custom category this way: it gets its account (an
+    // account is never deleted here, whatever the list left out).
+    if (customCategories !== undefined) {
+      await require("../utils/ledgerData").ensureChart(biz.id).catch((e) => console.error("[businesses] chart:", e.message));
+    }
     res.json(publicBusiness(biz));
   } catch (err) {
     if (err?.code === "P2002") {
@@ -342,8 +349,9 @@ router.patch("/:id/branding", async (req, res) => {
         public_id: `biz_${biz.id}`,
         overwrite: true,
         resource_type: meta.resourceType,
-        // Strip EXIF/GPS: a photographed document can carry the location it was
-        // taken, which we have no reason to store or serve.
+        // Only keeps the file's metadata out of Cloudinary's reply. It strips
+        // nothing: the stored image keeps any EXIF/GPS it came with
+        // (Cloudinary removes metadata only from versions it transforms).
         image_metadata: false,
         allowed_formats: ["png", "jpg", "jpeg", "webp"],
       });
@@ -817,8 +825,9 @@ router.post("/:id/upload-cac", async (req, res) => {
       public_id: `cac_${crypto.randomUUID()}`,
       overwrite: false,
       resource_type: meta.resourceType,
-      // Strip EXIF/GPS: a photographed certificate can carry the location it was
-      // taken, which we have no reason to store or serve.
+      // Only keeps the file's metadata out of Cloudinary's reply. It strips
+      // nothing: the stored certificate keeps any EXIF/GPS it came with
+      // (Cloudinary removes metadata only from versions it transforms).
       image_metadata: false,
       type: "private",
       access_mode: "authenticated",

@@ -14,6 +14,7 @@
 const prisma = require("./db");
 const { NOT_SAVINGS } = require("../config/moneySources");
 const { booksFor, vatReturnFor } = require("./booksData");
+const { spendingByAccount } = require("./insightsEngine");
 const { renderEmail, txnRow, escHtml } = require("./emailLayout");
 const { getTransport } = require("./transactionEmail");
 
@@ -63,7 +64,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   const dateThis = { gte: range.start, lt: range.end };
   const datePrev = { gte: prev.start, lt: prev.end };
   const bizScope = { businessId: { in: bizIds } };
-  const [salesG, expG, txIncomeG, txExpenseG, prevSalesG, prevTxIncomeG, expCats, txExpCats] = await Promise.all([
+  const [salesG, expG, txIncomeG, txExpenseG, prevSalesG, prevTxIncomeG] = await Promise.all([
     prisma.sales.groupBy({
       by: ["businessId"],
       where: { ...bizScope, date: dateThis },
@@ -97,16 +98,6 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     prisma.transaction.groupBy({
       by: ["businessId"],
       where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: datePrev, ...NOT_SAVINGS },
-      _sum: { amount: true },
-    }),
-    prisma.expense.groupBy({
-      by: ["businessId", "category"],
-      where: { ...bizScope, date: dateThis },
-      _sum: { amount: true },
-    }),
-    prisma.transaction.groupBy({
-      by: ["businessId", "category"],
-      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis, ...NOT_SAVINGS },
       _sum: { amount: true },
     }),
   ]);
@@ -151,23 +142,14 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   for (const g of remIncomeG) get(g.businessId).income += remainderOf(g);
   for (const g of remExpenseG) get(g.businessId).expense += remainderOf(g);
   for (const g of remPrevIncomeG) get(g.businessId).prevIncome += remainderOf(g);
-  // Expense categories from both sources, merged per (business, category).
-  const catTotals = new Map(); // "bizId|category" → amount
-  for (const g of [...expCats, ...txExpCats]) {
-    const key = `${g.businessId}|${g.category || "other"}`;
-    catTotals.set(key, (catTotals.get(key) || 0) + Number(g._sum.amount || 0));
-  }
-  for (const [key, amount] of catTotals) {
-    if (amount <= 0) continue;
-    const sep = key.indexOf("|"); // businessId is a uuid — first "|" is the divider
-    get(key.slice(0, sep)).cats.push({ category: key.slice(sep + 1), amount });
-  }
-  for (const s of stats.values()) s.cats.sort((a, b) => b.amount - a.amount);
 
   // Money in, money out and VAT come from the books rule (utils/books.js), the
   // same one the app's Reports use: invoice payments, debt repayments and
-  // refunds count too, and every naira once. The group-bys above still give
-  // the entry count and the expense categories.
+  // refunds count too, and every naira once. So do the top expenses: the
+  // month's spending by account as Insights shows it (a split expense line by
+  // line, nothing the books leave on the balance sheet), the same amounts the
+  // Expenses figure beside them adds up. The group-bys above still give the
+  // entry count.
   const dayOf = (d) => new Date(d.getTime() + WAT_OFFSET_MS).toISOString().slice(0, 10);
   const thisDays = { from: dayOf(range.start), to: dayOf(new Date(range.end.getTime() - 1)) };
   const prevDays = { from: dayOf(prev.start), to: dayOf(new Date(prev.end.getTime() - 1)) };
@@ -191,6 +173,10 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }
     s.count += extra;
     s.prevIncome = before ? before.sales.total : 0;
+    s.cats = (await spendingByAccount(b.id, range))
+      .filter((g) => g.amount > 0)
+      .sort((x, y) => y.amount - x.amount)
+      .map((g) => ({ category: g.category, amount: g.amount }));
   }
 
   // Group active businesses per owner.

@@ -1,6 +1,8 @@
 const express = require("express");
 const router = express.Router();
 const prisma = require("../utils/db");
+const { assertAccountUsable } = require("../utils/ledgerData");
+const chart = require("../utils/chart");
 const auth = require("../middleware/auth");
 const { ownerOnly } = require("../middleware/requirePermission");
 const { computeNextDue } = require("../utils/recurringSchedule");
@@ -56,6 +58,7 @@ router.post("/", async (req, res) => {
   try {
     const {
       businessId, category, amount, paymentMethod, notes, frequency, startDate,
+      accountId, paidThroughAccountId,
       // Auto-debit
       autoSend, payeeAccountNumber, payeeBankCode, payeeBankName, payeeAccountName, pin,
     } = req.body;
@@ -103,17 +106,23 @@ router.post("/", async (req, res) => {
 
     const base = startDate ? new Date(startDate) : new Date();
     const nextDue = base;
+    // The chart of accounts: what each expense it records counts as, and
+    // where it is paid from (the runner copies both onto every expense).
+    const account = biz ? await assertAccountUsable(biz.id, accountId, "expense") : null;
+    const paidFrom = biz ? await assertAccountUsable(biz.id, paidThroughAccountId, "money") : null;
 
     const item = await prisma.recurringExpense.create({
       data: {
         userId: req.user.id,
         businessId: businessId || null,
-        category: category || "other",
+        category: account && account.categorySlug ? account.categorySlug : category || "other",
         amount: parseFloat(amount),
         paymentMethod: paymentMethod || "cash",
         notes: notes || null,
         frequency,
         nextDue,
+        accountId: account ? account.id : null,
+        paidThroughAccountId: paidFrom ? paidFrom.id : null,
         ...(autoSend
           ? {
               autoSend: true,
@@ -145,6 +154,7 @@ router.post("/", async (req, res) => {
 
     res.status(201).json(item);
   } catch (err) {
+    if (err.status && err.code) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error(err);
     res.status(500).json({ error: "Failed to create recurring expense" });
   }
@@ -154,7 +164,7 @@ router.post("/", async (req, res) => {
 router.patch("/:id", async (req, res) => {
   try {
     const {
-      category, amount, paymentMethod, notes, frequency, active,
+      category, amount, paymentMethod, notes, frequency, active, accountId, paidThroughAccountId,
       // Auto-debit fields. Any change that turns autoSend ON or modifies the
       // payee requires a fresh PIN entry (the consent token).
       autoSend, payeeAccountNumber, payeeBankCode, payeeBankName, payeeAccountName, pin,
@@ -166,7 +176,24 @@ router.patch("/:id", async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Not found" });
 
     const data = {};
-    if (category !== undefined) data.category = category;
+    if (category !== undefined) {
+      data.category = category;
+      // An older app version knows only categories: another one sent with no
+      // account means the rule is now that category's, so it stops naming its
+      // old account (what it records then follows the category).
+      if (accountId === undefined && existing.accountId && chart.canonicalSlug(category) !== chart.canonicalSlug(existing.category)) {
+        data.accountId = null;
+      }
+    }
+    if (accountId !== undefined && existing.businessId) {
+      const account = await assertAccountUsable(existing.businessId, accountId, "expense");
+      data.accountId = account ? account.id : null;
+      if (account && account.categorySlug) data.category = account.categorySlug;
+    }
+    if (paidThroughAccountId !== undefined && existing.businessId) {
+      const paidFrom = await assertAccountUsable(existing.businessId, paidThroughAccountId, "money");
+      data.paidThroughAccountId = paidFrom ? paidFrom.id : null;
+    }
     if (amount !== undefined) data.amount = parseFloat(amount);
     if (paymentMethod !== undefined) data.paymentMethod = paymentMethod;
     if (notes !== undefined) data.notes = notes;
@@ -237,6 +264,7 @@ router.patch("/:id", async (req, res) => {
 
     res.json(updated);
   } catch (err) {
+    if (err.status && err.code) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error(err);
     res.status(500).json({ error: "Failed to update recurring expense" });
   }

@@ -1,8 +1,9 @@
 // Books rule end to end (2026-10-09): invoice payments and refunds linked to
 // the bank rows they are, write-offs, void/delete rules, VAT numbering, the
 // "what was this money" outcomes, credit sales with their debt, the auto
-// matcher's link, and the totals booksFor gives. Real routers over HTTP,
-// real Postgres, real login tokens.
+// matcher's link, and the totals booksFor gives. Since the chart of accounts
+// (2026-10-12): a bank row explained with an account pays no invoice and no
+// refund as well. Real routers over HTTP, real Postgres, real login tokens.
 //
 //   TEST_DATABASE_URL=postgresql://postgres:<pw>@localhost:5432/kashbook_books_e2e \
 //     node scripts/books-e2e-test.js
@@ -26,6 +27,7 @@ const prisma = require("../src/utils/db");
 const { signToken } = require("../src/utils/jwt");
 const { booksFor, receivablesFor } = require("../src/utils/booksData");
 const { tryMatchInvoice } = require("../src/utils/invoiceMatch");
+const { ensureChart } = require("../src/utils/ledgerData");
 
 const app = express();
 app.use(express.json());
@@ -369,6 +371,82 @@ const inv = (id) => prisma.invoice.findUnique({ where: { id }, include: { paymen
       const c = await credit(777, { purpose: "owner_money" });
       await tryMatchInvoice(biz, 777, "ref-auto2", { transactionId: c.id });
       eq((await inv(i.id)).status, "SENT");
+    });
+
+    section("Explained with an account");
+    // Chart of accounts (2026-10-12): money the merchant explained with an
+    // account is explained, even when the account leaves the purpose empty
+    // (money in on an income account, money out on an expense account). It
+    // never pays an invoice or a refund as well: the naira would count twice.
+    await ensureChart(biz.id);
+    const accountBySeed = (seed) => prisma.ledgerAccount.findFirst({ where: { businessId: biz.id, seed } });
+    const generalIncome = await accountBySeed("general_income");
+    const rentAccount = await accountBySeed("rent");
+    const categorize = async (id, accountId) => {
+      const r = await call("POST", `/transactions/${id}/categorize`, T, { accountId });
+      eq(r.status, 200, JSON.stringify(r.body));
+      return r.body.transaction;
+    };
+    await test("a credit on an income account can't pay an invoice", async () => {
+      const c = await credit(2600);
+      const t0 = await categorize(c.id, generalIncome.id);
+      eq(t0.accountId, generalIncome.id); eq(t0.purpose, null, "an income account keeps no purpose");
+      const i = await invoice(2600);
+      const r = await pay(i.id, { amount: 2600, method: "bank", transactionId: c.id });
+      eq(r.status, 409, JSON.stringify(r.body)); eq(r.body.code, "TRANSACTION_TAKEN");
+      const after = await inv(i.id);
+      eq(after.amountPaid, 0); eq(after.status, "SENT"); eq(after.payments.length, 0);
+      const t = await txRow(c.id);
+      eq(t.matchedInvoiceId, null); eq(t.matchedAmount, null); eq(t.accountId, generalIncome.id);
+    });
+    await test("…nor be linked to a payment recorded by hand, until the account is off", async () => {
+      const c = await credit(2700);
+      await categorize(c.id, generalIncome.id);
+      const i = await invoice(2700);
+      const p = (await pay(i.id, { amount: 2700, method: "transfer" })).body.payments[0];
+      const r = await call("POST", `/invoices/${i.id}/payments/${p.id}/link`, T, { transactionId: c.id });
+      eq(r.status, 409, JSON.stringify(r.body)); eq(r.body.code, "TRANSACTION_TAKEN");
+      const kept = await prisma.invoicePayment.findUnique({ where: { id: p.id } });
+      eq(kept.method, "transfer"); eq(kept.transactionId, null);
+      eq((await txRow(c.id)).matchedInvoiceId, null);
+      eq((await categorize(c.id, null)).accountId, null);
+      const ok = await call("POST", `/invoices/${i.id}/payments/${p.id}/link`, T, { transactionId: c.id });
+      eq(ok.status, 200, JSON.stringify(ok.body));
+      eq((await txRow(c.id)).matchedInvoiceId, i.id);
+    });
+    await test("the auto-matcher leaves it alone, and takes it once the account is off", async () => {
+      const i = await invoice(2468);
+      const c = await credit(2468);
+      await categorize(c.id, generalIncome.id);
+      await tryMatchInvoice(biz, 2468, "ref-auto3", { transactionId: c.id });
+      const left = await inv(i.id);
+      eq(left.status, "SENT"); eq(left.payments.length, 0);
+      eq((await txRow(c.id)).matchedInvoiceId, null);
+      // The same call once nothing explains the credit: the invoice was the
+      // only candidate, so the refusal above was the account's.
+      await categorize(c.id, null);
+      await tryMatchInvoice(biz, 2468, "ref-auto3", { transactionId: c.id });
+      eq((await inv(i.id)).status, "PAID");
+      eq((await txRow(c.id)).matchedInvoiceId, i.id);
+    });
+    await test("a debit on an expense account can't be a customer refund, until the account is off", async () => {
+      const note = (await call("POST", "/invoices", T, {
+        businessId: biz.id, customerId: cust.id, issueDate: today, type: "credit_note", status: "SENT",
+        items: [{ name: "Return", quantity: 1, rate: 3100 }],
+      })).body;
+      const d = await debit(3100);
+      const t0 = await categorize(d.id, rentAccount.id);
+      eq(t0.accountId, rentAccount.id); eq(t0.purpose, null, "an expense account keeps no purpose");
+      const r = await call("POST", `/invoices/${note.id}/refund`, T, { amount: 3100, method: "bank", transactionId: d.id });
+      eq(r.status, 409, JSON.stringify(r.body)); eq(r.body.code, "TRANSACTION_TAKEN");
+      const t = await txRow(d.id);
+      eq(t.purpose, null); eq(t.accountId, rentAccount.id);
+      const n = await inv(note.id);
+      eq(n.amountPaid, 0); eq(n.payments.length, 0);
+      await categorize(d.id, null);
+      const ok = await call("POST", `/invoices/${note.id}/refund`, T, { amount: 3100, method: "bank", transactionId: d.id });
+      eq(ok.status, 201, JSON.stringify(ok.body));
+      eq((await txRow(d.id)).purpose, "customer_refund");
     });
 
     section("Credit sales and their transfers");
