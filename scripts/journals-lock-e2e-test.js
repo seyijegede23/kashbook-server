@@ -112,6 +112,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const lagosDay = (ms) => new Date(ms + 60 * 60 * 1000).toISOString().slice(0, 10);
 const daysAgo = (n) => lagosDay(Date.now() - n * DAY_MS);
 const TODAY = lagosDay(Date.now());
+const YESTERDAY = lagosDay(Date.now() - 24 * 3600 * 1000);
 const OLD = daysAgo(40);
 const LOCK = daysAgo(30);
 const OPEN = daysAgo(20);
@@ -391,15 +392,15 @@ function ok(r, status, what = "") {
       eq((await setLock(LOCK, tReports)).body.code, "OWNER_ONLY");
       eq((await setLock(LOCK, TR)).status, 404, "another owner's business");
     });
-    await test("a day up to today, or null; nothing else", async () => {
+    await test("a day up to yesterday, or null; nothing else (today stays open)", async () => {
       eq((await call("PUT", `/businesses/${biz.id}/books-lock`, T, {})).body.code, "BAD_DATE");
-      for (const date of ["2026-13-01", "2026-02-29", "yesterday", 5, TOMORROW, `${LOCK}T00:00:00Z`]) {
+      for (const date of ["2026-13-01", "2026-02-29", "yesterday", 5, TOMORROW, TODAY, `${LOCK}T00:00:00Z`]) {
         const r = await setLock(date);
         eq(r.status, 400, `date ${date}`);
         eq(r.body.code, "BAD_DATE");
       }
-      const t = ok(await setLock(TODAY), 200);
-      eq(t.booksLockDate, TODAY, "today itself may be locked");
+      const t = ok(await setLock(YESTERDAY), 200);
+      eq(t.booksLockDate, YESTERDAY, "yesterday may be locked");
       eq(t.kycBvn, undefined, "the business as GET /businesses sends it");
       const n = ok(await setLock(null), 200);
       eq(n.booksLockDate, null, "null unlocks");
@@ -827,9 +828,13 @@ function ok(r, status, what = "") {
     });
 
     // ════════════════════════════════════════════════════════════════════
-    section(`Locked up to today (${TODAY})`);
+    // The route locks up to yesterday at the latest; a lock date of today (an
+    // older lock, or one written by hand) must still hold, so it is written
+    // straight to the business here.
+    const lockToday = (bizId) => prisma.business.update({ where: { id: bizId }, data: { booksLockDate: TODAY } });
+    section(`Locked up to today (${TODAY}), written directly`);
     await test("today's own writes wait for tomorrow", async () => {
-      ok(await setLock(TODAY), 200);
+      await lockToday(biz.id);
       locked(await call("POST", "/sales", T, { businessId: biz.id, amount: 10 }), TODAY, "a sale dated now");
       locked(await call("POST", "/expenses", T, { businessId: biz.id, amount: 10, category: "rent" }), TODAY, "an expense dated now");
       locked(await newJournal({ lines: move(1) }), TODAY, "a journal dated today");
@@ -839,11 +844,18 @@ function ok(r, status, what = "") {
       locked(await call("POST", `/customers/${custA.id}/debts/${custADebt.id}/payment`, T, { amount: 10, method: "cash" }), TODAY, "a repayment");
       locked(await call("POST", "/invoices", T, { businessId: biz.id, issueDate: TODAY, items: items(5), status: "SENT" }), TODAY, "an invoice dated today");
     });
+    await test("a date the books cannot read as a day (year 11476, year -1) counts as locked", async () => {
+      const count0 = await prisma.transaction.count({ where: { businessId: biz.id } });
+      for (const date of ["+011476-03-01T00:00:00.000Z", "-000001-06-01T00:00:00.000Z"]) {
+        locked(await call("POST", "/transactions", T, { businessId: biz.id, type: "income", amount: 70, date }), TODAY, `a row dated ${date}`);
+      }
+      eq(await prisma.transaction.count({ where: { businessId: biz.id } }), count0, "nothing saved");
+    });
     await test("a credit landing today is booked, and the matcher leaves it alone", async () => {
       const fresh = await call("POST", "/invoices", T, { businessId: biz2.id, issueDate: OPEN, items: items(321.09), status: "SENT" });
       ok(fresh, 201);
       // biz2 is open; lock biz2 today, then a credit lands today.
-      ok(await setLock(TODAY, T, biz2.id), 200);
+      await lockToday(biz2.id);
       const credit = await prisma.transaction.create({
         data: {
           businessId: biz2.id, userId: owner.id, type: "income", amount: 321.09, date: new Date(), paymentMethod: "bank",

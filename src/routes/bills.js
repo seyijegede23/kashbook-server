@@ -75,7 +75,7 @@ const { assertAccountUsable, invalidateLedger } = require("../utils/ledgerData")
 const { assertUnlockedIn } = require("../utils/booksLock");
 const { audit } = require("../utils/audit");
 const { toKobo } = require("../utils/money");
-const { BILL_INCLUDE, publicBill } = require("../utils/billView");
+const { BILL_INCLUDE, billFor } = require("../utils/billView");
 const { PROVIDER_SOURCES, isLedgerBankRow } = require("../config/moneySources");
 
 router.use(auth);
@@ -95,7 +95,9 @@ function statusOf(amountKobo, paidK) {
   return paidK > 0 ? "partial" : "unpaid";
 }
 
-// A bill as a client receives it: publicBill (utils/billView.js).
+// A bill as a client receives it: publicBill (utils/billView.js), through
+// billFor, so staff who do not see the bank get no debit ids (viewBill).
+const viewBill = (req, row) => billFor(row, { canSeeBank: req.user.permissions?.canViewBalance === true });
 
 // ── Refusals ─────────────────────────────────────────────────────────────────
 
@@ -297,7 +299,7 @@ router.get("/", requirePermission("canManagePayables"), async (req, res) => {
       include: BILL_INCLUDE,
       orderBy: [{ billDate: "desc" }, { createdAt: "desc" }],
     });
-    res.json({ bills: bills.map(publicBill) });
+    res.json({ bills: bills.map((b) => viewBill(req, b)) });
   } catch (err) {
     sendError(res, err, "Failed to load bills");
   }
@@ -310,7 +312,7 @@ router.get("/:id", requirePermission("canManagePayables"), async (req, res) => {
     if (!found) return sendError(res, billNotFound());
     const bill = await prisma.businessDebt.findUnique({ where: { id: found.id }, include: BILL_INCLUDE });
     if (!bill) return sendError(res, billNotFound());
-    res.json({ bill: publicBill(bill) });
+    res.json({ bill: viewBill(req, bill) });
   } catch (err) {
     sendError(res, err, "Failed to load the bill");
   }
@@ -368,7 +370,7 @@ router.post("/", requirePermission("canManagePayables"), async (req, res) => {
 
     invalidateLedger(biz.id);
     logBill(req, "BILL_CREATE", bill.id, { businessId: biz.id, amount: bill.originalAmount, accountId: bill.accountId });
-    res.status(201).json({ bill: publicBill(bill) });
+    res.status(201).json({ bill: viewBill(req, bill) });
   } catch (err) {
     sendError(res, err, "Failed to add the bill");
   }
@@ -475,7 +477,7 @@ router.patch("/:id", requirePermission("canManagePayables"), async (req, res) =>
       invalidateLedger(found.biz.id);
       logBill(req, "BILL_UPDATE", found.id, { fields: result.fields, before: result.before });
     }
-    res.json({ bill: publicBill(result.bill) });
+    res.json({ bill: viewBill(req, result.bill) });
   } catch (err) {
     sendError(res, err, "Failed to update the bill");
   }
@@ -618,7 +620,7 @@ router.post("/:id/payments", requirePermission("canManagePayables"), async (req,
     logBill(req, "BILL_PAYMENT", found.id, {
       paymentId: result.payment.id, amount: result.payment.amount, method, transactionId: result.payment.transactionId,
     });
-    res.status(201).json({ bill: publicBill(result.bill), payment: result.payment, transaction: result.transaction });
+    res.status(201).json({ bill: viewBill(req, result.bill), payment: result.payment, transaction: result.transaction });
   } catch (err) {
     sendError(res, err, "Failed to record the payment");
   }
@@ -662,7 +664,7 @@ router.delete("/:id/payments/:paymentId", ownerOnly("Only the business owner can
       paymentId, amount: result.payment.amount, method: result.payment.method,
       freedTransaction: result.transaction ? result.transaction.id : null,
     });
-    res.json({ bill: publicBill(result.bill), transaction: result.transaction });
+    res.json({ bill: viewBill(req, result.bill), transaction: result.transaction });
   } catch (err) {
     sendError(res, err, "Failed to remove the payment");
   }

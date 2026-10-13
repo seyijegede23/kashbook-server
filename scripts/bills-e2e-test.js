@@ -888,6 +888,19 @@ async function waitFor(fn, what, ms = 2000) {
       const withBank = (await GET(`/sync?businessId=${biz.id}`, reports.token)).body.bills.find((x) => x.id === b.id);
       eq(withBank.payments[0].transactionId, d.id);
       eq(withBank.payments[0].method, "bank");
+      // Staff with bills but not the bank: the whole bill, its payment from
+      // the KashBook account as such, but no debit id (routes and sync).
+      const viaRoute = (await GET(`/bills/${b.id}`, payables.token)).body.bill;
+      const viaList = (await GET(`/bills?businessId=${biz.id}`, payables.token)).body.bills.find((x) => x.id === b.id);
+      const viaSync = (await GET(`/sync?businessId=${biz.id}`, payables.token)).body.bills.find((x) => x.id === b.id);
+      for (const [where, got] of [["route", viaRoute], ["list", viaList], ["sync", viaSync]]) {
+        eq(got.vendorName, "Hidden Debit Ltd", `${where}: the bill is theirs to read`);
+        eq(got.payments[0].method, "bank", `${where}: paid from the KashBook account`);
+        eq(got.payments[0].amount, 3000, where);
+        eq(got.payments[0].transactionId, null, `${where}: no debit id`);
+      }
+      eq((await GET(`/bills/${b.id}`, payBank.token)).body.bill.payments[0].transactionId, d.id, "bills + bank staff get it");
+      eq((await GET(`/bills/${b.id}`, T)).body.bill.payments[0].transactionId, d.id, "the owner gets it");
     });
     await test("published adjustments go to members with the reports, whole on every pull; drafts never", async () => {
       const line = (accountId, debit, credit, position) => ({ accountId, debit, credit, position });

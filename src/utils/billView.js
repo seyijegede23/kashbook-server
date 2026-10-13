@@ -111,4 +111,23 @@ function booksOnlyBill(row, seen) {
   };
 }
 
-module.exports = { BILL_INCLUDE, publicBill, booksOnlyBill };
+// A whole bill for whoever may open bills: as publicBill, except that a
+// member who does not see the KashBook account's rows (canViewBalance; owners
+// do) gets no debit id on its payments (owner's call, 2026-10-13). They
+// still see that a payment came from the KashBook account, how much and on
+// which day: that is part of the bill. The id would only point at bank rows
+// withheld from them.
+// A payment from the KashBook account carries the debit's own time: it goes
+// out on its Lagos day only (asTypedDay), as a typed payment is kept.
+function billFor(row, { canSeeBank }) {
+  const b = publicBill(row);
+  if (canSeeBank === true || !b || typeof b !== "object" || !Array.isArray(b.payments)) return b;
+  return {
+    ...b,
+    payments: b.payments.map((p) =>
+      p.transactionId || p.method === "bank" ? { ...p, transactionId: null, date: asTypedDay(p.date) || p.date } : p,
+    ),
+  };
+}
+
+module.exports = { BILL_INCLUDE, publicBill, booksOnlyBill, billFor };

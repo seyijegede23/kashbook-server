@@ -48,8 +48,19 @@ function dayOf(value) {
     if (Number.isFinite(t)) days.push(books.dayKey(new Date(t)));
     return days.sort()[0];
   }
-  const day = books.dayKey(value);
-  return DAY.test(day) ? day : null;
+  // A Date or a time in milliseconds: its Lagos day. A real time whose day
+  // the books cannot read as a plain day (a year before 0000 or after 9999,
+  // which they would sort before every real day), or one at the very edge of
+  // the range where reading it throws, counts as EARLIEST too (fail closed).
+  // An invalid date names no day.
+  let day;
+  try {
+    day = books.dayKey(value);
+  } catch {
+    return EARLIEST;
+  }
+  if (!day) return null;
+  return DAY.test(day) ? day : EARLIEST;
 }
 
 // The refusal a write gets when it touches a locked day: 409 BOOKS_LOCKED,

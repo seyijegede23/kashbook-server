@@ -455,6 +455,18 @@ const uri = (mime, buf) => `data:${mime};base64,${buf.toString("base64")}`;
       eq((await prisma.recurringExpense.findUnique({ where: { id: rule.body.id } })).amount, 5000, "the amount unchanged");
       eq((await call("PATCH", `/recurring-expenses/${rule.body.id}`, T, { amount: "7500" })).body.amount, 7500, "a numeric string is a number");
       await prisma.recurringExpense.delete({ where: { id: rule.body.id } });
+      // A rule saved on credit before bills can still be edited as it is (the
+      // app sends its method back), and moved off credit.
+      const old = await prisma.recurringExpense.create({
+        data: { userId: owner.id, businessId: biz.id, amount: 3000, frequency: "monthly", paymentMethod: "credit", category: "rent", nextDue: new Date("2099-01-01") },
+      });
+      const kept = await call("PATCH", `/recurring-expenses/${old.id}`, T, { paymentMethod: "credit", amount: 3500, notes: "still on credit" });
+      eq(kept.status, 200, JSON.stringify(kept.body));
+      eq(kept.body.paymentMethod, "credit");
+      eq(kept.body.amount, 3500);
+      eq((await call("PATCH", `/recurring-expenses/${old.id}`, T, { paymentMethod: "cash" })).body.paymentMethod, "cash");
+      eq((await call("PATCH", `/recurring-expenses/${old.id}`, T, { paymentMethod: "credit" })).status, 400, "and never back to credit");
+      await prisma.recurringExpense.delete({ where: { id: old.id } });
     });
     await test("an expense is never put on credit (a bill instead); one saved on credit before bills may keep it", async () => {
       const count0 = await prisma.expense.count({ where: { businessId: biz.id } });

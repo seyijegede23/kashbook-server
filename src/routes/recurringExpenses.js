@@ -196,7 +196,12 @@ router.patch("/:id", async (req, res) => {
       include: { business: true },
     });
     if (!existing) return res.status(404).json({ error: "Not found" });
-    const refusedMethod = methodRefusal(paymentMethod);
+    // A rule saved on credit before release 2 may keep it (it now makes an
+    // unpaid bill each time, utils/recurringExpenseRunner.js): only a change
+    // INTO credit, or to a method the app does not offer, is refused.
+    const isCredit = (m) => typeof m === "string" && m.trim().toLowerCase() === "credit";
+    const keepsCredit = isCredit(paymentMethod) && isCredit(existing.paymentMethod);
+    const refusedMethod = keepsCredit ? null : methodRefusal(paymentMethod);
     if (refusedMethod) return res.status(400).json(refusedMethod);
 
     const data = {};

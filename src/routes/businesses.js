@@ -312,10 +312,13 @@ router.patch("/:id", async (req, res) => {
 // transactions): nothing dated on or before it may be added, changed or
 // removed (utils/booksLock.js), so figures already reported, a VAT return or
 // last year's accounts, stay as they were. Bank rows from the provider still
-// arrive. The owner's alone, a day up to today in Lagos; null unlocks the
-// books. Set under the business lock that every guarded write checks it
-// under, so a write and a new lock date never pass each other. Answers with
-// the business, as PATCH does (booksLockDate among its fields).
+// arrive. The owner's alone, a day up to YESTERDAY in Lagos (owner's call,
+// 2026-10-13): today stays open, so nothing the app records by itself today
+// (a recurring expense or invoice, money arriving) can land on a locked day;
+// null unlocks the books. Set under the business lock that every guarded
+// write checks it under, so a write and a new lock date never pass each
+// other. Answers with the business, as PATCH does (booksLockDate among its
+// fields).
 router.put("/:id/books-lock", ownerOnly("Only the business owner can lock the books."), async (req, res) => {
   try {
     const body = req.body || {};
@@ -329,8 +332,8 @@ router.put("/:id/books-lock", ownerOnly("Only the business owner can lock the bo
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== date) {
         return res.status(400).json({ error: "Choose the day to lock the books up to.", code: "BAD_DATE", field: "date" });
       }
-      if (date > dayKey(new Date())) {
-        return res.status(400).json({ error: "The books can be locked up to today at the latest.", code: "BAD_DATE", field: "date" });
+      if (date >= dayKey(new Date())) {
+        return res.status(400).json({ error: "The books can be locked up to yesterday at the latest: today is still open.", code: "BAD_DATE", field: "date" });
       }
     }
     const biz = await prisma.business.findFirst({

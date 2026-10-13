@@ -15,8 +15,10 @@ const { allocateInvoiceNumber } = require("./invoiceNumber");
 const { pushTo } = require("./pushNotification");
 const { formatAmountForBusiness } = require("../config/amlLimits");
 
+// The day in Lagos, as the books read days (books.dayKey): not the UTC day,
+// which is a day early before 01:00 Lagos, and could fall on a locked day.
 function isoDay(d = new Date()) {
-  return d.toISOString().slice(0, 10);
+  return require("./books").dayKey(d);
 }
 
 async function processRecurringInvoices(now = new Date()) {

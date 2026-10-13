@@ -11,7 +11,7 @@ const { isBankLedgerRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
 const { accountsFor, publicAccount } = require("../utils/ledgerData");
 const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
-const { BILL_INCLUDE, publicBill, booksOnlyBill } = require("../utils/billView");
+const { BILL_INCLUDE, billFor, booksOnlyBill } = require("../utils/billView");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 
 router.use(auth);
@@ -182,7 +182,7 @@ router.get("/", async (req, res) => {
       // shape routes/bills.js answers with.
       // A member without the bank rows gets each payment from the KashBook
       // account as a plain transfer, without its debit (booksOnlyBill).
-      bills: bills.map((b) => (canSeeBills ? publicBill(b) : booksOnlyBill(b, { canSeeBank }))),
+      bills: bills.map((b) => (canSeeBills ? billFor(b, { canSeeBank }) : booksOnlyBill(b, { canSeeBank }))),
       invoices,
       recurring: isOwner ? recurring : [],
       accounts: accounts.map(publicAccount),
