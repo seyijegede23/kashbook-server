@@ -252,6 +252,12 @@ async function main() {
     const list = await call("GET", `/invoices?businessId=${biz.id}`, owner.id);
     const row = (list.body || []).find((i) => i.id === d.id);
     check("the list returns the new fields", !!row && row.paymentTerms === "net_45" && row.subject === "Updated", row && [row.paymentTerms, row.subject]);
+    const ranged = await call("GET", `/invoices?businessId=${biz.id}&dateFrom=${d.issueDate}&dateTo=${d.issueDate}`, owner.id);
+    check("a day range lists the invoices of those days (issueDate is text)", ranged.status === 200 && (ranged.body || []).some((i) => i.id === d.id), ranged.status);
+    const later = await call("GET", `/invoices?businessId=${biz.id}&dateFrom=2999-01-01`, owner.id);
+    check("a range after it leaves it out", later.status === 200 && !(later.body || []).some((i) => i.id === d.id), later.status);
+    const badRange = await call("GET", `/invoices?businessId=${biz.id}&dateFrom=yesterday`, owner.id);
+    check("a range bound that is not a day is refused", badRange.status === 400, badRange.status);
 
     console.log("\nTyped (manual) numbers");
     const counterOf = async () => (await prisma.business.findUnique({ where: { id: biz.id } })).invoiceCounter;

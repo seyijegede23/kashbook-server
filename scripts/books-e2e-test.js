@@ -215,6 +215,16 @@ const inv = (id) => prisma.invoice.findUnique({ where: { id }, include: { paymen
       const r = await call("POST", `/invoices/${cn.id}/refund`, T, { amount: 10000, method: "bank", transactionId: d.id });
       eq(r.status, 400); eq(r.body.code, "AMOUNT_MISMATCH");
     });
+    await test("only a transfer out of the KashBook account: a hand-typed row is refused and left as it was", async () => {
+      for (const over of [{ source: null, paymentMethod: "cash", category: "other" }, { category: "card" }]) {
+        const typed = await debit(10000, over);
+        const r = await call("POST", `/invoices/${cn.id}/refund`, T, { amount: 10000, method: "bank", transactionId: typed.id });
+        eq(r.status, 400, JSON.stringify(r.body));
+        eq(r.body.code, "NOT_OUTGOING");
+        eq((await txRow(typed.id)).purpose, null, "not marked");
+        await prisma.transaction.delete({ where: { id: typed.id } });
+      }
+    });
     const d1 = await debit(10000);
     const before = (await books()).sales.total;
     await test("linked refund: debit marked customer_refund, not an expense", async () => {

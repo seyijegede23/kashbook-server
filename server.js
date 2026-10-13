@@ -52,7 +52,6 @@ const customerRoutes = require("./src/routes/customers");
 const inventoryRoutes = require("./src/routes/inventory");
 const salesRoutes = require("./src/routes/sales");
 const expenseRoutes = require("./src/routes/expenses");
-const businessDebtRoutes = require("./src/routes/businessDebts");
 const suggestionRoutes = require("./src/routes/suggestions");
 const reminderRoutes = require("./src/routes/reminders");
 const invoiceRoutes = require("./src/routes/invoices");
@@ -303,7 +302,8 @@ app.use("/customers", apiLimiter);
 app.use("/inventory", apiLimiter);
 app.use("/sales", apiLimiter);
 app.use("/expenses", apiLimiter);
-app.use("/business-debts", apiLimiter);
+app.use("/bills", apiLimiter);
+app.use("/journals", apiLimiter);
 app.use("/suggestions", apiLimiter);
 app.use("/reminders", apiLimiter);
 app.use("/invoices", apiLimiter);
@@ -327,8 +327,9 @@ app.use("/admin-api", authLimiter);
 {
   const { invalidateOwner } = require("./src/utils/ledgerData");
   const { ownerIdOf } = require("./src/utils/scope");
-  const ledgerWrites = ["/sales", "/expenses", "/transactions", "/invoices", "/customers", "/business-debts",
-    "/recurring-expenses", "/recurring-invoices", "/payroll", "/transfers", "/businesses", "/sync", "/ledger", "/instagram"];
+  const ledgerWrites = ["/sales", "/expenses", "/transactions", "/invoices", "/customers",
+    "/recurring-expenses", "/recurring-invoices", "/payroll", "/transfers", "/businesses", "/sync", "/ledger", "/instagram",
+    "/bills", "/journals"];
   app.use(ledgerWrites, (req, res, next) => {
     if (req.method !== "GET") {
       res.on("finish", () => {
@@ -349,7 +350,6 @@ app.use("/customers", customerRoutes);
 app.use("/inventory", inventoryRoutes);
 app.use("/sales", salesRoutes);
 app.use("/expenses", expenseRoutes);
-app.use("/business-debts", businessDebtRoutes);
 app.use("/suggestions", suggestionRoutes);
 app.use("/reminders", reminderRoutes);
 app.use("/invoices", invoiceRoutes);
@@ -371,6 +371,10 @@ app.use("/whatsapp", whatsappRoutes);
 app.use("/savings", require("./src/routes/savings"));
 // The chart of accounts and the books it reads (2026-10-11).
 app.use("/ledger", require("./src/routes/ledger"));
+// Release 2 of the chart of accounts (2026-10-13): bills, which replace
+// payables, and manual journals (Adjustments in the app).
+app.use("/bills", require("./src/routes/bills"));
+app.use("/journals", require("./src/routes/journals"));
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.

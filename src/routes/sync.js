@@ -11,6 +11,8 @@ const { isBankLedgerRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
 const { accountsFor, publicAccount } = require("../utils/ledgerData");
 const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
+const { BILL_INCLUDE, publicBill, booksOnlyBill } = require("../utils/billView");
+const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 
 router.use(auth);
 
@@ -58,8 +60,15 @@ router.get("/", async (req, res) => {
     // the month views showed expenses with no income. 2,500 rows per table
     // is about two years for a busy shop and a few hundred kB gzipped.
     const txCap = sinceDate ? undefined : 2500;
+    // Bills are the canManagePayables capability's (owners hold it): those
+    // members get them whole. A member who sees the bank rows or the reports
+    // gets them for the books alone (booksOnlyBill); anyone else, not at all.
+    const canSeeBills = req.user.permissions?.canManagePayables === true;
+    const canSeeBank = req.user.permissions?.canViewBalance === true;
+    const canSeeReports = req.user.permissions?.canViewReports === true;
+    const billsForBooks = canSeeBills || canSeeBank || canSeeReports;
 
-    const [sales, expenses, transactions, customers, inventory, debts, invoices, recurring] =
+    const [sales, expenses, transactions, customers, inventory, bills, invoices, recurring, journals] =
       await Promise.all([
         prisma.sales.findMany({
           where: { ...userScope, ...incremental },
@@ -88,10 +97,17 @@ router.get("/", async (req, res) => {
           where: { ...userScope, ...incremental },
           orderBy: sinceDate ? { updatedAt: "asc" } : { name: "asc" },
         }),
-        prisma.businessDebt.findMany({
-          where: { ...userScope, ...incremental },
-          orderBy: sinceDate ? { updatedAt: "asc" } : { createdAt: "desc" },
-        }),
+        // Every bill with its payments, never capped: the app's own totals
+        // count them (useBooks), so a page of them would be wrong figures. A
+        // payment added or taken back moves its bill's updatedAt
+        // (routes/bills.js), so an incremental pull carries it.
+        billsForBooks
+          ? prisma.businessDebt.findMany({
+            where: { ...userScope, ...incremental },
+            include: BILL_INCLUDE,
+            orderBy: sinceDate ? { updatedAt: "asc" } : [{ billDate: "desc" }, { createdAt: "desc" }],
+          })
+          : [],
         prisma.invoice.findMany({
           where: { ...businessScope, ...incremental },
           include: {
@@ -105,6 +121,25 @@ router.get("/", async (req, res) => {
           where: { userId: targetUserId, businessId, ...incremental },
           orderBy: { nextDue: "asc" },
         }),
+        // Published adjustments (manual journals), whole on every pull and
+        // never capped: their lines on income and spending accounts count in
+        // the phone's totals as in the server's (books.js), and one taken back
+        // to a draft or deleted must leave the phone's books, which an
+        // incremental pull could not say. A business keeps few. Readable with
+        // the reports (routes/journals.js), so only those members get them.
+        canSeeReports
+          ? prisma.manualJournal.findMany({
+            where: { businessId, status: "published" },
+            select: {
+              id: true, businessId: true, number: true, date: true, note: true, status: true, updatedAt: true,
+              lines: {
+                select: { id: true, accountId: true, debit: true, credit: true, description: true },
+                orderBy: [{ position: "asc" }, { id: "asc" }],
+              },
+            },
+            orderBy: [{ date: "asc" }, { id: "asc" }],
+          })
+          : [],
       ]);
     // The chart of accounts, whole on every pull (a business has well under
     // a hundred): every member picks accounts, nobody gets amounts from it.
@@ -126,14 +161,16 @@ router.get("/", async (req, res) => {
     //                  canViewBalance would have been the wrong gate: it would
     //                  hand them to a trusted staff member the owner-only rule
     //                  says must never see them. Owners only, full stop.
-    //   debts        — what the business owes, the same class as payables,
-    //                  which businessDebts.js and payables.js both gate.
+    //   bills        — what the business owes, and to whom: canManagePayables,
+    //                  as on every route in routes/bills.js (read above). A
+    //                  member with the bank rows or the reports gets only what
+    //                  the books read (booksOnlyBill).
+    //   journals     — published adjustments: canViewReports, as on the
+    //                  journals routes.
     //
     // Sales, expenses, customers, inventory and invoices are the bookkeeping a
     // staff member is employed to do, and stay.
-    const canSeeBank = req.user.permissions?.canViewBalance === true;
     const isOwner = req.user.accountType !== "staff";
-    const canSeeDebts = req.user.permissions?.canManagePayables === true;
     res.json({
       sales,
       // A receipt's storage keys never leave the server (utils/expenseView.js).
@@ -141,10 +178,16 @@ router.get("/", async (req, res) => {
       transactions: canSeeBank ? transactions : [],
       customers,
       inventory,
-      debts: canSeeDebts ? debts : [],
+      // Bills replace payables (release 2): each with its payments, in the
+      // shape routes/bills.js answers with.
+      // A member without the bank rows gets each payment from the KashBook
+      // account as a plain transfer, without its debit (booksOnlyBill).
+      bills: bills.map((b) => (canSeeBills ? publicBill(b) : booksOnlyBill(b, { canSeeBank }))),
       invoices,
       recurring: isOwner ? recurring : [],
       accounts: accounts.map(publicAccount),
+      // Every published adjustment (see above): the app replaces its list.
+      journals: canSeeReports ? journals : null,
       // Told, not silently emptied — the client can distinguish "no bank
       // activity" from "not yours to see" instead of rendering a confident zero.
       bankWithheld: !canSeeBank,
@@ -158,7 +201,8 @@ router.get("/", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /sync/pull?businessId=
-// Full snapshot for new device login
+// Full snapshot for new device login. The legacy payables it used to carry are
+// retired (release 2): bills come with GET /sync above.
 // ─────────────────────────────────────────────────────────────────────────────
 router.get("/pull", async (req, res) => {
   const { businessId } = req.query;
@@ -167,7 +211,7 @@ router.get("/pull", async (req, res) => {
     return res.status(403).json({ error: "Forbidden" });
 
   try {
-    const [transactions, customers, inventory, payables] = await Promise.all([
+    const [transactions, customers, inventory] = await Promise.all([
       prisma.transaction.findMany({
         where: { businessId },
         orderBy: { date: "desc" },
@@ -177,11 +221,6 @@ router.get("/pull", async (req, res) => {
         include: { debts: { include: { payments: true } } },
       }),
       prisma.inventoryItem.findMany({ where: { businessId } }),
-      prisma.payable.findMany({
-        where: { businessId },
-        include: { payments: true },
-        orderBy: { createdAt: "desc" },
-      }),
     ]);
 
     // Same rule as the main pull above. This variant scopes on req.user.id so
@@ -194,9 +233,6 @@ router.get("/pull", async (req, res) => {
       transactions: canSeeBank ? transactions : [],
       customers,
       inventory,
-      // payables.js gates every one of its own routes on canManagePayables.
-      // Returning them here ungated is the same data through a different door.
-      payables: req.user.permissions?.canManagePayables === true ? payables : [],
       bankWithheld: !canSeeBank,
     });
   } catch (err) {
@@ -307,6 +343,9 @@ async function processOp(op, userId, userName, accountType) {
       if (data.paymentMethod === "bank" || data.source) {
         throw Object.assign(new Error("Bank transactions can't be created here."), { code: "BANK_ROW_FORBIDDEN" });
       }
+      // The books lock date (utils/booksLock.js), as on every route that adds,
+      // changes or removes a dated record: nothing on or before it.
+      await assertUnlocked(data.businessId, data.date);
       await prisma.transaction.upsert({
         where: { id: data.id },
         create: {
@@ -340,7 +379,23 @@ async function processOp(op, userId, userName, accountType) {
           }).catch(() => {});
           throw Object.assign(new Error("Bank transactions can't be deleted."), { code: "BANK_ROW_IMMUTABLE" });
         }
-        await prisma.transaction.delete({ where: { id: data.id } });
+        // Under the business lock, where every link to a row is written, and
+        // read again there: a row another record carries (a bill payment, a
+        // customer refund, a match) is not deleted under it, or that record
+        // would keep counting money no row backs (as DELETE /transactions/:id
+        // refuses it).
+        await prisma.withBusinessLock(tx.businessId || tx.userId, async () => {
+          const cur = await prisma.transaction.findUnique({ where: { id: tx.id } });
+          if (!cur) return;
+          if (cur.matchedBillId) {
+            throw Object.assign(new Error("This transfer paid a bill. Remove the payment from the bill before deleting it."), { code: "BILL_LINKED" });
+          }
+          if (cur.purpose === "customer_refund" || cur.matchedSaleId || cur.matchedCustomerId || cur.matchedExpenseId || cur.matchedInvoiceId) {
+            throw Object.assign(new Error("This transaction is linked to a record. Remove that link before deleting it."), { code: "MATCHED_ROW_LOCKED" });
+          }
+          await assertUnlocked(cur.businessId, cur.date);
+          await prisma.transaction.delete({ where: { id: cur.id } });
+        });
       }
       break;
     }
@@ -382,6 +437,10 @@ async function processOp(op, userId, userName, accountType) {
             { code: "CUSTOMER_HAS_PAYMENTS" },
           );
         }
+        // Credit given with no sale counts on its own day ("when sold"), and
+        // goes with the customer.
+        const credit = await prisma.debt.findMany({ where: { customerId: c.id }, select: { date: true } });
+        await assertUnlocked(c.businessId, credit.map((d) => d.date));
         await prisma.customer.delete({ where: { id: data.id } });
       }
       break;
@@ -398,6 +457,7 @@ async function processOp(op, userId, userName, accountType) {
       // Idempotent: only add if debt doesn't already exist
       const existing = await prisma.debt.findUnique({ where: { id: data.id } });
       if (!existing) {
+        await assertUnlocked(customer.businessId, data.date);
         await prisma.debt.create({
           data: {
             id: data.id,
@@ -433,7 +493,7 @@ async function processOp(op, userId, userName, accountType) {
       // SECURITY: bind the debt to the authorised customer. Fetching by id
       // alone allowed a cross-tenant write — pass your own customerId (passes
       // the ownership check above) plus a victim's debtId, and their receivable
-      // ledger gets modified. Mirrors record_payable_payment, which does this right.
+      // ledger gets modified.
       const debt = await prisma.debt.findFirst({
         where: { id: data.debtId, customerId: customer.id },
       });
@@ -451,14 +511,18 @@ async function processOp(op, userId, userName, accountType) {
             const remaining = Math.round((fresh.amount - fresh.paidAmount) * 100) / 100;
             const amount = Math.min(Math.round(Number(data.amount) * 100) / 100, remaining);
             if (!(amount > 0)) return; // already paid: nothing left to record
-            const when = new Date(data.date);
+            const sent = new Date(data.date);
+            const when = Number.isNaN(sent.getTime()) ? new Date() : sent;
+            // A repayment counts on its own day: never one on or before the
+            // books lock date. Read in this transaction, under the lock.
+            await assertUnlockedIn(px, customer.businessId, when);
             await px.debtPayment.create({
               data: {
                 id: data.id,
                 debtId: fresh.id,
                 amount,
                 note: data.note || "",
-                date: Number.isNaN(when.getTime()) ? new Date() : when,
+                date: when,
               },
             });
             const newPaid = Math.min(fresh.amount, Math.round((fresh.paidAmount + amount) * 100) / 100);
@@ -533,67 +597,9 @@ async function processOp(op, userId, userName, accountType) {
       break;
     }
 
-    // ── Payables ──────────────────────────────────────────────────────────────
-    case "add_payable": {
-      await assertOwns(data.businessId);
-      await prisma.payable.upsert({
-        where: { id: data.id },
-        create: {
-          id: data.id,
-          businessId: data.businessId,
-          creditorName: data.creditorName,
-          category: data.category || "other",
-          amount: Number(data.amount),
-          dueDate: data.dueDate ? new Date(data.dueDate) : null,
-          note: data.note || null,
-          date: new Date(data.date),
-        },
-        update: {},
-      });
-      break;
-    }
-
-    case "record_payable_payment": {
-      const payable = await prisma.payable.findUnique({
-        where: { id: data.payableId },
-      });
-      if (!payable) break;
-      await assertOwns(payable.businessId);
-
-      const alreadyRecorded = await prisma.payablePayment.findUnique({
-        where: { id: data.id },
-      });
-      if (!alreadyRecorded) {
-        const newPaid = Math.min(
-          payable.paidAmount + Number(data.amount),
-          payable.amount,
-        );
-        await prisma.payablePayment.create({
-          data: {
-            id: data.id,
-            payableId: data.payableId,
-            amount: Number(data.amount),
-            note: data.note || null,
-            date: new Date(data.date),
-          },
-        });
-        await prisma.payable.update({
-          where: { id: data.payableId },
-          data: { paidAmount: newPaid, paid: newPaid >= payable.amount },
-        });
-      }
-      break;
-    }
-
-    case "delete_payable": {
-      const payable = await prisma.payable.findUnique({ where: { id: data.id } });
-      if (payable) {
-        await assertOwns(payable.businessId);
-        await prisma.payable.delete({ where: { id: data.id } });
-      }
-      break;
-    }
-
+    // The legacy payable ops (add_payable, record_payable_payment,
+    // delete_payable) are retired with payables (release 2): bills live in
+    // routes/bills.js, and an op naming one is an unknown op.
     default:
       throw new Error(`Unknown operation type: ${type}`);
   }

@@ -21,23 +21,25 @@ function dateWhere(from, to) {
   return w;
 }
 
-// Records the rule needs. Invoices and debts are loaded whole (with their
-// payments) because a payment in the period can belong to an older document;
-// they are few per business.
+// Records the rule needs. Invoices, debts and bills are loaded whole (with
+// their payments) because a payment in the period can belong to an older
+// document; they are few per business.
 //
 // Either Lagos days ({ from, to }, inclusive "YYYY-MM-DD") or exact instants
 // ({ start, end } Dates, end exclusive). With instants the dated rows AND the
 // payments are cut to [start, end), so a partial day ("the same point last
-// week") is exact; pass the result to computeBooks without from/to.
+// week") is exact; pass the result to computeBooks without from/to. (A bill's
+// payments kept outside the books stay: they count on no day, they only say
+// how much of the bill the books carry.)
 async function loadBooksInput(businessId, { from, to, start, end } = {}, db = prisma) {
   const byInstant = start instanceof Date && end instanceof Date;
   const date = byInstant ? { gte: start, lt: end } : dateWhere(from, to);
   const biz = await db.business.findUnique({
     where: { id: businessId },
-    select: { id: true, userId: true, baseCurrency: true, vatEnabled: true, vatRate: true, vatInclusive: true },
+    select: { id: true, baseCurrency: true, vatEnabled: true, vatRate: true, vatInclusive: true },
   });
   if (!biz) return null;
-  const [sales, expenses, bankRows, invoices, debts, accounts] = await Promise.all([
+  const [sales, expenses, bankRows, invoices, debts, accounts, bills, journals] = await Promise.all([
     db.sales.findMany({
       where: { businessId, ...(date ? { date } : {}) },
       // channel and customerId: Insights breaks sales down by them (bookRows
@@ -66,7 +68,7 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
       select: {
         id: true, type: true, amount: true, date: true, purpose: true, channel: true, customerId: true,
         matchedSaleId: true, matchedCustomerId: true, matchedExpenseId: true,
-        matchedInvoiceId: true, matchedAmount: true,
+        matchedInvoiceId: true, matchedBillId: true, matchedAmount: true,
         fee: true, accountId: true, currency: true, source: true, paymentMethod: true,
         category: true, reference: true, description: true,
       },
@@ -83,10 +85,13 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
         },
       },
     }),
-    // This business's customers, and the owner's customers with no business
-    // yet: the app shows those in every business, so the books do too.
+    // This business's customers' debts. Every customer belongs to one business
+    // (release 2): one that had none was given one (scripts/backfill-r2.js)
+    // and the routes no longer make another, so a debt counts in its
+    // customer's business only, as the app (which syncs one business's
+    // customers) counts it.
     db.debt.findMany({
-      where: { customer: { OR: [{ businessId }, { businessId: null, userId: biz.userId }] } },
+      where: { customer: { businessId } },
       select: {
         id: true, customerId: true, amount: true, paidAmount: true, paid: true, date: true, saleId: true, note: true,
         payments: {
@@ -97,15 +102,49 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
         },
       },
     }),
+    // With aliasSlugs, so the chart read from this list (chart.indexChart)
+    // finds a merged category's account as the ledger does.
     db.ledgerAccount.findMany({
       where: { businessId },
-      select: { id: true, type: true, systemKey: true, categorySlug: true },
+      select: { id: true, type: true, systemKey: true, categorySlug: true, aliasSlugs: true },
+    }),
+    // Bills (release 2), loaded whole like invoices: a payment in the period
+    // can be towards an older bill. Every field the ledger reads (where the
+    // money went or came from, the memo its entries show).
+    db.businessDebt.findMany({
+      where: { businessId },
+      select: {
+        id: true, name: true, billNumber: true, note: true, accountId: true, receivedViaAccountId: true,
+        billDate: true, originalAmount: true, estimated: true,
+        payments: {
+          select: {
+            id: true, amount: true, date: true, method: true, transactionId: true, outsideBooks: true,
+            paidThroughAccountId: true, note: true,
+          },
+          orderBy: [{ date: "asc" }, { id: "asc" }],
+        },
+      },
+      orderBy: [{ billDate: "asc" }, { id: "asc" }],
+    }),
+    // Published manual journals dated in the period, with their lines (a
+    // draft counts nowhere).
+    db.manualJournal.findMany({
+      where: { businessId, status: "published", ...(date ? { date } : {}) },
+      select: {
+        id: true, number: true, date: true, note: true, status: true,
+        lines: {
+          select: { id: true, accountId: true, debit: true, credit: true, description: true },
+          orderBy: [{ position: "asc" }, { id: "asc" }],
+        },
+      },
+      orderBy: [{ date: "asc" }, { id: "asc" }],
     }),
   ]);
   if (byInstant) {
     const within = (d) => d >= start && d < end;
     for (const inv of invoices) inv.payments = inv.payments.filter((p) => within(p.date));
     for (const d of debts) d.payments = d.payments.filter((p) => within(p.date));
+    for (const b of bills) b.payments = b.payments.filter((p) => p.outsideBooks || within(p.date));
   }
   // The naira books count naira: rows in another currency are flagged and the
   // books rule leaves them out (a €100 credit is not ₦100).
@@ -117,7 +156,20 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
     vat: { enabled: biz.vatEnabled, rate: biz.vatRate, inclusive: biz.vatInclusive },
     baseCurrency: base,
     chart: accounts,
-    input: { sales, expenses, bankRows, invoices, debts, accounts: accountClasses(accounts) },
+    input: {
+      sales, expenses, bankRows, invoices, debts, accounts: accountClasses(accounts),
+      bills: bills.map(billInput), journals,
+    },
+  };
+}
+
+// A bill as the books rule reads it (books.js): the table keeps the payable's
+// own names (name is the supplier, originalAmount the bill's amount).
+function billInput(b) {
+  return {
+    id: b.id, vendorName: b.name, billNumber: b.billNumber, note: b.note,
+    accountId: b.accountId, receivedViaAccountId: b.receivedViaAccountId,
+    billDate: b.billDate, amount: b.originalAmount, estimated: b.estimated, payments: b.payments,
   };
 }
 
@@ -147,8 +199,9 @@ async function booksFor(businessId, { from, to, basis = "paid" } = {}, db = pris
 }
 
 // Open balances right now: what customers owe and what is owed to them.
+// A debt is owed in its customer's business only (as loadBooksInput reads it).
 async function receivablesFor(businessId, db = prisma) {
-  const biz = await db.business.findUnique({ where: { id: businessId }, select: { userId: true } });
+  const biz = await db.business.findUnique({ where: { id: businessId }, select: { id: true } });
   if (!biz) return null;
   const [invoices, debts] = await Promise.all([
     db.invoice.findMany({
@@ -156,7 +209,7 @@ async function receivablesFor(businessId, db = prisma) {
       select: { type: true, status: true, total: true, amountPaid: true, writtenOffAt: true },
     }),
     db.debt.findMany({
-      where: { customer: { OR: [{ businessId }, { businessId: null, userId: biz.userId }] }, paid: false },
+      where: { customer: { businessId }, paid: false },
       select: { amount: true, paidAmount: true, paid: true },
     }),
   ]);
@@ -178,5 +231,6 @@ async function vatReturnFor(businessId, month, db = prisma) {
 }
 
 module.exports = {
-  loadBooksInput, accountClasses, booksFor, booksForInstants, receivablesFor, vatReturnFor, lagosStart, lagosEnd, monthEnd,
+  loadBooksInput, accountClasses, billInput, booksFor, booksForInstants, receivablesFor, vatReturnFor, lagosStart, lagosEnd,
+  monthEnd,
 };

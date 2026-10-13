@@ -424,6 +424,60 @@ const uri = (mime, buf) => `data:${mime};base64,${buf.toString("base64")}`;
       eq(moved.body.accountId, null);
       await prisma.recurringExpense.delete({ where: { id: rule.body.id } });
     });
+    await test("a recurring expense is never on credit (release 2: that is a bill), nor any method the app does not offer", async () => {
+      const count0 = await prisma.recurringExpense.count({ where: { businessId: biz.id } });
+      for (const paymentMethod of ["credit", "barter", "Credit"]) {
+        const r = await call("POST", "/recurring-expenses", T, {
+          businessId: biz.id, amount: 5000, frequency: "monthly", paymentMethod, startDate: "2099-01-01",
+        });
+        eq(r.status, 400, paymentMethod);
+        eq(r.body.code, "BAD_METHOD");
+        eq(r.body.field, "paymentMethod");
+      }
+      eq(await prisma.recurringExpense.count({ where: { businessId: biz.id } }), count0, "nothing saved");
+      const rule = await call("POST", "/recurring-expenses", T, {
+        businessId: biz.id, amount: 5000, frequency: "monthly", paymentMethod: "transfer", startDate: "2099-01-01",
+      });
+      eq(rule.status, 201, JSON.stringify(rule.body));
+      const onCredit = await call("PATCH", `/recurring-expenses/${rule.body.id}`, T, { paymentMethod: "credit" });
+      eq(onCredit.status, 400);
+      eq(onCredit.body.code, "BAD_METHOD");
+      eq((await prisma.recurringExpense.findUnique({ where: { id: rule.body.id } })).paymentMethod, "transfer", "unchanged");
+      eq((await call("PATCH", `/recurring-expenses/${rule.body.id}`, T, { paymentMethod: "pos" })).body.paymentMethod, "pos");
+      // An amount that is not above zero, or not a number, records nothing.
+      for (const amount of [-5, 0, "abc", "-1"]) {
+        const r = await call("POST", "/recurring-expenses", T, { businessId: biz.id, amount, frequency: "monthly", startDate: "2099-01-01" });
+        eq(r.status, 400, `POST ${amount}`);
+        eq(r.body.code, "BAD_AMOUNT");
+        const p = await call("PATCH", `/recurring-expenses/${rule.body.id}`, T, { amount });
+        eq(p.status, 400, `PATCH ${amount}`);
+      }
+      eq((await prisma.recurringExpense.findUnique({ where: { id: rule.body.id } })).amount, 5000, "the amount unchanged");
+      eq((await call("PATCH", `/recurring-expenses/${rule.body.id}`, T, { amount: "7500" })).body.amount, 7500, "a numeric string is a number");
+      await prisma.recurringExpense.delete({ where: { id: rule.body.id } });
+    });
+    await test("an expense is never put on credit (a bill instead); one saved on credit before bills may keep it", async () => {
+      const count0 = await prisma.expense.count({ where: { businessId: biz.id } });
+      const r = await call("POST", "/expenses", T, { businessId: biz.id, amount: 2500, category: "rent", paymentMethod: "credit", date: today });
+      eq(r.status, 400, JSON.stringify(r.body));
+      eq(r.body.code, "CREDIT_IS_A_BILL");
+      eq(r.body.field, "paymentMethod");
+      eq(await prisma.expense.count({ where: { businessId: biz.id } }), count0, "nothing saved");
+      const cash = await call("POST", "/expenses", T, { businessId: biz.id, amount: 2500, category: "rent", paymentMethod: "cash", date: today });
+      eq(cash.status, 201, JSON.stringify(cash.body));
+      const moved = await call("PATCH", `/expenses/${cash.body.id}`, T, { paymentMethod: "credit" });
+      eq(moved.status, 400);
+      eq(moved.body.code, "CREDIT_IS_A_BILL");
+      eq((await prisma.expense.findUnique({ where: { id: cash.body.id } })).paymentMethod, "cash", "unchanged");
+      // One from before bills keeps its method through an edit of something else.
+      const old = await prisma.expense.create({
+        data: { userId: owner.id, businessId: biz.id, amount: 1800, category: "rent", paymentMethod: "credit", date: new Date() },
+      });
+      const kept = await call("PATCH", `/expenses/${old.id}`, T, { notes: "From before bills", paymentMethod: "credit" });
+      eq(kept.status, 200, JSON.stringify(kept.body));
+      eq((await call("PATCH", `/expenses/${old.id}`, T, { paymentMethod: "transfer" })).body.paymentMethod, "transfer");
+      for (const id of [cash.body.id, old.id]) eq((await call("DELETE", `/expenses/${id}`, T)).status, 200);
+    });
     await test("the books still tie out after the edits", tiesOut);
 
     section("Refusals");

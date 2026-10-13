@@ -204,6 +204,15 @@ model Business {
   // are as at the start of it) and the month the financial year starts.
   openingBalanceDate         String?
   fiscalYearStartMonth       Int       @default(1)
+  // Categories of the accounts the owner deleted (or made another kind of
+  // account): nothing makes an account for one again (release 1.1, 2026-10-13).
+  retiredCategorySlugs       String[]  @default([])
+  // Release 2 (2026-10-13): the last manual journal number given (MJ-00001),
+  // and the lock date, a Lagos "YYYY-MM-DD" on or before which nothing dated
+  // may be added, changed or removed (utils/booksLock.js; a CHECK keeps it a
+  // plain day).
+  journalCounter             Int       @default(0)
+  booksLockDate              String?
   createdAt                  DateTime  @default(now())
   updatedAt                  DateTime  @updatedAt
 
@@ -238,6 +247,7 @@ model Business {
   savingsMovements      SavingsMovement[]
   ledgerAccounts        LedgerAccount[]
   openingBalances       OpeningBalance[]
+  manualJournals        ManualJournal[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -636,6 +646,9 @@ model PayablePayment {
   date      DateTime @default(now())
 }
 
+// A bill: what the business owes a supplier, a landlord or a lender (release
+// 2, 2026-10-13, Zoho's bills; the table name is kept from payables). `name`
+// is the vendor.
 model BusinessDebt {
   id              String    @id @default(uuid())
   userId          String
@@ -652,10 +665,54 @@ model BusinessDebt {
   reminderEnabled Boolean   @default(false)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+  // The account the bill is for (an expense, or a liability such as Loans),
+  // the bill's own date and number, and for a loan or other liability the
+  // account the borrowed money went into. An estimated bill is a payable from
+  // before bills: what was paid on it before is one estimated payment kept
+  // outside the books.
+  accountId            String?
+  account              LedgerAccount? @relation("BillAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  billDate             DateTime       @default(now())
+  billNumber           String?
+  estimated            Boolean        @default(false)
+  receivedViaAccountId String?
+  receivedViaAccount   LedgerAccount? @relation("BillReceivedVia", fields: [receivedViaAccountId], references: [id], onDelete: SetNull)
+  createdById          String?
+  payments             BillPayment[]
 
   @@index([userId, businessId])
   @@index([userId, status])
   @@index([businessId, updatedAt])
+  @@index([accountId])
+  @@index([receivedViaAccountId])
+}
+
+// A payment towards a bill. method: cash | transfer | pos | cheque | other |
+// bank (CHECK in the migration). "bank" is money that left the KashBook
+// account: the payment names that debit (transactionId, bare like
+// DebtPayment.transactionId), and only a "bank" payment does; the debit carries
+// matchedBillId and matchedAmount. outsideBooks: a payment from before bills,
+// estimated, that only lowers what is owed and counts nowhere (it never names
+// a debit).
+model BillPayment {
+  id                   String         @id @default(uuid())
+  billId               String
+  bill                 BusinessDebt   @relation(fields: [billId], references: [id], onDelete: Cascade)
+  amount               Float
+  date                 DateTime       @default(now())
+  method               String         @default("cash")
+  paidThroughAccountId String?
+  paidThroughAccount   LedgerAccount? @relation("BillPaymentPaidThrough", fields: [paidThroughAccountId], references: [id], onDelete: SetNull)
+  transactionId        String?
+  estimated            Boolean        @default(false)
+  outsideBooks         Boolean        @default(false)
+  note                 String?
+  createdById          String?
+  createdAt            DateTime       @default(now())
+
+  @@index([billId])
+  @@index([transactionId])
+  @@index([paidThroughAccountId])
 }
 
 model Sales {
@@ -785,6 +842,9 @@ model Transaction {
   // InvoicePayment rows carrying transactionId = this row are the full list,
   // and matchedAmount is their sum, so a larger credit's remainder still counts.
   matchedInvoiceId  String?
+  // A debit that paid a bill (release 2): the bill whose BillPayment names
+  // this row. Bare, like matchedExpenseId; matchedAmount is the payment.
+  matchedBillId     String?
   // How much of this bank row the match actually accounted for (sale amount,
   // debt applied, expense recorded) — always ≤ amount. Scalar totals add the
   // unmatched remainder (amount − matchedAmount) back in, so a ₦5,000 credit
@@ -847,6 +907,7 @@ model Transaction {
   @@index([complianceStatus, flagSeverity])
   @@index([businessId, channel])
   @@index([accountId])
+  @@index([matchedBillId])
 }
 
 // Idempotency ledger for inbound Anchor webhooks. We insert the provider event
@@ -1662,6 +1723,7 @@ model LedgerAccount {
   description  String?
   systemKey    String? // an account the books post to by themselves (chart.js SYS)
   categorySlug String? // the expense category this account stands for
+  aliasSlugs   String[]        @default([]) // older categories merged into this account: each stands for it too
   seed         String? // the default chart key the app translates the name by; null once renamed
   parentId     String?
   parent       LedgerAccount?  @relation("SubAccounts", fields: [parentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
@@ -1683,6 +1745,10 @@ model LedgerAccount {
   invoicePaymentsDeposited InvoicePayment[]   @relation("InvoicePaymentDeposit")
   debtPaymentsDeposited    DebtPayment[]      @relation("DebtPaymentDeposit")
   openingBalances          OpeningBalance[]
+  bills                    BusinessDebt[]      @relation("BillAccount")
+  billsReceivedVia         BusinessDebt[]      @relation("BillReceivedVia")
+  billPaymentsPaidThrough  BillPayment[]       @relation("BillPaymentPaidThrough")
+  journalLines             ManualJournalLine[] @relation("JournalLineAccount")
 
   @@unique([businessId, systemKey])
   @@unique([businessId, categorySlug])
@@ -1707,5 +1773,48 @@ model OpeningBalance {
   updatedAt   DateTime      @updatedAt
 
   @@unique([businessId, accountId])
+  @@index([accountId])
+}
+
+// A manual journal (release 2, 2026-10-13; Adjustments in the app): the
+// owner's own entry, numbered per business from Business.journalCounter
+// (MJ-00001). status: draft | published (CHECK in the migration); only a
+// published journal posts, on its date, and its debits equal its credits to
+// the kobo (the route checks).
+model ManualJournal {
+  id          String              @id @default(uuid())
+  businessId  String
+  business    Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  number      String
+  date        DateTime            @default(now())
+  note        String?
+  status      String              @default("draft")
+  createdById String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  lines       ManualJournalLine[]
+
+  @@unique([businessId, number])
+  @@index([businessId, date])
+}
+
+// One line of a manual journal: a debit or a credit, never both (one side
+// more than zero, the other zero: CHECK in the migration). An account a line
+// names is refused deletion. The migration makes that key DEFERRABLE
+// INITIALLY DEFERRED (Prisma does not show it): checked at the end of the
+// transaction, so deleting a whole business still cascades through its
+// accounts and its journals' lines in one statement.
+model ManualJournalLine {
+  id          String        @id @default(uuid())
+  journalId   String
+  journal     ManualJournal @relation(fields: [journalId], references: [id], onDelete: Cascade)
+  accountId   String
+  account     LedgerAccount @relation("JournalLineAccount", fields: [accountId], references: [id], onDelete: NoAction)
+  debit       Float         @default(0)
+  credit      Float         @default(0)
+  description String?
+  position    Int           @default(0) // the order the owner entered the lines in
+
+  @@index([journalId])
   @@index([accountId])
 }

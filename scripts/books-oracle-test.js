@@ -144,10 +144,12 @@ function legacyOnly(input) {
 }
 
 // The lines the chart of accounts added must stay empty on legacy inputs; once
-// checked, they are dropped so the rest compares with the old shape.
+// checked, they are dropped so the rest compares with the old shape. Release 2
+// added bills and manual journals.
 function withoutNewLines(res) {
   const out = JSON.parse(JSON.stringify(res));
-  for (const [side, line] of [["sales", "bankIncome"], ["expenses", "bankCharges"]]) {
+  const added = [["sales", "bankIncome"], ["expenses", "bankCharges"], ["sales", "journals"], ["expenses", "bills"], ["expenses", "journals"]];
+  for (const [side, line] of added) {
     const l = out[side] && out[side].lines && out[side].lines[line];
     if (l && l.count === 0 && l.gross === 0 && l.vat === 0) delete out[side].lines[line];
   }

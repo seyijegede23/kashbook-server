@@ -223,17 +223,27 @@ function nameKey(name) {
 
 // ── Lookups over one business's chart ────────────────────────────────────────
 
-// accounts: [{ id, type, systemKey, categorySlug, inactiveAt, ... }]
+// accounts: [{ id, type, systemKey, categorySlug, aliasSlugs, inactiveAt, ... }]
+// An account stands for its own category and for the categories merged into
+// it (aliasSlugs), so an older app's expense in a merged category lands where
+// the merge put it. A category an account has as its own is never taken by
+// another account's alias, wherever either is listed.
 function indexChart(accounts) {
+  const list = accounts || [];
   const byId = new Map();
   const bySystemKey = new Map();
   const byCategorySlug = new Map();
-  for (const a of accounts || []) {
+  for (const a of list) {
     byId.set(a.id, a);
     if (a.systemKey) bySystemKey.set(a.systemKey, a);
     if (a.categorySlug) byCategorySlug.set(a.categorySlug, a);
   }
-  return { byId, bySystemKey, byCategorySlug, accounts: accounts || [] };
+  for (const a of list) {
+    for (const slug of Array.isArray(a.aliasSlugs) ? a.aliasSlugs : []) {
+      if (slug && !byCategorySlug.has(slug)) byCategorySlug.set(slug, a);
+    }
+  }
+  return { byId, bySystemKey, byCategorySlug, accounts: list };
 }
 
 function sysAccount(chart, key) {
@@ -360,7 +370,9 @@ function bankRowAccount(chart, tx, basis, recurring) {
 
 // context: "expense" (what was this money spent on), "income" (what was sold),
 // "money" (paid from / received into), "credit" or "debit" (a bank row the
-// merchant explains), "journal", "opening".
+// merchant explains), "bill" (what a bill is for: spending, or a loan or
+// another liability), "journal", "opening". No context offers an inactive
+// account or a controlled one (the engine keeps those, journals included).
 function pickerAllows(context, account) {
   if (!account || account.inactiveAt) return false;
   if (account.systemKey && CONTROLLED.includes(account.systemKey)) return false;
@@ -372,6 +384,9 @@ function pickerAllows(context, account) {
         type === "other_current_liability" || type === "long_term_liability" || account.systemKey === SYS.DRAWINGS;
     case "income":
       return cls === "income" && account.systemKey !== SYS.DISCOUNT && account.systemKey !== SYS.SALES_RETURNS;
+    case "bill":
+      return cls === "expense" || type === "other_current_liability" || type === "long_term_liability" ||
+        type === "other_liability";
     case "money":
       return type === "cash" || type === "bank" || type === "credit_card";
     case "credit":

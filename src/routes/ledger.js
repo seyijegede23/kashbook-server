@@ -7,18 +7,24 @@
 //   GET    /ledger/reports/profit-and-loss  by account ("when paid" by default)
 //   GET    /ledger/reports/balance-sheet    ("when sold" by default)
 //   GET    /ledger/reports/trial-balance
+//   GET    /ledger/reports/general-ledger   every entry in a period ("when sold" by default)
 //   POST   /ledger/accounts                 owner: a new account
 //   PATCH  /ledger/accounts/:id             owner: rename, code, description, parent, type, inactive
 //   DELETE /ledger/accounts/:id             owner: only when nothing uses it
 //   POST   /ledger/accounts/:id/merge       owner: move everything to another account, then delete
 //   GET    /ledger/opening-balances
-//   PUT    /ledger/opening-balances         owner
+//   PUT    /ledger/opening-balances         owner; never on or before the lock date
 //
 // Reading amounts needs the Reports permission; anything that reveals the
-// bank balance (balances, statements, balance sheet, trial balance) also
-// needs bank access, as the sync bundle already withholds bank rows. The
-// ledger itself is derived from the records (utils/ledger.js): nothing here
-// posts to it. Nothing posts Retained Earnings either: the profit of past
+// bank balance (balances, statements, balance sheet, trial balance, general
+// ledger) also needs bank access, as the sync bundle already withholds bank
+// rows. The words on a bill (its supplier, its number, its notes and its
+// payments' notes) need the bills permission, as in the sync bundle: a
+// statement or the general ledger sends a bill's entries without their memo
+// to anyone else (readableBy). The ledger itself is derived from the records
+// (utils/ledger.js): nothing here posts to it, and the reports read the
+// cached ledger, which other requests share, so they copy what they sort or
+// reshape. Nothing posts Retained Earnings either: the profit of past
 // financial years is worked out where it is read (balances, its statement),
 // as the balance sheet works it out.
 const router = require("express").Router();
@@ -32,6 +38,7 @@ const { receivablesFor } = require("../utils/booksData");
 const chart = require("../utils/chart");
 const ledger = require("../utils/ledger");
 const { toKobo, twoDecimals } = require("../utils/money");
+const { assertUnlocked } = require("../utils/booksLock");
 const {
   ACCOUNT_FIELDS, publicAccount, accountError, ensureChart, accountsFor, assertAccountUsable, invalidateLedger, loadLedger,
 } = require("../utils/ledgerData");
@@ -62,6 +69,23 @@ function needsBankAccess(req, res, next) {
     code: "PERMISSION_DENIED",
     permission: "canViewBalance",
   });
+}
+
+// A bill's supplier, its number and its notes belong to the bills permission
+// (canManagePayables; owners hold it), as on every bills route and in the
+// sync bundle (utils/billView.js booksOnlyBill). The ledger names an entry
+// for a bill, or for a payment towards one, by exactly those words (its memo:
+// utils/ledger.js billMemo). So a member without that permission reads those
+// entries with an empty memo, and the app titles them by their kind alone;
+// everything else about them (amounts, accounts, the bill's id) is what the
+// sync bundle already gives that member. `list` is the entries of an answer,
+// or a statement's lines, each with its kind and memo. The entries come from
+// the cached ledger the owner reads too, so the memo is left out of a copy,
+// never out of the entry itself.
+const BILL_KINDS = new Set(["bill", "bill_payment"]);
+function readableBy(req, list) {
+  if (req.user.accountType !== "staff" || req.user.permissions?.canManagePayables === true) return list;
+  return list.map((e) => (BILL_KINDS.has(e.kind) ? { ...e, memo: "" } : e));
 }
 
 const basisOf = (v, fallback) => (v === "paid" || v === "sold" ? v : fallback);
@@ -194,7 +218,8 @@ router.get("/accounts/:id/transactions", requirePermission("canViewReports"), ne
     // Retained Earnings reads each finished year's profit too (above).
     const entries = acc.systemKey === chart.SYS.RETAINED ? [...yearProfitEntries(L, acc.id), ...L.entries] : L.entries;
     const st = ledger.accountTransactions(entries, acc.id, acc, { from, to });
-    res.json({ account: publicAccount(acc), basis, from, to, ...st });
+    // A bill's words only for those who may open bills (readableBy).
+    res.json({ account: publicAccount(acc), basis, from, to, ...st, lines: readableBy(req, st.lines) });
   } catch (err) {
     sendError(res, err, "transactions");
   }
@@ -205,10 +230,18 @@ router.get("/accounts/:id/transactions", requirePermission("canViewReports"), ne
 // Dashboard and Reports count it). Owed to you is counted as Reports and the
 // More screen count it (books.receivables: open invoices and unpaid debts,
 // never a credit note or a credit sale no debt tracks). You owe is what the
-// business owes "when sold" plus the credit it owes customers back (credit
-// notes not used yet, also sent on their own as youOweCustomers). It leaves
-// out Unexplained Receipts (sent as `unexplained`): transfers into the bank
-// nobody has explained yet, which "when paid" counts as sales.
+// business owes "when sold", which is where its bills are (release 2): a bill
+// for spending sits in Accounts Payable from its bill date until it is paid
+// (an estimated bill from before bills, only the part not already paid on
+// it), and a loan or another liability bill on its own account, from its
+// bill date when it says where the borrowed money went (else from wherever
+// that money was recorded, a starting balance or a transfer explained as a
+// loan; a loan from before bills, estimated, from its bill date against
+// Opening Balance Adjustments), beside VAT and the rest. On top of that, the credit it owes
+// customers back (credit notes not used yet, also sent on their own as
+// youOweCustomers). It leaves out Unexplained Receipts (sent as
+// `unexplained`): transfers into the bank nobody has explained yet, which
+// "when paid" counts as sales.
 router.get("/summary", requirePermission("canViewReports"), needsBankAccess, async (req, res) => {
   try {
     const biz = await loadBusiness(req, req.query.businessId);
@@ -307,6 +340,57 @@ router.get("/reports/trial-balance", requirePermission("canViewReports"), needsB
   }
 });
 
+// The general ledger ("All entries"): every entry dated from `from` to `to`
+// (days compared as text, as sumByAccount compares them), in the order a
+// statement reads them: by day, a day's opening entry first, then in the
+// order the records were built. Each entry with its lines as a debit or a
+// credit in naira, the account by id only (names come from the chart the app
+// holds), and `amount`, what its debits come to (its credits come to the
+// same: every entry balances). An entry with no lines (a record of nothing)
+// is left out. `entries` is the cached ledger, which other requests share:
+// everything here is a new object or a new array, and nothing is sorted or
+// changed in place.
+function generalLedger(entries, { from, to } = {}) {
+  const picked = [];
+  entries.forEach((e, idx) => {
+    if (from && e.day < from) return;
+    if (to && e.day > to) return;
+    if (e.lines.length) picked.push({ e, idx });
+  });
+  picked.sort((a, b) =>
+    a.e.day < b.e.day ? -1 : a.e.day > b.e.day ? 1
+      : (a.e.kind === "opening" ? 0 : 1) - (b.e.kind === "opening" ? 0 : 1) || a.idx - b.idx);
+  let debit = 0; // kobo
+  let credit = 0;
+  const list = picked.map(({ e }) => {
+    let own = 0;
+    const lines = e.lines.map((l) => {
+      if (l.k > 0) own += l.k;
+      else credit -= l.k;
+      return { accountId: l.accountId, debit: l.k > 0 ? l.k / 100 : 0, credit: l.k < 0 ? -l.k / 100 : 0 };
+    });
+    debit += own;
+    return { id: e.id, day: e.day, kind: e.kind, memo: e.memo, ref: e.ref, amount: own / 100, lines };
+  });
+  return { entries: list, totals: { debit: debit / 100, credit: credit / 100 } };
+}
+
+router.get("/reports/general-ledger", requirePermission("canViewReports"), needsBankAccess, async (req, res) => {
+  try {
+    const biz = await loadBusiness(req, req.query.businessId);
+    const basis = basisOf(req.query.basis, "sold");
+    const from = DAY.test(String(req.query.from || "")) ? req.query.from : "";
+    const to = DAY.test(String(req.query.to || "")) ? req.query.to : today();
+    const L = await loadLedger(biz.id, { basis });
+    if (!L) throw accountError("Business not found.", "BUSINESS_NOT_FOUND", 404);
+    const gl = generalLedger(L.entries, { from, to });
+    // A bill's words only for those who may open bills (readableBy).
+    res.json({ basis, from, to, ...gl, entries: readableBy(req, gl.entries) });
+  } catch (err) {
+    sendError(res, err, "general ledger");
+  }
+});
+
 // ── The owner's changes to the chart ───────────────────────────────────────
 
 const owner = ownerOnly("Only the business owner can change the chart of accounts.");
@@ -355,13 +439,47 @@ async function checkParent(businessId, parentId, type, selfId) {
   return parent.id;
 }
 
+// The categories an account stands for: its own, and those merged into it
+// (aliasSlugs), each once.
+function slugsOf(acc) {
+  const aliases = Array.isArray(acc.aliasSlugs) ? acc.aliasSlugs : [];
+  return [...new Set([acc.categorySlug, ...aliases].filter(Boolean))];
+}
+
 // A category slug for an expense account, so older app versions (which send a
-// category, not an account) still land expenses in it.
+// category, not an account) still land expenses in it. A slug an account
+// stands for, as its own or as one merged into it, is taken. A retired one
+// (Business.retiredCategorySlugs: its account was deleted, or made another
+// kind) is free again: the owner is making an account for it on purpose, and
+// the write that gives the account its slug takes it out of the retired ones
+// (unretireSlug).
 async function freeSlug(businessId, name) {
   const base = chart.canonicalSlug(String(name).toLowerCase().replace(/\s+/g, "-")) || "other";
+  const taken = (slug) => prisma.ledgerAccount.count({ where: { businessId, OR: [{ categorySlug: slug }, { aliasSlugs: { has: slug } }] } });
   let slug = base;
-  for (let i = 2; await prisma.ledgerAccount.count({ where: { businessId, categorySlug: slug } }); i++) slug = `${base}-${i}`;
+  for (let i = 2; await taken(slug); i++) slug = `${base}-${i}`;
   return slug;
+}
+
+// The categories of the accounts the owner deleted, or made another kind of
+// account: the chart's set-up never makes an account for one of them again
+// (utils/ledgerData.js ensureChart). Each write is one statement, so two at
+// the same moment never lose one another's slugs. `px` is the transaction the
+// account itself changes in.
+function retireSlugs(px, businessId, slugs) {
+  if (!slugs.length) return Promise.resolve(0);
+  return px.$executeRaw`
+    UPDATE "Business"
+    SET "retiredCategorySlugs" = ARRAY(
+      SELECT DISTINCT s FROM unnest("retiredCategorySlugs" || ${slugs}::text[]) AS t(s) ORDER BY s
+    )
+    WHERE "id" = ${businessId}`;
+}
+
+function unretireSlug(px, businessId, slug) {
+  return px.$executeRaw`
+    UPDATE "Business" SET "retiredCategorySlugs" = array_remove("retiredCategorySlugs", ${slug})
+    WHERE "id" = ${businessId} AND ${slug} = ANY("retiredCategorySlugs")`;
 }
 
 // A recurring expense that names an account of another kind (a loan repaid,
@@ -378,11 +496,13 @@ const NOT_SPENDING = { account: { type: { notIn: SPENDING_TYPES } } };
 // so it is never one of `records`' expenses: see WHOLE_EXPENSE. `rules` adds
 // the recurring expenses on an account of another kind (NOT_SPENDING), as
 // the chart's set-up reads them (utils/ledgerData.js ensureChart). `category`
-// is the category itself or one of its older names.
+// is any category the account stands for (its own, or one merged into it, as
+// chart.indexChart reads them) or one of their older names, so a record still
+// carrying a merged category is a use of the account, and moves with it.
 function byCategoryOf(acc) {
-  const slugs = acc.categorySlug
-    ? [acc.categorySlug, ...Object.keys(chart.SLUG_ALIASES).filter((k) => k && chart.SLUG_ALIASES[k] === acc.categorySlug)]
-    : [];
+  const own = slugsOf(acc);
+  const older = (slug) => Object.keys(chart.SLUG_ALIASES).filter((k) => k && chart.SLUG_ALIASES[k] === slug);
+  const slugs = [...new Set(own.flatMap((slug) => [slug, ...older(slug)]))];
   if (!slugs.length) return null;
   const OR = slugs.map((s) => ({ category: { equals: s, mode: "insensitive" } }));
   return {
@@ -398,19 +518,26 @@ const WHOLE_EXPENSE = { items: { none: {} } };
 
 // An older app version adds a category as a custom category, and the chart's
 // set-up gives each one its account (utils/ledgerData.js ensureChart). So the
-// custom categories that stand for an account the owner deletes or merges
-// away go with it, in the same transaction, or the next look at the chart
-// makes the account again.
+// custom categories for an account the owner deletes, merges away or makes
+// another kind of account (any category it stands for) go with it, in the
+// same transaction. The category itself is retired or handed on there too,
+// which is what keeps the account from coming back when an older app puts
+// its custom category back; this keeps the older app's list tidy.
 async function dropCustomCategories(px, acc) {
-  if (!acc.categorySlug) return;
+  const slugs = new Set(slugsOf(acc));
+  if (!slugs.size) return;
   const custom = await px.customCategory.findMany({ where: { businessId: acc.businessId }, select: { id: true, label: true, value: true } });
-  const ids = custom.filter((c) => chart.canonicalSlug(c.value || c.label) === acc.categorySlug).map((c) => c.id);
+  const ids = custom.filter((c) => slugs.has(chart.canonicalSlug(c.value || c.label))).map((c) => c.id);
   if (ids.length) await px.customCategory.deleteMany({ where: { id: { in: ids } } });
 }
 
 // What uses an account: records naming it, opening balances, sub-accounts,
 // and expenses (or lines of one) and recurring expenses whose category it
-// stands for.
+// stands for. Release 2's records too: a bill that is for it, or whose
+// borrowed money went into it; a bill payment made from it; and a manual
+// journal's line on it, draft or published. A bill's account and a payment's
+// would otherwise be cut loose by a delete (their keys are SET NULL), and a
+// journal line's key refuses the delete only when it commits.
 async function usageOf(acc) {
   const id = acc.id;
   const byCategory = byCategoryOf(acc);
@@ -428,8 +555,22 @@ async function usageOf(acc) {
     byCategory ? prisma.recurringExpense.count({ where: byCategory.rules }) : 0,
     prisma.openingBalance.count({ where: { accountId: id } }),
     prisma.ledgerAccount.count({ where: { parentId: id } }),
+    prisma.businessDebt.count({ where: { OR: [{ accountId: id }, { receivedViaAccountId: id }] } }),
+    prisma.billPayment.count({ where: { paidThroughAccountId: id } }),
+    prisma.manualJournalLine.count({ where: { accountId: id } }),
   ]);
   return counts.reduce((s, n) => s + n, 0);
+}
+
+// A foreign key that refused a write: a record named the account after the
+// account's uses were counted. A journal line's key is checked when the
+// transaction commits, where the driver reports it on its own (SQLSTATE
+// 23503), not as Prisma's P2003.
+function isForeignKeyRefusal(err) {
+  if (!err) return false;
+  if (err.code === "P2003" || err.message === "ForeignKeyConstraintViolation") return true;
+  const cause = err.cause || (err.meta && err.meta.driverAdapterError && err.meta.driverAdapterError.cause);
+  return !!cause && (cause.kind === "ForeignKeyConstraintViolation" || cause.originalCode === "23503");
 }
 
 async function loadOwnAccount(req, id) {
@@ -453,12 +594,18 @@ router.post("/accounts", owner, async (req, res) => {
     await checkUnique(biz.id, { name, code });
     const parentId = await checkParent(biz.id, req.body.parentId, type);
     const categorySlug = chart.classOf(type) === "expense" ? await freeSlug(biz.id, name) : null;
-    const acc = await prisma.ledgerAccount.create({
-      data: {
-        businessId: biz.id, type, name, nameKey: chart.nameKey(name), code: code || null, codeKey: code ? chart.nameKey(code) : null,
-        description: description || null, parentId: parentId || null, categorySlug, createdById: req.user.id,
-      },
-      select: ACCOUNT_FIELDS,
+    // A category the owner retired comes back with the account made for it,
+    // in the same write.
+    const acc = await prisma.$transaction(async (px) => {
+      const made = await px.ledgerAccount.create({
+        data: {
+          businessId: biz.id, type, name, nameKey: chart.nameKey(name), code: code || null, codeKey: code ? chart.nameKey(code) : null,
+          description: description || null, parentId: parentId || null, categorySlug, createdById: req.user.id,
+        },
+        select: ACCOUNT_FIELDS,
+      });
+      if (categorySlug) await unretireSlug(px, biz.id, categorySlug);
+      return made;
     });
     invalidateLedger(biz.id);
     audit({ req, action: "ACCOUNT_CREATE", resourceType: "ledgerAccount", resourceId: acc.id, metadata: { type, name } }).catch(() => {});
@@ -469,51 +616,84 @@ router.post("/accounts", owner, async (req, res) => {
   }
 });
 
+// What a PATCH changes on the account (`b`, the request body), checked:
+// `data` for the account's row, and `retire`, the categories it stops
+// standing for when a type change takes it out of the expense class.
+async function changesTo(acc, b) {
+  const data = {};
+  let retire = [];
+  if (b.name !== undefined) {
+    data.name = cleanName(b.name);
+    data.nameKey = chart.nameKey(data.name);
+  }
+  const code = cleanCode(b.code);
+  if (code !== undefined) {
+    data.code = code;
+    data.codeKey = code ? chart.nameKey(code) : null;
+  }
+  const description = cleanDescription(b.description);
+  if (description !== undefined) data.description = description;
+  await checkUnique(acc.businessId, { name: data.name, code: data.code }, acc.id);
+
+  if (b.type !== undefined && b.type !== acc.type) {
+    const type = String(b.type);
+    if (acc.systemKey) throw accountError("A KashBook account keeps its type.", "SYSTEM_ACCOUNT");
+    if (!chart.ACCOUNT_TYPES[type] || chart.SYSTEM_ONLY_TYPES.includes(type)) throw accountError("Choose an account type.", "BAD_TYPE");
+    if (await usageOf(acc)) throw accountError("This account is in use, so its type can't change.", "TYPE_LOCKED", 409);
+    data.type = type;
+    if (chart.classOf(type) !== "expense") {
+      // No longer an expense account, it stands for no category, and those it
+      // stood for are retired as on a delete: an older app's expense in one of
+      // them goes to Other Expenses and makes no account for it.
+      data.categorySlug = null;
+      data.aliasSlugs = [];
+      retire = slugsOf(acc);
+    } else if (!acc.categorySlug) {
+      data.categorySlug = await freeSlug(acc.businessId, data.name || acc.name);
+    }
+  }
+  const parentId = await checkParent(acc.businessId, b.parentId, data.type || acc.type, acc.id);
+  if (parentId !== undefined) data.parentId = parentId;
+
+  if (b.inactive !== undefined) {
+    const off = b.inactive === true;
+    if (off && acc.systemKey) throw accountError("KashBook keeps this account in use.", "SYSTEM_ACCOUNT");
+    if (off && (await prisma.recurringExpense.count({ where: { active: true, OR: [{ accountId: acc.id }, { paidThroughAccountId: acc.id }] } }))) {
+      throw accountError("A recurring expense uses this account. Change it there first.", "IN_USE_RECURRING", 409);
+    }
+    // Every save of starting balances checks each account it names, and an
+    // inactive one is refused there, so an account that rested while holding
+    // a starting balance would block every later save of them.
+    if (off && (await prisma.openingBalance.count({ where: { accountId: acc.id } }))) {
+      throw accountError("This account has a starting balance. Clear it in Starting balances first.", "IN_USE_OPENING", 409);
+    }
+    data.inactiveAt = off ? acc.inactiveAt || new Date() : null;
+  }
+  return { data, retire };
+}
+
 router.patch("/accounts/:id", owner, async (req, res) => {
   try {
-    const acc = await loadOwnAccount(req, req.params.id);
-    const b = req.body || {};
-    const data = {};
-    if (b.name !== undefined) {
-      data.name = cleanName(b.name);
-      data.nameKey = chart.nameKey(data.name);
-    }
-    const code = cleanCode(b.code);
-    if (code !== undefined) {
-      data.code = code;
-      data.codeKey = code ? chart.nameKey(code) : null;
-    }
-    const description = cleanDescription(b.description);
-    if (description !== undefined) data.description = description;
-    await checkUnique(acc.businessId, { name: data.name, code: data.code }, acc.id);
-
-    if (b.type !== undefined && b.type !== acc.type) {
-      const type = String(b.type);
-      if (acc.systemKey) throw accountError("A KashBook account keeps its type.", "SYSTEM_ACCOUNT");
-      if (!chart.ACCOUNT_TYPES[type] || chart.SYSTEM_ONLY_TYPES.includes(type)) throw accountError("Choose an account type.", "BAD_TYPE");
-      if (await usageOf(acc)) throw accountError("This account is in use, so its type can't change.", "TYPE_LOCKED", 409);
-      data.type = type;
-      if (chart.classOf(type) !== "expense") data.categorySlug = null;
-      else if (!acc.categorySlug) data.categorySlug = await freeSlug(acc.businessId, data.name || acc.name);
-    }
-    const parentId = await checkParent(acc.businessId, b.parentId, data.type || acc.type, acc.id);
-    if (parentId !== undefined) data.parentId = parentId;
-
-    if (b.inactive !== undefined) {
-      const off = b.inactive === true;
-      if (off && acc.systemKey) throw accountError("KashBook keeps this account in use.", "SYSTEM_ACCOUNT");
-      if (off && (await prisma.recurringExpense.count({ where: { active: true, OR: [{ accountId: acc.id }, { paidThroughAccountId: acc.id }] } }))) {
-        throw accountError("A recurring expense uses this account. Change it there first.", "IN_USE_RECURRING", 409);
-      }
-      // Every save of starting balances checks each account it names, and an
-      // inactive one is refused there, so an account that rested while holding
-      // a starting balance would block every later save of them.
-      if (off && (await prisma.openingBalance.count({ where: { accountId: acc.id } }))) {
-        throw accountError("This account has a starting balance. Clear it in Starting balances first.", "IN_USE_OPENING", 409);
-      }
-      data.inactiveAt = off ? acc.inactiveAt || new Date() : null;
-    }
-    const updated = await prisma.ledgerAccount.update({ where: { id: acc.id }, data, select: ACCOUNT_FIELDS });
+    const acc0 = await loadOwnAccount(req, req.params.id);
+    // Under the business lock a merge and a delete take, with the account read
+    // again there: a type change then counts what a merge just moved into the
+    // account, and retires exactly the categories it stands for.
+    const { acc, data, updated } = await prisma.withBusinessLock(acc0.businessId, async () => {
+      const acc = await prisma.ledgerAccount.findUnique({ where: { id: acc0.id } });
+      if (!acc) throw accountError("Account not found.", "ACCOUNT_NOT_FOUND", 404);
+      const { data, retire } = await changesTo(acc, req.body || {});
+      const updated = await prisma.$transaction(async (px) => {
+        const row = await px.ledgerAccount.update({ where: { id: acc.id }, data, select: ACCOUNT_FIELDS });
+        if (retire.length) {
+          await retireSlugs(px, acc.businessId, retire);
+          await dropCustomCategories(px, acc);
+        }
+        // A category the owner retired comes back with the account made for it.
+        if (data.categorySlug) await unretireSlug(px, acc.businessId, data.categorySlug);
+        return row;
+      });
+      return { acc, data, updated };
+    });
     invalidateLedger(acc.businessId);
     audit({ req, action: "ACCOUNT_UPDATE", resourceType: "ledgerAccount", resourceId: acc.id, metadata: { fields: Object.keys(data) } }).catch(() => {});
     res.json(publicAccount(updated));
@@ -532,19 +712,34 @@ router.delete("/accounts/:id", owner, async (req, res) => {
     // create-expense): an expense saved on this account at the same moment is
     // either a use (and the delete is refused) or finds the account gone,
     // never cut loose by the delete (its account set to null) or refused by a
-    // foreign key.
+    // foreign key. The account is read again under the lock, so a category a
+    // merge just handed it is a use, or retired with the rest.
+    const inUse = (used) => Object.assign(
+      accountError("This account is in use. Move its records to another account, or mark it inactive.", "ACCOUNT_IN_USE", 409),
+      { extra: { used } },
+    );
     await prisma.withBusinessLock(acc.businessId, async () => {
-      const used = await usageOf(acc);
-      if (used) {
-        throw Object.assign(accountError("This account is in use. Move its records to another account, or mark it inactive.", "ACCOUNT_IN_USE", 409), {
-          extra: { used },
+      const now = await prisma.ledgerAccount.findUnique({ where: { id: acc.id } });
+      if (!now) throw accountError("Account not found.", "ACCOUNT_NOT_FOUND", 404);
+      const used = await usageOf(now);
+      if (used) throw inUse(used);
+      try {
+        await prisma.$transaction(async (px) => {
+          const gone = await px.ledgerAccount.deleteMany({ where: { id: now.id } });
+          if (!gone.count) throw accountError("Account not found.", "ACCOUNT_NOT_FOUND", 404);
+          // Its categories are retired with it: an older app's expense in one
+          // of them goes to Other Expenses, and the chart's set-up makes no
+          // account for it again.
+          await retireSlugs(px, now.businessId, slugsOf(now));
+          await dropCustomCategories(px, now);
         });
+      } catch (err) {
+        // A record named it after the count above, from a write that does
+        // not wait for this lock (a journal line's key refuses the delete
+        // only as it commits): in use after all, and nothing was deleted.
+        if (!isForeignKeyRefusal(err)) throw err;
+        throw inUse(Math.max(1, await usageOf(now)));
       }
-      await prisma.$transaction(async (px) => {
-        const gone = await px.ledgerAccount.deleteMany({ where: { id: acc.id } });
-        if (!gone.count) throw accountError("Account not found.", "ACCOUNT_NOT_FOUND", 404);
-        await dropCustomCategories(px, acc);
-      });
     });
     invalidateLedger(acc.businessId);
     audit({ req, action: "ACCOUNT_DELETE", resourceType: "ledgerAccount", resourceId: acc.id, metadata: { name: acc.name } }).catch(() => {});
@@ -578,9 +773,28 @@ router.post("/accounts/:id/merge", owner, async (req, res) => {
         throw accountError("Accounts can only be merged into one of the same kind.", "BAD_TARGET");
       }
       if (into.inactiveAt) throw accountError("Choose an active account.", "BAD_TARGET");
+      // Not into an account KashBook keeps in step with the records behind it
+      // (the KashBook Account, Accounts Receivable or Payable, Bank Matching,
+      // Unexplained Receipts...): what moved would be posted there by hand,
+      // which no picker, bill or journal may do, and that account would stop
+      // agreeing with its records (the bank's own figure, what customers owe,
+      // the open bills). Retained Earnings is the one a merge may fill, an
+      // older profits account folded into it: its statement shows what moved.
+      // The app never offers any of them as a target.
+      if (into.systemKey && chart.CONTROLLED.includes(into.systemKey) && into.systemKey !== chart.SYS.RETAINED) {
+        throw accountError("Choose an account you can record to.", "BAD_TARGET");
+      }
       const bothOpen = await prisma.openingBalance.count({ where: { accountId: { in: [from.id, into.id] } } });
       if (bothOpen > 1) throw accountError("Both accounts have a starting balance. Remove one first.", "BOTH_OPENING", 409);
-      return { from, into: await mergeInto(from, into) };
+      try {
+        return { from, into: await mergeInto(from, into) };
+      } catch (err) {
+        // A record named `from` while its records were moving, from a write
+        // that does not wait for this lock: nothing moved; the merge is
+        // simply tried again.
+        if (!isForeignKeyRefusal(err)) throw err;
+        throw accountError("This account changed while its records were moving. Please try again.", "ACCOUNT_CHANGED", 409);
+      }
     });
     invalidateLedger(from.businessId);
     audit({ req, action: "ACCOUNT_MERGE", resourceType: "ledgerAccount", resourceId: into.id, metadata: { from: from.id, fromName: from.name } }).catch(() => {});
@@ -591,14 +805,15 @@ router.post("/accounts/:id/merge", owner, async (req, res) => {
 });
 
 // The merge itself, in one transaction: every record on `from` moves to
-// `into`, then `from` goes, and its category with it, so nothing brings it
-// back (the chart's set-up makes an account for every category the books
-// still read). When `into` stands for no category it takes `from`'s, and an
-// older app version's expense in that category lands in `into` from now on.
-// When it stands for one of its own, what moved, and a recurring expense that
-// reads `from`'s category, carry `into`'s instead. The older app's custom
-// categories for `from` go too (dropCustomCategories). Returns `into` as the
-// merge leaves it.
+// `into`, then `from` goes, and `into` stands for every category `from` stood
+// for, so nothing brings `from` back (the chart's set-up makes an account for
+// every category no account stands for) and an older app version's expense in
+// one of them lands in `into` from now on. When `into` stands for no category
+// it takes `from`'s, and the ones merged into `from` with it. When it stands
+// for one of its own, `from`'s categories join the ones merged into it
+// (aliasSlugs), and what moved, and a recurring expense that reads one of
+// them, carry `into`'s own instead. The older app's custom categories for
+// `from` go too (dropCustomCategories). Returns `into` as the merge leaves it.
 async function mergeInto(from, into) {
   const byCategory = byCategoryOf(from);
   return prisma.$transaction(async (px) => {
@@ -617,6 +832,10 @@ async function mergeInto(from, into) {
       data: touch,
     });
     await px.customer.updateMany({ where: { debts: { some: { payments: { some: { depositAccountId: from.id } } } } }, data: touch });
+    // The same for a bill whose payment was made from `from` (a bill that is
+    // for it changes itself below), and a journal with a line on it.
+    await px.businessDebt.updateMany({ where: { payments: { some: { paidThroughAccountId: from.id } } }, data: touch });
+    await px.manualJournal.updateMany({ where: { lines: { some: { accountId: from.id } } }, data: touch });
 
     const move = (model, field) => px[model].updateMany({ where: { [field]: from.id }, data: { [field]: into.id } });
     await move("expense", "accountId");
@@ -631,6 +850,13 @@ async function mergeInto(from, into) {
     await move("recurringExpense", "accountId");
     await move("recurringExpense", "paidThroughAccountId");
     await move("openingBalance", "accountId");
+    // Release 2: bills (what they are for, where a loan's money went), their
+    // payments, and journal lines. A line still on `from` when it goes would
+    // fail the merge as it commits.
+    await move("businessDebt", "accountId");
+    await move("businessDebt", "receivedViaAccountId");
+    await move("billPayment", "paidThroughAccountId");
+    await move("manualJournalLine", "accountId");
     if (byCategory) {
       // Records that reached it by their category now name the account: an
       // itemized expense never does (its lines do), so it keeps none.
@@ -656,10 +882,12 @@ async function mergeInto(from, into) {
     await px.ledgerAccount.delete({ where: { id: from.id } });
     await dropCustomCategories(px, from);
     // Only once `from` is gone: a category stands for one account at a time.
-    if (from.categorySlug && !into.categorySlug) {
-      return px.ledgerAccount.update({ where: { id: into.id }, data: { categorySlug: from.categorySlug } });
-    }
-    return into;
+    const data = !into.categorySlug && from.categorySlug ? { categorySlug: from.categorySlug } : {};
+    const own = data.categorySlug || into.categorySlug;
+    const had = Array.isArray(into.aliasSlugs) ? into.aliasSlugs : [];
+    const aliases = [...new Set([...had, ...slugsOf(from)])].filter((slug) => slug !== own);
+    if (aliases.some((slug) => !had.includes(slug))) data.aliasSlugs = aliases;
+    return Object.keys(data).length ? px.ledgerAccount.update({ where: { id: into.id }, data }) : into;
   });
 }
 
@@ -700,9 +928,9 @@ router.put("/opening-balances", owner, async (req, res) => {
     const date = String(req.body.date || "");
     if (!DAY.test(date) || date > today()) throw accountError("Choose the day your books start (today or earlier).", "BAD_DATE");
     const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
-    const seen = new Set();
-    const rows = [];
-    for (const l of lines) {
+    const wanted = [];
+    for (const sent of lines) {
+      const l = sent && typeof sent === "object" ? sent : {}; // anything else is an empty line
       const sentDebit = Number(l.debit) || 0;
       const sentCredit = Number(l.credit) || 0;
       // Naira and kobo, read as money.twoDecimals reads them (2500.55 is two
@@ -717,16 +945,34 @@ router.put("/opening-balances", owner, async (req, res) => {
       const debit = toKobo(sentDebit) / 100;
       const credit = toKobo(sentCredit) / 100;
       if (!debit && !credit) continue;
-      const acc = await assertAccountUsable(biz.id, l.accountId, "opening");
-      if (seen.has(acc.id)) throw accountError("Each account once.", "DUPLICATE_ACCOUNT");
-      seen.add(acc.id);
-      rows.push({ businessId: biz.id, accountId: acc.id, debit, credit, updatedById: req.user.id });
+      wanted.push({ accountId: l.accountId, debit, credit });
     }
-    await prisma.$transaction([
-      prisma.openingBalance.deleteMany({ where: { businessId: biz.id } }),
-      ...(rows.length ? [prisma.openingBalance.createMany({ data: rows })] : []),
-      prisma.business.update({ where: { id: biz.id }, data: { openingBalanceDate: rows.length ? date : null } }),
-    ]);
+    // Under the business lock, where the lock date is set and where an
+    // account is merged or deleted: the accounts are checked, the lock date
+    // read and the balances written with nothing changing in between.
+    const rows = await prisma.withBusinessLock(biz.id, async () => {
+      // Starting balances are dated the day the books start, and saving them
+      // changes that day: the day they are on now (moved or cleared, they
+      // leave it) and the day they will be on. Neither may be on or before
+      // the lock date (utils/booksLock.js: 409 BOOKS_LOCKED with lockDate).
+      const before = await prisma.business.findUnique({ where: { id: biz.id }, select: { openingBalanceDate: true } });
+      await assertUnlocked(biz.id, before && before.openingBalanceDate, wanted.length ? date : null);
+      const seen = new Set();
+      const out = [];
+      for (const w of wanted) {
+        const acc = await assertAccountUsable(biz.id, w.accountId, "opening");
+        if (!acc) throw accountError("Choose an account for each starting balance.", "ACCOUNT_REQUIRED");
+        if (seen.has(acc.id)) throw accountError("Each account once.", "DUPLICATE_ACCOUNT");
+        seen.add(acc.id);
+        out.push({ businessId: biz.id, accountId: acc.id, debit: w.debit, credit: w.credit, updatedById: req.user.id });
+      }
+      await prisma.$transaction([
+        prisma.openingBalance.deleteMany({ where: { businessId: biz.id } }),
+        ...(out.length ? [prisma.openingBalance.createMany({ data: out })] : []),
+        prisma.business.update({ where: { id: biz.id }, data: { openingBalanceDate: out.length ? date : null } }),
+      ]);
+      return out;
+    });
     invalidateLedger(biz.id);
     audit({ req, action: "OPENING_BALANCES_SET", resourceType: "business", resourceId: biz.id, metadata: { date, accounts: rows.length } }).catch(() => {});
     res.json(await openingView(biz.id));

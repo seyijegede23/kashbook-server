@@ -5,6 +5,7 @@ const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const { validateExpense, validateIdParam } = require("../middleware/validate");
 const { accountError, assertAccountUsable, invalidateLedger } = require("../utils/ledgerData");
+const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 const { validateDataUri, DOC_TYPES } = require("../utils/uploadGuard");
 const { EXPENSE_INCLUDE, publicAttachment, publicAttachments, publicExpense } = require("../utils/expenseView");
 const { cleanReference, expenseCustomerId, resolveItems, itemData } = require("../utils/expenseFields");
@@ -104,6 +105,13 @@ router.get("/", async (req, res) => {
   }
 });
 
+// An expense is never on credit (chart of accounts release 2): something
+// paid for later is a bill (routes/bills.js), which can be paid off; an
+// expense on credit sat in Accounts Payable with nothing to settle it. Any
+// spelling ("Credit" too): chart.methodAccountKey reads methods lower-cased.
+const isCredit = (method) => typeof method === "string" && method.trim().toLowerCase() === "credit";
+const CREDIT_IS_A_BILL = "Something you will pay for later is a bill. Add it in Bills, and pay it off there.";
+
 // POST /expenses
 // A whole expense: { amount, accountId?, category?, ... }. An itemized one
 // (Zoho's "Itemize"): { items: [{ accountId, amount, description? }], ... },
@@ -111,6 +119,7 @@ router.get("/", async (req, res) => {
 // any amount, accountId or category sent is ignored. Either kind may carry
 // `reference` (the supplier's receipt or invoice number) and `customerId`
 // (the customer the cost was for: it shows on their page, no total changes).
+
 router.post("/", validateExpense, async (req, res) => {
   if (req.user.accountType === "staff") {
     return res.status(403).json({ error: "Staff cannot create expenses" });
@@ -135,6 +144,10 @@ router.post("/", validateExpense, async (req, res) => {
   // owner's records) is refused before any lookup.
   if (businessId !== undefined && businessId !== null && typeof businessId !== "string") {
     return res.status(400).json({ error: "businessId must be a string", code: "BAD_BUSINESS", field: "businessId" });
+  }
+  // Never on credit (see isCredit).
+  if (isCredit(paymentMethod)) {
+    return res.status(400).json({ error: CREDIT_IS_A_BILL, code: "CREDIT_IS_A_BILL", field: "paymentMethod" });
   }
   const sendsLines = Array.isArray(items) && items.length > 0;
   if (!sendsLines && !amount) return res.status(400).json({ error: "amount required" });
@@ -162,10 +175,14 @@ router.post("/", validateExpense, async (req, res) => {
     }
 
     const supplierRef = cleanReference(reference);
+    const when = date ? new Date(date) : new Date();
     // Checked and saved under the business lock, which an account merge or
     // delete also takes (routes/ledger.js), so every account checked here is
     // still there when the expense is saved with it.
     const expense = await prisma.withBusinessLock(bizId, async () => {
+      // The lock date (utils/booksLock.js): nothing dated on or before it is
+      // added. Asked under the lock it is set under.
+      await assertUnlocked(bizId, when);
       // Every line checked before anything is saved (utils/expenseFields.js).
       const lines = await resolveItems(bizId, items);
       // The chart of accounts: what the money was spent on (an expense
@@ -188,7 +205,7 @@ router.post("/", validateExpense, async (req, res) => {
           amount: lines ? lines.total : Number(amount),
           paymentMethod,
           notes: notes || null,
-          date: date ? new Date(date) : new Date(),
+          date: when,
           accountId: account ? account.id : null,
           paidThroughAccountId: paidFrom ? paidFrom.id : null,
           clientRef: ref,
@@ -308,6 +325,11 @@ router.patch("/:id", validateIdParam, async (req, res) => {
     } = req.body;
     const bizId = expense0.businessId;
     const supplierRef = cleanReference(reference);
+    // An expense is never put on credit (see POST); one saved on credit before
+    // bills may keep it until it is changed to how it was really paid.
+    if (isCredit(paymentMethod) && !isCredit(expense0.paymentMethod)) {
+      return res.status(400).json({ error: CREDIT_IS_A_BILL, code: "CREDIT_IS_A_BILL", field: "paymentMethod" });
+    }
 
     // Under the business lock, which an account merge or delete also takes
     // (routes/ledger.js), so the accounts checked here are still there when
@@ -376,6 +398,13 @@ router.patch("/:id", validateIdParam, async (req, res) => {
             { field: lines ? "items" : "amount" },
           );
         }
+        // The lock date, before anything is written: the expense's day before
+        // and after the edit and, when its total may change, the day of the
+        // transfer it records (whose part left unexplained changes with it).
+        await assertUnlockedIn(
+          px, fresh.businessId, fresh.date, date !== undefined ? new Date(date) : null,
+          transfer && total !== undefined ? transfer.date : null,
+        );
 
         const data = {
           ...(notes !== undefined && { notes }),
@@ -449,8 +478,13 @@ router.delete("/:id", validateIdParam, async (req, res) => {
       prisma.$transaction(async (px) => {
         const fresh = await px.expense.findUnique({ where: { id: expense.id } });
         if (!fresh) return null;
+        const tx = fresh.matchedTransactionId
+          ? await px.transaction.findUnique({ where: { id: fresh.matchedTransactionId } })
+          : null;
+        // The lock date: the expense's day, and the day of a transfer it
+        // frees (which counts on its own again).
+        await assertUnlockedIn(px, fresh.businessId, fresh.date, tx && tx.matchedExpenseId === fresh.id ? tx.date : null);
         if (fresh.matchedTransactionId) {
-          const tx = await px.transaction.findUnique({ where: { id: fresh.matchedTransactionId } });
           if (tx && tx.matchedExpenseId === fresh.id) {
             await px.transaction.update({ where: { id: tx.id }, data: { matchedExpenseId: null, matchedAmount: null } });
           }
@@ -474,7 +508,9 @@ router.delete("/:id", validateIdParam, async (req, res) => {
 // and kept privately on Cloudinary as the KYB certificate is
 // (utils/receiptStorage.js). The app sees { id, name, mime, size, uploadedAt }
 // and opens one through a link that lasts ten minutes. Who may: whoever may
-// edit the expense (editableExpense).
+// edit the expense (editableExpense). The lock date does not apply: a receipt
+// changes no figure (the books never read receipts), so one can be added to
+// an expense in a locked period, or removed from it.
 //
 // Each owner also keeps at most RECEIPT_BUDGET_FILES receipts and
 // RECEIPT_BUDGET_BYTES over all their expenses together, and adds at most 30

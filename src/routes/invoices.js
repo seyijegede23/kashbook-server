@@ -13,11 +13,52 @@ const {
 } = require("../utils/invoiceNumber");
 const { vatDeadline, round2 } = require("../utils/books");
 const { sameMoney } = require("../utils/money");
+const { isLedgerBankRow } = require("../config/moneySources");
 const { audit } = require("../utils/audit");
 const { recordLink } = require("../utils/paymentLinks");
 const { PAYMENT_TERMS: PAYMENT_TERM_CODES } = require("../utils/paymentTerms");
 const { snapshotFor } = require("../utils/customerFields");
 const { assertAccountUsable } = require("../utils/ledgerData");
+const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
+
+// The lock date (chart of accounts release 2, utils/booksLock.js): nothing
+// dated on or before it is added, changed or removed. An invoice or a credit
+// note is dated by its issueDate, drafts included, as Zoho Books locks every
+// transaction; a payment, a refund, a write-off and an applied credit by
+// their own day, and a payment linked to a bank transfer by the transfer's
+// day too. A quote is in no books and takes no payments, so it is never
+// locked; converting one makes an invoice dated its issueDate, which is. Each
+// route asks under the business lock, which the lock date is set under.
+const inBooks = (doc) => (doc && doc.type) !== "quote";
+
+// Credit applied from a credit note settles both documents and counts
+// nowhere in the books (utils/books.js), so its day is not one an edit of
+// either document changes.
+const SETTLEMENT_METHODS = ["credit_note", "credit_applied"];
+
+// A document's issueDate is a calendar day kept as text, "YYYY-MM-DD" (the
+// phone's own day: CreateInvoiceScreen sends nothing else). The books read
+// that text by its first ten characters (books.dayKey), and so does the lock
+// date (utils/booksLock.js), so only such a day is checked against the lock
+// and stored: " 2026-10-13" or "+002026-10-13" would sit before every real
+// day in the books, and "2026-13-01" in no year at all. Spaces around the day
+// are dropped, as for a journal's date and the lock date itself
+// (routes/journals.js readDay). A quote's date is read the same way, since
+// converting it makes an invoice of that day. Returns the day, or null when
+// the value is not a real day from 1900 to 2999.
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+function readIssueDay(v) {
+  const day = typeof v === "string" ? v.trim() : "";
+  const d = new Date(`${day}T00:00:00.000Z`);
+  if (
+    !DAY.test(day) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== day ||
+    day < "1900-01-01" || day > "2999-12-31"
+  ) {
+    return null;
+  }
+  return day;
+}
+const BAD_ISSUE_DATE = { error: "That date isn't valid. Choose a day.", code: "BAD_DATE", field: "issueDate" };
 
 // The chart of accounts (2026-10-11): each line may name the income account it
 // counts as (null = Sales; Sales Returns on a credit note). Checked once per
@@ -249,6 +290,16 @@ router.get("/", authMiddleware, async (req, res) => {
       }
       return d;
     };
+    // issueDate is a "YYYY-MM-DD" text column, compared as text: its bounds
+    // must be plain days (a Date there was a 500).
+    const toDay = (v, label) => {
+      if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+        const e = new Error(`Invalid ${label}`);
+        e.status = 400;
+        throw e;
+      }
+      return v;
+    };
 
     const where = { businessId };
     if (since) {
@@ -258,8 +309,8 @@ router.get("/", authMiddleware, async (req, res) => {
       if (type) where.type = type; // "invoice" | "quote"
       if (dateFrom || dateTo) {
         where.issueDate = {};
-        if (dateFrom) where.issueDate.gte = toDate(dateFrom, "dateFrom");
-        if (dateTo) where.issueDate.lte = toDate(dateTo, "dateTo");
+        if (dateFrom) where.issueDate.gte = toDay(dateFrom, "dateFrom");
+        if (dateTo) where.issueDate.lte = toDay(dateTo, "dateTo");
       }
     }
 
@@ -315,6 +366,10 @@ router.post("/", authMiddleware, async (req, res) => {
 
     if (!businessId) return res.status(400).json({ error: "businessId required" });
     if (!issueDate) return res.status(400).json({ error: "issueDate required" });
+    // The day as the books and the lock date will read it (readIssueDay):
+    // checked against the lock and stored as this, never as sent.
+    const issueDay = readIssueDay(issueDate);
+    if (!issueDay) return res.status(400).json(BAD_ISSUE_DATE);
     if (items.length === 0) return res.status(400).json({ error: "At least one line item required" });
 
     const biz = await ownsBusiness(req, businessId);
@@ -354,6 +409,7 @@ router.post("/", authMiddleware, async (req, res) => {
     // (routes/ledger.js), so every account a line names is checked under it and
     // is still there when the invoice is written.
     const invoice = await prisma.withBusinessLock(businessId, async () => {
+      if (docType !== "quote") await assertUnlocked(businessId, issueDay);
       await checkLineAccounts(businessId, items, req.user.accountType === "staff");
       let invoiceNumber;
       if (manualNumber) {
@@ -376,7 +432,7 @@ router.post("/", authMiddleware, async (req, res) => {
           // A new document is a draft or sent. PAID and the rest come from
           // payments, never from the create body.
           status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
-          issueDate,
+          issueDate: issueDay,
           dueDate: isCredit ? null : dueDate || null,
           subtotal,
           taxRate: Number(taxRate) || 0,
@@ -408,7 +464,7 @@ router.post("/", authMiddleware, async (req, res) => {
     res.status(201).json(formatInvoice(invoice));
   } catch (err) {
     if (err.status && err.code) {
-      return res.status(err.status).json({ error: err.message, code: err.code, number: err.number });
+      return res.status(err.status).json({ error: err.message, code: err.code, number: err.number, ...(err.extra || {}) });
     }
     console.error(err);
     res.status(500).json({ error: "Failed to create invoice" });
@@ -534,6 +590,12 @@ router.put("/:id", authMiddleware, async (req, res) => {
       template,
     } = req.body;
 
+    // A new issue date must be a real day (readIssueDay); none (or null, or
+    // "") keeps the saved one. The lock is asked about, and the document
+    // saved with, exactly this day.
+    const newIssueDay = issueDate ? readIssueDay(issueDate) : null;
+    if (issueDate && !newIssueDay) return res.status(400).json(BAD_ISSUE_DATE);
+
     const { subtotal, taxAmount, discountAmount, total } = invoiceTotals({ items, taxRate, discountType, discountValue });
 
     // A credit note cannot shrink below the credit already used from it, nor
@@ -599,6 +661,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // after every check, in one transaction, so a refusal or a failed write
     // leaves the old ones.
     const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+      // The lock date: the document's day before and after the edit, and
+      // every payment's or refund's day, whose VAT share and accounts follow
+      // the document's lines and totals. Read again under the lock.
+      const cur = await prisma.invoice.findUnique({ where: { id: existing.id }, select: { type: true, issueDate: true } });
+      if (!cur) throw Object.assign(new Error("Invoice not found"), { status: 404, code: "INVOICE_NOT_FOUND" });
+      if (inBooks(cur)) {
+        const paid = await prisma.invoicePayment.findMany({
+          where: { invoiceId: existing.id, method: { notIn: SETTLEMENT_METHODS } },
+          select: { date: true },
+        });
+        await assertUnlocked(existing.businessId, cur.issueDate, newIssueDay, paid.map((p) => p.date));
+      }
       const saved = await savedLinesOf(existing.id);
       const lines = keepLineAccounts(items, saved);
       const kept = new Set(saved.map((l) => l.accountId).filter(Boolean));
@@ -621,7 +695,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
             ...(newNumber ? { invoiceNumber: newNumber } : {}),
             customerId: resolvedCustomerId,
             ...snapshot,
-            issueDate: issueDate || existing.issueDate,
+            // The new day, or else the one read under the lock above, which
+            // the lock date was checked against (the copy read before the
+            // lock may be stale).
+            issueDate: newIssueDay || cur.issueDate,
             dueDate: isCredit ? null : dueDate || null,
             subtotal,
             taxRate: Number(taxRate) || 0,
@@ -652,7 +729,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     res.json(formatInvoice(invoice));
   } catch (err) {
     if (err.status && err.code) {
-      return res.status(err.status).json({ error: err.message, code: err.code, number: err.number });
+      return res.status(err.status).json({ error: err.message, code: err.code, number: err.number, ...(err.extra || {}) });
     }
     console.error(err);
     res.status(500).json({ error: "Failed to update invoice" });
@@ -713,6 +790,9 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
           throw creditError(409, "VAT_PERIOD_CLOSED", "That month's VAT return is due or filed. Issue a credit note instead.");
         }
       }
+      // Sending, voiding or redrafting a document moves it in or out of the
+      // books on its issue day.
+      if (inBooks(cur)) await assertUnlocked(cur.businessId, cur.issueDate);
       return prisma.invoice.update({
         where: { id: cur.id },
         data: { status: newStatus },
@@ -829,6 +909,9 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
             });
           }
         }
+        // The lock date: the day the payment lands on (a bank payment's is
+        // the credit's).
+        await assertUnlockedIn(px, inv.businessId, tx ? tx.date : when);
 
         await px.invoicePayment.create({
           data: {
@@ -893,6 +976,12 @@ router.delete("/:id/payments/:paymentId", authMiddleware, async (req, res) => {
           throw creditError(409, "WRITTEN_OFF", "This invoice was written off. Undo the write-off first.");
         }
         if (inv.status === "VOID") throw creditError(409, "INVOICE_VOID", "This document is void.");
+        // The lock date: the payment's day, and the day of the bank transfer
+        // it frees.
+        const freed = p.transactionId
+          ? await px.transaction.findUnique({ where: { id: p.transactionId }, select: { date: true } })
+          : null;
+        await assertUnlockedIn(px, inv.businessId, p.date, freed ? freed.date : null);
 
         await px.invoicePayment.delete({ where: { id: p.id } });
         if (p.transactionId) {
@@ -970,6 +1059,8 @@ router.post("/:id/payments/:paymentId/link", authMiddleware, async (req, res) =>
         if (amount > credit.remaining + 0.005) {
           throw creditError(400, "EXCEEDS_TRANSFER", "That is more than is left of the transfer.", { remaining: credit.remaining });
         }
+        // The lock date: the payment moves from its own day to the credit's.
+        await assertUnlockedIn(px, inv.businessId, p.date, credit.tx.date);
         await recordLink(px, { req, kind: "invoice_payment", payment: p, transactionId: credit.tx.id });
         await px.invoicePayment.update({
           where: { id: p.id },
@@ -1011,9 +1102,12 @@ router.post("/:id/write-off", authMiddleware, async (req, res) => {
       }
       const left = round2(inv.total - inv.amountPaid);
       if (!(left > 0)) throw creditError(400, "PAID_IN_FULL", "This invoice is already paid in full.");
+      // The write-off is dated today, which the lock date may cover.
+      const when = new Date();
+      await assertUnlocked(inv.businessId, when);
       return prisma.invoice.update({
         where: { id: inv.id },
-        data: { writtenOffAt: new Date(), writtenOffAmount: left },
+        data: { writtenOffAt: when, writtenOffAmount: left },
         include: INCLUDE,
       });
     });
@@ -1030,16 +1124,22 @@ router.delete("/:id/write-off", authMiddleware, async (req, res) => {
     const existing = await prisma.invoice.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, existing.businessId))) return res.status(403).json({ error: "Access denied" });
-    const updated = await prisma.invoice.update({
-      where: { id: existing.id },
-      data: { writtenOffAt: null, writtenOffAmount: null },
-      include: INCLUDE,
+    // Under the business lock, where the lock date is asked: the write-off
+    // comes off the day it was dated.
+    const updated = await prisma.withBusinessLock(existing.businessId, async () => {
+      const cur = await prisma.invoice.findUnique({ where: { id: existing.id }, select: { id: true, businessId: true, writtenOffAt: true } });
+      if (!cur) throw creditError(404, "INVOICE_NOT_FOUND", "Invoice not found.");
+      await assertUnlocked(cur.businessId, cur.writtenOffAt);
+      return prisma.invoice.update({
+        where: { id: cur.id },
+        data: { writtenOffAt: null, writtenOffAmount: null },
+        include: INCLUDE,
+      });
     });
     logMoney(req, "INVOICE_WRITE_OFF_UNDO", existing.id, {});
     res.json(formatInvoice(updated));
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to undo the write-off" });
+    return sendCreditError(res, err, "Failed to undo the write-off");
   }
 });
 
@@ -1107,7 +1207,9 @@ router.post("/:id/apply-credit", authMiddleware, async (req, res) => {
         throw creditError(400, "EXCEEDS_BALANCE", "That is more than the invoice still owes.", { outstanding });
       }
 
+      // Applied today, which the lock date may cover.
       const when = new Date();
+      await assertUnlocked(cn.businessId, when);
       const invPaid = toMoney(inv.amountPaid + amount);
       const invStatus =
         invPaid >= toMoney(inv.total) ? "PAID" : inv.dueDate && inv.dueDate < lagosToday() ? "OVERDUE" : "PARTIAL";
@@ -1183,9 +1285,17 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
             throw creditError(404, "TRANSACTION_NOT_FOUND", "That transfer was not found.");
           }
           if (debit.type === "income") throw creditError(400, "NOT_OUTGOING", "Pick money that went out.");
-          // Already explained: marked, recorded as an expense, or explained
-          // with an account (money out on an expense account keeps no purpose).
-          if (debit.purpose || debit.accountId || debit.matchedExpenseId) {
+          // Only the provider's own transfer out of the KashBook account in the
+          // business's currency, never a hand-typed row: a refund said to have
+          // left the KashBook account must have left it (as routes/bills.js).
+          const biz = await px.business.findUnique({ where: { id: cn.businessId }, select: { baseCurrency: true } });
+          if (!isLedgerBankRow(debit, (biz && biz.baseCurrency) || "NGN")) {
+            throw creditError(400, "NOT_OUTGOING", "Pick money that went out of the KashBook account.");
+          }
+          // Already explained: marked, recorded as an expense, paid towards a
+          // bill (release 2), or explained with an account (money out on an
+          // expense account keeps no purpose).
+          if (debit.purpose || debit.accountId || debit.matchedExpenseId || debit.matchedBillId) {
             throw creditError(409, "TRANSACTION_TAKEN", "That transfer is already explained.");
           }
           // One record per naira: the whole transfer is the refund.
@@ -1194,7 +1304,18 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
               transferAmount: Number(debit.amount),
             });
           }
-          await px.transaction.update({ where: { id: debit.id }, data: { purpose: "customer_refund" } });
+        }
+        // The lock date: the day the refund lands on (a bank refund's is the
+        // debit's). Asked before anything is written.
+        await assertUnlockedIn(px, cn.businessId, debit ? debit.date : when);
+        if (debit) {
+          // Only if it is still unexplained: a write that took it meanwhile
+          // (a bill payment, a categorize) wins, and nothing here is saved.
+          const marked = await px.transaction.updateMany({
+            where: { id: debit.id, purpose: null, accountId: null, matchedExpenseId: null, matchedBillId: null },
+            data: { purpose: "customer_refund" },
+          });
+          if (marked.count !== 1) throw creditError(409, "TRANSACTION_TAKEN", "That transfer is already explained.");
         }
         await px.invoicePayment.create({
           data: {
@@ -1264,19 +1385,37 @@ router.post("/:id/convert-to-invoice", authMiddleware, async (req, res) => {
     if (existing.type !== "quote")
       return res.status(400).json({ error: "Only a quote can be converted." });
 
-    const invoiceNumber = await allocateInvoiceNumber(prisma, existing.businessId, "invoice");
     // The new invoice carries the customer's addresses and TIN as they are now.
     const snapshot = await snapshotFor(prisma, existing.customerId);
 
-    const invoice = await prisma.invoice.update({
-      where: { id: req.params.id },
-      data: { type: "invoice", invoiceNumber, status: "DRAFT", ...snapshot },
-      include: INCLUDE,
+    // Under the business lock, where every document is numbered and the lock
+    // date is asked: the new invoice keeps the quote's issueDate, so a quote
+    // dated on or before the lock date is moved to an open day before it is
+    // converted. Read again under the lock (converted meanwhile, or deleted).
+    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+      const cur = await prisma.invoice.findUnique({ where: { id: existing.id }, select: { id: true, type: true, issueDate: true } });
+      if (!cur) throw creditError(404, "INVOICE_NOT_FOUND", "Invoice not found.");
+      if (cur.type !== "quote") throw creditError(400, "NOT_A_QUOTE", "Only a quote can be converted.");
+      // The quote's day must be a real one (readIssueDay): a quote saved
+      // before issue dates were checked may carry other text, which would
+      // make an invoice the books place before every real day. Such a quote
+      // gets a real day first: editing a quote's date is never refused for
+      // the lock date, since a quote is in no books.
+      const issueDay = readIssueDay(cur.issueDate);
+      if (!issueDay) {
+        throw creditError(400, "BAD_DATE", "This quote's date isn't valid. Change it, then convert the quote.", { field: "issueDate" });
+      }
+      await assertUnlocked(existing.businessId, issueDay);
+      const invoiceNumber = await allocateInvoiceNumber(prisma, existing.businessId, "invoice");
+      return prisma.invoice.update({
+        where: { id: cur.id },
+        data: { type: "invoice", invoiceNumber, status: "DRAFT", issueDate: issueDay, ...snapshot },
+        include: INCLUDE,
+      });
     });
     res.json(formatInvoice(invoice));
   } catch (err) {
-    console.error("convert error:", err);
-    res.status(500).json({ error: "Failed to convert quote" });
+    return sendCreditError(res, err, "Failed to convert quote");
   }
 });
 
@@ -1313,6 +1452,8 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       if (cur.type !== "quote" && cur.status !== "DRAFT" && biz?.vatEnabled) {
         throw creditError(409, "VAT_ISSUED_LOCKED", "An issued VAT invoice can be voided, not deleted.");
       }
+      // The lock date: the document's day, and a write-off's that goes with it.
+      if (inBooks(cur)) await assertUnlocked(cur.businessId, cur.issueDate, cur.writtenOffAt);
       await prisma.invoice.delete({ where: { id: cur.id } });
     });
     res.json({ ok: true });

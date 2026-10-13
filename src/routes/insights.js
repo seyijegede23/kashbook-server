@@ -50,8 +50,11 @@ router.post("/ask", requirePermission("canViewReports"), async (req, res) => {
     // "What is my balance" is a BALANCE question wearing a reports costume.
     // The route gate is canViewReports; the engine must still refuse the one
     // intent that reads the bank.
+    // "Who do I owe?" reads the bills, which are the canManagePayables
+    // capability's (owners hold it), as on the bills routes.
     const result = await answerQuestion(question, biz, context, {
       canViewBalance: req.user.permissions?.canViewBalance === true,
+      canManagePayables: req.user.permissions?.canManagePayables === true,
     });
     res.json(result);
   } catch (err) {

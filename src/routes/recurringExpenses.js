@@ -53,6 +53,26 @@ router.get("/", async (req, res) => {
   }
 });
 
+// How a rule's expenses are paid. Not "credit" (chart of accounts release
+// 2): what the business owes is a bill (routes/bills.js), and an expense saved
+// on credit would sit in Accounts Payable with no bill to pay it off.
+const RULE_METHODS = ["cash", "bank", "transfer", "pos"];
+
+// An amount above zero, a real number (a numeric string too), as each run
+// records it: zero, a negative or text would record nonsense every period.
+const validAmount = (v) => {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) && n > 0;
+};
+const methodRefusal = (method) =>
+  method !== undefined && method !== null && !RULE_METHODS.includes(method)
+    ? {
+        error: "Choose how it is paid: cash, bank, transfer or POS. Something you will pay for later goes in Bills.",
+        code: "BAD_METHOD",
+        field: "paymentMethod",
+      }
+    : null;
+
 // POST /recurring-expenses
 router.post("/", async (req, res) => {
   try {
@@ -63,7 +83,9 @@ router.post("/", async (req, res) => {
       autoSend, payeeAccountNumber, payeeBankCode, payeeBankName, payeeAccountName, pin,
     } = req.body;
 
-    if (!amount || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+    if (!validAmount(amount)) return res.status(400).json({ error: "Invalid amount", code: "BAD_AMOUNT", field: "amount" });
+    const refusedMethod = methodRefusal(paymentMethod);
+    if (refusedMethod) return res.status(400).json(refusedMethod);
     const validFreq = ["daily", "weekly", "monthly", "yearly"].includes(frequency) ||
       (typeof frequency === "string" && frequency.startsWith("custom_") && parseInt(frequency.split("_")[1], 10) > 0);
     if (!validFreq) return res.status(400).json({ error: "Invalid frequency" });
@@ -174,6 +196,8 @@ router.patch("/:id", async (req, res) => {
       include: { business: true },
     });
     if (!existing) return res.status(404).json({ error: "Not found" });
+    const refusedMethod = methodRefusal(paymentMethod);
+    if (refusedMethod) return res.status(400).json(refusedMethod);
 
     const data = {};
     if (category !== undefined) {
@@ -194,7 +218,10 @@ router.patch("/:id", async (req, res) => {
       const paidFrom = await assertAccountUsable(existing.businessId, paidThroughAccountId, "money");
       data.paidThroughAccountId = paidFrom ? paidFrom.id : null;
     }
-    if (amount !== undefined) data.amount = parseFloat(amount);
+    if (amount !== undefined) {
+      if (!validAmount(amount)) return res.status(400).json({ error: "Invalid amount", code: "BAD_AMOUNT", field: "amount" });
+      data.amount = parseFloat(amount);
+    }
     if (paymentMethod !== undefined) data.paymentMethod = paymentMethod;
     if (notes !== undefined) data.notes = notes;
     if (frequency !== undefined) data.frequency = frequency;

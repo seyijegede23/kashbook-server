@@ -18,6 +18,11 @@
 // "When sold" counts documents instead: recorded sales, issued invoices, minus
 // credit notes, plus credit given on the customer screen; bank credits linked
 // to nothing sit outside sales as "not yet explained"; write-offs are bad debt.
+// Bills (release 2) are what the business owes its suppliers: a bill on
+// spending counts when paid as each payment is made (a payment from the
+// KashBook account carries its debit, which then stops counting) and when sold
+// on its bill date; a bill for a loan never counts. Published manual journals
+// count their lines on income and spending accounts, in both views.
 
 const MONEY_IN_METHODS = ["cash", "card", "cheque", "transfer", "pos", "other"];
 // Paid into the business's own KashBook account: the payment must link the
@@ -102,8 +107,11 @@ function isCreditMatched(tx) {
   return !!(tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId);
 }
 
+// A debit is matched when it records an expense, or pays a bill (release 2:
+// the bill's payment then carries the matchedAmount, and what is left of the
+// debit counts as it did before).
 function isDebitMatched(tx) {
-  return !!tx.matchedExpenseId;
+  return !!(tx.matchedExpenseId || tx.matchedBillId);
 }
 
 function isMatchedBankRow(tx) {
@@ -156,6 +164,49 @@ function vatShareOfDocument(amount, doc) {
   return round2((num(amount) * tax) / total);
 }
 
+// ── Bills and manual journals (release 2) ───────────────────────────────────
+
+// Naira as whole kobo, so a journal balances exactly or not at all.
+function koboOf(v) {
+  return Math.round(num(v) * 100);
+}
+
+// What a bill is in the books: its amount less what was paid on it outside
+// the books. Only a payable from before bills (estimated) has such a payment:
+// what was paid on it then counts nowhere, because nobody knows when it was
+// paid, and it only lowers what is owed. The rule reads the payments
+// themselves, so the bill and what it still owes always agree. Never below zero.
+function billBooksAmount(bill) {
+  let outside = 0;
+  for (const p of (bill && bill.payments) || []) if (p && p.outsideBooks) outside += num(p.amount);
+  return Math.max(0, round2(num(bill && bill.amount) - outside));
+}
+
+// A bill is spending when its account is (or it names none this input knows,
+// as a record with no account always counts); a bill for a loan or another
+// liability, or anything else on the balance sheet, never touches profit.
+function billIsSpending(bill, accounts) {
+  const acc = accountOf(accounts, bill && bill.accountId);
+  return !acc || acc.cls === "expense";
+}
+
+// A manual journal the books take: published, debits equal to credits to the
+// kobo, every line on an account this input knows. Any other (a draft, or one
+// the route would never have saved) counts nowhere and posts nothing.
+function journalInBooks(journal, accounts) {
+  if (!journal || lower(journal.status) !== "published") return false;
+  const lines = journal.lines || [];
+  if (!lines.length) return false;
+  let debit = 0;
+  let credit = 0;
+  for (const line of lines) {
+    if (!accountOf(accounts, line && line.accountId)) return false;
+    debit += koboOf(line.debit);
+    credit += koboOf(line.credit);
+  }
+  return debit === credit;
+}
+
 // ── The totals ──────────────────────────────────────────────────────────────
 
 function emptyLines() {
@@ -169,14 +220,16 @@ function addTo(line, amount, vat) {
 }
 
 // The lines each view adds up; the others are information beside a total.
+// Release 2: bills (their payments when paid, the bill on its date when sold)
+// and published manual journals (both views).
 const COUNTED_LINES = {
   paid: {
-    sales: ["recorded", "invoicePayments", "debtPayments", "bank", "bankIncome", "refunds"],
-    expenses: ["recorded", "bank", "supplierRefunds", "bankCharges"],
+    sales: ["recorded", "invoicePayments", "debtPayments", "bank", "bankIncome", "refunds", "journals"],
+    expenses: ["recorded", "bank", "supplierRefunds", "bankCharges", "bills", "journals"],
   },
   sold: {
-    sales: ["recorded", "invoiced", "creditNotes", "creditGiven", "bankIncome"],
-    expenses: ["recorded", "bank", "supplierRefunds", "badDebts", "bankCharges"],
+    sales: ["recorded", "invoiced", "creditNotes", "creditGiven", "bankIncome", "journals"],
+    expenses: ["recorded", "bank", "supplierRefunds", "badDebts", "bankCharges", "bills", "journals"],
   },
 };
 
@@ -213,6 +266,22 @@ function isBalanceSheetClass(cls) {
 //                    an itemized expense (its amount is their sum): it counts
 //                    line by line on the expense's date, each line by its own
 //                    account; an empty list is a whole expense
+// Since bills and manual journals (release 2, 2026-10-13):
+//   bills:    [{ id, accountId, billDate, amount, estimated, payments: [{ id,
+//                amount, date, method, transactionId, outsideBooks }] }]
+//             what the business owes a supplier (or a lender). A bill on
+//             spending counts when paid as each payment is made, and when sold
+//             on its bill date (less anything paid outside the books); a bill
+//             on the balance sheet (a loan) never counts. A payment kept
+//             outside the books counts nowhere. The server's loader also
+//             passes vendorName, billNumber, note, receivedViaAccountId and
+//             each payment's paidThroughAccountId and note, for the ledger.
+//   journals: [{ id, date, status, lines: [{ accountId, debit, credit }] }]
+//             manual journals: a published one's lines on income accounts
+//             count as sales (credit less debit) and on spending accounts as
+//             expenses (debit less credit), in both views, on its date; lines
+//             on the balance sheet count nowhere (journalInBooks)
+//   bankRows[].matchedBillId: the bill a debit paid (isDebitMatched)
 // opts: { from, to ("YYYY-MM-DD", inclusive, either may be empty),
 //         basis: "paid" | "sold", vat: { enabled, rate, inclusive } }
 //
@@ -221,8 +290,9 @@ function isBalanceSheetClass(cls) {
 // folds the events into its lines, and the ledger (server/src/utils/ledger.js)
 // turns the same events into its profit-and-loss entries, so a total and the
 // accounts behind it can never disagree. `src` names the record carrying the
-// amount ({ kind, rec, pay, doc, debt, item }; item: the line of an itemized
-// expense) so the ledger can find its accounts.
+// amount ({ kind, rec, pay, doc, debt, item, bill, line }; item: the line of
+// an itemized expense; bill: the bill a payment is towards; line: the line of
+// a journal) so the ledger can find its accounts.
 function bookEvents(input, opts) {
   const o = opts || {};
   const basis = o.basis === "sold" ? "sold" : "paid";
@@ -234,6 +304,8 @@ function bookEvents(input, opts) {
   const bankRows = (input && input.bankRows) || [];
   const invoices = (input && input.invoices) || [];
   const debts = (input && input.debts) || [];
+  const bills = (input && input.bills) || [];
+  const journals = (input && input.journals) || [];
   // allDates: every record whatever its date (bookRows), else the period.
   const inPeriod = (d) => (o.allDates ? true : inRange(d, from, to));
 
@@ -367,6 +439,37 @@ function bookEvents(input, opts) {
     }
   }
 
+  // Bills: spending when paid as each payment is made (a payment linked to a
+  // KashBook debit counts here and its debit stops counting, isDebitMatched),
+  // and when sold on the bill date, less what was paid outside the books.
+  for (const bill of bills) {
+    if (!billIsSpending(bill, accounts)) continue;
+    if (basis === "paid") {
+      for (const p of bill.payments || []) {
+        if (!p || p.outsideBooks || !inPeriod(p.date)) continue;
+        add("expenses", "bills", num(p.amount), 0, p.date, { kind: "billPayment", rec: p, bill });
+      }
+    } else if (inPeriod(bill.billDate)) {
+      const a = billBooksAmount(bill);
+      if (a > 0) add("expenses", "bills", a, 0, bill.billDate, { kind: "bill", rec: bill, bill });
+    }
+  }
+
+  // Manual journals, in both views on their date: what a line moves into or
+  // out of an income account is sales, into or out of a spending account is
+  // spending (either may be below zero); the balance sheet counts nowhere.
+  for (const j of journals) {
+    if (!inPeriod(j.date) || !journalInBooks(j, accounts)) continue;
+    for (const line of j.lines) {
+      const k = koboOf(line.debit) - koboOf(line.credit); // above zero: a debit
+      if (!k) continue;
+      const cls = accountOf(accounts, line.accountId).cls;
+      const src = { kind: "journal", rec: j, line };
+      if (cls === "income") add("sales", "journals", -k / 100, 0, j.date, src);
+      else if (cls === "expense") add("expenses", "journals", k / 100, 0, j.date, src);
+    }
+  }
+
   return { basis, vat, from, to, events };
 }
 
@@ -389,6 +492,7 @@ function computeBooks(input, opts) {
     // before the rule, or with no customer). They still count on the sale
     // date, inside "recorded"; this line says how much of it that is.
     creditUnlinked: emptyLines(),
+    journals: emptyLines(), // both views: manual journals on income accounts (may be negative)
   };
   const E = {
     recorded: emptyLines(),
@@ -396,6 +500,8 @@ function computeBooks(input, opts) {
     supplierRefunds: emptyLines(), // negative
     badDebts: emptyLines(), // sold view
     bankCharges: emptyLines(), // transfer fees (and a savings break fee)
+    bills: emptyLines(), // paid view: payments towards bills; sold view: bills on their date
+    journals: emptyLines(), // both views: manual journals on spending accounts (may be negative)
   };
 
   for (const ev of events) addTo((ev.side === "sales" ? L : E)[ev.line], ev.gross, ev.vat);
@@ -563,6 +669,15 @@ function vatReturn(input, month, vatOpts) {
     }
     inputVat += vat.enabled && vat.rate > 0 ? (bought * vat.rate) / (100 + vat.rate) : 0;
   }
+  // A bill is a purchase on its bill date (the supplier's invoice is the tax
+  // point), like an expense on its date: the part of it the books carry (a
+  // payable from before bills, less what was paid outside the books), by the
+  // same accounts. Never a loan or another liability: borrowing buys nothing.
+  for (const b of (input && input.bills) || []) {
+    if (!inRange(b.billDate, from, to) || !claimable(accountOf(accounts, b.accountId))) continue;
+    const bought = billBooksAmount(b);
+    inputVat += vat.enabled && vat.rate > 0 ? (bought * vat.rate) / (100 + vat.rate) : 0;
+  }
   const output = round2(invoicesVat + salesVat - creditVat);
   return {
     month,
@@ -579,6 +694,12 @@ function vatReturn(input, month, vatOpts) {
   };
 }
 
+// The name a bill goes by on a row or a ledger entry: its supplier's, else its
+// number, else its note.
+function billLabel(bill) {
+  return (bill && (bill.vendorName || bill.name || bill.billNumber || bill.note)) || "";
+}
+
 // One row per counted amount, under either view: summing the income rows gives
 // computeBooks' gross sales and the expense rows its expenses, so charts and
 // breakdowns (by day, channel, customer, category) agree with the totals.
@@ -586,14 +707,18 @@ function vatReturn(input, month, vatOpts) {
 // recordedByName...) where it has them. Built from the same events as the
 // totals, every date included. A counted line of an itemized expense is a row
 // of its own (id "<expense>:<line>", expenseId, itemId), with the line's
-// account and category.
+// account and category. Release 2: a payment towards a bill ("bp_<payment>",
+// source "bill_payment", when paid), a bill on its date ("bill_<bill>",
+// source "bill", when sold) and a counted line of a manual journal
+// ("mj_<line>", source "journal", journalId) each carry the account they count
+// in (accountId; a bill's may be null, which reads as Other Expenses).
 function bookRows(input, basis) {
   const view = basis === "sold" ? "sold" : "paid";
   const counted = COUNTED_LINES[view];
   const rows = [];
   for (const ev of bookEvents(input, { basis: view, allDates: true }).events) {
     if (!(ev.side === "sales" ? counted.sales : counted.expenses).includes(ev.line)) continue;
-    const { kind, rec, doc, debt, item } = ev.src;
+    const { kind, rec, doc, debt, item, bill, line } = ev.src;
     const type = ev.side === "sales" ? "income" : "expense";
     if (kind === "expense" && item) {
       rows.push(Object.assign({}, rec, {
@@ -642,6 +767,23 @@ function bookRows(input, basis) {
         id: `debt_${rec.id}`, type, amount: ev.gross, date: ev.day,
         description: rec.note, customerId: rec.customerId || null, source: "debt",
       });
+    } else if (kind === "billPayment") {
+      rows.push({
+        id: `bp_${rec.id}`, type, amount: ev.gross, date: ev.day,
+        description: billLabel(bill), accountId: bill.accountId || null, billId: bill.id, paymentId: rec.id,
+        paymentMethod: rec.method || null, source: "bill_payment",
+      });
+    } else if (kind === "bill") {
+      rows.push({
+        id: `bill_${rec.id}`, type, amount: ev.gross, date: ev.day,
+        description: billLabel(rec), accountId: rec.accountId || null, billId: rec.id, source: "bill",
+      });
+    } else if (kind === "journal") {
+      rows.push({
+        id: `mj_${line.id || `${rec.id}_${rec.lines.indexOf(line)}`}`, type, amount: ev.gross, date: ev.day,
+        description: line.description || rec.note || rec.number || "", accountId: line.accountId,
+        journalId: rec.id, source: "journal",
+      });
     }
   }
   return rows;
@@ -680,6 +822,10 @@ module.exports = {
   vatInside,
   vatInsideReceived,
   vatShareOfDocument,
+  billBooksAmount,
+  billIsSpending,
+  journalInBooks,
+  billLabel,
   COUNTED_LINES,
   bookEvents,
   computeBooks,

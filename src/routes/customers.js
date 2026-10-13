@@ -4,10 +4,29 @@ const prisma = require("../utils/db");
 const { validateCustomer, validateIdParam } = require("../middleware/validate");
 const { readCustomerFields, normalizePhone } = require("../utils/customerFields");
 const { assertAccountUsable } = require("../utils/ledgerData");
+const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 
 // How a customer paid back credit (chart of accounts, 2026-10-11): the money
 // lands in the account its method stands for unless one is picked.
 const REPAYMENT_METHODS = ["cash", "transfer", "pos", "card", "cheque", "other"];
+
+// Every customer belongs to one business (chart of accounts release 2): their
+// debts count in that business's books, and nowhere else. A new customer
+// names its business, and a debt or a repayment is refused for a customer
+// with none (one whose business was deleted), whose debts no books would
+// count. Debts are dated records, so the business's lock date applies to them
+// (utils/booksLock.js): each write asks under the business lock, which the
+// lock date is set under.
+const NO_BUSINESS = {
+  error: "This customer isn't in a business, so their debts can't be recorded.",
+  code: "BUSINESS_REQUIRED",
+};
+
+// A refusal as the app reads it: { error, code }, and what else it carries
+// (the lock date of a BOOKS_LOCKED refusal, `extra`).
+function sendRefusal(res, err) {
+  return res.status(err.status).json({ error: err.message, code: err.code, ...(err.extra || {}) });
+}
 
 router.use(auth);
 
@@ -78,6 +97,10 @@ function duplicatePhone(res, existing) {
 router.post("/", validateCustomer, async (req, res) => {
   const { name, phone, reminderEnabled = false, businessId } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
+  // Every customer belongs to one business.
+  if (typeof businessId !== "string" || !businessId) {
+    return res.status(400).json({ error: "Choose the business this customer belongs to.", code: "BUSINESS_REQUIRED", field: "businessId" });
+  }
 
   const userId = getTargetUserId(req);
   const refuse = req.body.onDuplicate === "refuse";
@@ -98,12 +121,10 @@ router.post("/", validateCustomer, async (req, res) => {
   }
 
   try {
-    if (businessId) {
-      const owned = await prisma.business.findFirst({
-        where: { id: businessId, userId },
-      });
-      if (!owned) return res.status(403).json({ error: "Forbidden" });
-    }
+    const owned = await prisma.business.findFirst({
+      where: { id: businessId, userId },
+    });
+    if (!owned) return res.status(403).json({ error: "Forbidden" });
 
     if (mobile) {
       const existing = await prisma.customer.findUnique({
@@ -115,7 +136,7 @@ router.post("/", validateCustomer, async (req, res) => {
     const customer = await prisma.customer.create({
       data: {
         userId,
-        businessId: businessId || null,
+        businessId: owned.id,
         name: name.trim(),
         phone: mobile,
         reminderEnabled: reminderEnabled === true,
@@ -244,9 +265,17 @@ router.delete("/:id", validateIdParam, async (req, res) => {
       });
     }
 
-    await prisma.customer.delete({ where: { id: req.params.id } });
+    // The debts still here are credit given, which the books count on their
+    // own days ("when sold"), and they go with the customer: the lock date
+    // applies to those days. Under the business lock it is set under.
+    await prisma.withBusinessLock(customer.businessId || customer.userId, async () => {
+      const debts = await prisma.debt.findMany({ where: { customerId: customer.id }, select: { date: true } });
+      await assertUnlocked(customer.businessId, debts.map((d) => d.date));
+      await prisma.customer.delete({ where: { id: customer.id } });
+    });
     res.json({ message: "Deleted" });
   } catch (err) {
+    if (err && err.status) return sendRefusal(res, err);
     res.status(500).json({ error: "Failed to delete customer" });
   }
 });
@@ -263,21 +292,26 @@ router.post("/:id/debts", async (req, res) => {
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
+    if (!customer.businessId) return res.status(409).json(NO_BUSINESS);
 
-    await prisma.debt.create({
-      data: {
-        customerId: req.params.id,
-        amount: Number(amount),
-        paidAmount: 0,
-        paid: false,
-        note: note || "",
-        date: date ? new Date(date) : new Date(),
-      },
+    const when = date ? new Date(date) : new Date();
+    const updated = await prisma.withBusinessLock(customer.businessId, async () => {
+      await assertUnlocked(customer.businessId, when);
+      await prisma.debt.create({
+        data: {
+          customerId: customer.id,
+          amount: Number(amount),
+          paidAmount: 0,
+          paid: false,
+          note: note || "",
+          date: when,
+        },
+      });
+      return recalcAndSaveOwed(customer.id);
     });
-
-    const updated = await recalcAndSaveOwed(req.params.id);
     res.status(201).json(updated);
   } catch (err) {
+    if (err && err.status) return sendRefusal(res, err);
     console.error(err);
     res.status(500).json({ error: "Failed to add debt" });
   }
@@ -303,20 +337,20 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
-    // Where the money went, when picked (a customer with no business has no chart).
-    const deposit = customer.businessId
-      ? await assertAccountUsable(customer.businessId, req.body.depositAccountId, "money", {
-          isStaff: req.user.accountType === "staff",
-        })
-      : null;
+    if (!customer.businessId) return res.status(409).json(NO_BUSINESS);
+    // Where the money went, when picked: an account of the customer's business.
+    const deposit = await assertAccountUsable(customer.businessId, req.body.depositAccountId, "money", {
+      isStaff: req.user.accountType === "staff",
+    });
 
     // Books rule: every repayment is a counted sale, so it is never more than
     // the debt still owes, and the payment and the debt change together. Under
-    // the business lock (the owner's id for customers with no business) so two
-    // phones settling the same debt cannot both pay it.
-    const lockKey = customer.businessId || customer.userId;
-    const updated = await prisma.withBusinessLock(lockKey, () =>
+    // the business lock so two phones settling the same debt cannot both pay
+    // it, and where the lock date is asked: a repayment is dated today.
+    const paidAt = new Date();
+    const updated = await prisma.withBusinessLock(customer.businessId, () =>
       prisma.$transaction(async (px) => {
+        await assertUnlockedIn(px, customer.businessId, paidAt);
         // SECURITY: the debt must belong to the customer we just authorised.
         // Looking it up by id alone let an attacker with one owned customer
         // write payments against — and settle — another merchant's debt.
@@ -335,13 +369,14 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
         }
         await px.debtPayment.create({
           data: {
-            debtId: debt.id, amount, note: note || "", date: new Date(), method,
+            debtId: debt.id, amount, note: note || "", date: paidAt, method,
             depositAccountId: deposit ? deposit.id : null,
           },
         });
         const paidAmount = Math.min(debt.amount, Math.round((debt.paidAmount + amount) * 100) / 100);
-        // Compare-and-set: match-debt locks on the transfer's business,
-        // which for a customer with no business is another key.
+        // Compare-and-set: every other writer of a debt's paidAmount (an
+        // older app's offline queue, matching a transfer) is checked the
+        // same way, whatever lock it holds.
         const moved = await px.debt.updateMany({
           where: { id: debt.id, paidAmount: debt.paidAmount },
           data: { paidAmount, paid: paidAmount >= debt.amount - 0.005 },
@@ -361,7 +396,7 @@ router.post("/:id/debts/:debtId/payment", async (req, res) => {
     res.json(updated);
   } catch (err) {
     if (err.status) {
-      return res.status(err.status).json({ error: err.message, code: err.code, remaining: err.remaining });
+      return res.status(err.status).json({ error: err.message, code: err.code, remaining: err.remaining, ...(err.extra || {}) });
     }
     console.error(err);
     res.status(500).json({ error: "Failed to record payment" });
@@ -379,19 +414,24 @@ router.post("/:id/credit", async (req, res) => {
     if (!customer) return res.status(404).json({ error: "Customer not found" });
     if (customer.userId !== getTargetUserId(req))
       return res.status(403).json({ error: "Forbidden" });
+    if (!customer.businessId) return res.status(409).json(NO_BUSINESS);
 
-    await prisma.debt.create({
-      data: {
-        customerId: req.params.id,
-        amount: Number(amount),
-        note: note || "",
-        date: date ? new Date(date) : new Date(),
-      },
+    const when = date ? new Date(date) : new Date();
+    const updated = await prisma.withBusinessLock(customer.businessId, async () => {
+      await assertUnlocked(customer.businessId, when);
+      await prisma.debt.create({
+        data: {
+          customerId: customer.id,
+          amount: Number(amount),
+          note: note || "",
+          date: when,
+        },
+      });
+      return recalcAndSaveOwed(customer.id);
     });
-
-    const updated = await recalcAndSaveOwed(req.params.id);
     res.json(updated);
   } catch (err) {
+    if (err && err.status) return sendRefusal(res, err);
     res.status(500).json({ error: "Failed to record credit" });
   }
 });

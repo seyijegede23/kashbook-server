@@ -8,14 +8,17 @@ const { loadBooksInput } = require("./booksData");
 
 const ACCOUNT_FIELDS = {
   id: true, businessId: true, type: true, name: true, code: true, description: true, systemKey: true,
-  categorySlug: true, seed: true, parentId: true, inactiveAt: true, createdAt: true, updatedAt: true,
+  categorySlug: true, aliasSlugs: true, seed: true, parentId: true, inactiveAt: true, createdAt: true, updatedAt: true,
 };
 
-// An account as the app receives it (sync bundle, /ledger routes).
+// An account as the app receives it (sync bundle, /ledger routes). aliasSlugs:
+// the categories merged into it, which the app resolves to it as the server
+// does (chart.indexChart).
 function publicAccount(a) {
   return {
     id: a.id, type: a.type, class: chart.classOf(a.type), name: a.name, code: a.code, description: a.description,
-    systemKey: a.systemKey, system: !!a.systemKey, categorySlug: a.categorySlug, seed: a.seed, parentId: a.parentId,
+    systemKey: a.systemKey, system: !!a.systemKey, categorySlug: a.categorySlug,
+    aliasSlugs: Array.isArray(a.aliasSlugs) ? a.aliasSlugs : [], seed: a.seed, parentId: a.parentId,
     inactive: !!a.inactiveAt, controlled: !!(a.systemKey && chart.CONTROLLED.includes(a.systemKey)),
     hiddenAtZero: !!(a.systemKey && chart.HIDDEN_AT_ZERO.includes(a.systemKey)),
   };
@@ -37,15 +40,28 @@ function accountError(message, code, status = 400, { field, line } = {}) {
 // that only what the books need is added: a system account a later release
 // introduced, and an account for each expense category the books still read
 // (below), so a default the merchant renamed or deleted never comes back.
+// A category needs no account of its own when an account stands for it, as
+// its own or as one merged into it (aliasSlugs), or when the owner retired it
+// (Business.retiredCategorySlugs: its account was deleted, or made another
+// kind), however often an older app version sends it.
 // Idempotent and race-safe (a lock per business, unique keys underneath).
 async function ensureChart(businessId) {
   return prisma.withBusinessLock(`chart:${businessId}`, async () => {
     const existing = await prisma.ledgerAccount.findMany({
       where: { businessId },
-      select: { id: true, type: true, systemKey: true, categorySlug: true, nameKey: true },
+      select: { id: true, type: true, systemKey: true, categorySlug: true, aliasSlugs: true, nameKey: true },
     });
+    // Read after the accounts: a delete, or a change to another kind of
+    // account, takes the category off its account and retires it in one
+    // transaction (routes/ledger.js), so the category is in one read or the
+    // other.
+    const biz = await prisma.business.findUnique({ where: { id: businessId }, select: { retiredCategorySlugs: true } });
     const haveSys = new Set(existing.map((a) => a.systemKey).filter(Boolean));
-    const haveSlug = new Set(existing.map((a) => a.categorySlug).filter(Boolean));
+    const haveSlug = new Set([
+      ...existing.map((a) => a.categorySlug),
+      ...existing.flatMap((a) => a.aliasSlugs || []),
+      ...((biz && biz.retiredCategorySlugs) || []),
+    ].filter(Boolean));
     const haveName = new Set(existing.map((a) => a.nameKey));
     const rows = [];
     // A name not yet used in this chart ("Rent", else "Rent 2", ...).

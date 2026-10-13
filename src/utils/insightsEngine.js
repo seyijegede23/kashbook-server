@@ -897,8 +897,9 @@ async function sumExpenses(businessId, range) {
   return { total: got.books.expenses.total, count: records.size };
 }
 
-// The business's chart (each account with its name) and its recurring
-// expenses, read once per request like the books.
+// The business's chart (each account with its name, and the categories
+// merged into it, which stand for it as the ledger reads them) and its
+// recurring expenses, read once per request like the books.
 function chartOf(businessId) {
   const cache = spanStore.getStore();
   const key = `chart|${businessId}`;
@@ -906,7 +907,7 @@ function chartOf(businessId) {
   const value = Promise.all([
     prisma.ledgerAccount.findMany({
       where: { businessId },
-      select: { id: true, name: true, type: true, systemKey: true, categorySlug: true },
+      select: { id: true, name: true, type: true, systemKey: true, categorySlug: true, aliasSlugs: true },
     }),
     prisma.recurringExpense.findMany({ where: { businessId }, select: { id: true, category: true, accountId: true } }),
   ]).then(([accounts, rules]) => ({ C: chart.indexChart(accounts), recurring: new Map(rules.map((r) => [r.id, r])) }));
@@ -1085,22 +1086,51 @@ const HANDLERS = {
     };
   },
 
-  // The other direction: what the merchant owes (unpaid payables).
-  async payables({ business }) {
-    const rows = await prisma.payable.findMany({
-      where: { businessId: business.id, paid: false },
-      select: { creditorName: true, amount: true, paidAmount: true },
+  // The other direction: what the merchant owes, from the bills still open
+  // (routes/bills.js; bills replaced payables in release 2), by vendor. Bills
+  // are the canManagePayables capability's, as on their own routes and in the
+  // sync bundle: an asker without it (the route says; owners hold it) gets no
+  // vendor and no figure.
+  async payables({ business, canManagePayables }) {
+    if (canManagePayables !== true) {
+      return { answer: "Bills aren't shared with you. Ask the business owner to turn on bills for you." };
+    }
+    const rows = await prisma.businessDebt.findMany({
+      where: { businessId: business.id, status: { not: "paid" } },
+      select: { name: true, remainingAmount: true, dueDate: true },
     });
-    const open = rows
-      .map((r) => ({ name: r.creditorName, balance: Math.max(0, (r.amount || 0) - (r.paidAmount || 0)) }))
-      .filter((r) => r.balance > 0)
-      .sort((a, b) => b.balance - a.balance);
-    if (open.length === 0) return { answer: "You don't owe anyone right now — no unpaid payables. ✅" };
-    const total = open.reduce((n, r) => n + r.balance, 0);
-    const list = open.slice(0, 5).map((r) => `${r.name} (${money(r.balance, business.baseCurrency)})`).join(", ");
+    // Worked in kobo, so the total is exact. A bill is overdue the day after
+    // its due date, as the Lagos calendar runs.
+    const kobo = (n) => Math.round((Number(n) || 0) * 100);
+    const lagosDay = (d) => new Date(new Date(d).getTime() + WAT_MS).toISOString().slice(0, 10);
+    const today = lagosDay(Date.now());
+    const byVendor = new Map();
+    let overdue = 0;
+    for (const r of rows) {
+      const k = kobo(r.remainingAmount);
+      if (k <= 0) continue;
+      const name = String(r.name || "").trim() || "Unnamed";
+      const key = name.toLowerCase();
+      const v = byVendor.get(key) || { name, kobo: 0, bills: 0 };
+      v.kobo += k;
+      v.bills += 1;
+      byVendor.set(key, v);
+      if (r.dueDate && lagosDay(r.dueDate) < today) overdue += 1;
+    }
+    const vendors = [...byVendor.values()].sort((a, b) => b.kobo - a.kobo || a.name.localeCompare(b.name));
+    if (vendors.length === 0) return { answer: "You don't owe anyone right now. No unpaid bills. ✅" };
+    const count = vendors.reduce((n, v) => n + v.bills, 0);
+    const total = vendors.reduce((n, v) => n + v.kobo, 0) / 100;
+    const list = vendors.slice(0, 5).map((v) => `${v.name} (${money(v.kobo / 100, business.baseCurrency)})`).join(", ");
+    const late = overdue ? ` ${overdue} ${overdue === 1 ? "is" : "are"} overdue.` : "";
     return {
-      answer: `You owe ${money(total, business.baseCurrency)} across ${open.length} payable${open.length === 1 ? "" : "s"}: ${list}.`,
-      data: { total, count: open.length },
+      answer: `You owe ${money(total, business.baseCurrency)} on ${count} unpaid bill${count === 1 ? "" : "s"}: ${list}.${late}`,
+      data: {
+        total,
+        count,
+        overdue,
+        vendors: vendors.slice(0, 5).map((v) => ({ name: v.name, owed: v.kobo / 100, bills: v.bills })),
+      },
     };
   },
 
@@ -1512,6 +1542,10 @@ const FALLBACK =
 // `canViewBalance` defaults TRUE so the cron-driven monthly P&L email and every
 // existing owner-side caller behave exactly as before. Only the HTTP route,
 // which knows who is asking, passes it as false.
+// `canManagePayables` (bills, release 2) defaults FALSE: who the business owes
+// is shown only to a caller that says the asker holds it (the HTTP route
+// passes req.user.permissions.canManagePayables; owners hold it), never by
+// default.
 // Fuzzy customer lookup for person-entity questions. Token-based (bank/legal
 // vs informal names never whole-string match): exact full-name equality wins,
 // then all-query-tokens-present, then within-1 token matches. Exactly one
@@ -1622,7 +1656,7 @@ async function answerComparison(parsed, business) {
   };
 }
 
-async function answerQuestion(question, business, context = null, { canViewBalance = true } = {}) {
+async function answerQuestion(question, business, context = null, { canViewBalance = true, canManagePayables = false } = {}) {
   const parsed = parseQuestion(question, context);
 
   if (!parsed.intent) {
@@ -1674,7 +1708,9 @@ async function answerQuestion(question, business, context = null, { canViewBalan
   }
 
   const handler = HANDLERS[parsed.intent];
-  const result = await handler({ business, canViewBalance, ...parsed });
+  // The asker's capabilities last, so nothing parsed from the question can
+  // stand in for them.
+  const result = await handler({ business, ...parsed, canViewBalance, canManagePayables });
   return {
     intent: parsed.intent,
     answer: result.answer,

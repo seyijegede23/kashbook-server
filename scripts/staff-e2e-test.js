@@ -107,8 +107,7 @@ app.use("/businesses", require("../src/routes/businesses"));
 app.use("/transfers", require("../src/routes/transfers"));
 app.use("/recurring-expenses", require("../src/routes/recurringExpenses").router);
 app.use("/sync", require("../src/routes/sync"));
-app.use("/payables", require("../src/routes/payables"));
-app.use("/business-debts", require("../src/routes/businessDebts"));
+app.use("/bills", require("../src/routes/bills"));
 app.use("/insights", require("../src/routes/insights"));
 
 let server, BASE;
@@ -285,9 +284,10 @@ const send = (amount, over = {}) =>
   await test("GET /businesses/:id/balance is refused", async () => {
     assert.ok([403, 404].includes((await GET(`/businesses/${biz.id}/balance`, tStaff)).status));
   });
-  await test("payables mutations are refused", async () => {
-    const r = await POST(`/payables`, tStaff, { businessId: biz.id, creditorName: "X", amount: 100 });
+  await test("bill writes are refused", async () => {
+    const r = await POST(`/bills`, tStaff, { businessId: biz.id, vendorName: "X", amount: 100 });
     assert.strictEqual(r.status, 403);
+    assert.strictEqual(r.body.code, "PERMISSION_DENIED");
   });
   await test("recurring auto-debits are OWNER-ONLY, not grantable", async () => {
     const r = await POST(`/recurring-expenses`, tStaff, { businessId: biz.id, amount: 100, frequency: "daily" });
@@ -313,8 +313,8 @@ const send = (amount, over = {}) =>
   // serves the same field is the failure mode this whole section exists for.
   section("1b. side doors into the same data");
 
-  await test("business debts are refused", async () => {
-    const r = await GET(`/business-debts?businessId=${biz.id}`, tStaff);
+  await test("bills are refused", async () => {
+    const r = await GET(`/bills?businessId=${biz.id}`, tStaff);
     assert.strictEqual(r.status, 403);
   });
   await test("/sync withholds recurring auto-debits from ALL staff", async () => {
@@ -326,7 +326,7 @@ const send = (amount, over = {}) =>
     assert.strictEqual(r.body.recurring.length, 0,
       "standing instructions are owner-only — no capability unlocks them");
   });
-  await test("/sync withholds debts without canManagePayables", async () => {
+  await test("/sync withholds bills without canManagePayables", async () => {
     // Seed a debt FIRST. Asserting "the list is empty" against a table that was
     // already empty passes whatever the gate does — a vacuous test is worse than
     // no test, because it reads as coverage.
@@ -334,9 +334,9 @@ const send = (amount, over = {}) =>
       data: { userId: owner.id, businessId: biz.id, name: "Supplier Co", originalAmount: 250_000, remainingAmount: 250_000 },
     });
     const owned = await GET(`/sync?businessId=${biz.id}`, tOwner);
-    assert.strictEqual(owned.body.debts.length, 1, "the owner must still see it — otherwise this proves nothing");
+    assert.strictEqual(owned.body.bills.length, 1, "the owner must still see it — otherwise this proves nothing");
     const r = await GET(`/sync?businessId=${biz.id}`, tStaff);
-    assert.strictEqual(r.body.debts.length, 0);
+    assert.strictEqual(r.body.bills.length, 0);
   });
   await test("POST /sync cannot be used to plant a business", async () => {
     const r = await POST(`/sync`, tStaff, {

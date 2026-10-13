@@ -3,6 +3,14 @@
 // Behaviour for every item:
 //   - Bookkeeping-only items (autoSend=false): create the Expense row, advance
 //     nextDue. Same as before.
+//   - Bookkeeping-only items on credit (chart of accounts release 2): an
+//     unpaid bill instead of the Expense row (recordRuleBill), as an expense
+//     saved on credit becomes one (scripts/backfill-r2.js). An expense on
+//     credit sat in Accounts Payable with nothing to settle it, and counted as
+//     spending though nothing was paid; a bill is paid off in Bills. A rule
+//     that cannot make one (no business, or an account that is not spending)
+//     is paused and its owner told. A rule that names the account it is paid
+//     from records the Expense row as before: the books took that as paid.
 //   - Auto-debit items (autoSend=true): run the auto-debit transfer FIRST. If
 //     it succeeds, executeTransfer writes a Transaction row that IS the
 //     bookkeeping entry — we never create a separate Expense row. If the
@@ -24,6 +32,8 @@ const { pushTo } = require("./pushNotification");
 const { getThresholds, formatAmountForBusiness } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
 const chart = require("./chart");
+const { ensureChart, invalidateLedger } = require("./ledgerData");
+const { toKobo } = require("./money");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -46,6 +56,118 @@ async function ruleAccountOnRow(rec, businessId) {
   return { accountId: null, purpose: null };
 }
 
+// "credit" in any spelling, as the ledger reads a payment method
+// (chart.methodAccountKey).
+const isCredit = (method) => String(method == null ? "" : method).trim().toLowerCase() === "credit";
+
+// Whether a rule names the account it is paid from. The ledger takes an
+// expense's money from that account before its method (chart.moneyAccount),
+// so the expense such a rule records was booked as paid from there, never as
+// owed, even on credit (scripts/backfill-r2.js leaves those expenses too).
+async function namesPaidFrom(rec) {
+  if (!rec.paidThroughAccountId || !rec.businessId) return false;
+  const acc = await prisma.ledgerAccount.findFirst({
+    where: { id: rec.paidThroughAccountId, businessId: rec.businessId },
+    select: { systemKey: true },
+  });
+  return !!acc && acc.systemKey !== chart.SYS.AP;
+}
+
+// Text cut to `max` characters, whole ones (never half an emoji).
+const cut = (text, max) => Array.from(text).slice(0, max).join("");
+
+// Who a rule's bill is from: the first line of the rule's note, else the payee
+// it names, else its account (the rule never said), as scripts/backfill-r2.js
+// names a bill made from an expense. At most 120 characters, as POST /bills.
+function ruleVendor(rec, account) {
+  const first = String(rec.notes || "").split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+  return cut(first || String(rec.payeeAccountName || "").trim() || account.name, 120);
+}
+
+// A rule on credit, when due: an unpaid bill dated now (as its expense was),
+// for the rule's amount, with the rule's note, on the account its expense
+// would have been booked to (the rule's own, else its category's, which
+// ensureChart sets up, else Other Expenses: chart.expenseAccount). Only on
+// spending that the engine does not keep by itself: a bill on the balance
+// sheet (a loan, equipment, rent paid ahead) would mean something else, as
+// scripts/backfill-r2.js leaves such an expense. Written under the business
+// lock, which an account merge or delete also takes (routes/ledger.js), as
+// POST /bills does. Returns { ok: true, bill }, or { ok: false, reason,
+// accountId } with nothing written.
+async function recordRuleBill(rec, now) {
+  const businessId = rec.businessId;
+  // A bill belongs to one of the owner's businesses: a rule left without one
+  // (its business was deleted) has nowhere to put it.
+  if (!businessId || !rec.business || rec.business.userId !== rec.userId) {
+    return { ok: false, reason: "no_business", accountId: null };
+  }
+  const amountK = toKobo(rec.amount);
+  if (!(amountK > 0)) throw new Error(`the rule's amount (${rec.amount}) is not above zero`);
+  await ensureChart(businessId);
+  const made = await prisma.withBusinessLock(businessId, () =>
+    prisma.$transaction(async (px) => {
+      const accounts = await px.ledgerAccount.findMany({
+        where: { businessId },
+        select: { id: true, type: true, name: true, systemKey: true, categorySlug: true, aliasSlugs: true },
+      });
+      const account = chart.expenseAccount(chart.indexChart(accounts), { accountId: rec.accountId, category: rec.category });
+      if (!account || chart.classOf(account.type) !== "expense" || chart.CONTROLLED.includes(account.systemKey)) {
+        return { ok: false, reason: "account_not_spending", accountId: account ? account.id : null };
+      }
+      const note = String(rec.notes || "").trim();
+      const bill = await px.businessDebt.create({
+        data: {
+          userId: rec.userId,
+          businessId,
+          name: ruleVendor(rec, account),
+          type: account.categorySlug || "other",
+          originalAmount: amountK / 100,
+          remainingAmount: amountK / 100,
+          status: "unpaid",
+          billDate: now,
+          note: note ? cut(note, 500) : null,
+          accountId: account.id,
+          estimated: false,
+          createdById: rec.userId,
+        },
+      });
+      return { ok: true, bill };
+    }),
+  );
+  if (made.ok) {
+    invalidateLedger(businessId);
+    await audit({
+      action: "BILL_CREATE",
+      resourceType: "bill",
+      resourceId: made.bill.id,
+      actorOverride: { type: "system", id: null },
+      metadata: { businessId, amount: made.bill.originalAmount, accountId: made.bill.accountId, recurringExpenseId: rec.id },
+    });
+  }
+  return made;
+}
+
+// A rule on credit that cannot make a bill is paused, and its owner told,
+// rather than record an expense on credit again. Turned back on, it tries
+// again on its next due date.
+async function pauseCreditRule(rec, made) {
+  await prisma.recurringExpense.update({ where: { id: rec.id }, data: { active: false } });
+  await pushTo(
+    rec.userId,
+    "Recurring expense paused",
+    `${formatAmountForBusiness(rec.business, rec.amount)} on credit can no longer be recorded as an expense. ` +
+      "Add it in Bills, or choose how it is paid and turn it back on.",
+  );
+  await audit({
+    action: "RECURRING_PAUSED_CREDIT",
+    resourceType: "recurringExpense",
+    resourceId: rec.id,
+    severity: "warn",
+    actorOverride: { type: "system", id: null },
+    metadata: { userId: rec.userId, businessId: rec.businessId || null, reason: made.reason, accountId: made.accountId },
+  });
+}
+
 async function processRecurringExpenses({ now = new Date() } = {}) {
   const due = await prisma.recurringExpense.findMany({
     where: { active: true, nextDue: { lte: now } },
@@ -53,6 +175,8 @@ async function processRecurringExpenses({ now = new Date() } = {}) {
   });
 
   let createdExpenses = 0;
+  let createdBills = 0;
+  let pausedCreditRules = 0;
   let autoDebited = 0;
   let autoDebitErrors = 0;
 
@@ -68,6 +192,14 @@ async function processRecurringExpenses({ now = new Date() } = {}) {
         const result = await runAutoDebit(rec, now);
         if (result.ok) autoDebited++;
         else autoDebitErrors++;
+      } else if (isCredit(rec.paymentMethod) && !(await namesPaidFrom(rec))) {
+        // On credit: an unpaid bill, never an expense (see the top).
+        const made = await recordRuleBill(rec, now);
+        if (made.ok) createdBills++;
+        else {
+          await pauseCreditRule(rec, made);
+          pausedCreditRules++;
+        }
       } else {
         // Bookkeeping-only branch: just record the Expense row as before.
         await prisma.expense.create({
@@ -115,11 +247,12 @@ async function processRecurringExpenses({ now = new Date() } = {}) {
   if (due.length > 0) {
     console.log(
       `[recurring] processed ${due.length} due item(s): ` +
-      `${createdExpenses} bookkeeping rows, ${autoDebited} auto-debited, ${autoDebitErrors} auto-debit errors`,
+      `${createdExpenses} bookkeeping rows, ${createdBills} bills, ${pausedCreditRules} credit rules paused, ` +
+      `${autoDebited} auto-debited, ${autoDebitErrors} auto-debit errors`,
     );
   }
 
-  return { processed: due.length, createdExpenses, autoDebited, autoDebitErrors };
+  return { processed: due.length, createdExpenses, createdBills, pausedCreditRules, autoDebited, autoDebitErrors };
 }
 
 // Run the auto-debit pipeline for one recurring item.

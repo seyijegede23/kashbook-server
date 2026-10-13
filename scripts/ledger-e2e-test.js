@@ -15,7 +15,18 @@
 // account stays gone, its category going to the account it merged into;
 // Retained Earnings holds past years' profit, with a line a year on its
 // statement; the Accounting home's You owe leaves unexplained transfers out
-// and its Owed to you is Reports' figure.
+// and its Owed to you is Reports' figure. Release 1.1 (2026-10-13): whatever
+// an older app sends, a category merged into another account counts there (a
+// chain of merges too), and the category of a deleted account, or of one made
+// another kind, makes no account again until the owner makes one on purpose.
+// Release 2 (2026-10-13; bills, payments and journals written straight to
+// the database here, their routes have their own e2e): the general ledger
+// lists every entry of a period in reading order, balanced, without moving
+// anything in the shared cached ledger; You owe counts the open bills; a
+// bill, a payment or a journal line keeps its account in use, and a merge
+// moves them (never into an account the engine keeps, and a line written
+// meanwhile fails it cleanly); starting balances never land on or leave a
+// locked day; the backfill, one owner at a time.
 //
 //   TEST_DATABASE_URL=postgresql://postgres:<pw>@localhost:5432/kashbook_coa_e2e \
 //     node scripts/ledger-e2e-test.js
@@ -55,6 +66,8 @@ app.use("/sales", require("../src/routes/sales"));
 app.use("/expenses", require("../src/routes/expenses"));
 app.use("/transactions", require("../src/routes/transactions"));
 app.use("/sync", require("../src/routes/sync"));
+// An older app puts its custom categories back with the business (PATCH /businesses/:id).
+app.use("/businesses", require("../src/routes/businesses"));
 
 let BASE;
 const call = (method, path, token, body) =>
@@ -891,6 +904,591 @@ const today = new Date(Date.now() + 3600000).toISOString().slice(0, 10);
       eq(st.body.lines.map((l) => `${l.day}:${l.amount}:${l.kind}`).join(" "), "2025-08-08:2500:bank_in 2026-01-01:6000:year_profit");
       eq(st.body.closing, 8500);
       await tiesOut(B, ["2025-08-08", "2026-10-12"], { periods: ["", "2026-01-01"], extra: (day) => (day >= "2025-08-08" ? 2500 : 0) });
+    });
+
+    section("A merged or deleted category stays gone, whatever an older app sends (release 1.1)");
+    // deepStrictEqual that says what it got.
+    const same = (a, b, what = "") => assert.deepStrictEqual(a, b, `${what} ${JSON.stringify(a)} !== ${JSON.stringify(b)}`);
+    // A phone on an older app version knows only categories. It keeps sending
+    // the category of an account the owner merged away or deleted: on an
+    // expense, and in the custom categories it puts back with the business.
+    // Each check runs in a business of its own.
+    const chartNow = async (B) => {
+      const r = await call("GET", `/ledger/accounts?${B.bq}`, T);
+      eq(r.status, 200, JSON.stringify(r.body));
+      return r.body.accounts;
+    };
+    const newAccount = async (B, name, type = "expense") => {
+      const r = await call("POST", "/ledger/accounts", T, { businessId: B.b.id, type, name });
+      eq(r.status, 201, JSON.stringify(r.body));
+      return r.body;
+    };
+    const merge = async (from, into) => {
+      const r = await call("POST", `/ledger/accounts/${from.id}/merge`, T, { intoId: into.id });
+      eq(r.status, 200, JSON.stringify(r.body));
+      return r.body.into;
+    };
+    // An expense as an older app saves it: a category, no account.
+    const oldAppExpense = async (B, category, amount) => {
+      const r = await call("POST", "/expenses", T, { businessId: B.b.id, amount, category, date: today });
+      eq(r.status, 201, JSON.stringify(r.body));
+      eq(r.body.accountId, null, "an older app names no account");
+      return r.body;
+    };
+    // The custom categories as an older app puts them back: the whole list it
+    // keeps, each value made from its label as that app makes it.
+    const putCategories = async (B, labels) => {
+      const customCategories = labels.map((label) => ({ label, value: label.toLowerCase().replace(/\s+/g, "-"), icon: "pricetag-outline" }));
+      const r = await call("PATCH", `/businesses/${B.b.id}`, T, { customCategories });
+      eq(r.status, 200, JSON.stringify(r.body));
+    };
+    const debitIn = (B, amount) => prisma.transaction.create({
+      data: { businessId: B.b.id, type: "expense", amount, date: new Date(), paymentMethod: "bank", category: "transfer", source: "anchor", currency: "NGN", description: "test" },
+    });
+    // What an account spent today ("when paid", by account), and whether an
+    // expense is on its statement.
+    const spentOn = async (B, account) => {
+      const pl = await call("GET", `/ledger/reports/profit-and-loss?${B.bq}&basis=paid&from=${today}&to=${today}`, T);
+      eq(pl.status, 200, JSON.stringify(pl.body));
+      return (pl.body.expenses.find((r) => r.accountId === account.id) || { amount: 0 }).amount;
+    };
+    const onStatement = async (B, account, x) => {
+      const st = await call("GET", `/ledger/accounts/${account.id}/transactions?${B.bq}`, T);
+      eq(st.status, 200, JSON.stringify(st.body));
+      return st.body.lines.some((l) => l.id === `expense:${x.id}`);
+    };
+    // The names of the accounts that stand for a category, by their own or a merged one.
+    const standsFor = (list, slug) => list.filter((a) => a.categorySlug === slug || (a.aliasSlugs || []).includes(slug)).map((a) => a.name);
+    const retiredOf = async (B) => [...(await prisma.business.findUnique({ where: { id: B.b.id } })).retiredCategorySlugs].sort();
+    const todayRange = { start: lagosStart(today), end: new Date(lagosEnd(today).getTime() + 1) };
+    const tiesOutToday = async (B) => {
+      for (const basis of ["paid", "sold"]) {
+        const pl = await call("GET", `/ledger/reports/profit-and-loss?${B.bq}&basis=${basis}&from=${today}&to=${today}`, T);
+        const b = await booksFor(B.b.id, { from: today, to: today, basis });
+        eq(Math.round(pl.body.totalExpenses * 100), Math.round(b.expenses.total * 100), `${basis}: profit and loss = the books`);
+      }
+    };
+
+    await test("merged into an account with a category of its own: an older app's expense in the old category counts there, and the old account never comes back", async () => {
+      const B = await ownBusiness("Alias merge");
+      const other = B.list.find((a) => a.systemKey === chart.SYS.OTHER_EXPENSES);
+      const fum = await newAccount(B, "Fumigation");
+      const pest = await newAccount(B, "Pest Control");
+      same([fum.categorySlug, pest.categorySlug], ["fumigation", "pest-control"], "each with a category of its own");
+      const into = await merge(fum, pest);
+      const x = await oldAppExpense(B, "fumigation", 4321);
+      eq(await spentOn(B, pest), 4321, "profit and loss by account: on Pest Control");
+      eq(await spentOn(B, other), 0, "not in Other Expenses");
+      assert.ok(await onStatement(B, pest, x), "on Pest Control's statement");
+      const spend = await spendingByAccount(B.b.id, todayRange);
+      eq((spend.find((g) => g.accountId === pest.id) || {}).amount, 4321, "Insights: on Pest Control");
+      same(standsFor(await chartNow(B), "fumigation"), ["Pest Control"], "the chart makes no account for it");
+      await putCategories(B, ["Fumigation"]);
+      let list = await chartNow(B);
+      same(standsFor(list, "fumigation"), ["Pest Control"], "nor for the custom category put back");
+      eq(list.some((a) => a.name === "Fumigation"), false, "Fumigation stayed gone");
+      eq(into.categorySlug, "pest-control", "Pest Control keeps its own category");
+      same(into.aliasSlugs, ["fumigation"], "and stands for Fumigation's");
+      const synced = await call("GET", `/sync?${B.bq}`, T);
+      same(synced.body.accounts.find((a) => a.id === pest.id).aliasSlugs, ["fumigation"], "the app is sent it");
+      // The expense in the old category is a use of Pest Control.
+      const del = await call("DELETE", `/ledger/accounts/${pest.id}`, T);
+      eq(del.body.code, "ACCOUNT_IN_USE", JSON.stringify(del.body));
+      eq(del.body.used, 1, "the older app's expense");
+      // Staff recording a transfer under the old category: on Pest Control too.
+      const debit = await debitIn(B, 900);
+      const s = await call("POST", `/transactions/${debit.id}/create-expense`, tBoth, { category: "fumigation" });
+      eq(s.status, 201, JSON.stringify(s.body));
+      eq(s.body.expense.category, "pest-control", "staff file it under the account that stands for it");
+      eq(await spentOn(B, pest), 5221, "both on Pest Control");
+      // An account the owner names Fumigation now: the category stays Pest Control's.
+      const again = await newAccount(B, "Fumigation");
+      eq(again.categorySlug, "fumigation-2", "a category another account stands for is taken");
+      await oldAppExpense(B, "fumigation", 1000);
+      eq(await spentOn(B, pest), 6221, "the old category still counts on Pest Control");
+      eq(await spentOn(B, again), 0, "not on the new account");
+      list = await chartNow(B);
+      same(standsFor(list, "fumigation"), ["Pest Control"]);
+      await tiesOutToday(B);
+    });
+    await test("merged into an account with no category of its own, it takes the category and those merged into it; a chain A into B into C: C stands for all three", async () => {
+      const B = await ownBusiness("Alias chain");
+      const lamp = await newAccount(B, "Lamp Oil");
+      const kero = await newAccount(B, "Kerosene");
+      const light = await newAccount(B, "Lighting");
+      const jan = B.list.find((a) => a.name === "Janitorial");
+      eq(jan.categorySlug, null, "Janitorial stands for no category");
+      const toKero = await merge(lamp, kero);
+      // Saved between the merges, in a category merged into Kerosene: each
+      // merge after it moves it on.
+      const mid = await oldAppExpense(B, "lamp-oil", 50);
+      const toJan = await merge(kero, jan);
+      const toLight = await merge(jan, light);
+      const xs = [await oldAppExpense(B, "Lighting", 100), await oldAppExpense(B, "kerosene", 200), await oldAppExpense(B, "Lamp-Oil", 400)];
+      eq(await spentOn(B, light), 750, "all three categories on Lighting");
+      for (const x of [mid, ...xs]) assert.ok(await onStatement(B, light, x), `the ${x.category} expense is on Lighting's statement`);
+      const moved = await prisma.expense.findUnique({ where: { id: mid.id } });
+      same([moved.accountId, moved.category], [light.id, "lighting"], "the expense in a merged category moved with the merges");
+      await putCategories(B, ["Kerosene", "Lamp Oil"]);
+      const list = await chartNow(B);
+      for (const slug of ["lighting", "kerosene", "lamp-oil"]) same(standsFor(list, slug), ["Lighting"], `${slug}: Lighting alone`);
+      for (const name of ["Lamp Oil", "Kerosene", "Janitorial"]) eq(list.some((a) => a.name === name), false, `${name} stayed gone`);
+      same([toKero.categorySlug, toKero.aliasSlugs], ["kerosene", ["lamp-oil"]], "Kerosene stands for Lamp Oil's too");
+      same([toJan.categorySlug, toJan.aliasSlugs], ["kerosene", ["lamp-oil"]], "Janitorial takes Kerosene's, and Lamp Oil's with it");
+      same([toLight.categorySlug, [...toLight.aliasSlugs].sort()], ["lighting", ["kerosene", "lamp-oil"]], "Lighting stands for all three");
+      eq((await call("DELETE", `/ledger/accounts/${light.id}`, T)).body.used, 4, "an expense in any of the three is a use, and the one that moved");
+      await tiesOutToday(B);
+    });
+    await test("deleted: an older app's expense in its category counts in Other Expenses and makes nothing, even with the category put back; made again by the owner, it takes the category back", async () => {
+      const B = await ownBusiness("Retired");
+      const other = B.list.find((a) => a.systemKey === chart.SYS.OTHER_EXPENSES);
+      await putCategories(B, ["Snacks"]);
+      const snacks = (await chartNow(B)).find((a) => a.name === "Snacks");
+      assert.ok(snacks, "the older app's custom category made the account");
+      eq(snacks.categorySlug, "snacks");
+      eq((await call("DELETE", `/ledger/accounts/${snacks.id}`, T)).status, 204, "unused, so it may go");
+      const x = await oldAppExpense(B, "snacks", 2500);
+      eq(await spentOn(B, other), 2500, "in Other Expenses");
+      same(standsFor(await chartNow(B), "snacks"), [], "the chart makes no account for it");
+      await putCategories(B, ["Snacks"]);
+      const list = await chartNow(B);
+      same(standsFor(list, "snacks"), [], "nor for the custom category put back");
+      eq(list.some((a) => a.name === "Snacks"), false, "Snacks stayed gone");
+      eq(await spentOn(B, other), 2500, "still in Other Expenses");
+      assert.ok(await onStatement(B, other, x), "on Other Expenses' statement");
+      same(await retiredOf(B), ["snacks"], "its category is retired");
+      // The owner makes Snacks again, on purpose.
+      const again = await newAccount(B, "Snacks");
+      eq(again.categorySlug, "snacks", "it takes the category back");
+      same(await retiredOf(B), [], "which is no longer retired");
+      eq(await spentOn(B, again), 2500, "the older app's expense lands in it");
+      eq(await spentOn(B, other), 0, "and leaves Other Expenses");
+      assert.ok(await onStatement(B, again, x), "on the new account's statement");
+      same(standsFor(await chartNow(B), "snacks"), ["Snacks"], "one account for it");
+      await tiesOutToday(B);
+    });
+    await test("made another kind of account while unused: its category and those merged into it are retired; an expense account again, it takes its own back", async () => {
+      const B = await ownBusiness("Kind change");
+      const other = B.list.find((a) => a.systemKey === chart.SYS.OTHER_EXPENSES);
+      const gas = await newAccount(B, "Gas Cylinders");
+      const propane = await newAccount(B, "Propane");
+      await merge(propane, gas);
+      await putCategories(B, ["Gas Cylinders", "Propane"]);
+      const p = await call("PATCH", `/ledger/accounts/${gas.id}`, T, { type: "fixed_asset" });
+      eq(p.status, 200, JSON.stringify(p.body));
+      eq(p.body.categorySlug, null, "an asset stands for no category");
+      const customLeft = await prisma.customCategory.count({ where: { businessId: B.b.id } });
+      await oldAppExpense(B, "gas-cylinders", 300);
+      await oldAppExpense(B, "propane", 50);
+      eq(await spentOn(B, other), 350, "both in Other Expenses");
+      await putCategories(B, ["Gas Cylinders", "Propane"]);
+      const list = await chartNow(B);
+      for (const slug of ["gas-cylinders", "propane"]) same(standsFor(list, slug), [], `no account for ${slug}`);
+      eq(list.filter((a) => a.class === "expense" && /^(gas cylinders|propane)/i.test(a.name)).length, 0, "no expense account by either name");
+      eq(await spentOn(B, other), 350, "still in Other Expenses");
+      same(p.body.aliasSlugs, [], "nor does the asset keep Propane's");
+      same(await retiredOf(B), ["gas-cylinders", "propane"], "both retired");
+      eq(customLeft, 0, "the older app's custom categories went with them, as on a delete");
+      // An expense account again (it is still unused): its own category comes
+      // back to it; Propane's stays retired.
+      const back = await call("PATCH", `/ledger/accounts/${gas.id}`, T, { type: "expense" });
+      eq(back.status, 200, JSON.stringify(back.body));
+      eq(back.body.categorySlug, "gas-cylinders");
+      same(await retiredOf(B), ["propane"]);
+      eq(await spentOn(B, gas), 300, "the older app's expense lands in it again");
+      eq(await spentOn(B, other), 50, "Propane's stays in Other Expenses");
+      same(standsFor(await chartNow(B), "propane"), [], "and makes no account");
+      await tiesOutToday(B);
+    });
+
+    section("Release 2: the general ledger");
+    const glOf = (B, query, token = T) => call("GET", `/ledger/reports/general-ledger?${B.bq}${query ? `&${query}` : ""}`, token);
+    const sysIn = (B, key) => B.list.find((a) => a.systemKey === key);
+    const slugIn = (B, slug) => B.list.find((a) => a.categorySlug === slug);
+    // Every entry's debits equal its credits, and `amount`, to the kobo; and
+    // the totals are what the entries come to.
+    const glBalanced = (body) => {
+      let all = 0;
+      for (const e of body.entries) {
+        const dr = e.lines.reduce((s, l) => s + kob(l.debit), 0);
+        const cr = e.lines.reduce((s, l) => s + kob(l.credit), 0);
+        eq(dr, cr, `${e.id} balances`);
+        eq(dr, kob(e.amount), `${e.id} amount`);
+        for (const l of e.lines) eq((kob(l.debit) > 0) !== (kob(l.credit) > 0), true, `${e.id}: a line is a debit or a credit`);
+        all += dr;
+      }
+      same([kob(body.totals.debit), kob(body.totals.credit)], [all, all], "the totals");
+    };
+    let GL;
+    await test("every entry of the period by day, a day's opening first, each balanced; the shared cached ledger is left as it was", async () => {
+      GL = await ownBusiness("General ledger");
+      const rent = slugIn(GL, "rent");
+      // Built sales, then expenses, then bank rows: read by day.
+      const sale = await prisma.sales.create({ data: { userId: owner.id, businessId: GL.b.id, amount: 10000, paymentMethod: "cash", date: at("2026-03-02") } });
+      const exp = await prisma.expense.create({ data: { userId: owner.id, businessId: GL.b.id, amount: 2000, category: "rent", accountId: rent.id, paymentMethod: "cash", date: at("2026-03-01") } });
+      const tx = await prisma.transaction.create({
+        data: { businessId: GL.b.id, type: "income", amount: 5000, date: at("2026-03-03"), paymentMethod: "bank", category: "transfer", source: "anchor", currency: "NGN", description: "test" },
+      });
+      const put = await call("PUT", "/ledger/opening-balances", T, { businessId: GL.b.id, date: "2026-03-01", lines: [{ accountId: sysIn(GL, "cash").id, debit: 1000, credit: 0 }] });
+      eq(put.status, 200, JSON.stringify(put.body));
+      invalidateOwner(owner.id);
+      const cached = await loadLedger(GL.b.id, { basis: "sold" });
+      const frozen = JSON.stringify(cached.entries);
+      const r = await glOf(GL, "to=2026-03-03");
+      eq(r.status, 200, JSON.stringify(r.body));
+      same([r.body.basis, r.body.from, r.body.to], ["sold", "", "2026-03-03"], "when sold by default, from the start");
+      same(r.body.entries.map((e) => `${e.day} ${e.kind} ${e.ref}`), [
+        "2026-03-01 opening null", `2026-03-01 expense ${exp.id}`, `2026-03-02 sale ${sale.id}`, `2026-03-03 bank_in ${tx.id}`,
+      ]);
+      glBalanced(r.body);
+      same(kob(r.body.totals.debit), kob(1000 + 2000 + 10000 + 5000));
+      const ids = new Set(GL.list.map((a) => a.id));
+      eq(r.body.entries.every((e) => e.lines.every((l) => ids.has(l.accountId))), true, "lines name accounts of this chart");
+      const ex = r.body.entries[1];
+      same(ex.lines, [{ accountId: rent.id, debit: 2000, credit: 0 }, { accountId: sysIn(GL, "cash").id, debit: 0, credit: 2000 }], "the expense's lines");
+      assert.strictEqual(await loadLedger(GL.b.id, { basis: "sold" }), cached, "still the cached build");
+      eq(JSON.stringify(cached.entries), frozen, "in its own order, unchanged");
+      const one = await glOf(GL, "from=2026-03-02&to=2026-03-02");
+      same(one.body.entries.map((e) => e.ref), [sale.id], "one day");
+      eq((await glOf(GL, "from=2026-03-04&to=2026-03-03")).body.entries.length, 0, "an empty period");
+    });
+    await test("its lines add up to the trial balance, in both views; an invoice is an entry when sold, not when paid", async () => {
+      const doc = await prisma.invoice.create({
+        data: { businessId: GL.b.id, userId: owner.id, invoiceNumber: `GL-${tag}`, type: "invoice", status: "SENT", issueDate: "2026-03-04", subtotal: 3000, total: 3000 },
+      });
+      invalidateOwner(owner.id);
+      for (const basis of ["sold", "paid"]) {
+        const r = await glOf(GL, `basis=${basis}&to=2026-03-31`);
+        eq(r.status, 200, JSON.stringify(r.body));
+        eq(r.body.basis, basis);
+        glBalanced(r.body);
+        const sums = new Map();
+        for (const e of r.body.entries) for (const l of e.lines) sums.set(l.accountId, (sums.get(l.accountId) || 0) + kob(l.debit) - kob(l.credit));
+        const tb = await call("GET", `/ledger/reports/trial-balance?${GL.bq}&basis=${basis}&asOf=2026-03-31`, T);
+        const want = new Map(tb.body.rows.map((row) => [row.accountId, kob(row.debit) - kob(row.credit)]));
+        same([...sums].filter(([, k]) => k).sort(), [...want].sort(), `${basis}: the trial balance`);
+        eq(r.body.entries.some((e) => e.ref === doc.id), basis === "sold", `${basis}: the invoice`);
+      }
+    });
+    await test("published journals are entries as written; a draft is not; a bill and its payment, by view", async () => {
+      const prepaid = GL.list.find((a) => a.name === "Prepaid Expenses");
+      const cash = sysIn(GL, "cash");
+      const rent = slugIn(GL, "rent");
+      const journal = (status, n) => prisma.manualJournal.create({
+        data: {
+          businessId: GL.b.id, number: `MJ-${tag}-${n}`, status, date: at("2026-03-05"), note: "Rent paid ahead",
+          lines: { create: [{ accountId: prepaid.id, debit: 500, position: 0 }, { accountId: cash.id, credit: 500, position: 1 }] },
+        },
+      });
+      const pub = await journal("published", 1);
+      const draft = await journal("draft", 2);
+      const bill = await prisma.businessDebt.create({
+        data: {
+          userId: owner.id, businessId: GL.b.id, name: "Landlord", originalAmount: 4000, remainingAmount: 2500, status: "partial",
+          accountId: rent.id, billDate: at("2026-03-06"), payments: { create: [{ amount: 1500, method: "cash", date: at("2026-03-07") }] },
+        },
+      });
+      invalidateOwner(owner.id);
+      const lines = (e) => e.lines.map((l) => `${l.accountId}:${l.debit}:${l.credit}`).sort();
+      for (const basis of ["sold", "paid"]) {
+        const r = await glOf(GL, `basis=${basis}&from=2026-03-05&to=2026-03-31`);
+        eq(r.status, 200, JSON.stringify(r.body));
+        glBalanced(r.body);
+        const mj = r.body.entries.filter((e) => e.ref === pub.id);
+        eq(mj.length, 1, `${basis}: the published journal`);
+        same([mj[0].day, lines(mj[0])], ["2026-03-05", [`${cash.id}:0:500`, `${prepaid.id}:500:0`].sort()], `${basis}: its lines`);
+        eq(r.body.entries.some((e) => e.ref === draft.id), false, `${basis}: no draft`);
+        const forBill = r.body.entries.filter((e) => e.ref === bill.id).map((e) => `${e.day} ${lines(e).join(" ")}`);
+        const ap = sysIn(GL, "ap");
+        same(forBill, basis === "sold"
+          ? [`2026-03-06 ${[`${ap.id}:0:4000`, `${rent.id}:4000:0`].sort().join(" ")}`, `2026-03-07 ${[`${ap.id}:1500:0`, `${cash.id}:0:1500`].sort().join(" ")}`]
+          : [`2026-03-07 ${[`${cash.id}:0:1500`, `${rent.id}:1500:0`].sort().join(" ")}`],
+        `${basis}: the bill`);
+      }
+    });
+    await test("who may read it: the Reports permission and bank access; never another owner's business", async () => {
+      eq((await glOf(GL, "", tPlain)).status, 403);
+      const r = await glOf(GL, "", tReports);
+      same([r.status, r.body.permission], [403, "canViewBalance"]);
+      eq((await glOf(GL, "", tBoth)).status, 200);
+      eq((await call("GET", `/ledger/reports/general-ledger?businessId=${rivalBiz.id}`, T)).status, 404);
+    });
+    await test("a bill's words (its supplier, its notes) only for those who may open bills; everyone else gets its entries without them", async () => {
+      const tBills = await staffWith("glbills", { canViewReports: true, canViewBalance: true, canManagePayables: true });
+      const BILL_KINDS = new Set(["bill", "bill_payment"]);
+      const memos = (list) => list.filter((e) => BILL_KINDS.has(e.kind)).map((e) => e.memo);
+      const range = "basis=sold&from=2026-03-05&to=2026-03-31";
+      const own = await glOf(GL, range);
+      const both = await glOf(GL, range, tBoth);
+      const bills = await glOf(GL, range, tBills);
+      eq(both.status, 200, JSON.stringify(both.body));
+      const mine = memos(own.body.entries);
+      eq(mine.length >= 2 && mine.every((m) => m === "Landlord"), true, JSON.stringify(mine));
+      same(memos(bills.body.entries), mine, "staff with bills read them");
+      same(memos(both.body.entries), mine.map(() => ""), "staff without bills get none");
+      // Everything else is the owner's answer: the entries, their amounts and
+      // lines, and every other memo (an adjustment keeps its note).
+      const shape = (body) => body.entries.map((e) => [e.id, e.kind, e.amount, e.lines, BILL_KINDS.has(e.kind) ? "" : e.memo]);
+      same(shape(both.body), shape(own.body), "the same entries");
+      eq(both.body.entries.some((e) => e.kind === "journal" && e.memo === "Rent paid ahead"), true, "a journal keeps its note");
+      eq(JSON.stringify(both.body).includes("Landlord"), false, "nowhere in the general ledger");
+      // An account's statement too: Accounts Payable lists every bill.
+      const apUrl = `/ledger/accounts/${sysIn(GL, "ap").id}/transactions?${GL.bq}&from=2026-03-01&to=2026-03-31`;
+      const stOwn = await call("GET", apUrl, T);
+      const stBoth = await call("GET", apUrl, tBoth);
+      eq(stBoth.status, 200, JSON.stringify(stBoth.body));
+      eq(memos(stOwn.body.lines).includes("Landlord"), true, "the owner reads the supplier");
+      same(memos(stBoth.body.lines), memos(stOwn.body.lines).map(() => ""), "staff without bills do not");
+      eq(JSON.stringify(stBoth.body).includes("Landlord"), false, "nowhere in the statement");
+      // The cached ledger the owner shares keeps its words.
+      eq(memos((await glOf(GL, range)).body.entries).every((m) => m === "Landlord"), true, "the owner's answer afterwards");
+    });
+
+    section("Release 2: You owe counts the bills");
+    await test("an open bill is owed until it is paid; an estimated bill only its part not paid before bills; a loan, where its money went", async () => {
+      const B = await ownBusiness("Owe bills");
+      const [RENT, CASH, LOANS, AP] = [slugIn(B, "rent"), sysIn(B, "cash"), sysIn(B, "loans"), sysIn(B, "ap")];
+      const home = async () => {
+        invalidateOwner(owner.id);
+        const s = await call("GET", `/ledger/summary?${B.bq}`, T);
+        eq(s.status, 200, JSON.stringify(s.body));
+        return [s.body.youOwe, s.body.profitThisYear, s.body.cashAndBank];
+      };
+      same(await home(), [0, 0, 0], "nothing yet");
+      const bill = await prisma.businessDebt.create({
+        data: { userId: owner.id, businessId: B.b.id, name: "Landlord", originalAmount: 10000, remainingAmount: 10000, accountId: RENT.id, billDate: new Date() },
+      });
+      same(await home(), [10000, 0, 0], "owed from its bill date, not spending when paid until it is paid");
+      await prisma.billPayment.create({ data: { billId: bill.id, amount: 4000, method: "cash", date: new Date() } });
+      same(await home(), [6000, -4000, -4000], "paid from cash: spending when paid");
+      await prisma.businessDebt.create({
+        data: {
+          userId: owner.id, businessId: B.b.id, name: "Old supplier", originalAmount: 5000, remainingAmount: 3000, accountId: RENT.id,
+          billDate: new Date(), estimated: true,
+          payments: { create: [{ amount: 2000, method: "other", estimated: true, outsideBooks: true, date: new Date() }] },
+        },
+      });
+      same(await home(), [9000, -4000, -4000], "what was paid before bills counts nowhere");
+      await prisma.businessDebt.create({
+        data: {
+          userId: owner.id, businessId: B.b.id, name: "Lender", type: "loan", originalAmount: 100000, remainingAmount: 100000,
+          accountId: LOANS.id, receivedViaAccountId: CASH.id, billDate: new Date(),
+        },
+      });
+      same(await home(), [109000, -4000, 96000], "a loan: owed, its money in cash, never profit");
+      const bal = (await call("GET", `/ledger/balances?${B.bq}`, T)).body.balances;
+      same([bal.find((x) => x.accountId === AP.id).balance, bal.find((x) => x.accountId === LOANS.id).balance], [9000, 100000], "Accounts Payable and Loans");
+      eq((await call("GET", `/ledger/reports/balance-sheet?${B.bq}`, T)).body.balanced, true);
+      for (const basis of ["paid", "sold"]) {
+        const pl = await call("GET", `/ledger/reports/profit-and-loss?${B.bq}&basis=${basis}&from=${today}&to=${today}`, T);
+        const b = await booksFor(B.b.id, { from: today, to: today, basis });
+        eq(kob(pl.body.totalExpenses), kob(b.expenses.total), `${basis}: profit and loss = the books`);
+      }
+    });
+
+    section("Release 2: what uses an account");
+    let U;
+    const uses = {};
+    await test("an account a bill, its loan's money, a payment or a journal line names is in use: never deleted, its type kept", async () => {
+      U = await ownBusiness("Uses");
+      Object.assign(uses, {
+        hire: await newAccount(U, "Generator Hire"),
+        hire2: await newAccount(U, "Generator Rental"),
+        petty: await newAccount(U, "Petty Cash", "cash"),
+        loanFloat: await newAccount(U, "Loan Float", "cash"),
+        drawer: await newAccount(U, "Cash Drawer", "cash"),
+        lender: await newAccount(U, "Lender Loan", "long_term_liability"),
+        lender2: await newAccount(U, "Bank Loan", "long_term_liability"),
+        misc: await newAccount(U, "Misc Adjust", "other_current_asset"),
+      });
+      uses.bill = await prisma.businessDebt.create({
+        data: {
+          userId: owner.id, businessId: U.b.id, name: "Hire co", originalAmount: 900, remainingAmount: 800, accountId: uses.hire.id,
+          payments: { create: [{ amount: 100, method: "cash", paidThroughAccountId: uses.drawer.id }] },
+        },
+      });
+      uses.loan = await prisma.businessDebt.create({
+        data: { userId: owner.id, businessId: U.b.id, name: "Bank", originalAmount: 50000, remainingAmount: 50000, accountId: uses.lender.id, receivedViaAccountId: uses.loanFloat.id },
+      });
+      uses.journal = await prisma.manualJournal.create({
+        data: {
+          businessId: U.b.id, number: `MJ-${tag}-U`, status: "draft",
+          lines: { create: [{ accountId: uses.misc.id, debit: 50, position: 0 }, { accountId: uses.drawer.id, credit: 50, position: 1 }] },
+        },
+      });
+      for (const [acc, used] of [[uses.hire, 1], [uses.lender, 1], [uses.loanFloat, 1], [uses.drawer, 2], [uses.misc, 1]]) {
+        const d = await call("DELETE", `/ledger/accounts/${acc.id}`, T);
+        same([d.status, d.body.code, d.body.used], [409, "ACCOUNT_IN_USE", used], acc.name);
+      }
+      eq((await call("PATCH", `/ledger/accounts/${uses.hire.id}`, T, { type: "other_expense" })).body.code, "TYPE_LOCKED", "a bill's account");
+      eq((await call("PATCH", `/ledger/accounts/${uses.misc.id}`, T, { type: "fixed_asset" })).body.code, "TYPE_LOCKED", "a draft journal's account");
+      eq(await prisma.ledgerAccount.count({ where: { id: { in: [uses.hire.id, uses.lender.id, uses.loanFloat.id, uses.drawer.id, uses.misc.id] } } }), 5);
+    });
+    await test("a merge moves bills, payments and journal lines, and touches the bills and journals so phones pick them up", async () => {
+      const loan0 = await prisma.businessDebt.findUnique({ where: { id: uses.loan.id } });
+      const journal0 = await prisma.manualJournal.findUnique({ where: { id: uses.journal.id } });
+      await new Promise((r) => setTimeout(r, 15));
+      await merge(uses.hire, uses.hire2);
+      await merge(uses.lender, uses.lender2);
+      await merge(uses.loanFloat, uses.petty);
+      // Read between the merges: the next one moves only the bill's payment.
+      const bill0 = await prisma.businessDebt.findUnique({ where: { id: uses.bill.id } });
+      await new Promise((r) => setTimeout(r, 15));
+      await merge(uses.drawer, uses.petty);
+      const bill = await prisma.businessDebt.findUnique({ where: { id: uses.bill.id }, include: { payments: true } });
+      same([bill.accountId, bill.payments[0].paidThroughAccountId], [uses.hire2.id, uses.petty.id], "the bill and its payment");
+      const loan = await prisma.businessDebt.findUnique({ where: { id: uses.loan.id } });
+      same([loan.accountId, loan.receivedViaAccountId], [uses.lender2.id, uses.petty.id], "the loan");
+      const lines = await prisma.manualJournalLine.findMany({ where: { journalId: uses.journal.id }, orderBy: { position: "asc" } });
+      same(lines.map((l) => l.accountId), [uses.misc.id, uses.petty.id], "the journal line");
+      const journal = await prisma.manualJournal.findUnique({ where: { id: uses.journal.id } });
+      same([bill.updatedAt > bill0.updatedAt, loan.updatedAt > loan0.updatedAt, journal.updatedAt > journal0.updatedAt], [true, true, true],
+        "touched: the bill whose payment moved, the loan, the journal whose line moved");
+      eq(await prisma.ledgerAccount.count({ where: { id: { in: [uses.hire.id, uses.lender.id, uses.loanFloat.id, uses.drawer.id] } } }), 0, "merged away");
+      const d = await call("DELETE", `/ledger/accounts/${uses.petty.id}`, T);
+      same([d.body.code, d.body.used], ["ACCOUNT_IN_USE", 3], "the loan's money, the payment and the journal line, all on it now");
+    });
+    await test("never into an account KashBook keeps in step with its records; nothing moves", async () => {
+      const float = await newAccount(U, "Float", "cash");
+      const owed = await newAccount(U, "Supplier Credit", "other_current_liability");
+      await prisma.businessDebt.create({ data: { userId: owner.id, businessId: U.b.id, name: "Credit", originalAmount: 10, remainingAmount: 10, accountId: owed.id } });
+      for (const [from, key] of [[float, "kashbook"], [float, "bank_match"], [float, "ar"], [float, "legacy"], [owed, "ap"], [owed, "suspense"]]) {
+        const r = await call("POST", `/ledger/accounts/${from.id}/merge`, T, { intoId: sysIn(U, key).id });
+        same([r.status, r.body.code], [400, "BAD_TARGET"], key);
+      }
+      eq(await prisma.ledgerAccount.count({ where: { id: { in: [float.id, owed.id] } } }), 2, "both still there");
+      eq((await prisma.businessDebt.count({ where: { accountId: owed.id } })), 1, "the bill still on its account");
+    });
+    await test("a journal line written after the count still keeps its account: the delete is refused as it commits", async () => {
+      const acc = await newAccount(U, "Late Account", "other_current_asset");
+      await prisma.manualJournal.create({
+        data: {
+          businessId: U.b.id, number: `MJ-${tag}-L`,
+          lines: { create: [{ accountId: acc.id, debit: 10, position: 0 }, { accountId: sysIn(U, "cash").id, credit: 10, position: 1 }] },
+        },
+      });
+      // The count misses it once, as if the line were written just after.
+      const real = prisma.manualJournalLine.count;
+      let missed = false;
+      prisma.manualJournalLine.count = async (...args) => {
+        if (!missed) {
+          missed = true;
+          return 0;
+        }
+        return real.apply(prisma.manualJournalLine, args);
+      };
+      let d;
+      try {
+        d = await call("DELETE", `/ledger/accounts/${acc.id}`, T);
+      } finally {
+        prisma.manualJournalLine.count = real;
+      }
+      eq(missed, true, "the count was asked");
+      same([d.status, d.body.code, d.body.used], [409, "ACCOUNT_IN_USE", 1], JSON.stringify(d.body));
+      eq(await prisma.ledgerAccount.count({ where: { id: acc.id } }), 1, "still there");
+    });
+    await test("a journal line written on an account while it is merged away: nothing moves, and the merge can be tried again", async () => {
+      const a = await newAccount(U, "Old Till", "cash");
+      const b = await newAccount(U, "New Till", "cash");
+      const j = await prisma.manualJournal.create({
+        data: {
+          businessId: U.b.id, number: `MJ-${tag}-M`,
+          lines: { create: [{ accountId: b.id, debit: 10, position: 0 }, { accountId: sysIn(U, "cash").id, credit: 10, position: 1 }] },
+        },
+      });
+      const real = prisma.$transaction;
+      let hooked = false;
+      prisma.$transaction = function hookedTransaction(fn, ...rest) {
+        if (hooked || typeof fn !== "function") return real.call(this, fn, ...rest);
+        hooked = true;
+        return real.call(this, async (px) => {
+          const out = await fn(px);
+          // Another write names the account the merge is taking away.
+          await px.manualJournalLine.create({ data: { journalId: j.id, accountId: a.id, debit: 5, position: 9 } });
+          return out;
+        }, ...rest);
+      };
+      let m;
+      try {
+        m = await call("POST", `/ledger/accounts/${a.id}/merge`, T, { intoId: b.id });
+      } finally {
+        prisma.$transaction = real;
+      }
+      eq(hooked, true, "the merge's transaction");
+      same([m.status, m.body.code], [409, "ACCOUNT_CHANGED"], JSON.stringify(m.body));
+      eq(await prisma.ledgerAccount.count({ where: { id: a.id } }), 1, "nothing moved");
+      eq(await prisma.manualJournalLine.count({ where: { journalId: j.id } }), 2, "the line went with it");
+      eq((await call("POST", `/ledger/accounts/${a.id}/merge`, T, { intoId: b.id })).status, 200, "tried again");
+    });
+
+    section("Release 2: starting balances and the lock date");
+    await test("never on or before the lock date, nor moved or cleared off a locked day; after it, saved", async () => {
+      const B = await ownBusiness("Locked opening");
+      const CASH = sysIn(B, "cash");
+      const put = (date, debit = 1000) => call("PUT", "/ledger/opening-balances", T, {
+        businessId: B.b.id, date, lines: debit ? [{ accountId: CASH.id, debit, credit: 0 }] : [],
+      });
+      const lock = (day) => prisma.business.update({ where: { id: B.b.id }, data: { booksLockDate: day } });
+      await lock("2026-06-30");
+      let r = await put("2026-06-30");
+      same([r.status, r.body.code, r.body.lockDate], [409, "BOOKS_LOCKED", "2026-06-30"], JSON.stringify(r.body));
+      eq(r.body.error, "The books are locked up to 2026-06-30. Nothing dated on or before that day can be added, changed or removed.");
+      eq((await put("2026-01-01")).body.code, "BOOKS_LOCKED", "well before it");
+      same([(await prisma.business.findUnique({ where: { id: B.b.id } })).openingBalanceDate, await prisma.openingBalance.count({ where: { businessId: B.b.id } })], [null, 0], "nothing saved");
+      eq((await put("2026-07-01")).status, 200, "the day after it");
+      await lock("2026-07-15");
+      eq((await put("2026-08-01")).body.code, "BOOKS_LOCKED", "moved off a locked day");
+      eq((await put("2026-07-01", 2000)).body.code, "BOOKS_LOCKED", "changed on it");
+      eq((await put("2026-07-01", 0)).body.code, "BOOKS_LOCKED", "cleared");
+      const g = await call("GET", `/ledger/opening-balances?${B.bq}`, T);
+      same([g.status, g.body.date, g.body.lines.map((l) => l.debit)], [200, "2026-07-01", [1000]], "as saved, and still read");
+      await lock(null);
+      eq((await put("2026-08-01", 3000)).status, 200, "unlocked");
+      eq((await call("PUT", "/ledger/opening-balances", T, { businessId: B.b.id, date: "2026-08-01", lines: [{ debit: 5, credit: 0 }] })).body.code, "ACCOUNT_REQUIRED", "a balance with no account");
+    });
+
+    section("Release 2: the backfill, one owner at a time");
+    await test("a payable becomes an estimated bill, an expense on credit an unpaid bill, a customer gets a business; a dry run writes nothing; a second run changes nothing", async () => {
+      const { backfillR2 } = require("./backfill-r2");
+      const o = await mkUser({ email: `coa-bf-${tag}@t.local`, firstName: "Bf", accountType: "OWNER" });
+      const ob = await prisma.business.create({ data: { userId: o.id, name: `Bf ${tag}`, country: "NG", baseCurrency: "NGN" } });
+      const oT = signToken({ userId: o.id, tokenVersion: 0 });
+      const list = (await call("GET", `/ledger/accounts?businessId=${ob.id}`, oT)).body.accounts;
+      const rent = list.find((a) => a.categorySlug === "rent");
+      const cust = await prisma.customer.create({ data: { userId: o.id, name: `Bf ${tag}` } });
+      const payable = await prisma.businessDebt.create({
+        data: { userId: o.id, businessId: ob.id, name: "Landlord", type: "rent", originalAmount: 10000, remainingAmount: 4000, status: "partial" },
+      });
+      const onCredit = await prisma.expense.create({
+        data: { userId: o.id, businessId: ob.id, amount: 3000, category: "rent", paymentMethod: "credit", date: at("2026-09-09"), notes: "Shop rent" },
+      });
+      const state = async () => JSON.stringify([
+        await prisma.customer.findMany({ where: { userId: o.id }, select: { id: true, businessId: true } }),
+        await prisma.businessDebt.findMany({ where: { userId: o.id }, orderBy: { id: "asc" }, include: { payments: true } }),
+        await prisma.expense.findMany({ where: { userId: o.id }, select: { id: true } }),
+      ]);
+      const log = () => {};
+      const s0 = await state();
+      const dry = await backfillR2({ dryRun: true, ownerId: o.id, log });
+      eq(await state(), s0, "the dry run wrote nothing");
+      same([dry.customers.assigned, dry.payables.converted, dry.creditExpenses.converted, dry.creditExpenses.bills], [1, 1, 1, 1]);
+      const run = await backfillR2({ ownerId: o.id, log });
+      same([run.customers.assigned, run.payables.converted, run.payables.paidOutside, run.creditExpenses.bills], [1, 1, 1, 1]);
+      eq((await prisma.customer.findUnique({ where: { id: cust.id } })).businessId, ob.id, "the owner's only business");
+      const p = await prisma.businessDebt.findUnique({ where: { id: payable.id }, include: { payments: true } });
+      same([p.accountId, p.estimated, p.remainingAmount, p.payments.map((x) => [x.amount, x.outsideBooks, x.estimated, x.method])],
+        [rent.id, true, 4000, [[6000, true, true, "other"]]], "the payable");
+      eq(await prisma.expense.count({ where: { id: onCredit.id } }), 0, "the expense went");
+      const made = await prisma.businessDebt.findFirst({ where: { userId: o.id, id: { not: payable.id } } });
+      same([made.name, made.accountId, made.originalAmount, made.status, made.estimated, made.billDate.toISOString()],
+        ["Shop rent", rent.id, 3000, "unpaid", false, onCredit.date.toISOString()], "its bill");
+      const s1 = await state();
+      const again = await backfillR2({ ownerId: o.id, log });
+      eq(await state(), s1, "the second run wrote nothing");
+      same([again.customers.assigned, again.payables.converted, again.creditExpenses.converted], [0, 0, 0]);
+      invalidateOwner(o.id);
+      const home = await call("GET", `/ledger/summary?businessId=${ob.id}`, oT);
+      eq(home.body.youOwe, 4000 + 3000, "You owe: what the payable still owes and the bill the expense became");
     });
   } finally {
     server.close();

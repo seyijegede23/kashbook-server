@@ -15,6 +15,7 @@ const { getBaseCurrency, DEFAULT_COUNTRY } = require("../config/countries");
 const { getRiskCategory } = require("../config/amlLimits");
 const { getProvider } = require("../providers");
 const { computeLedgerBalance } = require("../utils/ledgerBalance");
+const { dayKey } = require("../utils/books");
 // Dojah pre-check (runBvnCheck/runCacCheck) removed from the KYC flow — the admin
 // approval gate + Anchor's own authoritative KYC make it redundant. The
 // utils/kycCheck module is left in place for an easy re-enable.
@@ -303,6 +304,58 @@ router.patch("/:id", async (req, res) => {
       });
     }
     res.status(500).json({ error: "Failed to update business" });
+  }
+});
+
+// PUT /businesses/:id/books-lock  { date: "YYYY-MM-DD" | null }
+// The lock date (chart of accounts release 2, 2026-10-13, as Zoho Books locks
+// transactions): nothing dated on or before it may be added, changed or
+// removed (utils/booksLock.js), so figures already reported, a VAT return or
+// last year's accounts, stay as they were. Bank rows from the provider still
+// arrive. The owner's alone, a day up to today in Lagos; null unlocks the
+// books. Set under the business lock that every guarded write checks it
+// under, so a write and a new lock date never pass each other. Answers with
+// the business, as PATCH does (booksLockDate among its fields).
+router.put("/:id/books-lock", ownerOnly("Only the business owner can lock the books."), async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!("date" in body)) {
+      return res.status(400).json({ error: "Choose the day to lock the books up to.", code: "BAD_DATE", field: "date" });
+    }
+    let date = null;
+    if (body.date !== null) {
+      date = typeof body.date === "string" ? body.date.trim() : "";
+      const d = new Date(`${date}T00:00:00.000Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== date) {
+        return res.status(400).json({ error: "Choose the day to lock the books up to.", code: "BAD_DATE", field: "date" });
+      }
+      if (date > dayKey(new Date())) {
+        return res.status(400).json({ error: "The books can be locked up to today at the latest.", code: "BAD_DATE", field: "date" });
+      }
+    }
+    const biz = await prisma.business.findFirst({
+      where: { id: req.params.id, userId: req.user.id },
+      select: { id: true },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const { before, updated } = await prisma.withBusinessLock(biz.id, async () => {
+      const cur = await prisma.business.findUnique({ where: { id: biz.id }, select: { booksLockDate: true } });
+      const row = await prisma.business.update({
+        where: { id: biz.id },
+        data: { booksLockDate: date },
+        include: { customCategories: true },
+      });
+      return { before: cur ? cur.booksLockDate : null, updated: row };
+    });
+    audit({
+      req, action: "BOOKS_LOCK_SET", resourceType: "business", resourceId: biz.id,
+      metadata: { from: before, to: date },
+    }).catch(() => {});
+    res.json(publicBusiness(updated));
+  } catch (err) {
+    console.error("[businesses] books lock:", err);
+    res.status(500).json({ error: "Failed to lock the books" });
   }
 });
 

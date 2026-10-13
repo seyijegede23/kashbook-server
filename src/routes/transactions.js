@@ -12,12 +12,22 @@ const { recordLink, linkedFrom } = require("../utils/paymentLinks");
 const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
 const { cleanReference, expenseCustomerId } = require("../utils/expenseFields");
 const { destroyReceipts } = require("../utils/receiptStorage");
+const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
 // match endpoints, so "Match to Sale or Debt" silently 404'd and reverted.
 // Bank-ledger rows remain provider-owned and append-only: POST refuses creating
 // them, PATCH/DELETE refuse touching them. Matching (below) only LABELS credits
 // and moves bookkeeping records; it never edits a bank row's money fields.
+//
+// The lock date (chart of accounts release 2, utils/booksLock.js): a bank row
+// dated on or before it is never refused (the bank's own rows always arrive,
+// and the webhooks never ask), but explaining one is: matching it, recording
+// a sale or an expense from it, applying it to a debt, linking a repayment to
+// it, marking or categorizing it, and undoing any of those. Every such route
+// also asks with the days of the records it moves (a matched sale's, a
+// repayment's), and a manual row is a dated record of its own. Each asks
+// under the business lock, which the lock date is set under.
 
 router.use(auth);
 
@@ -99,27 +109,68 @@ router.post("/", async (req, res) => {
   }
 
   try {
-    const tx = await prisma.transaction.create({
-      data: {
-        businessId,
-        userId: getTargetUserId(req),
-        type,
-        amount: Number(amount),
-        description: description || null,
-        category: category || null,
-        customerId: customerId || null,
-        paymentMethod: paymentMethod || "cash",
-        channel: normalizeChannel(channel),
-        date: new Date(date),
-        recordedBy: req.user.id,
-        recordedByName: req.user.name,
-      },
+    const when = new Date(date);
+    const tx = await prisma.withBusinessLock(businessId, async () => {
+      await assertUnlocked(businessId, when);
+      return prisma.transaction.create({
+        data: {
+          businessId,
+          userId: getTargetUserId(req),
+          type,
+          amount: Number(amount),
+          description: description || null,
+          category: category || null,
+          customerId: customerId || null,
+          paymentMethod: paymentMethod || "cash",
+          channel: normalizeChannel(channel),
+          date: when,
+          recordedBy: req.user.id,
+          recordedByName: req.user.name,
+        },
+      });
     });
     res.status(201).json(tx);
   } catch (err) {
+    if (err && err.status && err.code) return respondMatchFailure(res, err, "Failed to create transaction");
     res.status(500).json({ error: "Failed to create transaction" });
   }
 });
+
+// ── Rows another record carries ──────────────────────────────────────────
+// A row another record names carries money that record counts: a row matched
+// to a sale, to a customer's repayments, to an expense or to invoice payments;
+// a debit that paid a bill (release 2), which the bill payment names; or a
+// debit that paid a credit note's refund (marked customer_refund), which the
+// refund names. That record keeps counting all it carries, so a smaller amount
+// or a deleted row would leave money counted that no row backs (in the
+// ledger, Bank Matching or Undeposited Funds off by the difference). The link
+// is undone first, where it was made: a bill payment on the bill, a refund on
+// the credit note, a match here (DELETE /:id/match). The app offers neither
+// change on a bank row; this holds a direct call to the same rule.
+function carriedBy(tx) {
+  if (tx.matchedBillId) return "bill";
+  if (tx.purpose === "customer_refund") return "refund";
+  if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedExpenseId || tx.matchedInvoiceId) return "match";
+  return null;
+}
+const UNDO_FIRST = {
+  bill: "This transfer paid a bill. Remove the payment from the bill",
+  refund: "This transfer paid a customer refund. Remove the refund from the credit note",
+  match: "This transaction is matched to a record. Unmatch it",
+};
+
+// The refusal for changing the amount of ("amount") or deleting ("delete") a
+// row another record carries, saying what to undo first; null when nothing
+// carries it. Deleting a debit a bill payment carries is refused as
+// unmatching it is (BILL_LINKED).
+function carriedRowRefusal(tx, action) {
+  const by = carriedBy(tx);
+  if (!by) return null;
+  if (action === "amount") {
+    return matchError(409, "MATCHED_ROW_AMOUNT_LOCKED", `${UNDO_FIRST[by]} before changing the amount.`);
+  }
+  return matchError(409, by === "bill" ? "BILL_LINKED" : "MATCHED_ROW_LOCKED", `${UNDO_FIRST[by]} before deleting it.`);
+}
 
 // PATCH /transactions/:id
 router.patch("/:id", async (req, res) => {
@@ -139,26 +190,37 @@ router.patch("/:id", async (req, res) => {
     // A matched row's amount is load-bearing: matchedAmount ≤ amount is the
     // invariant every remainder aggregate rests on, and shrinking the amount
     // under an existing match would make the remainder go negative and cancel
-    // other rows' legitimate remainders inside summed aggregates. Unmatch
-    // first, then edit.
-    if (amount !== undefined && (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedExpenseId || tx.matchedInvoiceId)) {
-      return res.status(409).json({
-        error: "This transaction is matched to a record. Unmatch it before changing the amount.",
-        code: "MATCHED_ROW_AMOUNT_LOCKED",
+    // other rows' legitimate remainders inside summed aggregates. A debit a
+    // bill payment or a refund carries is held the same way (carriedBy).
+    // Undo the link first, then edit.
+    const amountRefusal = amount !== undefined ? carriedRowRefusal(tx, "amount") : null;
+    if (amountRefusal) return respondMatchFailure(res, amountRefusal, "Failed to update transaction");
+    // The lock date: the row's day before and after the edit, read again
+    // under the business lock. The links too: a bill payment, a refund or a
+    // match takes this lock to name the row, so the check above is the quick
+    // answer and this one the guarantee.
+    const updated = await prisma.withBusinessLock(tx.businessId, async () => {
+      const cur = await prisma.transaction.findUnique({ where: { id: tx.id } });
+      if (!cur) throw matchError(404, "TRANSACTION_NOT_FOUND", "Transaction not found");
+      if (amount !== undefined) {
+        const linked = carriedRowRefusal(cur, "amount");
+        if (linked) throw linked;
+      }
+      await assertUnlocked(cur.businessId, cur.date, date !== undefined ? new Date(date) : null);
+      return prisma.transaction.update({
+        where: { id: cur.id },
+        data: {
+          ...(amount !== undefined && { amount: Number(amount) }),
+          ...(description !== undefined && { description }),
+          ...(category !== undefined && { category }),
+          ...(paymentMethod !== undefined && { paymentMethod }),
+          ...(date !== undefined && { date: new Date(date) }),
+        },
       });
-    }
-    const updated = await prisma.transaction.update({
-      where: { id: req.params.id },
-      data: {
-        ...(amount !== undefined && { amount: Number(amount) }),
-        ...(description !== undefined && { description }),
-        ...(category !== undefined && { category }),
-        ...(paymentMethod !== undefined && { paymentMethod }),
-        ...(date !== undefined && { date: new Date(date) }),
-      },
     });
     res.json(updated);
   } catch (err) {
+    if (err && err.status && err.code) return respondMatchFailure(res, err, "Failed to update transaction");
     res.status(500).json({ error: "Failed to update transaction" });
   }
 });
@@ -178,10 +240,24 @@ router.delete("/:id", async (req, res) => {
       await audit({ req, action: "TXN_DELETE_BANK_BLOCKED", resourceType: "transaction", resourceId: tx.id, severity: "warning", metadata: { source: tx.source, paymentMethod: tx.paymentMethod, category: tx.category } }).catch(() => {});
       return res.status(403).json({ error: "Bank transactions can't be deleted.", code: "BANK_ROW_IMMUTABLE" });
     }
+    // Nor a row another record carries (carriedBy): that record would go on
+    // counting money no row backs.
+    const linkRefusal = carriedRowRefusal(tx, "delete");
+    if (linkRefusal) return respondMatchFailure(res, linkRefusal, "Failed to delete transaction");
 
-    await prisma.transaction.delete({ where: { id: req.params.id } });
+    // The lock date: the row's day, read again under the business lock, and
+    // the links with it, as on PATCH.
+    await prisma.withBusinessLock(tx.businessId, async () => {
+      const cur = await prisma.transaction.findUnique({ where: { id: tx.id } });
+      if (!cur) return;
+      const linked = carriedRowRefusal(cur, "delete");
+      if (linked) throw linked;
+      await assertUnlocked(cur.businessId, cur.date);
+      await prisma.transaction.delete({ where: { id: cur.id } });
+    });
     res.json({ message: "Deleted" });
   } catch (err) {
+    if (err && err.status && err.code) return respondMatchFailure(res, err, "Failed to delete transaction");
     res.status(500).json({ error: "Failed to delete transaction" });
   }
 });
@@ -257,10 +333,17 @@ const debtTotalOwed = (debts) =>
   debts.reduce((s, d) => s + Math.max(0, d.amount - d.paidAmount), 0);
 
 // Translate a coded matchError into a response; 500 for anything else. An
-// expense detail refused by utils/expenseFields.js also says which field.
+// expense detail refused by utils/expenseFields.js also says which field, and
+// a refusal may carry more for the app (`extra`: the lock date of a
+// BOOKS_LOCKED refusal).
 function respondMatchFailure(res, err, fallback) {
   if (err && err.status && err.code) {
-    return res.status(err.status).json({ error: err.message, code: err.code, ...(err.field ? { field: err.field } : {}) });
+    return res.status(err.status).json({
+      error: err.message,
+      code: err.code,
+      ...(err.field ? { field: err.field } : {}),
+      ...(err.extra || {}),
+    });
   }
   console.error(`[transactions] ${fallback}:`, err);
   return res.status(500).json({ error: fallback });
@@ -328,6 +411,9 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
         if (sale.isCredit && (await px.debt.count({ where: { saleId: sale.id } }))) {
           throw matchError(409, "CREDIT_SALE_HAS_DEBT", "This sale was on credit. Apply the transfer to the customer's debt instead.");
         }
+        // The lock date: the transfer's day, and the sale's, whose money now
+        // comes from the transfer.
+        await assertUnlockedIn(px, tx.businessId, tx.date, sale.date);
 
         const updatedTx = await px.transaction.update({
           where: { id: tx.id },
@@ -406,7 +492,8 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
   try {
     const pre = await loadMatchableCredit(req, res);
     if (!pre) return;
-    const { amount, remainder } = resolveCappedAmount(req.body || {}, pre);
+    // A quick answer; the cap that counts is taken again under the lock.
+    resolveCappedAmount(req.body || {}, pre);
     const account = await assertAccountUsable(pre.businessId, accountId, "income", { isStaff: req.user.accountType === "staff" });
 
     if (customerId) {
@@ -420,6 +507,12 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
+        // The cap on the transfer as it is now: a manual row's amount can
+        // change between the read above and this lock (PATCH /:id), and the
+        // sale never carries more than the row (matchedAmount ≤ amount).
+        const { amount, remainder } = resolveCappedAmount(req.body || {}, tx);
+        // The lock date: the sale is dated the transfer's day.
+        await assertUnlockedIn(px, tx.businessId, tx.date);
 
         const sale = await px.sales.create({
           data: {
@@ -444,15 +537,15 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
           where: { id: tx.id },
           data: { matchedSaleId: sale.id, matchedAmount: amount },
         });
-        return { sale, transaction: updatedTx };
+        return { sale, transaction: updatedTx, amount, remainder };
       }),
     );
 
     audit({
       req, action: "TX_MATCH_CREATE_SALE", resourceType: "transaction", resourceId: pre.id,
-      metadata: { saleId: result.sale.id, amount, remainder },
+      metadata: { saleId: result.sale.id, amount: result.amount, remainder: result.remainder },
     }).catch(() => {});
-    res.status(201).json({ ...result, remainder });
+    res.status(201).json({ sale: result.sale, transaction: result.transaction, remainder: result.remainder });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to create sale from transfer");
   }
@@ -496,6 +589,12 @@ async function loadMatchableDebit(req, res) {
     res.status(409).json({ error: "This transfer is already recorded as an expense. Unmatch it first.", code: "ALREADY_MATCHED" });
     return null;
   }
+  // A payment towards a bill (release 2) already carries this money; an
+  // expense would count it twice.
+  if (tx.matchedBillId) {
+    res.status(409).json({ error: "This transfer paid a bill. Remove that payment from the bill first.", code: "ALREADY_MATCHED" });
+    return null;
+  }
   return tx;
 }
 
@@ -516,7 +615,8 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
   try {
     const pre = await loadMatchableDebit(req, res);
     if (!pre) return;
-    const { amount, remainder } = resolveCappedAmount(req.body || {}, pre);
+    // A quick answer; the cap that counts is taken again under the lock.
+    resolveCappedAmount(req.body || {}, pre);
     const reference = cleanReference((req.body || {}).reference);
     const customerId = await expenseCustomerId(getTargetUserId(req), pre.businessId, (req.body || {}).customerId);
     // A category no account stands for becomes an account the next time the
@@ -537,19 +637,31 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
       // versions file the expense in the same place.
       let category = account && account.categorySlug ? account.categorySlug : category0;
       // Staff: the category of an active account that stands for what they
-      // sent, else Other Expenses. Never a new account, and never a default
-      // the owner deleted or rested. Read under the lock for the same reason.
+      // sent, as its own or as one merged into it (an older app still offers
+      // a category the owner merged away), else Other Expenses. Never a new
+      // account, and never a default the owner deleted or rested. Read under
+      // the lock for the same reason. An account's own category beats one
+      // merged into another, as chart.indexChart reads them.
       if (isStaff && !(account && account.categorySlug)) {
-        const known = await prisma.ledgerAccount.findFirst({
-          where: { businessId: pre.businessId, categorySlug: chart.canonicalSlug(category0), inactiveAt: null },
+        const slug = chart.canonicalSlug(category0);
+        const known = await prisma.ledgerAccount.findMany({
+          where: { businessId: pre.businessId, inactiveAt: null, OR: [{ categorySlug: slug }, { aliasSlugs: { has: slug } }] },
           select: { categorySlug: true },
+          // The chart's own order (utils/ledgerData.js accountsFor).
+          orderBy: [{ createdAt: "asc" }, { name: "asc" }],
         });
-        category = known ? known.categorySlug : "other";
+        const hit = known.find((a) => a.categorySlug === slug) || known[0];
+        category = (hit && hit.categorySlug) || "other";
       }
       return prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
-        if (tx.matchedExpenseId || tx.purpose || tx.accountId)
+        if (tx.matchedExpenseId || tx.matchedBillId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already recorded as an expense.");
+        // The cap on the transfer as it is now, as for a sale: the expense
+        // never carries more than the row (matchedAmount ≤ amount).
+        const { amount, remainder } = resolveCappedAmount(req.body || {}, tx);
+        // The lock date: the expense is dated the transfer's day.
+        await assertUnlockedIn(px, tx.businessId, tx.date);
 
         const expense = await px.expense.create({
           data: {
@@ -574,17 +686,17 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
           where: { id: tx.id },
           data: { matchedExpenseId: expense.id, matchedAmount: amount },
         });
-        return { expense, transaction: updatedTx };
+        return { expense, transaction: updatedTx, amount, remainder };
       });
     });
 
     audit({
       req, action: "TX_MATCH_CREATE_EXPENSE", resourceType: "transaction", resourceId: pre.id,
-      metadata: { expenseId: result.expense.id, amount, remainder, category: result.expense.category },
+      metadata: { expenseId: result.expense.id, amount: result.amount, remainder: result.remainder, category: result.expense.category },
     }).catch(() => {});
     // As every expense response: lines ([] here) and receipts without their
     // storage keys (utils/expenseView.js).
-    res.status(201).json({ ...result, expense: publicExpense(result.expense), remainder });
+    res.status(201).json({ expense: publicExpense(result.expense), transaction: result.transaction, remainder: result.remainder });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to record expense from transfer");
   }
@@ -602,9 +714,10 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
 
     const customer = await prisma.customer.findUnique({ where: { id: customerId } });
     // Another business's customer would move this naira into that business's
-    // books (its debts count there) while the credit stops counting here.
-    if (!customer || customer.userId !== getTargetUserId(req) ||
-        (customer.businessId && customer.businessId !== pre.businessId))
+    // books (its debts count there) while the credit stops counting here. A
+    // customer always belongs to one business (release 2): one with none (its
+    // business was deleted) is in no books, and the naira would vanish.
+    if (!customer || customer.userId !== getTargetUserId(req) || customer.businessId !== pre.businessId)
       return res.status(404).json({ error: "Customer not found" });
 
     const result = await prisma.withBusinessLock(pre.businessId, () =>
@@ -615,6 +728,8 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
+        // The lock date: the repayments are dated the transfer's day.
+        await assertUnlockedIn(px, tx.businessId, tx.date);
 
         const unpaidDebts = await px.debt.findMany({
           where: { customerId, paid: false },
@@ -689,6 +804,41 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
   }
 });
 
+// Every day an unmatch changes, for the lock date: the transfer's own, the
+// day of the sale or expense it carried (which counts on its own again, or
+// goes), and the day of each repayment and invoice payment it made or was
+// linked to, with the day a linked one goes back to.
+async function unmatchDays(px, tx) {
+  const days = [tx.date];
+  if (tx.matchedSaleId) {
+    const sale = await px.sales.findUnique({ where: { id: tx.matchedSaleId }, select: { date: true } });
+    if (sale) days.push(sale.date);
+  }
+  if (tx.matchedExpenseId) {
+    const expense = await px.expense.findUnique({ where: { id: tx.matchedExpenseId }, select: { date: true } });
+    if (expense) days.push(expense.date);
+  }
+  const linked = [
+    ...(tx.matchedCustomerId
+      ? (await px.debtPayment.findMany({ where: { transactionId: tx.id }, select: { id: true, date: true } })).map((p) => ({ kind: "debt_payment", p }))
+      : []),
+    ...(tx.matchedInvoiceId
+      ? (await px.invoicePayment.findMany({ where: { transactionId: tx.id }, select: { id: true, date: true } })).map((p) => ({ kind: "invoice_payment", p }))
+      : []),
+  ];
+  for (const { kind, p } of linked) {
+    days.push(p.date);
+    const was = await linkedFrom(px, kind, p.id, tx.id);
+    if (was && was.date) days.push(new Date(was.date));
+  }
+  return days;
+}
+
+// A debit that paid a bill (release 2) is undone from the bill, where the
+// payment is: unmatching it here would leave the payment counting with no
+// money behind it.
+const BILL_LINKED = "This transfer paid a bill. Remove the payment from the bill instead.";
+
 // DELETE /transactions/:id/match   (?deleteSale=true)
 // Undo a match completely. For a debt match that means REVERSING the payments
 // this credit created — the old handler cleared the label and left the money
@@ -706,6 +856,7 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     if (!tx0) return res.status(404).json({ error: "Transaction not found" });
     if (!(await ownsBusiness(req, tx0.businessId)))
       return res.status(403).json({ error: "Forbidden" });
+    if (tx0.matchedBillId) return res.status(409).json({ error: BILL_LINKED, code: "BILL_LINKED" });
     if (!tx0.matchedSaleId && !tx0.matchedCustomerId && !tx0.matchedExpenseId && !tx0.matchedInvoiceId)
       return res.json({ matched: false }); // idempotent no-op
     // Taking invoice payments or debt repayments back out of the books is the
@@ -716,6 +867,9 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     const result = await prisma.withBusinessLock(tx0.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
+        if (tx.matchedBillId) throw matchError(409, "BILL_LINKED", BILL_LINKED);
+        // The lock date, before anything is undone.
+        await assertUnlockedIn(px, tx.businessId, await unmatchDays(px, tx));
         const out = { saleDeleted: false, expenseDeleted: false, customer: null };
 
         // Expense mirror of the sale branch below: unlink keeps the Expense as
@@ -884,14 +1038,17 @@ router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async
           include: { debt: { include: { customer: { select: { id: true, userId: true, businessId: true } } } } },
         });
         const customer = payment && payment.debt && payment.debt.customer;
-        if (!payment || !customer || customer.userId !== getTargetUserId(req) ||
-            (customer.businessId && customer.businessId !== tx.businessId)) {
+        // This business's own customer only (every customer belongs to one
+        // business, release 2), as on match-debt.
+        if (!payment || !customer || customer.userId !== getTargetUserId(req) || customer.businessId !== tx.businessId) {
           throw matchError(404, "PAYMENT_NOT_FOUND", "Repayment not found.");
         }
         if (payment.transactionId) throw matchError(409, "ALREADY_LINKED", "This repayment is already linked.");
         if (Number(payment.amount) > Number(tx.amount) + 0.005) {
           throw matchError(400, "EXCEEDS_TRANSFER", "The repayment is more than the transfer.");
         }
+        // The lock date: the repayment moves from its own day to the transfer's.
+        await assertUnlockedIn(px, tx.businessId, payment.date, tx.date);
         await recordLink(px, { req, kind: "debt_payment", payment, transactionId: tx.id });
         await px.debtPayment.update({ where: { id: payment.id }, data: { transactionId: tx.id, date: tx.date } });
         return px.transaction.update({
@@ -950,6 +1107,8 @@ router.post("/:id/classify", requirePermission("canViewBalance"), async (req, re
         // Staff never change what the owner filed in the owner's stake, and
         // clearing it is a change too.
         if (isStaff && (await inOwnersStake(px, tx))) throw matchError(403, "OWNER_ONLY", OWNERS_STAKE_REFUSAL);
+        // The lock date: what the transfer counts as changes on its day.
+        await assertUnlockedIn(px, tx.businessId, tx.date);
         return px.transaction.update({ where: { id: tx.id }, data: { purpose, accountId: null } });
       }),
     );
@@ -1002,12 +1161,15 @@ router.post("/:id/categorize", requirePermission("canViewBalance"), async (req, 
         if (tx.purpose && !CREDIT_OUTCOMES.includes(tx.purpose) && tx.purpose !== "account") {
           throw matchError(409, "PURPOSE_LOCKED", "This transfer can't be changed here.");
         }
-        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.matchedExpenseId) {
+        // A payment towards a bill (release 2) is a match too.
+        if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.matchedExpenseId || tx.matchedBillId) {
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched. Unmatch it first.");
         }
         // Whatever staff send, null included, a row the owner filed in the
         // owner's stake stays as the owner left it.
         if (isStaff && (await inOwnersStake(px, tx))) throw matchError(403, "OWNER_ONLY", OWNERS_STAKE_REFUSAL);
+        // The lock date: what the transfer counts as changes on its day.
+        await assertUnlockedIn(px, tx.businessId, tx.date);
         return px.transaction.update({ where: { id: tx.id }, data: { accountId: account ? account.id : null, purpose } });
       }),
     );

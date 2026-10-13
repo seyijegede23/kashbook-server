@@ -18,8 +18,22 @@
 //   - "when sold" adds what the books rule leaves outside profit: invoices and
 //     credit given owed by customers (Accounts Receivable), payments against
 //     them, unexplained credits (Unexplained Receipts);
+//   - bills (release 2): on spending, "when paid" each payment is the
+//     spending, paid from its money; "when sold" the bill is spending on its
+//     date, owed in Accounts Payable, and each payment settles it. A payment
+//     from the KashBook account meets its debit in Bank Matching, as a sale
+//     meets its credit. A bill for a loan (or any balance-sheet account) is
+//     never profit: in both views the money borrowed comes in where the bill
+//     says it went, and each payment pays the loan back. A loan from before
+//     bills that says nowhere is owed from its bill date against Opening
+//     Balance Adjustments, as a starting balance would be. A payment kept
+//     outside the books posts nothing;
+//   - published manual journals post their lines on their date, in both
+//     views: their profit-and-loss lines from the books rule's events, the
+//     rest as written;
 //   - opening balances post the difference between what the merchant says an
-//     account held when the books start and what the records already put there.
+//     account held when the books start and what the records already put
+//     there, bills and journals included (the opening entry is built last).
 //
 // Amounts are integer kobo inside the engine; every split adds up exactly.
 const books = require("./books");
@@ -89,6 +103,29 @@ function buildLedger(input, ctx) {
   // transfer brought in (see "Sales: where the money is").
   const pendingSales = []; // { e, rec, gross }: the sale's entry, its income and VAT posted
   const linkedToSale = new Map(); // sale id → kobo its transfer left in Bank Matching for it
+  // The same for a payment towards a bill ("when paid"): its spending is
+  // posted with the events, its money side once the bank rows say how much
+  // its debit left in Bank Matching for it (see "Bill payments").
+  const pendingBillPayments = []; // { e, p, k }: the payment's entry, its spending posted
+  const linkedToBill = new Map(); // debit id → kobo it left in Bank Matching for the bill payment naming it
+
+  // An account a bill or a bill payment names as where money came from or
+  // went (paid from, received into), when money can sit there: never a
+  // profit-and-loss account (its amount would be profit the books rule does
+  // not count) and never one the engine keeps (the KashBook Account moves
+  // only with bank rows, so it always equals the bank ledger). Else null, and
+  // the payment's method decides.
+  function heldIn(id) {
+    const a = chart.explicitAccount(C, id);
+    if (!a || chart.isProfitClass(chart.classOf(a.type))) return null;
+    if (a.systemKey && chart.CONTROLLED.includes(a.systemKey)) return null;
+    return a;
+  }
+
+  // What a bill on spending is spent on: its account, else (none, or one this
+  // chart does not know) Other Expenses, as books.bookRows' rows say.
+  const billSpentOn = (bill) => chart.expenseAccount(C, { accountId: bill.accountId });
+  const billMemo = (bill, p) => (p && p.note) || books.billLabel(bill);
 
   // A document's income accounts: its lines (null → Sales, or Sales Returns on
   // a credit note) and its discount, in proportion to their amounts.
@@ -111,6 +148,7 @@ function buildLedger(input, ctx) {
   const { events } = books.bookEvents(input, { basis, vat: ctx.vat, allDates: true });
   const counted = books.COUNTED_LINES[basis];
   const bankEvents = new Map(); // bank row → its counted events (posted with the row)
+  const journalEvents = new Map(); // journal → its counted events (posted with the journal)
 
   for (const ev of events) {
     const isCounted = (ev.side === "sales" ? counted.sales : counted.expenses).includes(ev.line);
@@ -121,6 +159,11 @@ function buildLedger(input, ctx) {
     if (kind === "bank" || kind === "fee") {
       if (!bankEvents.has(rec)) bankEvents.set(rec, []);
       bankEvents.get(rec).push(ev);
+      continue;
+    }
+    if (kind === "journal") {
+      if (!journalEvents.has(rec)) journalEvents.set(rec, []);
+      journalEvents.get(rec).push(ev);
       continue;
     }
 
@@ -192,6 +235,17 @@ function buildLedger(input, ctx) {
         .dr(sys(SYS.AR), gross)
         .cr(sys(SYS.SALES), gross - v)
         .cr(sys(SYS.VAT), v);
+    } else if (kind === "billPayment") {
+      // "When paid": a payment towards a bill is the spending, at the bill's
+      // account; where it was paid from follows the bank rows.
+      const bill = ev.src.bill;
+      const e = entry(`bp:${rec.id}`, ev.day, "bill_payment", billMemo(bill, rec), bill.id).dr(billSpentOn(bill), gross);
+      pendingBillPayments.push({ e, p: rec, k: gross });
+    } else if (kind === "bill") {
+      // "When sold": a bill is spending on its date, owed to the supplier.
+      entry(`bill:${rec.id}`, ev.day, "bill", billMemo(rec), rec.id)
+        .dr(billSpentOn(rec), gross)
+        .cr(sys(SYS.AP), gross);
     }
   }
 
@@ -263,6 +317,8 @@ function buildLedger(input, ctx) {
       rest -= matched;
       // Left there for the sale it was matched to, which takes it back out.
       if (isIn && tx.matchedSaleId) linkedToSale.set(tx.matchedSaleId, (linkedToSale.get(tx.matchedSaleId) || 0) + matched);
+      // Or for the bill payment that names this debit.
+      if (!isIn && tx.matchedBillId) linkedToBill.set(tx.id, (linkedToBill.get(tx.id) || 0) + matched);
     }
     if (rest) {
       if (isIn) e.cr(sys(SYS.SUSPENSE), rest);
@@ -291,6 +347,26 @@ function buildLedger(input, ctx) {
     }
     e.dr(own, gross - link);
   }
+
+  // ── Bill payments: where the money came from ──────────────────────────────
+  // A payment linked to a KashBook debit takes from Bank Matching what that
+  // debit left there for it, never more than the payment, so the two meet at
+  // zero. The rest of it (none, when the route saved it as it should: the
+  // debit's matchedAmount is the payment), or all of an unlinked payment, is
+  // where the payment says: the account it was paid from, else its method's.
+  // A payment marked "bank" has one debit and it is already linked, so what
+  // that debit does not cover waits in Undeposited Funds, as for a sale.
+  function billPaymentMoney(e, p, k) {
+    const left = p.transactionId ? linkedToBill.get(p.transactionId) || 0 : 0;
+    const link = Math.max(0, Math.min(k, left));
+    if (link) linkedToBill.set(p.transactionId, left - link);
+    const bankMatch = sys(SYS.BANK_MATCH);
+    const picked = heldIn(p.paidThroughAccountId);
+    let own = chart.moneyAccount(C, { accountId: picked && picked.id, linked: false, method: p.method, direction: "out" });
+    if (own && own.id === bankMatch.id) own = sys(SYS.UNDEPOSITED);
+    e.cr(bankMatch, link).cr(own, k - link);
+  }
+  for (const { e, p, k } of pendingBillPayments) billPaymentMoney(e, p, k);
 
   // ── Expenses on the balance sheet (equipment, prepaid rent, drawings...) ──
   // What the books rule leaves out of spending: a whole expense on such an
@@ -336,6 +412,67 @@ function buildLedger(input, ctx) {
             .cr(sys(SYS.AR), amt);
         }
       }
+    }
+  }
+
+  // ── Bills: what is owed to suppliers and lenders, and paid back ───────────
+  // A payment kept outside the books posts nothing, in either view: the bill
+  // already carries only what was not paid that way (books.billBooksAmount).
+  for (const bill of input.bills || []) {
+    const payments = (bill.payments || []).filter((p) => p && !p.outsideBooks);
+    if (books.billIsSpending(bill, input.accounts)) {
+      // On spending, "when sold": each payment settles Accounts Payable.
+      // ("When paid", the payments were the spending, posted above.)
+      if (basis !== "sold") continue;
+      for (const p of payments) {
+        const k = K(p.amount);
+        if (!k) continue;
+        billPaymentMoney(entry(`bp:${p.id}`, p.date, "bill_payment", billMemo(bill, p), bill.id).dr(sys(SYS.AP), k), p, k);
+      }
+      continue;
+    }
+    // A loan or another liability (or anything else on the balance sheet),
+    // the same in both views and never profit: on the bill date the money
+    // borrowed comes in where the bill says it went, and each payment pays
+    // it back. A payable from before bills (estimated) that names nowhere was
+    // owed before the books knew of it, and no record holds the money it
+    // brought in: its open part (what was not paid outside the books) is
+    // owed from its bill date against Opening Balance Adjustments, as a
+    // starting balance would be, so the loan holds what the bill still owes
+    // and its payments never take it below zero (dated before the opening
+    // date, the opening entry counts it, so a stated starting balance still
+    // holds). Any other bill that names nowhere posts nothing on its date:
+    // its money is where it was recorded (a starting balance, or a KashBook
+    // transfer explained as a loan), and the payments still lower it.
+    const acc = chart.explicitAccount(C, bill.accountId);
+    if (!acc || chart.isProfitClass(chart.classOf(acc.type))) continue;
+    const via = heldIn(bill.receivedViaAccountId) || (bill.estimated ? sys(SYS.OPENING) : null);
+    const owed = K(books.billBooksAmount(bill));
+    if (via && owed) entry(`bill:${bill.id}`, bill.billDate, "bill", billMemo(bill), bill.id).dr(via, owed).cr(acc, owed);
+    for (const p of payments) {
+      const k = K(p.amount);
+      if (!k) continue;
+      billPaymentMoney(entry(`bp:${p.id}`, p.date, "bill_payment", billMemo(bill, p), bill.id).dr(acc, k), p, k);
+    }
+  }
+
+  // ── Manual journals: each as one entry on its date, in both views ────────
+  // A line on an income or spending account posts what the books rule
+  // counted for it (its event), so the profit and loss still equals
+  // computeBooks; a line on the balance sheet posts as written. The books
+  // rule takes only a published journal that balances to the kobo on
+  // accounts it knows (books.journalInBooks), so the entry balances too.
+  for (const j of input.journals || []) {
+    if (!books.journalInBooks(j, input.accounts)) continue;
+    if (!j.lines.every((line) => C.byId.get(line.accountId))) continue;
+    const byLine = new Map((journalEvents.get(j) || []).map((ev) => [ev.src.line, ev]));
+    const e = entry(`mj:${j.id}`, j.date, "journal", j.note || j.number, j.id);
+    for (const line of j.lines) {
+      const acc = C.byId.get(line.accountId);
+      const ev = byLine.get(line);
+      if (!ev) e.dr(acc, K(line.debit) - K(line.credit));
+      else if (ev.side === "sales") e.cr(acc, K(ev.gross));
+      else e.dr(acc, K(ev.gross));
     }
   }
 

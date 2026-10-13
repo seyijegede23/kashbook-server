@@ -17,6 +17,8 @@ const ig = require("../utils/instagram");
 const { encrypt, decrypt } = require("../utils/crypto");
 const { audit } = require("../utils/audit");
 const { allocateInvoiceNumber } = require("../utils/invoiceNumber");
+const { assertUnlocked } = require("../utils/booksLock");
+const { dayKey } = require("../utils/books");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +75,8 @@ function liveToken(business) {
 
 // Map a thrown error to an HTTP response.
 function fail(res, err, fallback = "Something went wrong with Instagram.") {
+  // The books are locked up to a day: answered as every other route answers it.
+  if (err.code === "BOOKS_LOCKED") return res.status(409).json({ error: err.message, code: err.code, ...err.extra });
   const status = err.statusCode || (err.status && err.status >= 400 && err.status < 500 ? 400 : 502);
   const payload = { error: err.message || fallback };
   if (err.reconnect) payload.reconnect = true;
@@ -527,6 +531,8 @@ router.post("/conversations/:id/record-sale", async (req, res) => {
     // Serialize per-business so a double-tap / concurrent request can't create two
     // customers (withBusinessLock queues same-business calls via a pg advisory lock).
     const result = await prisma.withBusinessLock(business.id, async () => {
+      // The sale is dated now: refused when the books are locked up to today.
+      await assertUnlocked(business.id, new Date());
       const customer = await resolveIgCustomer(business, convo, ownerUserId, { create: true });
       const sale = await prisma.sales.create({
         data: {
@@ -732,6 +738,10 @@ router.post("/conversations/:id/create-invoice", async (req, res) => {
 
     const ownerUserId = ownerId(req);
     const result = await prisma.withBusinessLock(business.id, async () => {
+      // Issued today in Lagos (not the UTC day, a day early before 1am), and
+      // refused when the books are locked up to today.
+      const issueDate = dayKey(new Date());
+      await assertUnlocked(business.id, issueDate);
       const customer = await resolveIgCustomer(business, convo, ownerUserId, { create: true });
       const snapshot = await snapshotFor(prisma, customer.id);
       const invoiceNumber = await allocateInvoiceNumber(prisma, business.id, "invoice");
@@ -739,7 +749,7 @@ router.post("/conversations/:id/create-invoice", async (req, res) => {
         data: {
           businessId: business.id, customerId: customer.id, userId: ownerUserId,
           invoiceNumber, type: "invoice", status: "SENT",
-          issueDate: new Date().toISOString().slice(0, 10),
+          issueDate,
           currency: business.baseCurrency || "NGN",
           subtotal: amount, total: amount,
           ...snapshot,

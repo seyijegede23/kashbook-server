@@ -5,6 +5,10 @@
 // and no longer waiting to be matched once explained so (2026-10-12), rows in
 // another currency left out, itemized expenses (2026-10-12) counted line by
 // line, and bookRows still adding up to the totals with all of it present.
+// Release 2 (2026-10-13): bills (payments when paid, the bill on its date when
+// sold, a loan never, a payment outside the books never, a debit that paid a
+// bill no longer counting itself), manual journals (their lines on income and
+// spending, both views), and the VAT estimate with bills.
 //
 //   node scripts/books-coa-test.js
 const assert = require("assert");
@@ -382,6 +386,288 @@ test("money in naira and kobo: every kobo amount is two decimals, a third decima
   let refused = 0;
   for (let k = 1; k <= 200000; k++) if (!twoDecimals(Number((k / 100).toFixed(2)))) refused++;
   eq(refused, 0, "kobo amounts up to ₦2,000 refused");
+});
+
+// ── Release 2: bills and manual journals ─────────────────────────────────────
+// The chart above, with a loan, a payroll liability and cash, as a business's
+// chart would have them.
+const chart2 = {
+  ...accounts,
+  loans: { cls: "liability", type: "long_term_liability" },
+  paye: { cls: "liability", type: "other_current_liability" },
+  cash: { cls: "asset", type: "cash" },
+};
+const pay = (id, amount, date, over = {}) => ({ id, amount, date, method: "cash", transactionId: null, outsideBooks: false, ...over });
+const rentBill = (over = {}) => ({
+  id: "b1", accountId: "rent", billDate: "2026-10-02", amount: 50000, estimated: false, vendorName: "Landlord",
+  payments: [pay("p1", 20000, "2026-10-05"), pay("p2", 10000, "2026-11-03", { method: "transfer" })],
+  ...over,
+});
+const month = (m) => ({ from: `2026-${m}-01`, to: `2026-${m}-31` });
+
+console.log("\n── Bills");
+test("a bill on spending: when paid each payment on its own date, when sold the whole bill on its bill date", () => {
+  const input = { bills: [rentBill()], accounts: chart2 };
+  const paid = (r) => books.computeBooks(input, { basis: "paid", ...r });
+  const sold = (r) => books.computeBooks(input, { basis: "sold", ...r });
+  eq(paid(month("10")).expenses.lines.bills.gross, 20000, "paid, October: the first payment");
+  eq(paid(month("10")).expenses.lines.bills.count, 1, "paid, October: one payment");
+  eq(paid(month("11")).expenses.total, 10000, "paid, November: the second");
+  eq(paid({}).expenses.total, 30000, "paid, all time: what was paid, not the bill");
+  eq(paid({}).profit, -30000, "paid profit");
+  eq(sold(month("10")).expenses.lines.bills.gross, 50000, "sold, October: the whole bill");
+  eq(sold(month("11")).expenses.total, 0, "sold, November: payments are not spending again");
+  eq(sold({}).expenses.total, 50000, "sold, all time");
+});
+test("a bill for a loan or another liability never counts, in either view, nor its payments", () => {
+  const input = {
+    bills: [
+      rentBill({ id: "b2", accountId: "loans", amount: 500000, payments: [pay("p3", 50000, "2026-10-09")] }),
+      rentBill({ id: "b3", accountId: "paye", amount: 42000, payments: [pay("p4", 42000, "2026-10-09")] }),
+    ],
+    accounts: chart2,
+  };
+  both((basis) => {
+    const b = books.computeBooks(input, { basis });
+    eq(b.expenses.total, 0, basis);
+    eq(b.expenses.lines.bills.count, 0, basis);
+    eq(books.bookRows(input, basis).length, 0, `${basis}: no rows`);
+  });
+});
+test("a bill with no account, or one this chart doesn't know, counts as spending (as a record with no account always has)", () => {
+  const input = {
+    bills: [
+      rentBill({ id: "b4", accountId: null, amount: 700, payments: [pay("p5", 700, "2026-10-06")] }),
+      rentBill({ id: "b5", accountId: "gone", amount: 300, payments: [pay("p6", 100, "2026-10-06")] }),
+    ],
+    accounts: chart2,
+  };
+  eq(books.computeBooks(input, { basis: "paid" }).expenses.total, 800, "paid: both payments");
+  eq(books.computeBooks(input, { basis: "sold" }).expenses.total, 1000, "sold: both bills");
+  eq(books.billIsSpending({ accountId: "loans" }, chart2), false, "a loan");
+  eq(books.billIsSpending({ accountId: "cogs" }, chart2), true, "cost of goods sold");
+  eq(books.billIsSpending({ accountId: "x" }, chart2), true, "an account this chart doesn't know");
+  eq(books.billIsSpending({ accountId: "rent" }, undefined), true, "no chart at all");
+});
+test("a payable from before bills: what was paid outside the books counts nowhere; when sold only the open part, on the bill date", () => {
+  const legacy = {
+    id: "b6", accountId: "cogs", billDate: "2026-09-10", amount: 80000, estimated: true, vendorName: "Ada Supplies",
+    payments: [
+      pay("p7", 30000, "2026-09-20", { outsideBooks: true, estimated: true }),
+      pay("p8", 15000, "2026-10-04"),
+    ],
+  };
+  const input = { bills: [legacy], accounts: chart2 };
+  eq(books.billBooksAmount(legacy), 50000, "what the books carry");
+  eq(books.computeBooks(input, { basis: "paid", ...month("09") }).expenses.total, 0, "paid, September: the payment outside the books");
+  eq(books.computeBooks(input, { basis: "paid", ...month("10") }).expenses.total, 15000, "paid, October: a real payment");
+  eq(books.computeBooks(input, { basis: "sold", ...month("09") }).expenses.total, 50000, "sold, September: the open part");
+  eq(books.computeBooks(input, { basis: "sold", ...month("10") }).expenses.total, 0, "sold, October: nothing more");
+  // Paid in full outside the books: nothing left to count, no row.
+  const settled = { ...legacy, payments: [pay("p9", 80000, "2026-09-20", { outsideBooks: true })] };
+  both((basis) => {
+    eq(books.computeBooks({ bills: [settled], accounts: chart2 }, { basis }).expenses.total, 0, basis);
+    eq(books.bookRows({ bills: [settled], accounts: chart2 }, basis).length, 0, `${basis} rows`);
+  });
+});
+test("a debit that paid a bill stops counting itself: the payment counts, the rest of the debit and its fee still do", () => {
+  const debit = { id: "t1", type: "expense", amount: 12000, fee: 26.88, matchedBillId: "b7", matchedAmount: 10000, date: "2026-10-06" };
+  const bill = rentBill({
+    id: "b7", billDate: "2026-10-01", amount: 10000,
+    payments: [pay("p10", 10000, "2026-10-06", { method: "bank", transactionId: "t1" })],
+  });
+  eq(books.isDebitMatched(debit), true, "matched");
+  eq(books.isMatchedBankRow(debit), true, "a matched row");
+  eq(books.bankCountedAmount(debit), 2000, "what is left of it");
+  const input = { bankRows: [debit], bills: [bill], accounts: chart2 };
+  both((basis) => {
+    const b = books.computeBooks(input, { basis });
+    eq(b.expenses.lines.bills.gross, 10000, `${basis}: the bill`);
+    eq(b.expenses.lines.bank.gross, 2000, `${basis}: the rest of the debit`);
+    eq(b.expenses.lines.bankCharges.gross, 26.88, `${basis}: its fee`);
+    eq(b.expenses.total, 12026.88, `${basis}: the money that left, once`);
+  });
+  // An older match with no matchedAmount: the whole debit is the payment's.
+  const whole = { ...debit, amount: 10000, matchedAmount: null };
+  eq(books.computeBooks({ bankRows: [whole], bills: [bill], accounts: chart2 }, { basis: "paid" }).expenses.total, 10026.88);
+  // Unlinked again (the payment deleted), the debit counts as before.
+  const freed = { ...debit, matchedBillId: null, matchedAmount: null };
+  eq(books.computeBooks({ bankRows: [freed], accounts: chart2 }, { basis: "paid" }).expenses.lines.bank.gross, 12000);
+});
+test("a bill payment's day is its Lagos day", () => {
+  const input = { bills: [rentBill({ payments: [pay("p11", 900, new Date("2026-10-31T23:30:00Z"))] })], accounts: chart2 };
+  eq(books.computeBooks(input, { basis: "paid", ...month("10") }).expenses.total, 0, "not October");
+  eq(books.computeBooks(input, { basis: "paid", ...month("11") }).expenses.total, 900, "the 1st of November in Lagos");
+  const late = { bills: [rentBill({ billDate: new Date("2026-10-31T23:30:00Z"), payments: [] })], accounts: chart2 };
+  eq(books.computeBooks(late, { basis: "sold", ...month("11") }).expenses.total, 50000, "a bill dated that late is November's");
+});
+test("bookRows: a row per payment (when paid) and per bill (when sold) with its account, adding up to the totals", () => {
+  const input = {
+    bills: [
+      rentBill(),
+      rentBill({ id: "b8", accountId: "loans", amount: 9000, payments: [pay("p12", 9000, "2026-10-07")] }),
+      rentBill({ id: "b9", accountId: null, vendorName: "", billNumber: "INV-77", amount: 400, payments: [pay("p13", 400, "2026-10-08")] }),
+      { id: "b10", accountId: "cogs", billDate: "2026-09-10", amount: 1000, estimated: true, name: "Old payable",
+        payments: [pay("p14", 600, "2026-09-11", { outsideBooks: true })] },
+    ],
+    bankRows: [{ id: "t9", type: "expense", amount: 500, date: "2026-10-09" }],
+    sales: [{ id: "s1", amount: 7000, date: "2026-10-09" }],
+    accounts: chart2,
+  };
+  both((basis) => {
+    const rows = books.bookRows(input, basis);
+    const b = books.computeBooks(input, { basis });
+    eq(sumOf(rows.filter((r) => r.type === "expense")), b.expenses.total, `${basis} expenses`);
+    eq(sumOf(rows.filter((r) => r.type === "income")), b.sales.gross, `${basis} income`);
+    eq(new Set(rows.map((r) => r.id)).size, rows.length, `${basis}: ids are unique`);
+  });
+  const paidRows = books.bookRows(input, "paid").filter((r) => r.source === "bill_payment");
+  assert.deepStrictEqual(
+    paidRows.map((r) => [r.id, r.amount, r.date, r.accountId, r.billId, r.paymentId, r.paymentMethod, r.description]),
+    [
+      ["bp_p1", 20000, "2026-10-05", "rent", "b1", "p1", "cash", "Landlord"],
+      ["bp_p2", 10000, "2026-11-03", "rent", "b1", "p2", "transfer", "Landlord"],
+      ["bp_p13", 400, "2026-10-08", null, "b9", "p13", "cash", "INV-77"],
+    ],
+  );
+  const soldRows = books.bookRows(input, "sold").filter((r) => r.source === "bill");
+  assert.deepStrictEqual(
+    soldRows.map((r) => [r.id, r.amount, r.date, r.accountId, r.billId, r.description]),
+    [
+      ["bill_b1", 50000, "2026-10-02", "rent", "b1", "Landlord"],
+      ["bill_b9", 400, "2026-10-02", null, "b9", "INV-77"],
+      ["bill_b10", 400, "2026-09-10", "cogs", "b10", "Old payable"],
+    ],
+  );
+});
+test("the VAT estimate takes in bills on spending on their bill date (the part the books carry), never a loan", () => {
+  const input = {
+    bills: [
+      rentBill({ id: "v1", billDate: "2026-10-02", amount: 10750, payments: [] }),
+      { id: "v2", accountId: "cogs", billDate: "2026-10-03", amount: 32250, estimated: true,
+        payments: [pay("vp1", 21500, "2026-10-03", { outsideBooks: true })] },
+      rentBill({ id: "v3", accountId: "loans", billDate: "2026-10-04", amount: 107500, payments: [] }),
+      rentBill({ id: "v4", accountId: null, billDate: "2026-10-05", amount: 1075, payments: [] }),
+      rentBill({ id: "v5", billDate: "2026-09-30", amount: 10750, payments: [pay("vp2", 10750, "2026-10-06")] }),
+      rentBill({ id: "v6", billDate: new Date("2026-10-31T23:30:00Z"), amount: 2150, payments: [] }),
+    ],
+    expenses: [{ id: "e1", amount: 2150, date: "2026-10-07", accountId: "rent" }],
+    accounts: chart2,
+  };
+  const r = books.vatReturn(input, "2026-10", VAT);
+  // 750 + 750 (the open part of v2) + 75 (no account) + 150 (the expense); v3
+  // is a loan, v5 is September's (its October payment is not a purchase), v6
+  // is November's in Lagos.
+  eq(r.inputEstimate, 1725);
+  eq(r.payable, -1725);
+  eq(books.vatReturn({ bills: input.bills, accounts: chart2 }, "2026-09", VAT).inputEstimate, 750, "September: v5");
+  eq(books.vatReturn(input, "2026-10", { enabled: false }).inputEstimate, 0, "no VAT, no estimate");
+});
+
+console.log("\n── Manual journals");
+const journal = (id, date, lines, over = {}) => ({
+  id, number: `MJ-${id}`, date, status: "published", note: `note ${id}`,
+  lines: lines.map(([accountId, debit, credit], i) => ({ id: `${id}l${i}`, accountId, debit, credit })),
+  ...over,
+});
+const journals = [
+  // Rent paid ahead, now used: into spending, out of the prepayment.
+  journal("j1", "2026-10-10", [["rent", 30000, 0], ["prepaid", 0, 30000]]),
+  // Interest the owner put in as capital: other income.
+  journal("j2", "2026-10-12", [["equity", 5000, 0], ["interest", 0, 5000]]),
+  // A correction: sales and their cost both down, the difference from cash.
+  journal("j3", "2026-10-15", [["sales", 2000, 0], ["cogs", 0, 500], ["cash", 0, 1500]]),
+  // Balance sheet only: cash banked.
+  journal("j4", "2026-10-16", [["furniture", 9000, 0], ["cash", 0, 9000]]),
+];
+test("published journal lines on income count as sales, on spending as expenses, in both views; the balance sheet nowhere", () => {
+  both((basis) => {
+    const b = books.computeBooks({ journals, accounts: chart2 }, { basis });
+    eq(b.sales.lines.journals.gross, 3000, `${basis}: 5,000 of interest less 2,000 of sales`);
+    eq(b.sales.lines.journals.count, 2, `${basis}: two income lines`);
+    eq(b.expenses.lines.journals.gross, 29500, `${basis}: 30,000 of rent less 500 of cost`);
+    eq(b.sales.total, 3000, basis);
+    eq(b.expenses.total, 29500, basis);
+    eq(b.profit, -26500, basis);
+  });
+});
+test("a journal carries no VAT: with VAT on, all of it is sales", () => {
+  both((basis) => {
+    const b = books.computeBooks({ journals, accounts: chart2 }, { basis, vat: VAT });
+    eq(b.sales.lines.journals.vat, 0, basis);
+    eq(b.sales.total, 3000, basis);
+  });
+});
+test("a draft, an unbalanced journal, or one naming an account the chart doesn't know counts nowhere", () => {
+  const bad = [
+    journal("d1", "2026-10-10", [["rent", 100, 0], ["cash", 0, 100]], { status: "draft" }),
+    journal("d2", "2026-10-10", [["rent", 100, 0], ["cash", 0, 99.99]]),
+    journal("d3", "2026-10-10", [["rent", 100, 0], ["gone", 0, 100]]),
+    journal("d4", "2026-10-10", []),
+  ];
+  for (const j of bad) eq(books.journalInBooks(j, chart2), false, j.id);
+  both((basis) => {
+    eq(books.computeBooks({ journals: bad, accounts: chart2 }, { basis }).expenses.total, 0, basis);
+    eq(books.bookRows({ journals: bad, accounts: chart2 }, basis).length, 0, `${basis} rows`);
+  });
+  // Without the chart nothing can be told apart, so nothing counts.
+  eq(books.computeBooks({ journals }, { basis: "paid" }).expenses.total, 0, "no chart");
+});
+test("debits equal credits to the kobo, not to the float", () => {
+  const j = journal("k1", "2026-10-10", [["rent", 0.1, 0], ["rent", 0.2, 0], ["cash", 0, 0.3]]);
+  eq(books.journalInBooks(j, chart2), true, "0.1 + 0.2 = 0.3 in kobo");
+  eq(books.computeBooks({ journals: [j], accounts: chart2 }, { basis: "paid" }).expenses.total, 0.3);
+});
+test("a journal counts on its own (Lagos) day", () => {
+  const late = [journal("n1", new Date("2026-10-31T23:30:00Z"), [["rent", 700, 0], ["cash", 0, 700]])];
+  eq(books.computeBooks({ journals: late, accounts: chart2 }, { basis: "sold", ...month("10") }).expenses.total, 0, "not October");
+  eq(books.computeBooks({ journals: late, accounts: chart2 }, { basis: "paid", ...month("11") }).expenses.total, 700, "November");
+  eq(books.computeBooks({ journals, accounts: chart2 }, { basis: "paid", from: "2026-10-11", to: "2026-10-31" }).expenses.total, -500, "after j1");
+});
+test("bookRows: a row per counted journal line with its account and journal, adding up; none for the balance sheet", () => {
+  const input = { journals, bankRows: [{ id: "t1", type: "expense", amount: 300, date: "2026-10-10" }], accounts: chart2 };
+  both((basis) => {
+    const rows = books.bookRows(input, basis);
+    const b = books.computeBooks(input, { basis });
+    eq(sumOf(rows.filter((r) => r.type === "expense")), b.expenses.total, `${basis} expenses`);
+    eq(sumOf(rows.filter((r) => r.type === "income")), b.sales.gross, `${basis} income`);
+    assert.deepStrictEqual(
+      rows.filter((r) => r.source === "journal").map((r) => [r.id, r.type, r.amount, r.accountId, r.journalId, r.date]),
+      [
+        ["mj_j1l0", "expense", 30000, "rent", "j1", "2026-10-10"],
+        ["mj_j2l1", "income", 5000, "interest", "j2", "2026-10-12"],
+        ["mj_j3l0", "income", -2000, "sales", "j3", "2026-10-15"],
+        ["mj_j3l1", "expense", -500, "cogs", "j3", "2026-10-15"],
+      ],
+      basis,
+    );
+  });
+});
+
+console.log("\n── Bills and journals beside everything else");
+test("every view's rows still add up with bills, journals, fees, itemized expenses and links together", () => {
+  const input = {
+    sales: [{ id: "s1", amount: 5000, date: "2026-10-01" }],
+    expenses: [itemized()],
+    bankRows: [
+      { id: "t1", type: "expense", amount: 10000, fee: 53.75, matchedBillId: "b1", matchedAmount: 8000, date: "2026-10-05" },
+      { id: "t2", type: "income", amount: 3000, date: "2026-10-06" },
+    ],
+    bills: [rentBill({ payments: [pay("p1", 8000, "2026-10-05", { method: "bank", transactionId: "t1" })] })],
+    journals,
+    accounts: chart2,
+  };
+  both((basis) => {
+    const rows = books.bookRows(input, basis);
+    const b = books.computeBooks(input, { basis });
+    eq(sumOf(rows.filter((r) => r.type === "expense")), b.expenses.total, `${basis} expenses`);
+    eq(sumOf(rows.filter((r) => r.type === "income")), b.sales.gross, `${basis} income`);
+    eq(new Set(rows.map((r) => r.id)).size, rows.length, `${basis}: ids are unique`);
+  });
+  // The debit: 8,000 is the bill's payment (paid view) or inside the bill
+  // (sold view), 2,000 still counts as a debit, the fee as a bank charge.
+  eq(books.computeBooks(input, { basis: "paid" }).expenses.total, 10200 + 8000 + 2000 + 53.75 + 29500);
+  eq(books.computeBooks(input, { basis: "sold" }).expenses.total, 10200 + 50000 + 2000 + 53.75 + 29500);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -4,6 +4,7 @@ const prisma = require("../utils/db");
 const { validateSale, validateIdParam } = require("../middleware/validate");
 const { normalizeChannel } = require("../utils/salesChannel");
 const { assertAccountUsable, invalidateLedger } = require("../utils/ledgerData");
+const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 
 router.use(auth);
 
@@ -122,11 +123,15 @@ router.post("/", validateSale, async (req, res) => {
     }
     const isStaff = req.user.accountType === "staff";
     const ownerId = getTargetUserId(req);
+    const when = date ? new Date(date) : new Date();
     // Checked and saved under the business lock, which an account merge or
     // delete also takes (routes/ledger.js), so every account checked here is
     // still there when the sale is saved with it (as POST /expenses does).
     const lockedForBusiness = (fn) => (businessId ? prisma.withBusinessLock(businessId, fn) : fn());
     const { sale, debt } = await lockedForBusiness(async () => {
+      // The lock date (utils/booksLock.js): nothing dated on or before it is
+      // added. Asked under the lock it is set under.
+      await assertUnlocked(businessId || null, when);
       // The chart of accounts: what the sale counts as (an income account, Sales
       // when none) and where the money went (by payment method when none). A
       // refusal names the field, so the app knows which of the two to leave out.
@@ -140,16 +145,15 @@ router.post("/", validateSale, async (req, res) => {
       // Sold on credit to a known customer: open that customer's debt for it in
       // the same transaction. Books rule: the sale then counts when the customer
       // pays (through the debt's payments), not on the day it was recorded.
-      // The customer must be this business's (or one with no business yet):
-      // another business's customer would carry the debt into its books.
+      // Every customer belongs to one business (release 2), whose books count
+      // their debts, so the customer must be this sale's business's: another
+      // business's would carry the debt into its books, and one with no
+      // business (its business was deleted) into none. A sale with no business
+      // opens no debt.
       const creditCustomer =
-        isCredit && customerId
+        isCredit && customerId && businessId
           ? await prisma.customer.findFirst({
-              where: {
-                id: String(customerId),
-                userId: ownerId,
-                ...(businessId ? { OR: [{ businessId }, { businessId: null }] } : {}),
-              },
+              where: { id: String(customerId), userId: ownerId, businessId },
               select: { id: true },
             })
           : null;
@@ -165,7 +169,7 @@ router.post("/", validateSale, async (req, res) => {
             isCredit,
             notes: notes || null,
             channel: normalizeChannel(channel),
-            date: date ? new Date(date) : new Date(),
+            date: when,
             recordedBy: req.user.id,
             recordedByName: req.user.name,
             accountId: account ? account.id : null,
@@ -227,7 +231,18 @@ router.patch("/:id", validateIdParam, async (req, res) => {
         ? await assertAccountUsable(sale0.businessId, depositAccountId, "money", { field: "depositAccountId" }) : undefined;
       return prisma.$transaction(async (px) => {
         const sale = await px.sales.findUnique({ where: { id: sale0.id } });
+        if (!sale) throw Object.assign(new Error("Sale not found"), { status: 404, code: "SALE_NOT_FOUND" });
         const debt = await px.debt.findFirst({ where: { saleId: sale.id } });
+        // The lock date: the sale's day before and after the edit, its debt's,
+        // and, when the amount changes, the day of the transfer it is matched
+        // to (whose part left unexplained changes with it).
+        const matched = sale.matchedTransactionId && amount !== undefined
+          ? await px.transaction.findUnique({ where: { id: sale.matchedTransactionId }, select: { date: true } })
+          : null;
+        await assertUnlockedIn(
+          px, sale.businessId, sale.date, date !== undefined ? new Date(date) : null,
+          debt ? debt.date : null, matched ? matched.date : null,
+        );
         const newAmount = amount !== undefined ? Number(amount) : Number(sale.amount);
         const toCredit = paymentMethod !== undefined ? paymentMethod === "credit" : !!sale.isCredit;
         if (debt && debt.paidAmount > 0 && (newAmount !== Number(sale.amount) || !toCredit)) {
@@ -266,15 +281,11 @@ router.patch("/:id", validateIdParam, async (req, res) => {
           });
           await refreshTotalOwed(px, debt.customerId);
         } else if (
-          !debt && toCredit && !sale.isCredit && sale.customerId &&
-          // Only the seller's own customer (this business's or one with no
-          // business), as when the sale is created on credit.
+          !debt && toCredit && !sale.isCredit && sale.customerId && sale.businessId &&
+          // Only this business's own customer, as when the sale is created
+          // on credit.
           (await px.customer.count({
-            where: {
-              id: sale.customerId,
-              userId: sale.userId,
-              ...(sale.businessId ? { OR: [{ businessId: sale.businessId }, { businessId: null }] } : {}),
-            },
+            where: { id: sale.customerId, userId: sale.userId, businessId: sale.businessId },
           }))
         ) {
           // Now on credit: open the customer's debt for it.
@@ -326,6 +337,15 @@ router.delete("/:id", validateIdParam, async (req, res) => {
         const fresh = await px.sales.findUnique({ where: { id: sale.id } });
         if (!fresh) return;
         const debt = await px.debt.findFirst({ where: { saleId: fresh.id } });
+        // The lock date: the sale's day, its debt's, and the day of a transfer
+        // it frees (which counts on its own again).
+        const matched = fresh.matchedTransactionId
+          ? await px.transaction.findUnique({ where: { id: fresh.matchedTransactionId }, select: { date: true, matchedSaleId: true } })
+          : null;
+        await assertUnlockedIn(
+          px, fresh.businessId, fresh.date, debt ? debt.date : null,
+          matched && matched.matchedSaleId === fresh.id ? matched.date : null,
+        );
         if (debt && debt.paidAmount > 0) {
           throw Object.assign(new Error("The customer has paid part of this credit sale, so it can't be deleted."), {
             status: 409, code: "CREDIT_SALE_PAID",

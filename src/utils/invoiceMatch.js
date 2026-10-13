@@ -12,10 +12,17 @@
 // Matching stays deliberately conservative: exactly ONE open invoice whose
 // remaining balance equals the credit to the kobo, issued in the last 90
 // days. Zero or several candidates → do nothing, the merchant decides.
+//
+// The lock date (chart of accounts release 2, utils/booksLock.js): a credit
+// dated on or before it is left alone. The bank row itself is always booked
+// (the caller has done that already); only the payment the matcher would add
+// on that locked day is skipped, as a person's match would be refused there.
+// The merchant can still apply the credit by hand once the books are open.
 const prisma = require("./db");
 const { sameMoney } = require("./money");
 const { pushTo } = require("./pushNotification");
 const { recalcInvoiceStatus } = require("./invoiceStatus");
+const { lockDateOf, isLocked } = require("./booksLock");
 
 // transactionId: the bank credit just booked. The payment links it and the
 // credit is marked as having paid the invoice (books rule: the payment carries
@@ -89,6 +96,10 @@ async function tryMatchInvoice(biz, amount, reference, { currency, transactionId
           return false;
         }
       }
+      // The payment would land on the credit's day (today for an old caller
+      // that names no credit). On or before the lock date: skipped, never
+      // refused, so the caller's booking of the credit stands.
+      if (isLocked(await lockDateOf(biz.id, px), tx ? tx.date : new Date())) return false;
       await px.invoicePayment.create({
         data: {
           invoiceId: inv.id,

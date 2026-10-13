@@ -3,13 +3,17 @@
 // matched bank rows, purposes, invoice payments of every kind, credit notes,
 // write-offs, voids, quotes), and, with { chart: true }, what the chart of
 // accounts added (accounts on records, fees, other currencies, payment
-// methods, invoice lines, bank links, itemized expenses).
+// methods, invoice lines, bank links, itemized expenses) and release 2 added
+// (bills on spending and on liabilities, with payments, payables from before
+// bills with an estimated payment outside the books, loans received into a
+// money account; manual journals, published and draft, now and then one the
+// books must refuse).
 //
-// The bank links drawn by default are one-sided ("t-sale", "x"): enough for
-// the books rule, which reads each side on its own. With { links: true } they
-// are real instead (linkRecords): each linked record and its bank row name
-// each other, with amounts as the routes save them, so Bank Matching, where
-// the two meet in the ledger, must come back to zero.
+// The bank links drawn by default are one-sided ("t-sale", "x", "t-bill"):
+// enough for the books rule, which reads each side on its own. With
+// { links: true } they are real instead (linkRecords): each linked record and
+// its bank row name each other, with amounts as the routes save them, so Bank
+// Matching, where the two meet in the ledger, must come back to zero.
 const chartLib = require("../../src/utils/chart");
 
 // mulberry32: small, seeded, reproducible.
@@ -37,6 +41,22 @@ function makeGen(r) {
   let n = 0;
   const id = (p) => `${p}${++n}`;
   return { int, pick, chance, money, day, when, id };
+}
+
+const MATCH_FIELDS = ["matchedSaleId", "matchedCustomerId", "matchedInvoiceId", "matchedExpenseId", "matchedBillId"];
+const isMatched = (tx) => MATCH_FIELDS.some((k) => tx[k]);
+
+// `total` kobo (≥ parts) in `parts` random pieces of at least one kobo each.
+function pieces(g, total, parts) {
+  const out = [];
+  let left = total;
+  for (let i = parts; i > 1; i--) {
+    const k = g.int(1, left - (i - 1));
+    out.push(k);
+    left -= k;
+  }
+  out.push(left);
+  return out;
 }
 
 // The default chart with ids, as a business would have it.
@@ -141,8 +161,9 @@ function randomInput(g, opts = {}) {
         : g.pick(["customer_refund", "savings_fee"]);
     }
     if (income && !tx.purpose && g.chance(0.3)) tx[g.pick(["matchedSaleId", "matchedCustomerId", "matchedInvoiceId"])] = "x";
-    if (!income && !tx.purpose && g.chance(0.3)) tx.matchedExpenseId = "x";
-    if ((tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.matchedExpenseId) && g.chance(0.7)) {
+    // A debit records an expense, or (release 2) pays a bill.
+    if (!income && !tx.purpose && g.chance(0.3)) tx[withChart && g.chance(0.4) ? "matchedBillId" : "matchedExpenseId"] = "x";
+    if (isMatched(tx) && g.chance(0.7)) {
       tx.matchedAmount = Math.round(amount * g.int(10, 100)) / 100;
     }
     if (!income && g.chance(0.4)) tx.fee = g.pick([0, 10.75, 26.88, 53.75]);
@@ -152,7 +173,7 @@ function randomInput(g, opts = {}) {
       tx.category = income ? "transfer" : g.chance(0.95) ? "transfer" : "other";
       tx.currency = g.chance(0.05) ? "EUR" : "NGN";
       if (tx.currency !== "NGN") tx.foreignCurrency = true;
-      if (!tx.purpose && !(tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.matchedExpenseId) && g.chance(0.3)) {
+      if (!tx.purpose && !isMatched(tx) && g.chance(0.3)) {
         tx.accountId = income ? maybeAccount(["income", "expense", "equity", "liability"], 1) : maybeAccount(["expense", "equity", "asset"], 1);
         const cls = chartLib.classOf((accounts.find((a) => a.id === tx.accountId) || {}).type);
         if (cls === "asset" || cls === "liability" || cls === "equity") tx.purpose = "account";
@@ -211,12 +232,95 @@ function randomInput(g, opts = {}) {
   }
   const input = { sales, expenses, bankRows, invoices, debts };
   if (withChart) {
+    input.bills = randomBills(g, accounts, moneyAccounts);
+    input.journals = randomJournals(g, accounts);
     input.accounts = {};
     for (const a of accounts) input.accounts[a.id] = { cls: chartLib.classOf(a.type), type: a.type };
     // Drawn after everything above, so books drawn without it stay the same.
     if (opts.links) linkRecords(g, input, moneyAccounts);
   }
   return input;
+}
+
+// Bills as routes/bills.js and scripts/backfill-r2.js save them (release 2):
+// mostly on spending (the "bill" picker), some on a loan or another liability
+// (received into a money account, or into equipment, or nowhere named), now
+// and then one with no account or one this chart does not know. Payments add
+// up to no more than the bill, by every method, sometimes from a money
+// account picked for them, sometimes "bank" with a one-sided link ("t-bill").
+// A payable from before bills (estimated) carries one payment kept outside
+// the books.
+function randomBills(g, accounts, moneyAccounts) {
+  const allowed = accounts.filter((a) => chartLib.pickerAllows("bill", a));
+  const spending = allowed.filter((a) => chartLib.classOf(a.type) === "expense");
+  const owed = allowed.filter((a) => chartLib.classOf(a.type) === "liability");
+  const into = [...moneyAccounts, ...accounts.filter((a) => a.type === "fixed_asset")];
+  const bills = [];
+  for (let i = 0, k = g.int(0, 4); i < k; i++) {
+    const roll = g.int(1, 20);
+    const acc = roll <= 13 ? g.pick(spending) : roll <= 18 ? g.pick(owed) : null;
+    const amount = g.money();
+    const bill = {
+      id: g.id("b"), accountId: acc ? acc.id : roll === 19 ? null : "acc-gone", billDate: g.when(), amount,
+      estimated: false, vendorName: g.pick(["Ada Supplies", "Landlord", "", "First Bank"]), billNumber: g.chance(0.3) ? `B-${i}` : null,
+      receivedViaAccountId: null, payments: [],
+    };
+    if (acc && chartLib.classOf(acc.type) === "liability" && g.chance(0.7) && into.length) bill.receivedViaAccountId = g.pick(into).id;
+    let left = Math.round(amount * 100);
+    if (g.chance(0.2)) {
+      bill.estimated = true;
+      const outside = Math.min(left, Math.round(g.money() * 100));
+      bill.payments.push({
+        id: g.id("bp"), amount: outside / 100, date: g.when(), method: "cash", transactionId: null,
+        estimated: true, outsideBooks: true, note: "Paid before bills",
+      });
+      left -= outside;
+    }
+    for (let j = 0, m = g.int(0, 3); j < m && left > 0; j++) {
+      const a = Math.min(left, Math.round(g.money() * 100));
+      left -= a;
+      const p = {
+        id: g.id("bp"), amount: a / 100, date: g.when(), method: g.pick(["cash", "transfer", "pos", "cheque", "other"]),
+        transactionId: null, outsideBooks: false, paidThroughAccountId: null,
+      };
+      if (g.chance(0.2) && moneyAccounts.length) p.paidThroughAccountId = g.pick(moneyAccounts).id;
+      if (g.chance(0.15)) {
+        p.method = "bank";
+        p.transactionId = "t-bill";
+      }
+      bill.payments.push(p);
+    }
+    bills.push(bill);
+  }
+  return bills;
+}
+
+// Manual journals (release 2): two to four lines, debits equal to credits to
+// the kobo, on any account a journal may name (chart.pickerAllows "journal":
+// income, spending and the balance sheet alike). Mostly published, some
+// drafts; now and then a published one the books must refuse (unbalanced, or
+// naming an account this chart does not know), which the route never saves.
+function randomJournals(g, accounts) {
+  const usable = accounts.filter((a) => chartLib.pickerAllows("journal", a));
+  const journals = [];
+  for (let i = 0, k = g.int(0, 3); i < k; i++) {
+    const n = g.int(2, 4);
+    const debits = g.int(1, n - 1);
+    const total = Math.max(n, Math.round(g.money() * 100));
+    const amounts = [...pieces(g, total, debits), ...pieces(g, total, n - debits)];
+    const lines = amounts.map((k2, j) => ({
+      id: g.id("jl"), accountId: g.pick(usable).id, position: j,
+      debit: j < debits ? k2 / 100 : 0, credit: j < debits ? 0 : k2 / 100,
+    }));
+    const roll = g.int(1, 40);
+    if (roll === 1) lines[0][lines[0].debit ? "debit" : "credit"] += 0.01;
+    if (roll === 2) lines[lines.length - 1].accountId = "acc-gone";
+    journals.push({
+      id: g.id("j"), number: `MJ-${String(i + 1).padStart(5, "0")}`, date: g.when(), note: g.pick(["", "Rent used up", "Correction"]),
+      status: g.chance(0.8) ? "published" : "draft", lines,
+    });
+  }
+  return journals;
 }
 
 // Money-in methods an invoice payment linked to a credit may have had.
@@ -226,13 +330,17 @@ const MONEY_IN = ["cash", "card", "cheque", "transfer", "pos", "other", "bank"];
 // sale (POST /transactions/:id/match: matchedAmount the smaller of the two, or
 // an older match's NULL on a credit no bigger than its sale), applied to one
 // or two repayments (match-debt), or carrying an invoice payment ("bank"); a
-// debit recording an expense (create-expense: never below it), or paying out
-// a credit note's refund (purpose customer_refund). Linked records sometimes
+// debit recording an expense (create-expense: never below it), paying a bill
+// (release 2, POST /bills/:id/payments with method "bank": matchedBillId, and
+// matchedAmount the payment, never more than the debit), or paying out a
+// credit note's refund (purpose customer_refund). Linked records sometimes
 // name a money account of their own too, which the link beats. Every other
 // way into Bank Matching is taken out first: the one-sided links, a refund
-// "to the bank" with no debit, a customer refund with no refund.
+// "to the bank" with no debit, a customer refund with no refund, a bill
+// payment "from the bank" with no debit.
 function linkRecords(g, input, moneyAccounts) {
   const { sales, expenses, bankRows, invoices, debts } = input;
+  const bills = input.bills || [];
   const pick = () => (moneyAccounts.length && g.chance(0.3) ? g.pick(moneyAccounts).id : null);
   for (const s of sales) delete s.matchedTransactionId;
   for (const e of expenses) delete e.matchedTransactionId;
@@ -243,8 +351,14 @@ function linkRecords(g, input, moneyAccounts) {
       if (p.method === "refund_bank") p.method = "refund_transfer";
     }
   }
+  for (const b of bills) {
+    for (const p of b.payments) {
+      p.transactionId = null;
+      if (p.method === "bank") p.method = "transfer";
+    }
+  }
   for (const t of bankRows) {
-    for (const k of ["matchedSaleId", "matchedCustomerId", "matchedInvoiceId", "matchedExpenseId", "matchedAmount"]) delete t[k];
+    for (const k of [...MATCH_FIELDS, "matchedAmount"]) delete t[k];
     if (t.purpose === "customer_refund") t.purpose = null;
   }
   const take = (list) => list.splice(g.int(0, list.length - 1), 1)[0];
@@ -261,11 +375,14 @@ function linkRecords(g, input, moneyAccounts) {
     refund: invoices
       .filter((i) => i.type === "credit_note" && i.status !== "void")
       .flatMap((i) => i.payments.filter((p) => p.method.startsWith("refund_")).map((p) => ({ p }))),
+    // Any payment towards a bill that is in the books, on spending or a loan.
+    billPayment: bills.flatMap((b) => b.payments.filter((p) => !p.outsideBooks).map((p) => ({ b, p }))),
   };
   for (const t of bankRows) {
     // Only a row nothing explains yet can be linked (the routes refuse others).
     if (t.purpose || t.accountId || t.foreignCurrency || !g.chance(0.7)) continue;
-    const kinds = (t.type === "income" ? ["sale", "repayment", "invoicePayment"] : ["expense", "refund"]).filter((k) => open[k].length);
+    const kinds = (t.type === "income" ? ["sale", "repayment", "invoicePayment"] : ["expense", "refund", "billPayment"])
+      .filter((k) => open[k].length);
     if (!kinds.length) continue;
     const kind = g.pick(kinds);
     // An older match saved no matchedAmount: the whole row is the record's.
@@ -318,6 +435,13 @@ function linkRecords(g, input, moneyAccounts) {
       e.paidThroughAccountId = pick() || e.paidThroughAccountId;
       t.matchedExpenseId = e.id;
       settle(e.amount);
+    } else if (kind === "billPayment") {
+      const { b, p } = take(open.billPayment);
+      p.method = "bank";
+      p.transactionId = t.id;
+      p.paidThroughAccountId = pick();
+      t.matchedBillId = b.id;
+      settle(p.amount);
     } else {
       const { p } = take(open.refund);
       p.method = "refund_bank";
@@ -339,4 +463,4 @@ function randomOpts(g) {
   return { from, to, basis: g.pick(["paid", "sold"]), vat };
 }
 
-module.exports = { rng, makeGen, seededChart, randomInput, randomOpts };
+module.exports = { rng, makeGen, seededChart, randomInput, randomOpts, randomBills, randomJournals };
