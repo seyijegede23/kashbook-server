@@ -84,6 +84,44 @@ function normalizeAmount(raw) {
   return n ? n / 100 : 0;
 }
 
+// How far apart the list's time and the webhook's paidAt may be for one
+// credit (live: a few seconds). The webhook's own repair uses the same window.
+const TWIN_WINDOW_MS = 5 * 60 * 1000;
+
+// The webhook-booked row (anc_pay_) that a credit on Anchor's list stands for,
+// when the list cannot name its Payment: same business, same exact amount,
+// within TWIN_WINDOW_MS of the list's time, and not yet claimed by another
+// list credit. Claiming writes the list's id into providerTxnId (the payment
+// id stays in the reference), so each webhook row stands for ONE list credit:
+// two same-amount credits the webhook booked are claimed one each, and a third
+// it missed finds nothing free and is booked. The closest free row is taken;
+// between two same-amount credits that only swaps which sender a row shows,
+// never the money. Under the business lock, as the webhook's repair is.
+async function claimWebhookTwin(biz, { amount, at, providerId }) {
+  const when = at ? new Date(at).getTime() : NaN;
+  if (!Number.isFinite(when) || !providerId) return null;
+  return prisma.withBusinessLock(biz.id, async () => {
+    const rows = await prisma.transaction.findMany({
+      where: {
+        businessId: biz.id,
+        source: "anchor",
+        type: "income",
+        amount,
+        reference: { startsWith: "anc_pay_" },
+        date: { gte: new Date(when - TWIN_WINDOW_MS), lte: new Date(when + TWIN_WINDOW_MS) },
+      },
+      select: { id: true, reference: true, providerTxnId: true, date: true },
+    });
+    // Unclaimed: the webhook's own row still carries the payment id (or none).
+    const free = rows.filter((r) => !r.providerTxnId || r.reference === `anc_pay_${r.providerTxnId}`);
+    if (!free.length) return null;
+    free.sort((x, y) => Math.abs(new Date(x.date).getTime() - when) - Math.abs(new Date(y.date).getTime() - when));
+    const twin = free[0];
+    await prisma.transaction.update({ where: { id: twin.id }, data: { providerTxnId: providerId } });
+    return twin;
+  });
+}
+
 async function reconcileBusiness(biz, { onCreate } = {}) {
   const txs = await fetchAnchorTransactions(biz.anchorAccountId);
   let created = 0;
@@ -126,11 +164,26 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
         source: "anchor",
         OR: [
           { reference: { in: candidateRefs } },
+          // A row the webhook repaired, or one this poller claimed below,
+          // keeps the id this list shows in providerTxnId (its reference is
+          // the webhook's anc_pay_ key, so the keys above miss it).
+          { providerTxnId: { in: [...new Set([t.id, reference].filter(Boolean))] } },
           { description: { contains: reference } },
         ],
       },
     });
     if (existing) continue;
+
+    // Webhook first, this list without a Payment link: the webhook booked this
+    // money as anc_pay_<paymentId>, an id this list never shows, so no key
+    // above can find it. Claim that row instead of booking the money twice.
+    if (!paymentRelId && !transferRelId) {
+      const twin = await claimWebhookTwin(biz, { amount, at: a.createdAt, providerId: t.id || reference });
+      if (twin) {
+        console.log(`[reconcile] ${biz.name} ₦${amount} ${reference} is the webhook's ${twin.reference}: claimed, not booked again`);
+        continue;
+      }
+    }
 
     // The sender lives on a related resource (Payment for NIP, transfer for
     // book) — not the transaction attrs. Follow whichever applies.
@@ -322,6 +375,8 @@ function startReconciliationLoop(intervalMs = 2 * 60 * 1000) {
 }
 
 module.exports = {
+  TWIN_WINDOW_MS,
+  claimWebhookTwin,
   reconcileAll,
   reconcileBusiness,
   resolveCreditSender,
