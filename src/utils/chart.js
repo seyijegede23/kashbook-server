@@ -76,11 +76,13 @@ const SYS = {
   OPENING: "opening_balance_adj",
   RETAINED: "retained_earnings",
   SALES: "sales",
+  SERVICE_INCOME: "service_income",
   DISCOUNT: "discount",
   SALES_RETURNS: "sales_returns",
   BANK_RECEIPTS: "bank_receipts",
   OTHER_INCOME: "other_income",
   COGS: "cogs",
+  COST_OF_SERVICES: "cost_of_services",
   STOCK_ADJ: "stock_adjustments",
   BAD_DEBT: "bad_debt",
   BANK_CHARGES: "bank_charges",
@@ -138,6 +140,7 @@ const DEFAULT_CHART = [
   { seed: "retained_earnings", sys: SYS.RETAINED, type: "equity", name: "Retained Earnings" },
   // Money in
   { seed: "sales", sys: SYS.SALES, type: "income", name: "Sales" },
+  { seed: "service_income", sys: SYS.SERVICE_INCOME, type: "income", name: "Service Income" },
   { seed: "discount", sys: SYS.DISCOUNT, type: "income", name: "Discount" },
   { seed: "sales_returns", sys: SYS.SALES_RETURNS, type: "income", name: "Sales Returns" },
   { seed: "general_income", type: "income", name: "General Income" },
@@ -148,6 +151,7 @@ const DEFAULT_CHART = [
   { seed: "other_income", sys: SYS.OTHER_INCOME, type: "other_income", name: "Other Income" },
   // Money out
   { seed: "cost_of_goods_sold", sys: SYS.COGS, cat: "supplies", type: "cost_of_goods_sold", name: "Cost of Goods Sold" },
+  { seed: "cost_of_services", sys: SYS.COST_OF_SERVICES, type: "cost_of_goods_sold", name: "Cost of Services" },
   { seed: "stock_adjustments", sys: SYS.STOCK_ADJ, type: "cost_of_goods_sold", name: "Stock Adjustments" },
   { seed: "advertising_marketing", cat: "marketing", type: "expense", name: "Advertising and Marketing" },
   { seed: "automobile_expense", type: "expense", name: "Automobile Expense" },
@@ -317,6 +321,18 @@ function incomeAccount(chart, accountId) {
   return explicit(chart, accountId) || sysAccount(chart, SYS.SALES);
 }
 
+// The income account a line for an item counts as when the line names none
+// of its own (release 3): the item's own account (incomeAccountId) while a
+// sale may use it (pickerAllows "income": in this chart, active, income and
+// not Discount or Sales Returns), else Service Income for a service, else
+// Sales. A typed line names no item (null): Sales.
+function incomeForItem(chart, item) {
+  const own = explicit(chart, item && item.incomeAccountId);
+  if (own && pickerAllows("income", own)) return own;
+  const service = item && item.itemType === "service" ? sysAccount(chart, SYS.SERVICE_INCOME) : null;
+  return service || sysAccount(chart, SYS.SALES);
+}
+
 // The account a bank row's purpose stands for.
 const PURPOSE_ACCOUNT = {
   cash_deposit: SYS.CASH,
@@ -430,6 +446,7 @@ module.exports = {
   moneyAccount,
   expenseAccount,
   incomeAccount,
+  incomeForItem,
   bankDebitDefaultKey,
   recurringIdOf,
   bankRowAccount,

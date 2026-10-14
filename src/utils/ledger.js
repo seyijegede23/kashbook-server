@@ -31,6 +31,20 @@
 //   - published manual journals post their lines on their date, in both
 //     views: their profit-and-loss lines from the books rule's events, the
 //     rest as written;
+//   - stock (release 3): Inventory Asset holds what the goods on hand cost,
+//     and equals the sum of every stock movement's value at any date. Goods
+//     a sale or an issued invoice takes out leave it on the document's date:
+//     "when sold" into Cost of Goods Sold, "when paid" into Goods Sold
+//     Awaiting Payment, which releases them into Cost of Goods Sold as the
+//     books count the money, or credit from a credit note is applied, and
+//     all that still waits when an invoice is written off (a sale paid on
+//     the spot: straight away). A
+//     credit note that puts goods back does the mirror. A sale's income is
+//     shared over its lines' accounts, as an invoice's is. A restock is a
+//     bill on Inventory Asset: in both views the goods come in on its bill
+//     date, owed in Accounts Payable, and each payment settles it. Stock
+//     counted or valued again moves Inventory Asset against Stock
+//     Adjustments; starting stock against Opening Balance Adjustments;
 //   - opening balances post the difference between what the merchant says an
 //     account held when the books start and what the records already put
 //     there, bills and journals included (the opening entry is built last).
@@ -144,6 +158,33 @@ function buildLedger(input, ctx) {
     return allocate(netKobo, weights).map((k, i) => ({ acc: accs[i], k }));
   }
 
+  // The kind of the entry that takes a document's goods out of stock (or, for
+  // a credit note, puts them back).
+  const costKindOf = (doc) => (lower(doc && doc.type) === "credit_note" ? "credit_note_cost" : "invoice_cost");
+
+  // The income account a line of a sale counts as (release 3): the one it
+  // names, when this chart has it as income, else Service Income for a
+  // service, else Sales.
+  function saleLineAccount(it) {
+    const own = chart.explicitAccount(C, it && it.accountId);
+    if (own && chart.classOf(own.type) === "income") return own;
+    const service = it && it.itemType === "service" ? chart.sysAccount(C, SYS.SERVICE_INCOME) : null;
+    return service || sys(SYS.SALES);
+  }
+
+  // A sale's income accounts for `netKobo` (an amount on it less its VAT): a
+  // sale with lines shares it over their accounts in proportion to their
+  // amounts (equally when every line is nothing, as a "price varies" service
+  // can be), whatever the sale's own total (a discount, or rounding); one
+  // without lines takes its own account, else Sales.
+  function saleIncomeLegs(sale, netKobo) {
+    const items = (sale && sale.items) || [];
+    if (!items.length) return [{ acc: chart.incomeAccount(C, sale && sale.accountId), k: netKobo }];
+    let weights = items.map((it) => Math.max(0, K(it && it.amount)));
+    if (!(weights.reduce((s, w) => s + w, 0) > 0)) weights = items.map(() => 1);
+    return allocate(netKobo, weights).map((k, i) => ({ acc: saleLineAccount(items[i]), k }));
+  }
+
   // ── The books rule's events: every profit-and-loss amount ─────────────────
   const { events } = books.bookEvents(input, { basis, vat: ctx.vat, allDates: true });
   const counted = books.COUNTED_LINES[basis];
@@ -168,12 +209,46 @@ function buildLedger(input, ctx) {
     }
 
     if (kind === "sale") {
-      // Its income and VAT now; its money side once the bank rows are posted.
+      // Its income (at its lines' accounts) and VAT now; its money side once
+      // the bank rows are posted.
       const v = vatLeg(ev.vat);
-      const e = entry(`sale:${rec.id}`, ev.day, "sale", rec.notes, rec.id)
-        .cr(chart.incomeAccount(C, rec.accountId), gross - v)
-        .cr(sys(SYS.VAT), v);
+      const e = entry(`sale:${rec.id}`, ev.day, "sale", rec.notes, rec.id);
+      for (const l of saleIncomeLegs(rec, gross - v)) e.cr(l.acc, l.k);
+      e.cr(sys(SYS.VAT), v);
       pendingSales.push({ e, rec, gross });
+    } else if (kind === "cost") {
+      // What the goods sold cost (release 3). On the document's date it
+      // leaves Inventory Asset for Cost of Goods Sold (a credit note's goods
+      // come back: the amount is below zero). With the money, or credit
+      // applied, or an invoice's write-off ("when paid") it moves from Goods
+      // Sold Awaiting Payment, where the document's date put it (below),
+      // into Cost of Goods Sold.
+      const via = ev.src.via;
+      if (via === "sale") {
+        entry(`cost:sale:${rec.id}`, ev.day, "sale_cost", rec.notes, rec.id).dr(sys(SYS.COGS), gross).cr(sys(SYS.STOCK), gross);
+      } else if (via === "document") {
+        entry(`cost:doc:${doc.id}`, ev.day, costKindOf(doc), doc.invoiceNumber, doc.id).dr(sys(SYS.COGS), gross).cr(sys(SYS.STOCK), gross);
+      } else if (via === "debtPayment") {
+        entry(`cost:dp:${rec.id}`, ev.day, "cost_released", rec.note || debt.note, doc.id)
+          .dr(sys(SYS.COGS), gross)
+          .cr(sys(SYS.DEFERRED_COGS), gross);
+      } else if (via === "writeOff") {
+        // An invoice written off: whatever of its goods' cost still waited.
+        entry(`cost:wo:${doc.id}`, ev.day, "cost_released", doc.invoiceNumber, doc.id)
+          .dr(sys(SYS.COGS), gross)
+          .cr(sys(SYS.DEFERRED_COGS), gross);
+      } else {
+        entry(`cost:ip:${rec.id}`, ev.day, "cost_released", doc.invoiceNumber, doc.id)
+          .dr(sys(SYS.COGS), gross)
+          .cr(sys(SYS.DEFERRED_COGS), gross);
+      }
+    } else if (kind === "stockMove") {
+      // Stock counted or valued again: Inventory Asset moves by the
+      // movement's value, against Stock Adjustments (the books' amount is
+      // minus that value).
+      entry(`stock:${rec.id}`, ev.day, `stock_${lower(rec.kind)}`, rec.note, rec.itemId || null)
+        .dr(sys(SYS.STOCK), -gross)
+        .dr(sys(SYS.STOCK_ADJ), gross);
     } else if (kind === "expense") {
       // A whole expense, or one counted line of an itemized expense (an entry
       // of its own, at the line's account), paid from the expense's money.
@@ -221,13 +296,13 @@ function buildLedger(input, ctx) {
         .dr(sys(SYS.BAD_DEBT), gross)
         .cr(sys(SYS.AR), gross);
     } else if (kind === "debtPayment") {
-      // "When paid": a repayment is the sale, at the sale's own account.
+      // "When paid": a repayment is the sale, at the sale's own accounts (its
+      // lines', when it has them).
       const sale = debt.saleId ? salesById.get(debt.saleId) : null;
       const v = vatLeg(ev.vat);
-      entry(`dp:${rec.id}`, ev.day, "repayment", rec.note || debt.note, debt.customerId)
-        .dr(repaymentMoney(rec), gross)
-        .cr(chart.incomeAccount(C, sale && sale.accountId), gross - v)
-        .cr(sys(SYS.VAT), v);
+      const e = entry(`dp:${rec.id}`, ev.day, "repayment", rec.note || debt.note, debt.customerId).dr(repaymentMoney(rec), gross);
+      for (const l of saleIncomeLegs(sale, gross - v)) e.cr(l.acc, l.k);
+      e.cr(sys(SYS.VAT), v);
     } else if (kind === "debt") {
       // "When sold": credit given on the customer screen is owed from that day.
       const v = vatLeg(ev.vat);
@@ -431,6 +506,31 @@ function buildLedger(input, ctx) {
       }
       continue;
     }
+    const acc = chart.explicitAccount(C, bill.accountId);
+    // A restock (release 3): a bill on Inventory Asset, the same in both
+    // views and never spending. On its bill date its goods come into stock
+    // at its lines' amounts (each line's stock movement carries the same
+    // value), owed in Accounts Payable, and each payment settles that. The
+    // route saves the bill's amount as the lines' sum; should the two ever
+    // differ, the difference sits in Opening Balance Adjustments, so stock
+    // still equals its movements and Accounts Payable what the bill says.
+    if (acc && acc.type === "stock") {
+      const owed = K(books.billBooksAmount(bill));
+      const lines = bill.items || [];
+      const goods = lines.length ? lines.reduce((s, it) => s + K(it && it.amount), 0) : owed;
+      if (goods || owed) {
+        entry(`bill:${bill.id}`, bill.billDate, "bill", billMemo(bill), bill.id)
+          .dr(acc, goods)
+          .cr(sys(SYS.AP), owed)
+          .dr(sys(SYS.OPENING), owed - goods);
+      }
+      for (const p of payments) {
+        const k = K(p.amount);
+        if (!k) continue;
+        billPaymentMoney(entry(`bp:${p.id}`, p.date, "bill_payment", billMemo(bill, p), bill.id).dr(sys(SYS.AP), k), p, k);
+      }
+      continue;
+    }
     // A loan or another liability (or anything else on the balance sheet),
     // the same in both views and never profit: on the bill date the money
     // borrowed comes in where the bill says it went, and each payment pays
@@ -444,7 +544,6 @@ function buildLedger(input, ctx) {
     // holds). Any other bill that names nowhere posts nothing on its date:
     // its money is where it was recorded (a starting balance, or a KashBook
     // transfer explained as a loan), and the payments still lower it.
-    const acc = chart.explicitAccount(C, bill.accountId);
     if (!acc || chart.isProfitClass(chart.classOf(acc.type))) continue;
     const via = heldIn(bill.receivedViaAccountId) || (bill.estimated ? sys(SYS.OPENING) : null);
     const owed = K(books.billBooksAmount(bill));
@@ -474,6 +573,35 @@ function buildLedger(input, ctx) {
       else if (ev.side === "sales") e.cr(acc, K(ev.gross));
       else e.dr(acc, K(ev.gross));
     }
+  }
+
+  // ── Stock: goods awaiting their money, and starting stock ────────────────
+  // "When paid", a credit sale a debt tracks and an issued document with an
+  // amount to collect (books.stockCosts: defer) take their goods out of
+  // stock on their own date into Goods Sold Awaiting Payment; the money
+  // releases them from there (the "cost" events above). So Inventory Asset
+  // moves on the same day in both views, and what is still awaited is the
+  // cost of what has not been paid for. A sale the books know only from its
+  // debt (listed false: a period's input, never the ledger's) is left out.
+  if (basis === "paid") {
+    for (const plan of books.stockCosts(input).values()) {
+      if (!plan.defer || !plan.listed) continue;
+      const isSale = plan.via === "sale";
+      entry(
+        isSale ? `cost:sale:${plan.doc.id}` : `cost:doc:${plan.doc.id}`, plan.doc[isSale ? "date" : "issueDate"],
+        isSale ? "sale_cost" : costKindOf(plan.doc), isSale ? plan.doc.notes : plan.doc.invoiceNumber, plan.doc.id,
+      ).dr(sys(SYS.DEFERRED_COGS), plan.k).cr(sys(SYS.STOCK), plan.k);
+    }
+  }
+  // Starting stock (an opening count, or the value set up for stock already
+  // held), in both views on its date: Inventory Asset against Opening Balance
+  // Adjustments, as a starting balance would be. Never profit.
+  for (const m of input.stockMoves || []) {
+    const mk = lower(m && m.kind);
+    if (mk !== "opening" && mk !== "opening_value") continue;
+    const k = K(m.value);
+    if (!k) continue;
+    entry(`stock:${m.id}`, m.date, `stock_${mk}`, m.note, m.itemId || null).dr(sys(SYS.STOCK), k).cr(sys(SYS.OPENING), k);
   }
 
   // ── Opening balances: what the merchant says each account held ───────────

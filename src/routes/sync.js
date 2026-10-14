@@ -13,6 +13,20 @@ const { accountsFor, publicAccount } = require("../utils/ledgerData");
 const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
 const { BILL_INCLUDE, billFor, booksOnlyBill } = require("../utils/billView");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
+const { SALE_ITEMS_INCLUDE, publicSale } = require("./sales").saleLines;
+const { canSeeCosts, publicItem } = require("./inventory").itemView;
+
+// The stock movements the books read beside the records (release 3): stock
+// adjusted or valued again counts in the profit (utils/books.js), and the
+// opening stock and its value are on the balance sheet. A sale's, invoice's
+// or bill's movements are read from their lines.
+const BOOKS_STOCK_KINDS = ["adjustment", "revalue", "opening", "opening_value"];
+
+// An invoice for a member without the reports: its lines without what their
+// goods cost.
+function withoutLineCosts(inv) {
+  return { ...inv, items: (inv.items || []).map((it) => ({ ...it, unitCost: null, costAmount: 0 })) };
+}
 
 router.use(auth);
 
@@ -68,10 +82,12 @@ router.get("/", async (req, res) => {
     const canSeeReports = req.user.permissions?.canViewReports === true;
     const billsForBooks = canSeeBills || canSeeBank || canSeeReports;
 
-    const [sales, expenses, transactions, customers, inventory, bills, invoices, recurring, journals] =
+    const [sales, expenses, transactions, customers, inventory, bills, invoices, recurring, journals, stockMoves] =
       await Promise.all([
+        // With their lines (release 3), which never change once saved.
         prisma.sales.findMany({
           where: { ...userScope, ...incremental },
+          include: SALE_ITEMS_INCLUDE,
           orderBy,
           take: txCap,
         }),
@@ -140,6 +156,16 @@ router.get("/", async (req, res) => {
             orderBy: [{ date: "asc" }, { id: "asc" }],
           })
           : [],
+        // The stock movements the books count (BOOKS_STOCK_KINDS), whole on
+        // every pull like the adjustments above: their values are costs, the
+        // reports' figure, so only those members get them.
+        canSeeReports
+          ? prisma.stockMovement.findMany({
+            where: { businessId, kind: { in: BOOKS_STOCK_KINDS } },
+            select: { id: true, itemId: true, kind: true, reason: true, date: true, quantity: true, value: true },
+            orderBy: [{ date: "asc" }, { id: "asc" }],
+          })
+          : [],
       ]);
     // The chart of accounts, whole on every pull (a business has well under
     // a hundred): every member picks accounts, nobody gets amounts from it.
@@ -168,26 +194,40 @@ router.get("/", async (req, res) => {
     //   journals     — published adjustments: canViewReports, as on the
     //                  journals routes.
     //
+    //   costs        — what goods cost (an item's stockValue and avgCost, a
+    //                  sale line's unitCost and costAmount, stockMoves): the
+    //                  reports' figure, canViewReports. Others get the items
+    //                  and lines without them.
+    //
     // Sales, expenses, customers, inventory and invoices are the bookkeeping a
     // staff member is employed to do, and stay.
     const isOwner = req.user.accountType !== "staff";
+    const canSeeCost = canSeeCosts(req);
     res.json({
-      sales,
+      // Each with its lines ([] for a sale without).
+      sales: sales.map((s) => publicSale(s, canSeeCost)),
       // A receipt's storage keys never leave the server (utils/expenseView.js).
       expenses: expenses.map(publicExpense),
       transactions: canSeeBank ? transactions : [],
       customers,
-      inventory,
+      // Archived items come too (archivedAt): the app keeps them out of its
+      // lists and pickers.
+      inventory: inventory.map((i) => publicItem(i, canSeeCost)),
       // Bills replace payables (release 2): each with its payments, in the
       // shape routes/bills.js answers with.
       // A member without the bank rows gets each payment from the KashBook
       // account as a plain transfer, without its debit (booksOnlyBill).
       bills: bills.map((b) => (canSeeBills ? billFor(b, { canSeeBank }) : booksOnlyBill(b, { canSeeBank }))),
-      invoices,
+      // An invoice line's cost (release 3: what the goods it took cost) is
+      // the reports' figure too.
+      invoices: canSeeCost ? invoices : invoices.map(withoutLineCosts),
       recurring: isOwner ? recurring : [],
       accounts: accounts.map(publicAccount),
       // Every published adjustment (see above): the app replaces its list.
       journals: canSeeReports ? journals : null,
+      // The stock movements the books count (see above): the app replaces
+      // its list; null for a member without the reports.
+      stockMoves: canSeeReports ? stockMoves : null,
       // Told, not silently emptied — the client can distinguish "no bank
       // activity" from "not yours to see" instead of rendering a confident zero.
       bankWithheld: !canSeeBank,
@@ -229,10 +269,11 @@ router.get("/pull", async (req, res) => {
     // it to ownerIdOf(req) — which is precisely the tidy-up this codebase
     // invites. Gate it explicitly rather than rely on the accident.
     const canSeeBank = req.user.permissions?.canViewBalance === true;
+    const canSeeCost = canSeeCosts(req);
     res.json({
       transactions: canSeeBank ? transactions : [],
       customers,
-      inventory,
+      inventory: inventory.map((i) => publicItem(i, canSeeCost)),
       bankWithheld: !canSeeBank,
     });
   } catch (err) {
@@ -542,61 +583,11 @@ async function processOp(op, userId, userName, accountType) {
       break;
     }
 
-    // ── Inventory ─────────────────────────────────────────────────────────────
-    case "add_inventory_item": {
-      await assertOwns(data.businessId);
-      await prisma.inventoryItem.upsert({
-        where: { id: data.id },
-        create: {
-          id: data.id,
-          userId,
-          businessId: data.businessId,
-          name: data.name,
-          quantity: Number(data.quantity) || 0,
-          price: Number(data.unitPrice ?? data.price ?? 0),
-          lowStockAlert: Number(data.lowStockThreshold ?? data.lowStockAlert ?? 5),
-          createdBy: userId,
-          createdByName: userName || null,
-        },
-        update: {},
-      });
-      break;
-    }
-
-    case "update_inventory_item": {
-      const item = await prisma.inventoryItem.findUnique({
-        where: { id: data.id },
-      });
-      if (!item) break;
-      await assertOwns(item.businessId);
-
-      const update = {};
-      if (data.name !== undefined) update.name = data.name;
-      if (data.quantity !== undefined) update.quantity = Number(data.quantity);
-      if (data.unitPrice !== undefined) update.price = Number(data.unitPrice);
-      if (data.price !== undefined) update.price = Number(data.price);
-      if (data.lowStockThreshold !== undefined)
-        update.lowStockAlert = Number(data.lowStockThreshold);
-      if (data.lowStockAlert !== undefined)
-        update.lowStockAlert = Number(data.lowStockAlert);
-
-      if (Object.keys(update).length > 0) {
-        await prisma.inventoryItem.update({ where: { id: data.id }, data: update });
-      }
-      break;
-    }
-
-    case "delete_inventory_item": {
-      const item = await prisma.inventoryItem.findUnique({
-        where: { id: data.id },
-      });
-      if (item) {
-        await assertOwns(item.businessId);
-        await prisma.inventoryItem.delete({ where: { id: data.id } });
-      }
-      break;
-    }
-
+    // The legacy inventory ops (add_inventory_item, update_inventory_item,
+    // delete_inventory_item) are retired with release 3: an item's stock and
+    // cost change only through the stock engine (utils/stock.js) behind
+    // routes/inventory.js, with a movement for every change, so an op naming
+    // one is an unknown op.
     // The legacy payable ops (add_payable, record_payable_payment,
     // delete_payable) are retired with payables (release 2): bills live in
     // routes/bills.js, and an op naming one is an unknown op.

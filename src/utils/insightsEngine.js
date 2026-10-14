@@ -28,6 +28,7 @@ const prisma = require("./db");
 // already leaves out what is not trade (savings rows, the owner's money, a
 // loan, equipment bought).
 const { booksForInstants } = require("./booksData");
+const { dayKey } = require("./books");
 const chart = require("./chart");
 
 // ── Money formatting ─────────────────────────────────────────────────────────
@@ -934,6 +935,13 @@ function spendingAccount(row, tx, { C, recurring }) {
   }
   if (row.source === "fee") return chart.sysAccount(C, chart.SYS.BANK_CHARGES);
   if (row.source === "write_off") return chart.sysAccount(C, chart.SYS.BAD_DEBT);
+  // Release 3: what the goods sold cost is Cost of Goods Sold, and stock
+  // lost, found or valued again is Stock Adjustments, as the ledger books
+  // them (whatever category the row carries).
+  if (row.source === "cogs") return chart.sysAccount(C, chart.SYS.COGS) || chart.expenseAccount(C, { category: row.category });
+  if (row.source === "stock_adjustment") {
+    return chart.sysAccount(C, chart.SYS.STOCK_ADJ) || chart.expenseAccount(C, { category: row.category });
+  }
   return chart.explicitAccount(C, row.accountId) || chart.expenseAccount(C, { category: row.category });
 }
 
@@ -963,6 +971,34 @@ async function spendingByAccount(businessId, range) {
   const [got, ctx] = await Promise.all([span(businessId, range), chartOf(businessId)]);
   if (!got) return [];
   return groupSpending(got.rows, got.input && got.input.bankRows, ctx);
+}
+
+// What a span's sales cost (release 3): its spending on cost-of-sales
+// accounts (Cost of Goods Sold, where the goods sold count, Cost of Services,
+// Stock Adjustments, and any the owner added of that kind), as the ledger
+// books it. { total, count }.
+async function costOfSales(businessId, range) {
+  const [got, ctx] = await Promise.all([span(businessId, range), chartOf(businessId)]);
+  if (!got) return { total: 0, count: 0 };
+  const bank = new Map(((got.input && got.input.bankRows) || []).map((t) => [t.id, t]));
+  let kobo = 0;
+  let count = 0;
+  for (const r of got.rows || []) {
+    if (r.type !== "expense") continue;
+    const acc = spendingAccount(r, bank.get(r.id), ctx);
+    if (!acc || acc.type !== "cost_of_goods_sold") continue;
+    kobo += Math.round(r.amount * 100);
+    count += 1;
+  }
+  return { total: kobo / 100, count };
+}
+
+// What the business says it sells (Business.sells: goods, services, both, or
+// null when not asked yet), read when the caller did not pass it.
+async function sellsOf(business) {
+  if (business.sells !== undefined) return business.sells;
+  const row = await prisma.business.findUnique({ where: { id: business.id }, select: { sells: true } });
+  return row ? row.sells : null;
 }
 
 // Rows carry what was received (VAT inside, for a VAT business); the totals
@@ -1048,9 +1084,10 @@ const HANDLERS = {
   },
 
   async profit({ business, range }) {
-    const [inc, exp] = await Promise.all([
+    const [inc, exp, costs] = await Promise.all([
       sumIncome(business.id, range, null),
       sumExpenses(business.id, range),
+      costOfSales(business.id, range),
     ]);
     const net = inc.total - exp.total;
     const prev = previousPeriod(range);
@@ -1060,9 +1097,18 @@ const HANDLERS = {
     ]);
     const tail = deltaPhrase(pctDelta(net, pInc.total - pExp.total), prev.label);
     const word = net >= 0 ? "profit" : "loss";
+    // Gross profit, when what was sold cost something: sales less what the
+    // goods and services sold cost (cost-of-sales accounts).
+    const grossProfit = Math.round((inc.total - costs.total) * 100) / 100;
+    const gross = costs.total !== 0
+      ? ` Gross profit was ${grossProfit < 0 ? "-" : ""}${money(Math.abs(grossProfit), business.baseCurrency)}, after ${money(costs.total, business.baseCurrency)} for what you sold.`
+      : "";
     return {
-      answer: `${range.label[0].toUpperCase()}${range.label.slice(1)}: ${money(inc.total, business.baseCurrency)} in, ${money(exp.total, business.baseCurrency)} out — a ${word} of ${money(Math.abs(net), business.baseCurrency)}${tail}.`,
-      data: { income: inc.total, expenses: exp.total, net },
+      answer: `${range.label[0].toUpperCase()}${range.label.slice(1)}: ${money(inc.total, business.baseCurrency)} in, ${money(exp.total, business.baseCurrency)} out — a ${word} of ${money(Math.abs(net), business.baseCurrency)}${tail}.${gross}`,
+      data: {
+        income: inc.total, expenses: exp.total, net,
+        ...(costs.total !== 0 ? { costOfSales: costs.total, grossProfit } : {}),
+      },
     };
   },
 
@@ -1153,41 +1199,96 @@ const HANDLERS = {
   },
 
   async top_products({ business, range }) {
-    // Sales aren't linked to inventory items, so the honest product signal we
-    // have is invoice line items (name + amount).
-    const rows = await prisma.invoiceItem.groupBy({
-      by: ["name"],
-      // Issued invoices only: quotes, drafts, voids and credit notes are not sales.
-      where: {
-        invoice: {
-          businessId: business.id,
-          type: "invoice",
-          createdAt: { gte: range.start, lt: range.end },
-          status: { notIn: ["VOID", "DRAFT"] },
+    // Release 3: what was sold, line by line, for lines that name an item
+    // (goods or a service; a typed line is no product): sales' lines on the
+    // sale's day, and issued invoices' lines on the invoice's day (quotes,
+    // drafts, voids and credit notes are not sales). Ranked by amount, and by
+    // quantity.
+    const firstDay = dayKey(range.start);
+    const lastDay = dayKey(new Date(range.end.getTime() - 1));
+    const [saleLines, invoiceLines] = await Promise.all([
+      prisma.saleItem.groupBy({
+        by: ["itemId"],
+        where: { businessId: business.id, itemId: { not: null }, sale: { date: { gte: range.start, lt: range.end } } },
+        _sum: { amount: true, quantity: true },
+        _count: { _all: true },
+      }),
+      prisma.invoiceItem.groupBy({
+        by: ["itemId"],
+        where: {
+          itemId: { not: null },
+          invoice: {
+            businessId: business.id,
+            type: "invoice",
+            status: { notIn: ["VOID", "DRAFT"] },
+            issueDate: { gte: firstDay, lte: lastDay },
+          },
         },
-      },
-      _sum: { amount: true },
-      _count: { _all: true },
-    });
-    const top = rows.sort((a, b) => (b._sum.amount || 0) - (a._sum.amount || 0)).slice(0, 3);
-    if (top.length === 0) {
-      return { answer: `I can't rank products ${range.label} yet — product names come from your invoice line items, and there aren't any in that period.` };
+        _sum: { amount: true, quantity: true },
+        _count: { _all: true },
+      }),
+    ]);
+    const byItem = new Map();
+    for (const r of [...saleLines, ...invoiceLines]) {
+      const cur = byItem.get(r.itemId) || { itemId: r.itemId, kobo: 0, milli: 0, lines: 0 };
+      cur.kobo += Math.round((r._sum.amount || 0) * 100);
+      cur.milli += Math.round((r._sum.quantity || 0) * 1000);
+      cur.lines += r._count._all;
+      byItem.set(r.itemId, cur);
     }
-    const list = top.map((t) => `${t.name} ${money(t._sum.amount, business.baseCurrency)}`).join(" · ");
-    return { answer: `Your top invoiced items ${range.label}: ${list}.`, data: { top } };
+    if (byItem.size === 0) {
+      return { answer: `No product sales recorded ${range.label}. Pick the product when you record a sale or an invoice to see your best sellers.` };
+    }
+    const items = await prisma.inventoryItem.findMany({
+      where: { id: { in: [...byItem.keys()] } },
+      select: { id: true, name: true },
+    });
+    const nameOf = new Map(items.map((i) => [i.id, i.name]));
+    const all = [...byItem.values()].map((v) => ({
+      itemId: v.itemId,
+      name: nameOf.get(v.itemId) || "Unknown",
+      amount: v.kobo / 100,
+      quantity: v.milli / 1000,
+      lines: v.lines,
+    }));
+    const top = [...all].sort((a, b) => b.amount - a.amount || b.quantity - a.quantity || a.name.localeCompare(b.name)).slice(0, 3);
+    const byQuantity = [...all].sort((a, b) => b.quantity - a.quantity || b.amount - a.amount || a.name.localeCompare(b.name)).slice(0, 3);
+    const list = top.map((t) => `${t.name} ${money(t.amount, business.baseCurrency)} (${t.quantity} sold)`).join(" · ");
+    const most = byQuantity[0].itemId !== top[0].itemId ? ` Most sold by quantity: ${byQuantity[0].name} (${byQuantity[0].quantity}).` : "";
+    return { answer: `Your best sellers ${range.label}: ${list}.${most}`, data: { top, byQuantity } };
   },
 
   async stock({ business }) {
-    const low = await prisma.$queryRaw`
-      SELECT name, quantity, "lowStockAlert" FROM "InventoryItem"
-      WHERE "businessId" = ${business.id} AND quantity <= "lowStockAlert"
-      ORDER BY quantity ASC LIMIT 5
-    `;
-    const count = await prisma.inventoryItem.count({ where: { businessId: business.id } });
-    if (count === 0) return { answer: "You haven't added any inventory items yet." };
-    if (low.length === 0) return { answer: `All ${count} inventory items are above their low-stock levels. ✅` };
+    // Release 3: goods only (a service has no stock and is never low), never
+    // an archived item, and what the stock on hand cost (stockValue).
+    if ((await sellsOf(business)) === "services") {
+      return { answer: "You sell services, so there's no stock to count." };
+    }
+    const [low, agg] = await Promise.all([
+      prisma.$queryRaw`
+        SELECT name, quantity, "lowStockAlert" FROM "InventoryItem"
+        WHERE "businessId" = ${business.id} AND "itemType" = 'goods' AND "archivedAt" IS NULL
+          AND quantity <= "lowStockAlert"
+        ORDER BY quantity ASC LIMIT 5
+      `,
+      prisma.inventoryItem.aggregate({
+        where: { businessId: business.id, itemType: "goods", archivedAt: null },
+        _count: { _all: true },
+        _sum: { stockValue: true },
+      }),
+    ]);
+    const count = agg._count._all;
+    if (count === 0) return { answer: "You haven't added any goods to your inventory yet." };
+    const stockValue = Math.round((agg._sum.stockValue || 0) * 100) / 100;
+    const worth = stockValue > 0 ? ` Your stock is worth ${money(stockValue, business.baseCurrency)} at cost.` : "";
+    if (low.length === 0) {
+      return { answer: `All ${count} goods are above their low-stock levels. ✅${worth}`, data: { count, stockValue } };
+    }
     const list = low.map((r) => `${r.name} (${r.quantity} left)`).join(", ");
-    return { answer: `${low.length} item${low.length === 1 ? " is" : "s are"} low on stock: ${list}.`, data: { low } };
+    return {
+      answer: `${low.length} item${low.length === 1 ? " is" : "s are"} low on stock: ${list}.${worth}`,
+      data: { low, count, stockValue },
+    };
   },
 
   async channels({ business, range }) {
@@ -1347,8 +1448,8 @@ const HANDLERS = {
       // decrements stock through the normal addTransaction flow. One clear
       // match auto-links; similar names become tappable choices instead.
       const items = await prisma.inventoryItem.findMany({
-        where: { businessId: business.id },
-        select: { id: true, name: true, quantity: true },
+        where: { businessId: business.id, archivedAt: null },
+        select: { id: true, name: true, quantity: true, itemType: true },
         take: 300,
       });
       const candidates = findInventoryCandidates(description, items);
@@ -1357,8 +1458,11 @@ const HANDLERS = {
       if (full.length === 1) {
         const item = full[0].item;
         action = { ...action, inventoryItemId: item.id, itemName: item.name, quantity };
-        const short = item.quantity < quantity ? ` (your records showed only ${item.quantity})` : "";
-        stockNote = ` Stock: ${item.name} ${item.quantity} → ${Math.max(0, item.quantity - quantity)}${short}.`;
+        // A service has no stock to take from.
+        if (item.itemType === "goods") {
+          const short = item.quantity < quantity ? ` (your records showed only ${item.quantity})` : "";
+          stockNote = ` Stock: ${item.name} ${item.quantity} → ${Math.max(0, item.quantity - quantity)}${short}.`;
+        }
       } else if (candidates.length >= 1) {
         // Similar product names — ask which one to take from stock.
         action = {
@@ -1403,9 +1507,10 @@ const HANDLERS = {
     };
     if (detail) {
       // "i bought 20 bags of rice for 5000" — if the expense clearly names a
-      // tracked product, the app offers to top up its stock after recording.
+      // tracked product, the app offers to top up its stock after recording
+      // (goods only, never an archived item).
       const items = await prisma.inventoryItem.findMany({
-        where: { businessId: business.id },
+        where: { businessId: business.id, itemType: "goods", archivedAt: null },
         select: { id: true, name: true, quantity: true },
         take: 300,
       });
@@ -1438,8 +1543,10 @@ const HANDLERS = {
           : `Send the full command with the count — e.g. “restock ${detail} 20”.`,
       };
     }
+    // A stock count is for goods (a service has none); a price for any item.
+    // Never an archived item.
     const items = await prisma.inventoryItem.findMany({
-      where: { businessId: business.id },
+      where: { businessId: business.id, archivedAt: null, ...(mode === "price" ? {} : { itemType: "goods" }) },
       select: { id: true, name: true, quantity: true },
       take: 300,
     });
@@ -1500,7 +1607,7 @@ const HANDLERS = {
       return { answer: "What should I call the product? Try “add product shawarma at 1500”." };
     }
     const items = await prisma.inventoryItem.findMany({
-      where: { businessId: business.id },
+      where: { businessId: business.id, archivedAt: null },
       select: { id: true, name: true, quantity: true },
       take: 300,
     });
@@ -1736,15 +1843,21 @@ async function generateInsightCards(business) {
   };
   const cards = [];
 
+  // Low stock: goods only (never a service), never an archived item, and no
+  // card at all for a business that sells services only.
+  const servicesOnly = (await sellsOf(business)) === "services";
   const [inc, prevInc, spending, low, topDebtor, byChannel] = await Promise.all([
     sumIncome(business.id, thisMonth, null),
     sumIncome(business.id, lastMonth, null),
     spendingByAccount(business.id, thisMonth),
-    prisma.$queryRaw`
-      SELECT name, quantity FROM "InventoryItem"
-      WHERE "businessId" = ${business.id} AND quantity <= "lowStockAlert"
-      ORDER BY quantity ASC LIMIT 3
-    `,
+    servicesOnly
+      ? []
+      : prisma.$queryRaw`
+          SELECT name, quantity FROM "InventoryItem"
+          WHERE "businessId" = ${business.id} AND "itemType" = 'goods' AND "archivedAt" IS NULL
+            AND quantity <= "lowStockAlert"
+          ORDER BY quantity ASC LIMIT 3
+        `,
     prisma.customer.findFirst({
       where: { businessId: business.id, totalOwed: { gt: 0 } },
       orderBy: { totalOwed: "desc" },
@@ -1830,4 +1943,5 @@ module.exports = {
   spendingRecordOf,
   spendingByAccount,
   groupSpending,
+  costOfSales,
 };

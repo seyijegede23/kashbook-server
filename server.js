@@ -504,53 +504,88 @@ cron.schedule(
 );
 
 // ── Background cron: low stock push notifications (every hour) ───────────────
+// Release 3 (2026-10-13): goods only (a service has no stock), never an
+// archived item, never in a business that says it sells services only (it
+// sees no stock anywhere), and once per crossing. An item is alerted when
+// its quantity is at or below its low-stock level and it has not been
+// alerted since it was last above it (lowStockNotifiedAt is null); the alert
+// sets lowStockNotifiedAt, and stock coming in above the level clears it
+// (utils/stock.js), so the next fall alerts again. A flag left on an item
+// that is above its level now (its level was lowered) is cleared here first.
+// Each item is claimed before it is alerted, only while it is still low and
+// unalerted, so a restock racing this run never leaves the flag on stock
+// that is no longer low. Owners with notifications off are passed over and
+// not marked (they hear about it once they turn notifications on). The suite
+// scripts/stock-docs-e2e-test.js runs this function's own text against a
+// database.
+async function sendLowStockAlerts() {
+  await prisma.$executeRaw`
+    UPDATE "InventoryItem" SET "lowStockNotifiedAt" = NULL
+    WHERE "lowStockNotifiedAt" IS NOT NULL AND quantity > "lowStockAlert"
+  `;
+  // Filter at the DB level so we only pull genuinely low rows (instead of
+  // loading the entire inventory table into memory each hour).
+  const actualLow = await prisma.$queryRaw`
+    SELECT i.id, i."userId", i.name, i.quantity, i.unit
+    FROM "InventoryItem" i
+    WHERE i."itemType" = 'goods'
+      AND i."archivedAt" IS NULL
+      AND i.quantity <= i."lowStockAlert"
+      AND i."lowStockNotifiedAt" IS NULL
+      AND NOT EXISTS (SELECT 1 FROM "Business" b WHERE b.id = i."businessId" AND b.sells = 'services')
+  `;
+  if (actualLow.length === 0) return 0;
+
+  const userIds = [...new Set(actualLow.map((i) => i.userId).filter(Boolean))];
+  const users = await prisma.user.findMany({
+    where: { id: { in: userIds } },
+    select: { id: true, expoPushToken: true, notificationsEnabled: true },
+  });
+  const userById = new Map(users.map((u) => [u.id, u]));
+
+  let sent = 0;
+  for (const item of actualLow) {
+    const user = userById.get(item.userId);
+    if (!item.userId || !user?.notificationsEnabled) continue;
+    const claimed = await prisma.$executeRaw`
+      UPDATE "InventoryItem" SET "lowStockNotifiedAt" = NOW()
+      WHERE id = ${item.id} AND "lowStockNotifiedAt" IS NULL
+        AND "itemType" = 'goods' AND "archivedAt" IS NULL AND quantity <= "lowStockAlert"
+    `;
+    if (claimed !== 1) continue;
+    sent++;
+    const body = `${item.name} is running low — only ${item.quantity} ${item.unit || "unit(s)"} left`;
+
+    // Always save in-app notification
+    await prisma.appNotification.create({
+      data: { userId: item.userId, title: "Low Stock Alert", body },
+    });
+
+    // Also send push if token is available
+    if (user.expoPushToken) {
+      fetch("https://exp.host/--/api/v2/push/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: user.expoPushToken,
+          title: "Low Stock Alert",
+          body,
+          sound: "default",
+          data: { screen: "Inventory" },
+        }),
+      }).catch(() => {});
+    }
+  }
+  if (sent > 0) console.log(`[Cron] Low stock alerts sent for ${sent} item(s)`);
+  return sent;
+}
+// End of sendLowStockAlerts.
+
 cron.schedule("0 * * * *", async () => {
   try {
     await prisma.withCronLock(4002, async () => {
-    await require("./src/utils/snapshots").recordHeartbeat("lowStock");
-    // Filter at the DB level so we only pull genuinely low rows (instead of
-    // loading the entire inventory table into memory each hour).
-    const actualLow = await prisma.$queryRaw`
-      SELECT i.*
-      FROM "InventoryItem" i
-      WHERE i.quantity <= i."lowStockAlert"
-    `;
-    if (actualLow.length === 0) return;
-
-    const userIds = [...new Set(actualLow.map((i) => i.userId).filter(Boolean))];
-    const users = await prisma.user.findMany({
-      where: { id: { in: userIds } },
-      select: { id: true, expoPushToken: true, notificationsEnabled: true },
-    });
-    const userById = new Map(users.map((u) => [u.id, u]));
-
-    for (const item of actualLow) {
-      item.user = userById.get(item.userId);
-      if (!item.userId || !item.user?.notificationsEnabled) continue;
-      const body = `${item.name} is running low — only ${item.quantity} ${item.unit || "unit(s)"} left`;
-
-      // Always save in-app notification
-      await prisma.appNotification.create({
-        data: { userId: item.userId, title: "Low Stock Alert", body },
-      });
-
-      // Also send push if token is available
-      if (item.user.expoPushToken) {
-        fetch("https://exp.host/--/api/v2/push/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            to: item.user.expoPushToken,
-            title: "Low Stock Alert",
-            body,
-            sound: "default",
-            data: { screen: "Inventory" },
-          }),
-        }).catch(() => {});
-      }
-    }
-    if (actualLow.length > 0)
-      console.log(`[Cron] Low stock alerts sent for ${actualLow.length} item(s)`);
+      await require("./src/utils/snapshots").recordHeartbeat("lowStock");
+      await sendLowStockAlerts();
     });
   } catch (err) {
     console.error("[Cron] Low stock check error:", err);

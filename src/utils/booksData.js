@@ -2,7 +2,7 @@
 // (utils/books.js). Every server total of sales, expenses or profit goes
 // through booksFor, so the emails, Insights and the app agree.
 const prisma = require("./db");
-const { computeBooks, receivables, vatReturn, bookRows } = require("./books");
+const { computeBooks, receivables, vatReturn, bookRows, dayKey } = require("./books");
 const { classOf } = require("./chart");
 
 // "YYYY-MM-DD" (Lagos) → the instant that day starts / ends.
@@ -30,7 +30,19 @@ function dateWhere(from, to) {
 // payments are cut to [start, end), so a partial day ("the same point last
 // week") is exact; pass the result to computeBooks without from/to. (A bill's
 // payments kept outside the books stay: they count on no day, they only say
-// how much of the bill the books carry.)
+// how much of the bill the books carry. An invoice's or a debt's payments
+// outside the span stay too, marked outsideSpan, and so does an invoice's
+// write-off, marked writtenOffOutsideSpan: they count nowhere, but they say
+// how much of the document was settled before the span, which decides the
+// share of its goods' cost a payment inside it releases. A document issued
+// on a day outside the span's Lagos days is marked issuedOutsideSpan: nothing
+// counts on its issue date, such as the cost of goods on a document with
+// nothing to collect.)
+//
+// Release 3 (stock cost): sales come with their lines, invoices' lines with
+// what their goods cost, bills with their restock lines, and the stock
+// movements the books and the ledger read (stockMoves: adjustments and new
+// values, which count, and starting stock, which only the ledger posts).
 async function loadBooksInput(businessId, { from, to, start, end } = {}, db = prisma) {
   const byInstant = start instanceof Date && end instanceof Date;
   const date = byInstant ? { gte: start, lt: end } : dateWhere(from, to);
@@ -39,7 +51,7 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
     select: { id: true, baseCurrency: true, vatEnabled: true, vatRate: true, vatInclusive: true },
   });
   if (!biz) return null;
-  const [sales, expenses, bankRows, invoices, debts, accounts, bills, journals] = await Promise.all([
+  const [sales, expenses, bankRows, invoices, debts, accounts, bills, journals, stockMoves] = await Promise.all([
     db.sales.findMany({
       where: { businessId, ...(date ? { date } : {}) },
       // channel and customerId: Insights breaks sales down by them (bookRows
@@ -49,6 +61,9 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
         currency: true, paymentMethod: true, matchedTransactionId: true, accountId: true, depositAccountId: true,
         // notes: the memo its ledger entry shows on account statements.
         notes: true,
+        // What was sold, line by line: the sale's income is shared over the
+        // lines' accounts, and their goods' cost is its cost of goods sold.
+        items: { select: SALE_LINE, orderBy: [{ position: "asc" }, { id: "asc" }] },
       },
     }),
     db.expense.findMany({
@@ -79,7 +94,11 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
         id: true, type: true, status: true, issueDate: true, total: true, customerId: true,
         invoiceNumber: true, taxAmount: true, amountPaid: true, writtenOffAt: true, writtenOffAmount: true,
         subtotal: true, discountAmount: true,
-        items: { select: { id: true, amount: true, accountId: true } },
+        // costAmount: what an issued invoice's goods cost (a restocked credit
+        // note line's: what came back into stock).
+        items: {
+          select: { id: true, amount: true, accountId: true, itemId: true, itemType: true, costAmount: true, restock: true },
+        },
         payments: {
           select: { id: true, amount: true, method: true, date: true, transactionId: true, depositAccountId: true },
         },
@@ -123,6 +142,12 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
           },
           orderBy: [{ date: "asc" }, { id: "asc" }],
         },
+        // A restock's lines (a bill on Inventory Asset): the goods it brought
+        // into stock, each at its amount.
+        items: {
+          select: { id: true, itemId: true, quantity: true, unitCost: true, amount: true },
+          orderBy: [{ position: "asc" }, { id: "asc" }],
+        },
       },
       orderBy: [{ billDate: "asc" }, { id: "asc" }],
     }),
@@ -139,11 +164,32 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
       },
       orderBy: [{ date: "asc" }, { id: "asc" }],
     }),
+    // Stock movements dated in the period (release 3): adjustments and new
+    // values count as stock adjustments; starting stock only the ledger
+    // posts. A sale's, an invoice's or a restock's own movements are read
+    // from those records' lines instead.
+    db.stockMovement.findMany({
+      where: { businessId, kind: { in: STOCK_MOVE_KINDS }, ...(date ? { date } : {}) },
+      select: { id: true, kind: true, reason: true, date: true, quantity: true, value: true, itemId: true, note: true },
+      orderBy: [{ date: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+    }),
   ]);
   if (byInstant) {
     const within = (d) => d >= start && d < end;
-    for (const inv of invoices) inv.payments = inv.payments.filter((p) => within(p.date));
-    for (const d of debts) d.payments = d.payments.filter((p) => within(p.date));
+    // A document's issue date is a day ("YYYY-MM-DD" text), not an instant:
+    // it is in the span when it is one of the span's Lagos days.
+    const firstDay = dayKey(start);
+    const lastDay = dayKey(new Date(end.getTime() - 1));
+    const dayWithin = (d) => {
+      const k = dayKey(d);
+      return !!k && k >= firstDay && k <= lastDay;
+    };
+    for (const inv of invoices) {
+      for (const p of inv.payments) if (!within(p.date)) p.outsideSpan = true;
+      if (!dayWithin(inv.issueDate)) inv.issuedOutsideSpan = true;
+      if (inv.writtenOffAt && !within(inv.writtenOffAt)) inv.writtenOffOutsideSpan = true;
+    }
+    for (const d of debts) for (const p of d.payments) if (!within(p.date)) p.outsideSpan = true;
     for (const b of bills) b.payments = b.payments.filter((p) => p.outsideBooks || within(p.date));
   }
   // The naira books count naira: rows in another currency are flagged and the
@@ -152,24 +198,50 @@ async function loadBooksInput(businessId, { from, to, start, end } = {}, db = pr
   for (const list of [sales, expenses, bankRows]) {
     for (const r of list) if (r.currency && r.currency !== base) r.foreignCurrency = true;
   }
+  // A repayment can be for a credit sale from before the period, whose goods'
+  // cost it releases "when paid" (books.stockCosts): such a debt carries that
+  // sale (only what the rule reads of it) when the period's sales do not.
+  const loaded = new Set(sales.map((s) => s.id));
+  const older = [...new Set(debts.map((d) => d.saleId).filter((id) => id && !loaded.has(id)))];
+  if (older.length) {
+    const found = await db.sales.findMany({
+      where: { id: { in: older }, businessId, items: { some: {} } },
+      select: { id: true, date: true, isCredit: true, currency: true, items: { select: { id: true, costAmount: true } } },
+    });
+    const byId = new Map(found.map((s) => [s.id, s]));
+    for (const s of found) if (s.currency && s.currency !== base) s.foreignCurrency = true;
+    for (const d of debts) if (d.saleId && byId.has(d.saleId)) d.sale = byId.get(d.saleId);
+  }
   return {
     vat: { enabled: biz.vatEnabled, rate: biz.vatRate, inclusive: biz.vatInclusive },
     baseCurrency: base,
     chart: accounts,
     input: {
       sales, expenses, bankRows, invoices, debts, accounts: accountClasses(accounts),
-      bills: bills.map(billInput), journals,
+      bills: bills.map(billInput), journals, stockMoves,
     },
   };
 }
 
+// What the books read of a sale's line (release 3): its income account, its
+// type, and what its goods cost; the item and name for anything that lists
+// what was sold.
+const SALE_LINE = {
+  id: true, itemId: true, name: true, itemType: true, quantity: true, amount: true, accountId: true, costAmount: true,
+};
+
+// The stock movements the books input carries (books.stockMoves).
+const STOCK_MOVE_KINDS = ["adjustment", "revalue", "opening", "opening_value"];
+
 // A bill as the books rule reads it (books.js): the table keeps the payable's
-// own names (name is the supplier, originalAmount the bill's amount).
+// own names (name is the supplier, originalAmount the bill's amount). A
+// restock's lines (release 3) come with it.
 function billInput(b) {
   return {
     id: b.id, vendorName: b.name, billNumber: b.billNumber, note: b.note,
     accountId: b.accountId, receivedViaAccountId: b.receivedViaAccountId,
     billDate: b.billDate, amount: b.originalAmount, estimated: b.estimated, payments: b.payments,
+    items: b.items || [],
   };
 }
 

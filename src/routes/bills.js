@@ -20,12 +20,13 @@
 // The contract (the app's api.js and AppContext read these shapes):
 //   GET    /bills?businessId=             → { bills: [Bill] }, newest bill date first
 //   GET    /bills/:id                     → { bill: Bill }
-//   POST   /bills                         → 201 { bill: Bill }
+//   POST   /bills                         → 201 { bill: Bill, payment, transaction, inventory }
 //          { businessId, vendorName, accountId, amount, billDate?, dueDate?,
-//            billNumber?, note?, receivedViaAccountId? }
-//   PATCH  /bills/:id                     → { bill: Bill }
-//          any of the POST fields except businessId; only the fields sent change
-//   DELETE /bills/:id                     → { deleted: id, transactions: [debits freed] }
+//            billNumber?, note?, receivedViaAccountId?, items?, payNow? }
+//   PATCH  /bills/:id                     → { bill: Bill, inventory }
+//          any of the POST fields except businessId and payNow; only the
+//          fields sent change
+//   DELETE /bills/:id                     → { deleted: id, transactions: [debits freed], inventory }
 //   POST   /bills/:id/payments            → 201 { bill: Bill, payment: Payment, transaction: debit | null }
 //          { amount, method, date?, paidThroughAccountId?, transactionId?, note? }
 //   DELETE /bills/:id/payments/:paymentId → { bill: Bill, transaction: debit freed | null }
@@ -34,7 +35,10 @@
 // remainingAmount, status, billDate, dueDate, billNumber, accountId,
 // receivedViaAccountId, estimated, note, createdById, createdAt, updatedAt,
 // ...) plus vendorName (= name), amount (= originalAmount), amountPaid,
-// balance (= remainingAmount, what is still owed) and payments, oldest first.
+// balance (= remainingAmount, what is still owed), payments, oldest first,
+// and items, a restock's lines in the order entered (BillItem: id, billId,
+// itemId, quantity, unitCost, amount, position, createdAt; [] on any other
+// bill).
 // status is "unpaid", "partial" or "paid". Payment: every BillPayment column
 // (id, billId, amount, date, method, paidThroughAccountId, transactionId,
 // estimated, outsideBooks, note, createdById, createdAt). The sync bundle
@@ -46,6 +50,23 @@
 //   - receivedViaAccountId: for a bill on a liability (a loan), the account
 //     the borrowed money went into (context "money"). On any other bill it is
 //     not kept.
+//   - items (release 3): a restock, [{ itemId, quantity, unitCost }], 1 to
+//     100 lines of this business's goods (a service has no stock). The bill
+//     is then on Inventory Asset (the account sent is not used), its amount is
+//     what the lines come to (each quantity times unitCost to the kobo,
+//     utils/stock.js lineCost; an amount sent must be that), and each line
+//     brings its goods into stock at that value on the bill's date (a
+//     "purchase" movement, "bill:<lineId>"). An edit that sends other lines
+//     replaces them; the same lines again change nothing. An edit or a delete
+//     that would take back goods already sold is refused (STOCK_ALREADY_SOLD).
+//     Such a bill stays a restock: another account is refused.
+//   - payNow (POST only): { method, date?, paidThroughAccountId?,
+//     transactionId?, note? }, the whole amount paid in the same request (the
+//     Restock screen's "paid now"), by the rules of POST /bills/:id/payments;
+//     no date is the bill's date.
+//   - inventory: the items whose stock the request moved, as they are now
+//     (what the stock cost, stockValue and avgCost, only for the owner and
+//     staff with canViewReports; null for anyone else).
 //   - method: cash, transfer (from another bank account), pos, cheque, other,
 //     or bank (from the KashBook account: transactionId names the debit, the
 //     provider's own transfer out of that account and never a row typed in by
@@ -54,7 +75,10 @@
 //     method but bank.
 //
 // Refusals are { error, code, field?, ...extra }:
-//   400 BUSINESS_REQUIRED, VENDOR_REQUIRED, BAD_AMOUNT, BAD_DATE,
+//   400 BUSINESS_REQUIRED, VENDOR_REQUIRED, BAD_AMOUNT, BAD_DATE, BAD_ITEMS
+//       { line? }, BAD_QUANTITY { line }, BAD_COST { line }, AMOUNT_MISMATCH
+//       { amount: what the lines come to }, BAD_PAY_NOW, NOT_STOCKED { itemId,
+//       line } (a service),
 //       ACCOUNT_REQUIRED, BAD_METHOD, TRANSACTION_REQUIRED, NOT_OUTGOING
 //       (money in, or a row that is not a transfer out of the KashBook
 //       account), PAID_IN_FULL, EXCEEDS_BALANCE { balance }, EXCEEDS_TRANSFER
@@ -62,20 +86,24 @@
 //       ACCOUNT_NOT_ALLOWED (utils/ledgerData.js assertAccountUsable)
 //   403 PERMISSION_DENIED { permission }, OWNER_ONLY, or Forbidden (a business
 //       that is not the caller's)
-//   404 BILL_NOT_FOUND, PAYMENT_NOT_FOUND, TRANSACTION_NOT_FOUND
+//   404 BILL_NOT_FOUND, PAYMENT_NOT_FOUND, TRANSACTION_NOT_FOUND,
+//       ITEM_NOT_FOUND { itemId, line }
 //   409 BOOKS_LOCKED { lockDate }, AMOUNT_BELOW_PAID { paid },
-//       TRANSACTION_TAKEN, CURRENCY_MISMATCH, BILL_CHANGED, BILL_NOT_CONVERTED
+//       TRANSACTION_TAKEN, CURRENCY_MISMATCH, BILL_CHANGED, BILL_NOT_CONVERTED,
+//       ITEM_ARCHIVED { itemId, line }, STOCK_ALREADY_SOLD { itemId },
+//       STOCK_BILL_ACCOUNT (another account for a restock)
 const router = require("express").Router();
 const auth = require("../middleware/auth");
 const prisma = require("../utils/db");
 const chart = require("../utils/chart");
 const { requirePermission, ownerOnly } = require("../middleware/requirePermission");
 const { ownerIdOf } = require("../utils/scope");
-const { assertAccountUsable, invalidateLedger } = require("../utils/ledgerData");
+const { assertAccountUsable, invalidateLedger, accountsFor } = require("../utils/ledgerData");
 const { assertUnlockedIn } = require("../utils/booksLock");
 const { audit } = require("../utils/audit");
 const { toKobo } = require("../utils/money");
 const { BILL_INCLUDE, billFor } = require("../utils/billView");
+const stock = require("../utils/stock");
 const { PROVIDER_SOURCES, isLedgerBankRow } = require("../config/moneySources");
 
 router.use(auth);
@@ -98,6 +126,27 @@ function statusOf(amountKobo, paidK) {
 // A bill as a client receives it: publicBill (utils/billView.js), through
 // billFor, so staff who do not see the bank get no debit ids (viewBill).
 const viewBill = (req, row) => billFor(row, { canSeeBank: req.user.permissions?.canViewBalance === true });
+
+// A bill with its payments and a restock's lines, in the order entered.
+const BILL_FULL = Object.freeze({ ...BILL_INCLUDE, items: { orderBy: [{ position: "asc" }, { createdAt: "asc" }] } });
+
+// Long enough for a restock of a hundred lines and its payment.
+const TX = { timeout: 20000 };
+
+// Whether the caller may see what stock cost (an item's stockValue and
+// avgCost): the owner, or staff with the reports.
+const seesCosts = (req) => req.user.accountType !== "staff" || req.user.permissions?.canViewReports === true;
+
+// The items a request moved, as its reply carries them (the app replaces its
+// copies), in the shape of routes/inventory.js publicItem: without the old
+// cost column, and what the stock cost only for those who may see costs.
+async function itemRows(req, px, ids) {
+  const list = [...ids];
+  if (!list.length) return [];
+  const rows = await px.inventoryItem.findMany({ where: { id: { in: list } } });
+  const costs = seesCosts(req);
+  return rows.map(({ cost: _unused, ...row }) => (costs ? row : { ...row, stockValue: null, avgCost: null }));
+}
 
 // ── Refusals ─────────────────────────────────────────────────────────────────
 
@@ -193,7 +242,7 @@ async function ownedBill(req) {
 
 // The bill again, under the lock, as the write will see it.
 async function freshBill(px, found) {
-  const bill = await px.businessDebt.findUnique({ where: { id: found.id }, include: BILL_INCLUDE });
+  const bill = await px.businessDebt.findUnique({ where: { id: found.id }, include: BILL_FULL });
   if (!bill || bill.businessId !== found.biz.id) throw billNotFound();
   return bill;
 }
@@ -287,6 +336,191 @@ function logBill(req, action, billId, metadata) {
 
 const isStaffReq = (req) => req.user.accountType === "staff";
 
+// ── Restocks (release 3) ─────────────────────────────────────────────────────
+
+const MAX_LINES = 100;
+
+// A restock's lines as sent, [{ itemId, quantity, unitCost }], 1 to 100. A
+// quantity has at most three decimals (2.5 kg); a cost is 0 or more. Each
+// line's amount is lineCost(quantity, unitCost), to the kobo, the one rule
+// the stock engine values goods by. Returns { lines: [{ itemId, quantity,
+// unitCost, amountK }], amountK } (amounts in kobo). Whether each item is
+// this business's goods is the stock engine's to say, under the lock.
+function readItems(v) {
+  if (!Array.isArray(v) || v.length < 1 || v.length > MAX_LINES) {
+    throw billError(400, "BAD_ITEMS", "A restock has 1 to 100 lines.", null, "items");
+  }
+  const num = (x) => (typeof x === "string" && x.trim() !== "" ? Number(x) : x);
+  const lines = v.map((it, line) => {
+    if (!it || typeof it !== "object") throw billError(400, "BAD_ITEMS", "Each line names an item, a quantity and a cost.", { line }, "items");
+    const itemId = typeof it.itemId === "string" && it.itemId.trim() ? it.itemId.trim() : null;
+    if (!itemId) throw billError(400, "BAD_ITEMS", "Pick the item for each line.", { line }, "items");
+    const quantity = num(it.quantity);
+    if (!stock.validQuantity(quantity)) {
+      throw billError(400, "BAD_QUANTITY", "Enter a quantity more than 0, with at most three decimals.", { line }, "items");
+    }
+    const unitCost = num(it.unitCost);
+    if (typeof unitCost !== "number" || !Number.isFinite(unitCost) || unitCost < 0 || unitCost > 1e12) {
+      throw billError(400, "BAD_COST", "Enter a cost of 0 or more.", { line }, "items");
+    }
+    return { itemId, quantity, unitCost, amountK: toKobo(stock.lineCost(quantity, unitCost)) };
+  });
+  const amountK = lines.reduce((s, l) => s + l.amountK, 0);
+  if (!(amountK > 0) || amountK > MAX_KOBO) {
+    throw billError(400, "BAD_AMOUNT", "A restock's lines must come to more than zero.", null, "items");
+  }
+  return { lines, amountK };
+}
+
+// Whether a bill's saved lines are the lines sent (same items, quantities and
+// costs, in the same order): an edit that sends them again moves nothing.
+function sameItems(saved, lines) {
+  if (saved.length !== lines.length) return false;
+  return saved.every((s, i) => {
+    const l = lines[i];
+    return s.itemId === l.itemId && Math.round(s.quantity * 1000) === Math.round(l.quantity * 1000) &&
+      Number(s.unitCost) === l.unitCost && toKobo(s.amount) === l.amountK;
+  });
+}
+
+// The business's Inventory Asset account, the one a restock is on.
+async function stockAccountOf(px, businessId) {
+  const account = await px.ledgerAccount.findFirst({ where: { businessId, systemKey: chart.SYS.STOCK } });
+  if (!account) throw billError(409, "NO_STOCK_ACCOUNT", "This business's chart has no Inventory Asset account yet. Try again.");
+  return account;
+}
+
+// Writes a restock's lines and brings their goods into stock at each line's
+// amount on the bill's date (a "purchase" movement, "bill:<lineId>"). A
+// refusal names the line (an item of another business, a service, an archived
+// item). Returns the ids of the items it moved.
+async function writeItems(px, bill, lines, date, createdById) {
+  const touched = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const row = await px.billItem.create({
+      data: { billId: bill.id, itemId: l.itemId, quantity: l.quantity, unitCost: l.unitCost, amount: naira(l.amountK), position: i },
+    });
+    try {
+      await stock.putIn(px, {
+        businessId: bill.businessId, itemId: l.itemId, quantity: l.quantity, value: naira(l.amountK), date,
+        sourceKey: `bill:${row.id}`, kind: "purchase", createdById,
+      });
+    } catch (err) {
+      if (err && err.code) err.extra = { ...(err.extra || {}), line: i };
+      throw err;
+    }
+    touched.add(l.itemId);
+  }
+  return touched;
+}
+
+// Takes a restock's goods back out of stock and removes its lines (refused
+// with 409 STOCK_ALREADY_SOLD when some have been sold since). Returns the
+// ids of the items it moved.
+async function removeItems(px, bill) {
+  if (!bill.items || !bill.items.length) return new Set();
+  const { items } = await stock.removeBySource(px, bill.businessId, bill.items.map((i) => `bill:${i.id}`));
+  await px.billItem.deleteMany({ where: { billId: bill.id } });
+  return new Set(items.map((i) => i.id));
+}
+
+// ── Paying ───────────────────────────────────────────────────────────────────
+
+// A payment as sent (POST /bills/:id/payments, or a new bill's payNow): the
+// method (none is cash), the debit a payment from the KashBook account names,
+// and its day (none: `defaultDay`, today unless given; a payment from the
+// KashBook account takes the debit's). Staff paying from the KashBook account
+// also need canViewBalance.
+function readPayment(req, src) {
+  const method = src.method === undefined || src.method === null || src.method === ""
+    ? "cash"
+    : String(src.method).toLowerCase();
+  if (!METHODS.includes(method)) throw billError(400, "BAD_METHOD", "Unknown payment method.", null, "method");
+  const bank = method === "bank";
+  if (bank && !src.transactionId) {
+    throw billError(400, "TRANSACTION_REQUIRED", "Pick the transfer that paid this bill.", null, "transactionId");
+  }
+  if (bank && isStaffReq(req) && req.user.permissions?.canViewBalance !== true) {
+    throw billError(
+      403, "PERMISSION_DENIED",
+      "You don't have access to the bank account. Ask the business owner to link this transfer.",
+      { permission: "canViewBalance" },
+    );
+  }
+  return {
+    method,
+    bank,
+    when: bank || src.date == null || src.date === "" ? null : readDate(src.date, "date"),
+    transactionId: bank ? String(src.transactionId) : null,
+    paidThroughAccountId: src.paidThroughAccountId,
+    note: readText(src.note, 200),
+  };
+}
+
+// Records a payment of amountK on `bill` (read under the lock, with its
+// payments): at most what it still owes; from the KashBook account, the debit
+// it names (debitRefusal) must be at least the payment, and is linked only if
+// nothing took it since it was read. The payment's day must be open.
+// `defaultDay`: the day a payment sent with none is on. Returns { payment,
+// transaction } (the debit as it now is, or null).
+async function payBill(px, req, biz, bill, amountK, pay, defaultDay) {
+  const amountBillK = toKobo(bill.originalAmount);
+  const paidK = paidKobo(bill.payments);
+  const balanceK = amountBillK - paidK;
+  if (balanceK <= 0) throw billError(400, "PAID_IN_FULL", "This bill is already paid in full.");
+  if (amountK > balanceK) {
+    throw billError(400, "EXCEEDS_BALANCE", "That is more than the bill still owes.", { balance: naira(balanceK) }, "amount");
+  }
+
+  let tx = null;
+  let paidThrough = null;
+  if (pay.bank) {
+    tx = await px.transaction.findUnique({ where: { id: pay.transactionId } });
+    const refused = debitRefusal(tx, biz);
+    if (refused) throw refused;
+    if (amountK > toKobo(tx.amount)) {
+      throw billError(400, "EXCEEDS_TRANSFER", "That is more than the transfer.", { transferAmount: Number(tx.amount) }, "amount");
+    }
+  } else {
+    paidThrough = await assertAccountUsable(
+      bill.businessId, pay.paidThroughAccountId, "money", { isStaff: isStaffReq(req), field: "paidThroughAccountId" }, px,
+    );
+  }
+  const date = pay.bank ? tx.date : pay.when || defaultDay || new Date();
+  await assertUnlockedIn(px, bill.businessId, date);
+
+  // The debit first, and only if nothing took it since it was read.
+  if (pay.bank) {
+    const linked = await px.transaction.updateMany({
+      where: { id: tx.id, businessId: bill.businessId, ...UNEXPLAINED },
+      data: { matchedBillId: bill.id, matchedAmount: naira(amountK) },
+    });
+    if (linked.count !== 1) {
+      throw billError(409, "TRANSACTION_TAKEN", "That transfer is already explained.", null, "transactionId");
+    }
+  }
+  const payment = await px.billPayment.create({
+    data: {
+      billId: bill.id,
+      amount: naira(amountK),
+      date,
+      method: pay.method,
+      paidThroughAccountId: paidThrough ? paidThrough.id : null,
+      transactionId: pay.bank ? tx.id : null,
+      note: pay.note,
+      createdById: req.user.id,
+    },
+  });
+  const newPaidK = paidK + amountK;
+  const moved = await px.businessDebt.updateMany({
+    where: { id: bill.id, updatedAt: bill.updatedAt },
+    data: { remainingAmount: naira(amountBillK - newPaidK), status: statusOf(amountBillK, newPaidK) },
+  });
+  if (moved.count !== 1) throw billChanged();
+  return { payment, transaction: pay.bank ? await px.transaction.findUnique({ where: { id: tx.id } }) : null };
+}
+
 // ── GET /bills?businessId= ───────────────────────────────────────────────────
 router.get("/", requirePermission("canManagePayables"), async (req, res) => {
   try {
@@ -296,7 +530,7 @@ router.get("/", requirePermission("canManagePayables"), async (req, res) => {
     if (!biz) return res.status(403).json({ error: "Forbidden" });
     const bills = await prisma.businessDebt.findMany({
       where: { businessId: biz.id, userId: ownerIdOf(req) },
-      include: BILL_INCLUDE,
+      include: BILL_FULL,
       orderBy: [{ billDate: "desc" }, { createdAt: "desc" }],
     });
     res.json({ bills: bills.map((b) => viewBill(req, b)) });
@@ -310,7 +544,7 @@ router.get("/:id", requirePermission("canManagePayables"), async (req, res) => {
   try {
     const found = await ownedBill(req);
     if (!found) return sendError(res, billNotFound());
-    const bill = await prisma.businessDebt.findUnique({ where: { id: found.id }, include: BILL_INCLUDE });
+    const bill = await prisma.businessDebt.findUnique({ where: { id: found.id }, include: BILL_FULL });
     if (!bill) return sendError(res, billNotFound());
     res.json({ bill: viewBill(req, bill) });
   } catch (err) {
@@ -328,25 +562,51 @@ router.post("/", requirePermission("canManagePayables"), async (req, res) => {
     if (!biz) return res.status(403).json({ error: "Forbidden" });
     const vendorName = readText(body.vendorName !== undefined ? body.vendorName : body.name, 120);
     if (!vendorName) throw billError(400, "VENDOR_REQUIRED", "Say who the bill is from.", null, "vendorName");
-    const amountK = readAmount(body.amount);
-    if (!body.accountId) throw accountRequired();
+    // A restock: its lines say the amount, and an amount sent must be theirs.
+    const restock = body.items === undefined || body.items === null ? null : readItems(body.items);
+    let amountK;
+    if (restock) {
+      amountK = restock.amountK;
+      if (body.amount !== undefined && body.amount !== null && body.amount !== "" && readAmount(body.amount) !== amountK) {
+        throw billError(400, "AMOUNT_MISMATCH", "The bill's amount must be what its lines come to.", { amount: naira(amountK) }, "amount");
+      }
+    } else {
+      amountK = readAmount(body.amount);
+      if (!body.accountId) throw accountRequired();
+    }
     // No bill date is today. A due date is optional.
     const billDate = body.billDate == null || body.billDate === "" ? new Date() : readDate(body.billDate, "billDate");
     const dueDate = body.dueDate === undefined ? null : readDate(body.dueDate, "dueDate");
     const billNumber = readText(body.billNumber, 50);
     const note = readText(body.note, 500);
+    // Paid in the same request, in full.
+    let payNow = null;
+    if (body.payNow !== undefined && body.payNow !== null && body.payNow !== false) {
+      if (typeof body.payNow !== "object" || Array.isArray(body.payNow)) {
+        throw billError(400, "BAD_PAY_NOW", "Say how the bill was paid.", null, "payNow");
+      }
+      payNow = readPayment(req, body.payNow);
+    }
+    // A chart missing a system account gets it first, outside the business
+    // lock (accountsFor takes a lock of its own).
+    if (restock) await accountsFor(biz.id);
 
     // The account is checked under the lock an account merge or delete also
     // takes (routes/ledger.js), so it is still there when the bill names it.
-    const bill = await prisma.withBusinessLock(biz.id, () =>
+    // The bill, a restock's goods and a payment made now are written in one
+    // transaction: a refusal of any of them leaves nothing.
+    const result = await prisma.withBusinessLock(biz.id, () =>
       prisma.$transaction(async (px) => {
         await assertUnlockedIn(px, biz.id, billDate);
-        const account = await assertAccountUsable(biz.id, body.accountId, "bill", { isStaff, field: "accountId" }, px);
+        // A restock is on Inventory Asset, whatever account was sent.
+        const account = restock
+          ? await stockAccountOf(px, biz.id)
+          : await assertAccountUsable(biz.id, body.accountId, "bill", { isStaff, field: "accountId" }, px);
         // Where borrowed money went: only a bill on a liability has it.
         const via = isLiability(account)
           ? await assertAccountUsable(biz.id, body.receivedViaAccountId, "money", { isStaff, field: "receivedViaAccountId" }, px)
           : null;
-        return px.businessDebt.create({
+        const created = await px.businessDebt.create({
           data: {
             userId: ownerIdOf(req),
             businessId: biz.id,
@@ -363,14 +623,36 @@ router.post("/", requirePermission("canManagePayables"), async (req, res) => {
             receivedViaAccountId: via ? via.id : null,
             createdById: req.user.id,
           },
-          include: BILL_INCLUDE,
+          include: BILL_FULL,
         });
-      }),
+        const touched = restock ? await writeItems(px, created, restock.lines, billDate, req.user.id) : new Set();
+        const paid = payNow ? await payBill(px, req, biz, created, amountK, payNow, billDate) : null;
+        return {
+          bill: await px.businessDebt.findUnique({ where: { id: created.id }, include: BILL_FULL }),
+          payment: paid ? paid.payment : null,
+          transaction: paid ? paid.transaction : null,
+          inventory: await itemRows(req, px, touched),
+        };
+      }, TX),
     );
 
+    const bill = result.bill;
     invalidateLedger(biz.id);
-    logBill(req, "BILL_CREATE", bill.id, { businessId: biz.id, amount: bill.originalAmount, accountId: bill.accountId });
-    res.status(201).json({ bill: viewBill(req, bill) });
+    logBill(req, "BILL_CREATE", bill.id, {
+      businessId: biz.id, amount: bill.originalAmount, accountId: bill.accountId, lines: bill.items.length,
+    });
+    if (result.payment) {
+      logBill(req, "BILL_PAYMENT", bill.id, {
+        paymentId: result.payment.id, amount: result.payment.amount, method: result.payment.method,
+        transactionId: result.payment.transactionId,
+      });
+    }
+    res.status(201).json({
+      bill: viewBill(req, bill),
+      payment: result.payment,
+      transaction: result.transaction,
+      inventory: result.inventory,
+    });
   } catch (err) {
     sendError(res, err, "Failed to add the bill");
   }
@@ -381,6 +663,14 @@ router.post("/", requirePermission("canManagePayables"), async (req, res) => {
 // new one when it moves), so a bill dated on or before the lock date stays as
 // it is. A new account changes how every payment counts, so their days are
 // checked too. The amount is never below what is already paid.
+//
+// A restock (release 3): lines sent replace its lines when they differ (their
+// goods leave stock and the new ones come in, refused with 409
+// STOCK_ALREADY_SOLD when some have been sold since); its amount is always
+// what its lines come to (an amount sent must be that); it stays on Inventory
+// Asset (another account is refused, 409 STOCK_BILL_ACCOUNT); and a new bill
+// date moves its goods' movements to that day. Lines sent for another bill
+// make it a restock.
 router.patch("/:id", requirePermission("canManagePayables"), async (req, res) => {
   try {
     const body = req.body || {};
@@ -410,18 +700,38 @@ router.patch("/:id", requirePermission("canManagePayables"), async (req, res) =>
     if (has("receivedViaAccountId")) {
       ask.receivedViaAccountId = body.receivedViaAccountId ? String(body.receivedViaAccountId) : null;
     }
+    if (has("items")) ask.items = readItems(body.items);
+    if (ask.items) await accountsFor(found.biz.id);
 
     const result = await prisma.withBusinessLock(found.biz.id, () =>
       prisma.$transaction(async (px) => {
         const cur = await freshBill(px, found);
+        // A restock, now or after this edit: on Inventory Asset, its amount
+        // its lines'.
+        const restock = cur.items.length > 0 || !!ask.items;
+        const stockAccount = restock ? await stockAccountOf(px, cur.businessId) : null;
+        if (restock && ask.accountId !== undefined && ask.accountId !== stockAccount.id) {
+          throw billError(409, "STOCK_BILL_ACCOUNT", "A restock stays on Inventory Asset. Delete it and add a bill instead.", null, "accountId");
+        }
+        const itemsChange = !!ask.items && !sameItems(cur.items, ask.items.lines);
+        let wantK = ask.amountK;
+        if (restock) {
+          const linesK = ask.items ? ask.items.amountK : toKobo(cur.originalAmount);
+          if (ask.amountK !== undefined && ask.amountK !== linesK) {
+            throw billError(400, "AMOUNT_MISMATCH", "The bill's amount must be what its lines come to.", { amount: naira(linesK) }, "amount");
+          }
+          wantK = ask.items ? linesK : undefined;
+        }
         const data = {};
         if (ask.name !== undefined && ask.name !== cur.name) data.name = ask.name;
         if (ask.billDate !== undefined && !sameTime(ask.billDate, cur.billDate)) data.billDate = ask.billDate;
         if (ask.dueDate !== undefined && !sameTime(ask.dueDate, cur.dueDate)) data.dueDate = ask.dueDate;
         if (ask.billNumber !== undefined && ask.billNumber !== cur.billNumber) data.billNumber = ask.billNumber;
         if (ask.note !== undefined && ask.note !== cur.note) data.note = ask.note;
-        const amountChange = ask.amountK !== undefined && ask.amountK !== toKobo(cur.originalAmount);
-        const accountChange = ask.accountId !== undefined && ask.accountId !== cur.accountId;
+        const amountChange = wantK !== undefined && wantK !== toKobo(cur.originalAmount);
+        const accountChange = restock
+          ? cur.accountId !== stockAccount.id
+          : ask.accountId !== undefined && ask.accountId !== cur.accountId;
         // The account. One the bill names already is taken as it is, even if
         // the owner has since rested it, so an edit of other fields saves.
         let account = cur.accountId ? await px.ledgerAccount.findUnique({ where: { id: cur.accountId } }) : null;
@@ -429,13 +739,17 @@ router.patch("/:id", requirePermission("canManagePayables"), async (req, res) =>
         // a liability, or moving to another account), or to let one go.
         const viaChange = ask.receivedViaAccountId !== undefined && ask.receivedViaAccountId !== cur.receivedViaAccountId &&
           (accountChange || isLiability(account) || !!cur.receivedViaAccountId);
-        if (!Object.keys(data).length && !amountChange && !accountChange && !viaChange) return { bill: cur, fields: [] };
+        if (!Object.keys(data).length && !amountChange && !accountChange && !viaChange && !itemsChange) {
+          return { bill: cur, fields: [], inventory: [] };
+        }
 
         // The bill's own day, and the day it moves to.
         await assertUnlockedIn(px, cur.businessId, cur.billDate, data.billDate);
 
         if (accountChange) {
-          account = await assertAccountUsable(cur.businessId, ask.accountId, "bill", { isStaff, field: "accountId" }, px);
+          account = restock
+            ? stockAccount
+            : await assertAccountUsable(cur.businessId, ask.accountId, "bill", { isStaff, field: "accountId" }, px);
           data.accountId = account.id;
           data.type = typeFor(account);
           await assertUnlockedIn(px, cur.businessId, countedPaymentDays(cur));
@@ -454,30 +768,53 @@ router.patch("/:id", requirePermission("canManagePayables"), async (req, res) =>
         if (amountChange) {
           assertConverted(cur);
           const paidK = paidKobo(cur.payments);
-          if (ask.amountK < paidK) {
+          if (wantK < paidK) {
             throw billError(409, "AMOUNT_BELOW_PAID", "The bill can't be less than what is already paid on it.", { paid: naira(paidK) }, "amount");
           }
-          data.originalAmount = naira(ask.amountK);
-          data.remainingAmount = naira(ask.amountK - paidK);
-          data.status = statusOf(ask.amountK, paidK);
+          data.originalAmount = naira(wantK);
+          data.remainingAmount = naira(wantK - paidK);
+          data.status = statusOf(wantK, paidK);
         }
-        if (!Object.keys(data).length) return { bill: cur, fields: [] };
+        if (!Object.keys(data).length && !itemsChange) return { bill: cur, fields: [], inventory: [] };
 
-        const moved = await px.businessDebt.updateMany({ where: { id: cur.id, updatedAt: cur.updatedAt }, data });
+        // The goods: the old lines' leave stock and the new ones' come in on
+        // the bill's day; or, lines unchanged, their movements move to the
+        // bill's new day.
+        let touched = new Set();
+        if (itemsChange) {
+          const out = await removeItems(px, cur);
+          const back = await writeItems(px, cur, ask.items.lines, data.billDate || cur.billDate, req.user.id);
+          touched = new Set([...out, ...back]);
+        } else if (data.billDate && cur.items.length) {
+          await px.stockMovement.updateMany({
+            where: { businessId: cur.businessId, sourceKey: { in: cur.items.map((i) => `bill:${i.id}`) } },
+            data: { date: data.billDate },
+          });
+        }
+
+        const fields = Object.keys(data);
+        if (itemsChange) fields.push("items");
+        // Touched even when only its lines changed, so a write racing this one
+        // sees the bill changed.
+        const moved = await px.businessDebt.updateMany({
+          where: { id: cur.id, updatedAt: cur.updatedAt },
+          data: Object.keys(data).length ? data : { updatedAt: new Date() },
+        });
         if (moved.count !== 1) throw billChanged();
         return {
-          bill: await px.businessDebt.findUnique({ where: { id: cur.id }, include: BILL_INCLUDE }),
-          fields: Object.keys(data),
-          before: { amount: cur.originalAmount, accountId: cur.accountId, billDate: cur.billDate },
+          bill: await px.businessDebt.findUnique({ where: { id: cur.id }, include: BILL_FULL }),
+          fields,
+          before: { amount: cur.originalAmount, accountId: cur.accountId, billDate: cur.billDate, lines: cur.items.length },
+          inventory: await itemRows(req, px, touched),
         };
-      }),
+      }, TX),
     );
 
     if (result.fields.length) {
       invalidateLedger(found.biz.id);
       logBill(req, "BILL_UPDATE", found.id, { fields: result.fields, before: result.before });
     }
-    res.json({ bill: viewBill(req, result.bill) });
+    res.json({ bill: viewBill(req, result.bill), inventory: result.inventory });
   } catch (err) {
     sendError(res, err, "Failed to update the bill");
   }
@@ -486,7 +823,8 @@ router.patch("/:id", requirePermission("canManagePayables"), async (req, res) =>
 // ── DELETE /bills/:id (owner only) ───────────────────────────────────────────
 // The bill and its payments go; every debit a payment named is freed and
 // counts on its own again. Refused when the bill's day, or a day a payment
-// counts on, is locked.
+// counts on, is locked. A restock's goods leave stock again (refused with 409
+// STOCK_ALREADY_SOLD when some have been sold since).
 router.delete("/:id", ownerOnly("Only the business owner can delete a bill."), async (req, res) => {
   try {
     const found = await ownedBill(req);
@@ -495,6 +833,7 @@ router.delete("/:id", ownerOnly("Only the business owner can delete a bill."), a
       prisma.$transaction(async (px) => {
         const bill = await freshBill(px, found);
         await assertUnlockedIn(px, bill.businessId, bill.billDate, countedPaymentDays(bill));
+        const touched = await removeItems(px, bill);
         const transactions = [];
         for (const p of bill.payments) {
           const freed = await freeDebit(px, p.transactionId, bill.id);
@@ -502,8 +841,8 @@ router.delete("/:id", ownerOnly("Only the business owner can delete a bill."), a
         }
         const gone = await px.businessDebt.deleteMany({ where: { id: bill.id, updatedAt: bill.updatedAt } });
         if (gone.count !== 1) throw billChanged();
-        return { bill, transactions };
-      }),
+        return { bill, transactions, inventory: await itemRows(req, px, touched) };
+      }, TX),
     );
 
     invalidateLedger(found.biz.id);
@@ -512,8 +851,9 @@ router.delete("/:id", ownerOnly("Only the business owner can delete a bill."), a
       amount: result.bill.originalAmount,
       paid: naira(paidKobo(result.bill.payments)),
       freedTransactions: result.transactions.map((t) => t.id),
+      lines: result.bill.items.length,
     });
-    res.json({ deleted: found.id, transactions: result.transactions });
+    res.json({ deleted: found.id, transactions: result.transactions, inventory: result.inventory });
   } catch (err) {
     sendError(res, err, "Failed to delete the bill");
   }
@@ -530,26 +870,9 @@ router.delete("/:id", ownerOnly("Only the business owner can delete a bill."), a
 router.post("/:id/payments", requirePermission("canManagePayables"), async (req, res) => {
   try {
     const body = req.body || {};
-    const isStaff = isStaffReq(req);
     const amountK = readAmount(body.amount);
-    const method = body.method === undefined || body.method === null || body.method === ""
-      ? "cash"
-      : String(body.method).toLowerCase();
-    if (!METHODS.includes(method)) throw billError(400, "BAD_METHOD", "Unknown payment method.", null, "method");
-    const bank = method === "bank";
-    if (bank && !body.transactionId) {
-      throw billError(400, "TRANSACTION_REQUIRED", "Pick the transfer that paid this bill.", null, "transactionId");
-    }
-    if (bank && isStaff && req.user.permissions?.canViewBalance !== true) {
-      return res.status(403).json({
-        error: "You don't have access to the bank account. Ask the business owner to link this transfer.",
-        code: "PERMISSION_DENIED",
-        permission: "canViewBalance",
-      });
-    }
     // No date is today; a payment from the KashBook account takes the debit's.
-    const when = bank ? null : body.date == null || body.date === "" ? new Date() : readDate(body.date, "date");
-    const note = readText(body.note, 200);
+    const pay = readPayment(req, body);
     const found = await ownedBill(req);
     if (!found) throw billNotFound();
 
@@ -557,68 +880,18 @@ router.post("/:id/payments", requirePermission("canManagePayables"), async (req,
       prisma.$transaction(async (px) => {
         const bill = await freshBill(px, found);
         assertConverted(bill);
-        const amountBillK = toKobo(bill.originalAmount);
-        const paidK = paidKobo(bill.payments);
-        const balanceK = amountBillK - paidK;
-        if (balanceK <= 0) throw billError(400, "PAID_IN_FULL", "This bill is already paid in full.");
-        if (amountK > balanceK) {
-          throw billError(400, "EXCEEDS_BALANCE", "That is more than the bill still owes.", { balance: naira(balanceK) }, "amount");
-        }
-
-        let tx = null;
-        let paidThrough = null;
-        if (bank) {
-          tx = await px.transaction.findUnique({ where: { id: String(body.transactionId) } });
-          const refused = debitRefusal(tx, found.biz);
-          if (refused) throw refused;
-          if (amountK > toKobo(tx.amount)) {
-            throw billError(400, "EXCEEDS_TRANSFER", "That is more than the transfer.", { transferAmount: Number(tx.amount) }, "amount");
-          }
-        } else {
-          paidThrough = await assertAccountUsable(bill.businessId, body.paidThroughAccountId, "money", { isStaff, field: "paidThroughAccountId" }, px);
-        }
-        const date = bank ? tx.date : when;
-        await assertUnlockedIn(px, bill.businessId, date);
-
-        // The debit first, and only if nothing took it since it was read.
-        if (bank) {
-          const linked = await px.transaction.updateMany({
-            where: { id: tx.id, businessId: bill.businessId, ...UNEXPLAINED },
-            data: { matchedBillId: bill.id, matchedAmount: naira(amountK) },
-          });
-          if (linked.count !== 1) {
-            throw billError(409, "TRANSACTION_TAKEN", "That transfer is already explained.", null, "transactionId");
-          }
-        }
-        const payment = await px.billPayment.create({
-          data: {
-            billId: bill.id,
-            amount: naira(amountK),
-            date,
-            method,
-            paidThroughAccountId: paidThrough ? paidThrough.id : null,
-            transactionId: bank ? tx.id : null,
-            note,
-            createdById: req.user.id,
-          },
-        });
-        const newPaidK = paidK + amountK;
-        const moved = await px.businessDebt.updateMany({
-          where: { id: bill.id, updatedAt: bill.updatedAt },
-          data: { remainingAmount: naira(amountBillK - newPaidK), status: statusOf(amountBillK, newPaidK) },
-        });
-        if (moved.count !== 1) throw billChanged();
+        const paid = await payBill(px, req, found.biz, bill, amountK, pay, null);
         return {
-          bill: await px.businessDebt.findUnique({ where: { id: bill.id }, include: BILL_INCLUDE }),
-          payment,
-          transaction: bank ? await px.transaction.findUnique({ where: { id: tx.id } }) : null,
+          bill: await px.businessDebt.findUnique({ where: { id: bill.id }, include: BILL_FULL }),
+          payment: paid.payment,
+          transaction: paid.transaction,
         };
       }),
     );
 
     invalidateLedger(found.biz.id);
     logBill(req, "BILL_PAYMENT", found.id, {
-      paymentId: result.payment.id, amount: result.payment.amount, method, transactionId: result.payment.transactionId,
+      paymentId: result.payment.id, amount: result.payment.amount, method: pay.method, transactionId: result.payment.transactionId,
     });
     res.status(201).json({ bill: viewBill(req, result.bill), payment: result.payment, transaction: result.transaction });
   } catch (err) {
@@ -652,7 +925,7 @@ router.delete("/:id/payments/:paymentId", ownerOnly("Only the business owner can
         });
         if (moved.count !== 1) throw billChanged();
         return {
-          bill: await px.businessDebt.findUnique({ where: { id: bill.id }, include: BILL_INCLUDE }),
+          bill: await px.businessDebt.findUnique({ where: { id: bill.id }, include: BILL_FULL }),
           payment: p,
           transaction,
         };

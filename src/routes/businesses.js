@@ -53,6 +53,10 @@ async function notifyAdminsOfKycSubmission(summary) {
   );
 }
 
+// What a business may say it sells (Business.sells; the migration's CHECK
+// holds the same list).
+const SELLS = ["goods", "services", "both"];
+
 // Helper to resolve the correct business owner ID
 const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
@@ -208,12 +212,18 @@ router.patch("/:id", async (req, res) => {
   // yesterday's ₦500,000 of sales would read as $500,000 today, and a business
   // that passed AML checks under one set of limits would be judged under another.
   // A country move means a new business, not an edit.
-  const { name, emoji, color, customCategories, vatEnabled, vatRate, vatInclusive, taxId } = req.body;
+  const { name, emoji, color, customCategories, vatEnabled, vatRate, vatInclusive, taxId, sells } = req.body;
   if (req.body?.country !== undefined || req.body?.baseCurrency !== undefined || req.body?.currency !== undefined) {
     return res.status(400).json({
       code: "COUNTRY_IMMUTABLE",
       error: "A business keeps the country and currency it was created with. To trade in another country, create a new business.",
     });
+  }
+  // What the business sells (chart of accounts release 3): goods, services
+  // or both; null means not asked yet, which the app shows as both. The
+  // owner's call (staff are refused above). GET returns it with the rest.
+  if (sells !== undefined && sells !== null && !SELLS.includes(sells)) {
+    return res.status(400).json({ code: "BAD_SELLS", field: "sells", error: "Say whether the business sells goods, services or both." });
   }
   try {
     // Verify ownership
@@ -265,6 +275,7 @@ router.patch("/:id", async (req, res) => {
       data.taxId = tin || null;
     }
     if (vatInclusive !== undefined) data.vatInclusive = !!vatInclusive;
+    if (sells !== undefined) data.sells = sells;
     if (vatRate !== undefined) {
       // null clears the override (falls back to the country rate); otherwise
       // clamp to a sane 0–100%.

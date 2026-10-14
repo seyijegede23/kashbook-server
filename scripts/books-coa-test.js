@@ -8,7 +8,11 @@
 // Release 2 (2026-10-13): bills (payments when paid, the bill on its date when
 // sold, a loan never, a payment outside the books never, a debit that paid a
 // bill no longer counting itself), manual journals (their lines on income and
-// spending, both views), and the VAT estimate with bills.
+// spending, both views), and the VAT estimate with bills. Release 3
+// (2026-10-13): what the goods sold cost (on the document's date when sold,
+// with the money when paid, a credit note's goods back as a negative cost),
+// services costing nothing, unknown costs, stock adjustments and new values,
+// restocks (never spending, in the VAT estimate), with exact numbers.
 //
 //   node scripts/books-coa-test.js
 const assert = require("assert");
@@ -668,6 +672,340 @@ test("every view's rows still add up with bills, journals, fees, itemized expens
   // (sold view), 2,000 still counts as a debit, the fee as a bank charge.
   eq(books.computeBooks(input, { basis: "paid" }).expenses.total, 10200 + 8000 + 2000 + 53.75 + 29500);
   eq(books.computeBooks(input, { basis: "sold" }).expenses.total, 10200 + 50000 + 2000 + 53.75 + 29500);
+});
+
+// ── Release 3: stock cost ────────────────────────────────────────────────────
+// The chart above with Inventory Asset, as the loaders pass it.
+const chart3 = { ...chart2, stock: { cls: "asset", type: "stock" }, services: { cls: "income", type: "income" } };
+const goods = (id, amount, costAmount, over = {}) => ({ id, itemType: "goods", quantity: 1, amount, accountId: "sales", costAmount, ...over });
+const service = (id, amount, over = {}) => ({ id, itemType: "service", quantity: 1, amount, accountId: "services", costAmount: 0, ...over });
+const cogsOf = (input, opts) => books.computeBooks(input, opts).expenses.lines.cogs;
+const rowsOf = (input, basis, source) => books.bookRows(input, basis).filter((r) => r.source === source)
+  .map((r) => [r.id, r.amount, r.date]);
+
+console.log("\n── Stock cost: sales");
+test("a cash sale with goods: their cost on the sale date in both views, services and typed lines cost nothing", () => {
+  const input = {
+    sales: [{
+      id: "s1", amount: 15000, date: "2026-10-01", paymentMethod: "cash",
+      items: [goods("l1", 6000, 4000), goods("l2", 4000, 2500.5), service("l3", 4000), { id: "l4", itemType: "other", amount: 1000, costAmount: 0 }],
+    }],
+    accounts: chart3,
+  };
+  both((basis) => {
+    const b = books.computeBooks(input, { basis });
+    eq(b.sales.total, 15000, `${basis}: the sale, as one amount`);
+    eq(b.expenses.lines.cogs.gross, 6500.5, `${basis}: the goods' cost`);
+    eq(b.expenses.lines.cogs.count, 1, `${basis}: one amount for the sale`);
+    eq(b.expenses.total, 6500.5, basis);
+    eq(b.profit, 8499.5, basis);
+    assert.deepStrictEqual(rowsOf(input, basis, "cogs"), [["cogs_sale_s1", 6500.5, "2026-10-01"]], basis);
+  });
+  // Another month counts none of it.
+  both((basis) => eq(cogsOf(input, { basis, ...month("11") }).gross, 0, basis));
+});
+test("a sale of services only, or of goods whose cost is not known, has no cost", () => {
+  const input = {
+    sales: [
+      { id: "s1", amount: 5000, date: "2026-10-01", items: [service("l1", 3000), service("l2", 2000)] },
+      { id: "s2", amount: 800, date: "2026-10-01", items: [goods("l3", 800, 0, { unitCost: null })] },
+      { id: "s3", amount: 700, date: "2026-10-01" },
+    ],
+    accounts: chart3,
+  };
+  both((basis) => {
+    const b = books.computeBooks(input, { basis });
+    eq(b.expenses.lines.cogs.count, 0, basis);
+    eq(b.expenses.total, 0, basis);
+    eq(b.sales.total, 6500, basis);
+    eq(books.bookRows(input, basis).filter((r) => r.type === "expense").length, 0, `${basis}: no cost rows`);
+  });
+});
+test("a credit sale paid in two parts: when sold its cost on the sale date; when paid with each payment, exactly", () => {
+  const input = {
+    sales: [{ id: "s1", amount: 12000, date: "2026-10-01", isCredit: true, customerId: "c1", items: [goods("l1", 12000, 7000.01)] }],
+    debts: [{
+      id: "d1", amount: 12000, paidAmount: 12000, paid: true, date: "2026-10-01", saleId: "s1", customerId: "c1", note: "",
+      payments: [{ id: "p2", amount: 7000, date: "2026-11-02" }, { id: "p1", amount: 5000, date: "2026-10-05" }],
+    }],
+    accounts: chart3,
+  };
+  eq(cogsOf(input, { basis: "sold", ...month("10") }).gross, 7000.01, "sold, October: all of it");
+  eq(cogsOf(input, { basis: "sold", ...month("11") }).gross, 0, "sold, November: nothing");
+  // 7,000.01 × 5,000 / 12,000 = 2,916.6708 → 2,916.67; the rest with the last naira.
+  eq(cogsOf(input, { basis: "paid", ...month("10") }).gross, 2916.67, "paid, October: the first payment's share");
+  eq(cogsOf(input, { basis: "paid", ...month("11") }).gross, 4083.34, "paid, November: the rest, to the kobo");
+  eq(cogsOf(input, { basis: "paid" }).gross, 7000.01, "paid, all time: exactly its cost");
+  assert.deepStrictEqual(rowsOf(input, "paid", "cogs"), [["cogs_dp_p2", 4083.34, "2026-11-02"], ["cogs_dp_p1", 2916.67, "2026-10-05"]]);
+  const row = books.bookRows(input, "paid").find((r) => r.id === "cogs_dp_p1");
+  assert.deepStrictEqual([row.saleId, row.debtId, row.paymentId, row.customerId, row.category], ["s1", "d1", "p1", "c1", "supplies"]);
+  // Not paid yet: nothing when paid, all of it when sold.
+  const unpaid = { ...input, debts: [{ ...input.debts[0], paidAmount: 0, paid: false, payments: [] }] };
+  eq(cogsOf(unpaid, { basis: "paid" }).gross, 0, "paid: an unpaid sale shows no cost (and no loss)");
+  eq(books.computeBooks(unpaid, { basis: "paid" }).profit, 0, "paid profit");
+  eq(cogsOf(unpaid, { basis: "sold" }).gross, 7000.01, "sold");
+});
+test("a credit sale no debt tracks counts its cost on its date, like its money", () => {
+  const input = { sales: [{ id: "s1", amount: 3000, date: "2026-10-01", isCredit: true, items: [goods("l1", 3000, 1800)] }], accounts: chart3 };
+  both((basis) => eq(cogsOf(input, { basis, ...month("10") }).gross, 1800, basis));
+});
+test("a repayment in the period releases the cost of a credit sale from before it (the debt carries the sale)", () => {
+  // As booksData loads October alone: the September sale is not among the
+  // sales, so its debt carries it.
+  const sale = { id: "s9", amount: 10000, date: "2026-09-20", isCredit: true, items: [{ id: "x", costAmount: 6000 }] };
+  const input = {
+    sales: [],
+    debts: [{ id: "d1", amount: 10000, saleId: "s9", sale, customerId: "c1", payments: [{ id: "p1", amount: 2500, date: "2026-10-04" }] }],
+    accounts: chart3,
+  };
+  const b = books.computeBooks(input, { basis: "paid", ...month("10") });
+  eq(b.sales.total, 2500, "the repayment");
+  eq(b.expenses.lines.cogs.gross, 1500, "a quarter of the sale's cost");
+  eq(books.computeBooks(input, { basis: "sold", ...month("10") }).expenses.total, 0, "sold: the sale was September's");
+  // The whole books (the sale among the sales) count the same in October.
+  const whole = { ...input, sales: [sale], debts: [{ ...input.debts[0], sale: undefined }] };
+  eq(books.computeBooks(whole, { basis: "paid", ...month("10") }).expenses.lines.cogs.gross, 1500, "the same with the sale loaded");
+});
+test("a sale in another currency counts no money, but its goods' cost on its date in both views", () => {
+  const input = { sales: [{ id: "s1", amount: 100, currency: "EUR", foreignCurrency: true, date: "2026-10-01", items: [goods("l1", 100, 45000)] }], accounts: chart3 };
+  both((basis) => {
+    const b = books.computeBooks(input, { basis });
+    eq(b.sales.total, 0, basis);
+    eq(b.expenses.lines.cogs.gross, 45000, basis);
+  });
+});
+
+console.log("\n── Stock cost: invoices and credit notes");
+const inv = (over = {}) => ({
+  id: "i1", type: "invoice", status: "partial", issueDate: "2026-10-01", invoiceNumber: "INV-1", customerId: "c1",
+  total: 10750, taxAmount: 750, amountPaid: 4300, subtotal: 10000, discountAmount: 0,
+  items: [{ id: "a", amount: 6000, itemType: "goods", costAmount: 3600 }, { id: "b", amount: 4000, itemType: "goods", costAmount: 2400 }],
+  payments: [{ id: "ip1", amount: 4300, method: "cash", date: "2026-10-10" }],
+  ...over,
+});
+test("an invoice paid in part: when sold its goods' cost on the issue date; when paid the share the money brings", () => {
+  const input = { invoices: [inv()], accounts: chart3 };
+  eq(cogsOf(input, { basis: "sold" }).gross, 6000, "sold: all of it");
+  // 6,000 × 4,300 / 10,750 = 2,400.
+  eq(cogsOf(input, { basis: "paid" }).gross, 2400, "paid: the share of the money in");
+  assert.deepStrictEqual(rowsOf(input, "sold", "cogs"), [["cogs_doc_i1", 6000, "2026-10-01"]]);
+  assert.deepStrictEqual(rowsOf(input, "paid", "cogs"), [["cogs_ip_ip1", 2400, "2026-10-10"]]);
+  // Credit from a credit note applied releases its share as money would (it
+  // is no money: no sales); an unlinked bank payment releases nothing until
+  // it is linked. 6,000 × 7,300 / 10,750 = 4,074.4186 → 4,074.42, less the
+  // 2,400 before it.
+  const settled = { invoices: [inv({ payments: [...inv().payments, { id: "ip2", amount: 3000, method: "credit_note", date: "2026-10-11" }, { id: "ip3", amount: 3450, method: "bank", date: "2026-10-12" }] })], accounts: chart3 };
+  eq(cogsOf(settled, { basis: "paid" }).gross, 4074.42, "paid: the money and the credit applied");
+  eq(books.computeBooks(settled, { basis: "paid" }).sales.total, 4300, "paid: sales only from the money");
+  assert.deepStrictEqual(rowsOf(settled, "paid", "cogs"), [["cogs_ip_ip1", 2400, "2026-10-10"], ["cogs_ip_ip2", 1674.42, "2026-10-11"]]);
+});
+test("paid in full in three parts, the cost comes out exactly; overpaid, never more than the cost", () => {
+  const thirds = [1, 2, 3].map((n) => ({ id: `t${n}`, amount: 3583.33 + (n === 3 ? 0.01 : 0), method: "transfer", date: `2026-10-0${n + 1}` }));
+  const input = { invoices: [inv({ payments: thirds, amountPaid: 10750 })], accounts: chart3 };
+  const rows = rowsOf(input, "paid", "cogs");
+  eq(Math.round(rows.reduce((s, r) => s + r[1] * 100, 0)), 600000, "the three shares add up to the cost");
+  for (const r of rows) assert.ok(Math.abs(r[1] - 2000) <= 0.01, `${r[0]} ${r[1]} is a third, within a kobo`);
+  const over = { invoices: [inv({ payments: [{ id: "o1", amount: 10750, method: "cash", date: "2026-10-02" }, { id: "o2", amount: 500, method: "cash", date: "2026-10-03" }] })], accounts: chart3 };
+  eq(cogsOf(over, { basis: "paid" }).gross, 6000, "overpaid: the cost, once");
+});
+test("a draft, void or quote with costs on its lines moves no stock and costs nothing", () => {
+  for (const status of ["draft", "void"]) {
+    both((basis) => eq(cogsOf({ invoices: [inv({ status })], accounts: chart3 }, { basis }).gross, 0, `${status} ${basis}`));
+  }
+  both((basis) => eq(cogsOf({ invoices: [inv({ type: "quote", status: "sent" })], accounts: chart3 }, { basis }).gross, 0, `quote ${basis}`));
+  eq(books.documentCostKobo(inv({ status: "draft" })), 0, "documentCostKobo");
+  eq(books.documentCostKobo(inv({ status: "paid" })), 600000, "documentCostKobo, issued");
+});
+test("a credit note that puts goods back, refunded: a negative cost when issued (sold) or as the refund goes out (paid)", () => {
+  const sold = inv({ status: "paid", amountPaid: 10750, payments: [{ id: "ip1", amount: 10750, method: "cash", date: "2026-10-03" }] });
+  const cn = {
+    id: "cn1", type: "credit_note", status: "paid", issueDate: "2026-10-10", invoiceNumber: "CN-1", customerId: "c1",
+    total: 5375, taxAmount: 375, amountPaid: 5375, subtotal: 5000, discountAmount: 0,
+    items: [
+      { id: "r1", amount: 3000, itemType: "goods", restock: true, costAmount: 1800 },
+      { id: "r2", amount: 2000, itemType: "goods", restock: false, costAmount: 1200 }, // kept by the customer (damaged): no goods back
+    ],
+    payments: [{ id: "rf1", amount: 2687.5, method: "refund_cash", date: "2026-10-12" }, { id: "rf2", amount: 2687.5, method: "refund_transfer", date: "2026-11-01" }],
+  };
+  const input = { invoices: [sold, cn], accounts: chart3 };
+  eq(books.documentCostKobo(cn), -180000, "only the restocked line comes back");
+  const s = (r) => cogsOf(input, { basis: "sold", ...r }).gross;
+  eq(s(month("10")), 6000 - 1800, "sold, October: the invoice less the goods back");
+  const p = (r) => cogsOf(input, { basis: "paid", ...r }).gross;
+  eq(p(month("10")), 6000 - 900, "paid, October: the invoice, less half the goods back with the first refund");
+  eq(p(month("11")), -900, "paid, November: the rest with the second refund");
+  assert.deepStrictEqual(rowsOf(input, "paid", "cogs"), [["cogs_ip_ip1", 6000, "2026-10-03"], ["cogs_ip_rf1", -900, "2026-10-12"], ["cogs_ip_rf2", -900, "2026-11-01"]]);
+  // Applied to another invoice instead of refunded: the goods back count with
+  // the credit, on the day it was applied.
+  const applied = { invoices: [sold, { ...cn, payments: [{ id: "ca1", amount: 5375, method: "credit_applied", date: "2026-10-12" }] }], accounts: chart3 };
+  eq(cogsOf(applied, { basis: "paid" }).gross, 4200, "paid: the goods back with the credit applied");
+  assert.deepStrictEqual(rowsOf(applied, "paid", "cogs"), [["cogs_ip_ip1", 6000, "2026-10-03"], ["cogs_ip_ca1", -1800, "2026-10-12"]]);
+  eq(cogsOf(applied, { basis: "sold" }).gross, 4200, "sold: the goods back on the credit note's date");
+});
+test("credit from a credit note applied to an invoice releases both documents' costs as money would; settled in full, both views agree", () => {
+  const invoice = inv({
+    id: "i2", invoiceNumber: "INV-2", status: "paid", total: 10000, taxAmount: 0, amountPaid: 10000, subtotal: 10000,
+    items: [{ id: "a", amount: 10000, itemType: "goods", costAmount: 6000.01 }],
+    payments: [
+      { id: "c1", amount: 5000, method: "cash", date: "2026-10-15" },
+      { id: "c2", amount: 5000, method: "credit_note", date: "2026-10-16" },
+    ],
+  });
+  const note = {
+    id: "cn2", type: "credit_note", status: "paid", issueDate: "2026-10-14", invoiceNumber: "CN-2", customerId: "c1",
+    total: 5000, taxAmount: 0, amountPaid: 5000, subtotal: 5000, discountAmount: 0,
+    items: [{ id: "r1", amount: 5000, itemType: "goods", restock: true, costAmount: 3000 }],
+    payments: [{ id: "a1", amount: 5000, method: "credit_applied", date: "2026-10-16" }],
+  };
+  const input = { invoices: [invoice, note], accounts: chart3 };
+  // Half of 6,000.01 (3,000.005 → 3,000.01) with the cash, the rest with the
+  // credit; the goods back all with the credit applied.
+  assert.deepStrictEqual(rowsOf(input, "paid", "cogs"), [["cogs_ip_c1", 3000.01, "2026-10-15"], ["cogs_ip_c2", 3000, "2026-10-16"], ["cogs_ip_a1", -3000, "2026-10-16"]]);
+  const paid = books.computeBooks(input, { basis: "paid" });
+  eq(paid.expenses.lines.cogs.gross, 3000.01, "paid: 6,000.01 out, 3,000 back");
+  eq(paid.sales.total, 5000, "paid: only the cash is sales");
+  eq(cogsOf(input, { basis: "sold" }).gross, 3000.01, "sold: the same cost, once everything is settled");
+  eq(cogsOf(input, { basis: "paid", from: "2026-10-15", to: "2026-10-15" }).gross, 3000.01, "paid: the cash's day");
+  eq(cogsOf(input, { basis: "paid", from: "2026-10-16", to: "2026-10-16" }).gross, 0, "paid: the credit's day, out and back");
+});
+test("an invoice written off: when paid all its goods' cost still waiting is cost of goods sold on the write-off date (never bad debt)", () => {
+  const written = inv({ writtenOffAt: "2026-10-20", writtenOffAmount: 6450 });
+  const input = { invoices: [written], accounts: chart3 };
+  // 2,400 with the money on the 10th, the other 3,600 on the 20th.
+  assert.deepStrictEqual(rowsOf(input, "paid", "cogs"), [["cogs_ip_ip1", 2400, "2026-10-10"], ["cogs_wo_i1", 3600, "2026-10-20"]]);
+  const paid = books.computeBooks(input, { basis: "paid", ...month("10") });
+  eq(paid.expenses.lines.cogs.gross, 6000, "paid: all of it in October");
+  eq(paid.expenses.lines.badDebts.gross, 0, "paid: no bad debt");
+  eq(paid.expenses.total, 6000, "paid");
+  const row = books.bookRows(input, "paid").find((r) => r.id === "cogs_wo_i1");
+  assert.deepStrictEqual([row.invoiceId, row.customerId, row.description, row.source, row.category], ["i1", "c1", "INV-1", "cogs", "supplies"]);
+  // "When sold" as before: the cost on the issue date, the unpaid balance as bad debt.
+  const sold = books.computeBooks(input, { basis: "sold", ...month("10") });
+  eq(sold.expenses.lines.cogs.gross, 6000, "sold: on the issue date");
+  eq(sold.expenses.lines.badDebts.gross, 6450, "sold: bad debt");
+  eq(sold.expenses.total, 12450, "sold");
+  // Written off before any money: all of it then, and a later payment releases nothing more.
+  const early = { invoices: [inv({ writtenOffAt: "2026-10-05", writtenOffAmount: 10750 })], accounts: chart3 };
+  assert.deepStrictEqual(rowsOf(early, "paid", "cogs"), [["cogs_wo_i1", 6000, "2026-10-05"]]);
+  // Paid and written off the same day: the payment's share first, whatever the order.
+  const sameDay = { invoices: [inv({ writtenOffAt: "2026-10-10", writtenOffAmount: 6450 })], accounts: chart3 };
+  assert.deepStrictEqual(rowsOf(sameDay, "paid", "cogs"), [["cogs_ip_ip1", 2400, "2026-10-10"], ["cogs_wo_i1", 3600, "2026-10-10"]]);
+  // Outside an exact span the write-off counts nowhere (the loader marks it).
+  eq(cogsOf({ invoices: [inv({ writtenOffAt: "2026-10-20", writtenOffOutsideSpan: true })], accounts: chart3 }, { basis: "paid" }).gross, 2400, "outside the span");
+  // A credit note is never written off: its waiting cost stays with its refunds.
+  eq(books.stockCosts({ invoices: [{ ...written, type: "credit_note", items: [{ id: "r", amount: 1, restock: true, costAmount: 5 }] }] }).values().next().value.releases.size, 1, "only its payment releases");
+});
+test("a document with nothing to collect counts its goods' cost on its date in both views", () => {
+  const free = inv({ total: 0, taxAmount: 0, amountPaid: 0, subtotal: 0, items: [{ id: "a", amount: 0, itemType: "goods", costAmount: 950 }], payments: [] });
+  both((basis) => eq(cogsOf({ invoices: [free], accounts: chart3 }, { basis }).gross, 950, basis));
+});
+test("a document issued outside an exact span counts nothing on its issue date (the loader marks it)", () => {
+  // As booksForInstants loads today's span: an invoice of 2 units at nothing
+  // (cost 80) and a restocked credit note at nothing (-40), both issued on
+  // the 9th, are read with no period at all.
+  const free = inv({ id: "z1", issueDate: "2026-10-09", total: 0, taxAmount: 0, amountPaid: 0, subtotal: 0, items: [{ id: "a", amount: 0, itemType: "goods", costAmount: 80 }], payments: [] });
+  const back = {
+    id: "z2", type: "credit_note", status: "sent", issueDate: "2026-10-09", invoiceNumber: "CN-9", customerId: "c1",
+    total: 0, taxAmount: 0, amountPaid: 0, subtotal: 0, discountAmount: 0,
+    items: [{ id: "r", amount: 0, itemType: "goods", restock: true, costAmount: 40 }], payments: [],
+  };
+  const inside = { invoices: [free, back], accounts: chart3 };
+  both((basis) => eq(cogsOf(inside, { basis }).gross, 40, `${basis}: issued in the span`));
+  const outside = { invoices: [{ ...free, issuedOutsideSpan: true }, { ...back, issuedOutsideSpan: true }], accounts: chart3 };
+  both((basis) => {
+    eq(cogsOf(outside, { basis }).gross, 0, `${basis}: issued outside it`);
+    eq(books.bookRows(outside, basis).length, 0, `${basis}: no rows`);
+  });
+  // "When sold", the document's own amount waits for its issue date too.
+  const sent = { invoices: [inv({ status: "sent", issuedOutsideSpan: true })], accounts: chart3 };
+  const s = books.computeBooks(sent, { basis: "sold" });
+  eq(s.sales.total, 0, "sold: not invoiced in the span");
+  eq(s.expenses.lines.cogs.gross, 0, "sold: nor its cost");
+  // Its payments in the span still count, and release their share.
+  eq(cogsOf(sent, { basis: "paid" }).gross, 2400, "paid: the payment's share");
+});
+
+console.log("\n── Stock adjustments, new values, restocks");
+const moves = [
+  { id: "m1", kind: "adjustment", reason: "damaged", date: "2026-10-02", value: -2000, itemId: "g1" },
+  { id: "m2", kind: "adjustment", reason: "counted", date: "2026-10-03", value: 500, itemId: "g1" },
+  { id: "m3", kind: "revalue", date: "2026-10-04", value: -1000, itemId: "g2" },
+  { id: "m4", kind: "revalue", date: "2026-11-04", value: 300.25, itemId: "g2" },
+  { id: "m5", kind: "opening", date: "2026-10-01", value: 50000, itemId: "g1" },
+  { id: "m6", kind: "opening_value", date: "2026-10-01", value: 7000, itemId: "g3" },
+  { id: "m7", kind: "adjustment", reason: "lost", date: "2026-10-05", value: 0, itemId: "g4" },
+];
+test("stock lost or valued lower is spending, found or valued higher lowers it; starting stock counts nowhere", () => {
+  both((basis) => {
+    const b = books.computeBooks({ stockMoves: moves, accounts: chart3 }, { basis, ...month("10") });
+    eq(b.expenses.lines.stockAdjustments.gross, 2000 - 500 + 1000, basis);
+    eq(b.expenses.lines.stockAdjustments.count, 3, `${basis}: an amount per movement with a value`);
+    eq(b.expenses.total, 2500, basis);
+    eq(books.computeBooks({ stockMoves: moves, accounts: chart3 }, { basis, ...month("11") }).expenses.total, -300.25, `${basis} November`);
+  });
+  const rows = books.bookRows({ stockMoves: moves, accounts: chart3 }, "paid");
+  assert.deepStrictEqual(
+    rows.map((r) => [r.id, r.amount, r.date, r.source, r.category, r.moveKind, r.reason, r.itemId]),
+    [
+      ["sadj_m1", 2000, "2026-10-02", "stock_adjustment", "stock_adjustments", "adjustment", "damaged", "g1"],
+      ["sadj_m2", -500, "2026-10-03", "stock_adjustment", "stock_adjustments", "adjustment", "counted", "g1"],
+      ["sadj_m3", 1000, "2026-10-04", "stock_adjustment", "stock_adjustments", "revalue", null, "g2"],
+      ["sadj_m4", -300.25, "2026-11-04", "stock_adjustment", "stock_adjustments", "revalue", null, "g2"],
+    ],
+  );
+});
+const restock = (over = {}) => ({
+  id: "rb1", accountId: "stock", billDate: "2026-10-02", amount: 21500, estimated: false, vendorName: "Ada Wholesale",
+  items: [{ id: "bi1", itemId: "g1", quantity: 10, unitCost: 1500, amount: 15000 }, { id: "bi2", itemId: "g2", quantity: 2.5, unitCost: 2600, amount: 6500 }],
+  payments: [pay("rp1", 21500, "2026-10-02")],
+  ...over,
+});
+test("a restock (a bill on Inventory Asset) is never spending, paid now or later; its VAT is in the estimate", () => {
+  const input = { bills: [restock(), restock({ id: "rb2", payments: [pay("rp2", 1000, "2026-10-20")] })], accounts: chart3 };
+  eq(books.billIsSpending(input.bills[0], chart3), false, "not spending");
+  both((basis) => {
+    eq(books.computeBooks(input, { basis }).expenses.total, 0, basis);
+    eq(books.bookRows(input, basis).length, 0, `${basis}: no rows`);
+  });
+  // Two restocks of 21,500 in October: 7.5/107.5 of each.
+  eq(books.vatReturn(input, "2026-10", VAT).inputEstimate, 3000, "VAT inside 43,000");
+});
+
+console.log("\n── Stock cost: the period, the span, and the rows");
+test("a payment outside the span counts nowhere, but still decides the share a later one releases", () => {
+  const payments = [{ id: "p1", amount: 5000, date: "2026-10-05", outsideSpan: true }, { id: "p2", amount: 7000, date: "2026-11-02" }];
+  const input = {
+    sales: [{ id: "s1", amount: 12000, date: "2026-10-01", isCredit: true, items: [goods("l1", 12000, 7000.01)] }],
+    debts: [{ id: "d1", amount: 12000, saleId: "s1", customerId: "c1", payments }],
+    accounts: chart3,
+  };
+  const b = books.computeBooks(input, { basis: "paid" });
+  eq(b.sales.total, 7000, "only the payment in the span");
+  eq(b.expenses.lines.cogs.gross, 4083.34, "the second share, as with every payment read");
+});
+test("every view's rows add up to the totals with sales, invoices, credit notes, restocks and adjustments together", () => {
+  const input = {
+    sales: [
+      { id: "s1", amount: 15000, date: "2026-10-01", items: [goods("l1", 10000, 6500.5), service("l2", 5000)] },
+      { id: "s2", amount: 12000, date: "2026-10-01", isCredit: true, items: [goods("l3", 12000, 7000.01)] },
+    ],
+    debts: [{ id: "d1", amount: 12000, saleId: "s2", customerId: "c1", payments: [{ id: "p1", amount: 5000, date: "2026-10-05" }] }],
+    invoices: [inv()],
+    bills: [restock()],
+    stockMoves: moves,
+    accounts: chart3,
+  };
+  both((basis) => {
+    const rows = books.bookRows(input, basis);
+    const b = books.computeBooks(input, { basis });
+    eq(sumOf(rows.filter((r) => r.type === "expense")), b.expenses.total, `${basis} expenses`);
+    eq(sumOf(rows.filter((r) => r.type === "income")), b.sales.gross, `${basis} income`);
+    eq(new Set(rows.map((r) => r.id)).size, rows.length, `${basis}: ids are unique`);
+  });
+  eq(cogsOf(input, { basis: "sold" }).gross, 19500.51, "sold: 6,500.50 + 7,000.01 + 6,000");
+  eq(cogsOf(input, { basis: "paid" }).gross, 11817.17, "paid: 6,500.50 + 2,916.67 + 2,400");
+  // The sale's own row keeps its lines.
+  eq(books.bookRows(input, "sold").find((r) => r.id === "s1").items.length, 2, "items on the sale's row");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

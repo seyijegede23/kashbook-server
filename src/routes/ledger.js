@@ -537,7 +537,9 @@ async function dropCustomCategories(px, acc) {
 // borrowed money went into it; a bill payment made from it; and a manual
 // journal's line on it, draft or published. A bill's account and a payment's
 // would otherwise be cut loose by a delete (their keys are SET NULL), and a
-// journal line's key refuses the delete only when it commits.
+// journal line's key refuses the delete only when it commits. Release 3: a
+// line of a sale that counts as it, and an item whose sales count as it
+// (both keys are SET NULL too).
 async function usageOf(acc) {
   const id = acc.id;
   const byCategory = byCategoryOf(acc);
@@ -558,6 +560,8 @@ async function usageOf(acc) {
     prisma.businessDebt.count({ where: { OR: [{ accountId: id }, { receivedViaAccountId: id }] } }),
     prisma.billPayment.count({ where: { paidThroughAccountId: id } }),
     prisma.manualJournalLine.count({ where: { accountId: id } }),
+    prisma.saleItem.count({ where: { accountId: id } }),
+    prisma.inventoryItem.count({ where: { incomeAccountId: id } }),
   ]);
   return counts.reduce((s, n) => s + n, 0);
 }
@@ -836,6 +840,9 @@ async function mergeInto(from, into) {
     // for it changes itself below), and a journal with a line on it.
     await px.businessDebt.updateMany({ where: { payments: { some: { paidThroughAccountId: from.id } } }, data: touch });
     await px.manualJournal.updateMany({ where: { lines: { some: { accountId: from.id } } }, data: touch });
+    // Release 3: a sale whose line counts as `from` (an item that does
+    // changes itself below).
+    await px.sales.updateMany({ where: { items: { some: { accountId: from.id } } }, data: touch });
 
     const move = (model, field) => px[model].updateMany({ where: { [field]: from.id }, data: { [field]: into.id } });
     await move("expense", "accountId");
@@ -857,6 +864,10 @@ async function mergeInto(from, into) {
     await move("businessDebt", "receivedViaAccountId");
     await move("billPayment", "paidThroughAccountId");
     await move("manualJournalLine", "accountId");
+    // Release 3: sales' lines, and the items whose sales count as `from`
+    // (stamped, so every phone's next sync brings them with the new account).
+    await move("saleItem", "accountId");
+    await px.inventoryItem.updateMany({ where: { incomeAccountId: from.id }, data: { incomeAccountId: into.id, ...touch } });
     if (byCategory) {
       // Records that reached it by their category now name the account: an
       // itemized expense never does (its lines do), so it keeps none.

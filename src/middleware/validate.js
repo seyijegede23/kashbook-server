@@ -90,22 +90,87 @@ const validateCustomer = [
   checkResult,
 ];
 
-const validateInventoryItem = [
-  nameField("name"),
-  body("quantity")
-    .optional()
-    .isFloat({ min: 0 })
-    .withMessage("quantity must be a non-negative number"),
-  body("price")
-    .optional()
-    .isFloat({ min: 0 })
-    .withMessage("price must be a non-negative number"),
-  body("cost")
+// Products and services (release 3). A refusal carries a code and the field,
+// as the inventory routes' own refusals do, so the app can point at it. The
+// routes check the finer rules (three decimals for a quantity, kobo for a
+// price, a service's units) with the same codes.
+const INVENTORY_CODES = {
+  name: "BAD_NAME",
+  itemType: "BAD_ITEM_TYPE",
+  unit: "BAD_UNIT",
+  quantity: "BAD_QUANTITY",
+  price: "BAD_PRICE",
+  unitPrice: "BAD_PRICE",
+  costPrice: "BAD_COST",
+  lowStockAlert: "BAD_LOW_STOCK",
+  lowStockThreshold: "BAD_LOW_STOCK",
+  incomeAccountId: "ACCOUNT_NOT_FOUND",
+  description: "BAD_DESCRIPTION",
+  category: "BAD_ITEM",
+  sku: "BAD_ITEM",
+  barcode: "BAD_ITEM",
+};
+
+function checkInventoryResult(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    const first = errors.array()[0];
+    const field = first.path;
+    return res.status(400).json({ error: first.msg, code: INVENTORY_CODES[field] || "BAD_ITEM", field });
+  }
+  next();
+}
+
+const optionalNumber = (field, check, message) =>
+  body(field).optional({ nullable: true }).custom((v) => v === "" || check(v)).withMessage(message);
+const isNumberLike = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "")) && Number.isFinite(Number(v));
+const inRange = (min, max) => (v) => isNumberLike(v) && Number(v) >= min && Number(v) <= max;
+const shortText = (field, max) =>
+  body(field)
     .optional({ nullable: true })
-    .isFloat({ min: 0 })
-    .withMessage("cost must be a non-negative number"),
+    .isString()
+    .withMessage(`${field} must be text`)
+    .isLength({ max })
+    .withMessage(`${field} must be ${max} characters or less`);
+
+const inventoryFields = [
+  body("itemType")
+    .optional({ nullable: true })
+    .isIn(["goods", "service"])
+    .withMessage("An item is goods or a service"),
+  shortText("unit", 30),
+  optionalNumber("quantity", inRange(0, 1e9), "quantity must be a number, 0 or more"),
+  optionalNumber("price", inRange(0, 1e13), "price must be a number, 0 or more"),
+  optionalNumber("unitPrice", inRange(0, 1e13), "price must be a number, 0 or more"),
+  optionalNumber("costPrice", inRange(0, 1e13), "cost price must be a number, 0 or more"),
+  optionalNumber("lowStockAlert", (v) => inRange(0, 1e9)(v) && Number.isInteger(Number(v)), "low-stock level must be a whole number, 0 or more"),
+  optionalNumber("lowStockThreshold", (v) => inRange(0, 1e9)(v) && Number.isInteger(Number(v)), "low-stock level must be a whole number, 0 or more"),
+  body("incomeAccountId")
+    .optional({ nullable: true })
+    .isString()
+    .withMessage("incomeAccountId must be an account id"),
+  shortText("category", 100),
+  shortText("sku", 100),
+  shortText("barcode", 100),
   notesField("description"),
-  checkResult,
+];
+
+// POST /inventory: a name is required.
+const validateInventoryItem = [nameField("name"), ...inventoryFields, checkInventoryResult];
+
+// PATCH /inventory/:id: every field is optional, a name sent is not empty.
+const validateInventoryPatch = [
+  body("name")
+    .optional()
+    .isString()
+    .withMessage("name must be a string")
+    .trim()
+    .notEmpty()
+    .withMessage("name is required")
+    .isLength({ max: 120 })
+    .withMessage("name must be 120 characters or less"),
+  ...inventoryFields,
+  checkInventoryResult,
 ];
 
 const validateIdParam = [uuidParam("id"), checkResult];
@@ -116,5 +181,6 @@ module.exports = {
   validateExpense,
   validateCustomer,
   validateInventoryItem,
+  validateInventoryPatch,
   validateIdParam,
 };

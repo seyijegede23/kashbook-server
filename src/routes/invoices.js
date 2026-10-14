@@ -18,8 +18,10 @@ const { audit } = require("../utils/audit");
 const { recordLink } = require("../utils/paymentLinks");
 const { PAYMENT_TERMS: PAYMENT_TERM_CODES } = require("../utils/paymentTerms");
 const { snapshotFor } = require("../utils/customerFields");
-const { assertAccountUsable } = require("../utils/ledgerData");
+const { assertAccountUsable, accountsFor } = require("../utils/ledgerData");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
+const chart = require("../utils/chart");
+const stock = require("../utils/stock");
 
 // The lock date (chart of accounts release 2, utils/booksLock.js): nothing
 // dated on or before it is added, changed or removed. An invoice or a credit
@@ -75,10 +77,194 @@ async function checkLineAccounts(businessId, items, isStaff, kept = new Set()) {
   }
 }
 
+// ── Release 3: lines for an item, and the goods they move ─────────────────────
+// A line may name an item of this business (itemId), goods or a service; it
+// keeps the item's type (itemType; a typed line is "other"). An issued
+// invoice (any status but draft and void) takes each goods line's goods out
+// of stock (utils/stock.js takeOut, one movement "inv:<lineId>") and the line
+// keeps what they cost (unitCost, costAmount). An issued credit note puts back
+// the goods of each goods line marked restock, at the item's average cost
+// then (putIn; costAmount is the value that came back). Voiding, deleting or
+// redrafting a document undoes its movements (removeBySource), and an edit of
+// an issued one moves its lines again, in the one transaction that saves it,
+// so a refusal (409 NOT_ENOUGH_STOCK, 409 STOCK_ALREADY_SOLD) leaves the
+// document and the stock as they were. A quote moves nothing; converting one
+// makes a draft. Every write runs under the business lock, which the stock
+// writes of the sale and bill routes take too.
+//
+// A line with an item and no account of its own counts as the item's income
+// account (chart.incomeForItem: the item's own, else Service Income for a
+// service, else Sales, kept as null). A credit note's line with no account is
+// Sales Returns, as before.
+const TX = { timeout: 20000 };
+
+function lineError(status, code, message, extra) {
+  return Object.assign(new Error(message), { status, code, extra });
+}
+
+// Whether a document's lines move stock in this status: an issued invoice
+// (goods out) or an issued credit note (restocked goods back in).
+function movesStock(doc) {
+  const type = (doc && doc.type) || "invoice";
+  return !!doc && doc.status !== "DRAFT" && doc.status !== "VOID" && (type === "invoice" || type === "credit_note");
+}
+
+// Putting goods back into stock from a credit note (a line marked restock)
+// adds stock and lowers the cost of goods sold, so it is the owner's, or a
+// member's the owner trusts with bills and stock bought (canManagePayables;
+// owner's call, 2026-10-14). Anyone else may still issue the credit note,
+// without restock.
+const canRestock = (req) => req.user.accountType !== "staff" || req.user.permissions?.canManagePayables === true;
+
+// The quantity of a line in thousandths, as the stock engine counts it.
+const milliOf = (q) => Math.round((Number(q) || 0) * 1000);
+
+// The lines a create or an edit saves, read under the business lock. items:
+// the lines as sent. An item must be this business's (404 ITEM_NOT_FOUND
+// { itemId, line }); a goods line's quantity is one the stock engine takes,
+// more than 0 with at most three decimals (400 BAD_QUANTITY { line }).
+// mayRestock: whether the caller may mark a credit note's goods line restock
+// (canRestock); without it such a line is refused (403 PERMISSION_DENIED
+// { permission: "canManagePayables", field: "items", line }), unless the
+// document has that restock line already (the same item and quantity, as
+// saved: `saved`), which an edit of other fields sends back as it was.
+async function readDocLines(businessId, items, docType, { mayRestock = true, saved = [] } = {}) {
+  const isCredit = docType === "credit_note";
+  const keptRestock = saved.filter((l) => l.restock && l.itemId).map((l) => ({ ...l, taken: false }));
+  const ids = [...new Set(items.map((it) => it && it.itemId).filter(Boolean).map(String))];
+  const found = ids.length
+    ? await prisma.inventoryItem.findMany({
+        where: { id: { in: ids }, businessId },
+        select: { id: true, itemType: true, incomeAccountId: true },
+      })
+    : [];
+  const byId = new Map(found.map((i) => [i.id, i]));
+  let C = null;
+  const out = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i] || {};
+    const itemId = it.itemId ? String(it.itemId) : null;
+    const item = itemId ? byId.get(itemId) : null;
+    if (itemId && !item) throw lineError(404, "ITEM_NOT_FOUND", "That item isn't in this business.", { itemId, line: i });
+    const quantity = Number(it.quantity) || 1;
+    const rate = Number(it.rate) || 0;
+    const goods = !!item && item.itemType === "goods";
+    if (goods && !stock.validQuantity(quantity)) {
+      throw lineError(400, "BAD_QUANTITY", "Enter a quantity more than 0, with at most three decimals.", { line: i, field: "quantity" });
+    }
+    let accountId = it.accountId ? String(it.accountId) : null;
+    if (!accountId && item && !isCredit) {
+      C = C || chart.indexChart(await prisma.ledgerAccount.findMany({ where: { businessId } }));
+      const acc = chart.incomeForItem(C, item);
+      accountId = acc && acc.systemKey !== chart.SYS.SALES ? acc.id : null;
+    }
+    const restock = isCredit && goods && it.restock === true;
+    if (restock && !mayRestock) {
+      const same = keptRestock.find((l) => !l.taken && l.itemId === item.id && milliOf(l.quantity) === milliOf(quantity));
+      if (!same) {
+        throw lineError(403, "PERMISSION_DENIED", "Only the owner, or staff who manage bills, can put goods back into stock.", {
+          permission: "canManagePayables", field: "items", line: i,
+        });
+      }
+      same.taken = true;
+    }
+    out.push({
+      name: it.name,
+      description: it.description || null,
+      quantity,
+      rate,
+      amount: quantity * rate,
+      accountId,
+      itemId: item ? item.id : null,
+      itemType: item ? item.itemType : "other",
+      restock,
+    });
+  }
+  return out;
+}
+
+// The day a document's goods move on: its issue day, kept at midnight UTC
+// (the same day in Lagos), as a payment typed in for a day is kept.
+function stockDay(doc) {
+  const day = readIssueDay(doc.issueDate);
+  if (!day) {
+    throw lineError(400, "BAD_DATE", "This document's date isn't valid. Change it first.", { field: "issueDate" });
+  }
+  return new Date(`${day}T00:00:00.000Z`);
+}
+
+// Moves the goods of a document's saved lines (with their ids) and writes
+// each line's cost. Returns the ids of the items it moved.
+async function moveDocStock(px, doc, lines, createdById) {
+  const type = doc.type || "invoice";
+  const touched = new Set();
+  const moving = lines.filter((l) => l.itemId && l.itemType === "goods" && (type === "invoice" || l.restock));
+  if (!moving.length) return touched;
+  const date = stockDay(doc);
+  for (const line of moving) {
+    const base = {
+      businessId: doc.businessId, itemId: line.itemId, quantity: line.quantity, date,
+      sourceKey: `inv:${line.id}`, createdById,
+    };
+    let moved;
+    if (type === "invoice") {
+      moved = await stock.takeOut(px, { ...base, kind: "invoice" });
+    } else {
+      // Back at the item's average cost, read under its row lock.
+      await px.$queryRaw`SELECT "id" FROM "InventoryItem" WHERE "id" = ${line.itemId} FOR UPDATE`;
+      const item = await px.inventoryItem.findUnique({ where: { id: line.itemId }, select: { avgCost: true } });
+      moved = await stock.putIn(px, { ...base, kind: "credit_note", unitCost: item ? item.avgCost : null });
+    }
+    await px.invoiceItem.update({ where: { id: line.id }, data: { unitCost: moved.unitCost, costAmount: moved.costAmount } });
+    touched.add(line.itemId);
+  }
+  return touched;
+}
+
+// Undoes what a document's lines moved (nothing found, nothing done) and
+// clears their costs. Returns the ids of the items it moved.
+async function releaseDocStock(px, doc) {
+  const lines = await px.invoiceItem.findMany({ where: { invoiceId: doc.id }, select: { id: true } });
+  if (!lines.length) return new Set();
+  const { items } = await stock.removeBySource(px, doc.businessId, lines.map((l) => `inv:${l.id}`));
+  await px.invoiceItem.updateMany({
+    where: { invoiceId: doc.id, OR: [{ costAmount: { not: 0 } }, { unitCost: { not: null } }] },
+    data: { unitCost: null, costAmount: 0 },
+  });
+  return new Set(items.map((i) => i.id));
+}
+
+// The items a write moved, as they are now.
+async function itemRows(px, ids) {
+  const list = [...ids];
+  return list.length ? px.inventoryItem.findMany({ where: { id: { in: list } } }) : [];
+}
+
+// Whether the caller may see what goods cost: the owner, or staff with the
+// reports (canViewReports), as wherever costs are shown.
+const seesCosts = (req) => !!req && (req.user.accountType !== "staff" || req.user.permissions?.canViewReports === true);
+
+// An item a write moved, as its reply carries it (the app replaces its copy),
+// in the shape of routes/inventory.js publicItem: the row without the old
+// cost column, and what the stock cost only for those who may see costs.
+function stockRow(req, item) {
+  const { cost: _unused, ...row } = item;
+  return seesCosts(req) ? row : { ...row, stockValue: null, avgCost: null };
+}
+const stockRows = (req, items) => (items || []).map((i) => stockRow(req, i));
+
 // A document's lines as they are saved now (an edit), with the account each
 // one counts as. Those accounts are the `kept` of checkLineAccounts.
+// Release 3: with what each line moved (its item, quantity, restock and cost),
+// so an edit can keep the stock movements of the lines it leaves as they were.
 async function savedLinesOf(invoiceId) {
-  return prisma.invoiceItem.findMany({ where: { invoiceId }, select: { name: true, accountId: true } });
+  return prisma.invoiceItem.findMany({
+    where: { invoiceId },
+    select: {
+      id: true, name: true, accountId: true, itemId: true, itemType: true, quantity: true, restock: true,
+      unitCost: true, costAmount: true,
+    },
+  });
 }
 
 // An older app version (from before the chart of accounts) sends its lines
@@ -254,11 +440,14 @@ function calcStatus(invoice) {
   return status;
 }
 
-function formatInvoice(inv) {
+// req: the caller, for what goods cost (a line's unitCost and costAmount go
+// only to those who may see costs; anyone else gets null and 0).
+function formatInvoice(inv, req) {
+  const costs = seesCosts(req);
   return {
     ...inv,
     status: inv.status,
-    items: inv.items || [],
+    items: (inv.items || []).map((it) => (costs ? it : { ...it, unitCost: null, costAmount: 0 })),
     payments: inv.payments || [],
     customer: inv.customer
       ? { id: inv.customer.id, name: inv.customer.name, phone: inv.customer.phone }
@@ -331,9 +520,9 @@ router.get("/", authMiddleware, async (req, res) => {
         inv.dueDate &&
         inv.dueDate < now
       ) {
-        return { ...formatInvoice(inv), status: "OVERDUE" };
+        return { ...formatInvoice(inv, req), status: "OVERDUE" };
       }
-      return formatInvoice(inv);
+      return formatInvoice(inv, req);
     });
 
     res.json(result);
@@ -370,7 +559,7 @@ router.post("/", authMiddleware, async (req, res) => {
     // checked against the lock and stored as this, never as sent.
     const issueDay = readIssueDay(issueDate);
     if (!issueDay) return res.status(400).json(BAD_ISSUE_DATE);
-    if (items.length === 0) return res.status(400).json({ error: "At least one line item required" });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one line item required" });
 
     const biz = await ownsBusiness(req, businessId);
     if (!biz) return res.status(403).json({ error: "Access denied" });
@@ -407,61 +596,60 @@ router.post("/", authMiddleware, async (req, res) => {
     // they number theirs, so a typed number and an automatic one can never land
     // on the same value. An account merge or delete takes it too
     // (routes/ledger.js), so every account a line names is checked under it and
-    // is still there when the invoice is written.
-    const invoice = await prisma.withBusinessLock(businessId, async () => {
+    // is still there when the invoice is written. The number, the document and
+    // the goods it takes out of stock are written in one transaction: a
+    // refusal (NOT_ENOUGH_STOCK) leaves no document and uses no number.
+    // A chart missing an account a later release added (Service Income) gets
+    // it first, outside the lock, as accountsFor takes a lock of its own.
+    if (!isCredit && items.some((it) => it && it.itemId)) await accountsFor(businessId);
+    const result = await prisma.withBusinessLock(businessId, async () => {
       if (docType !== "quote") await assertUnlocked(businessId, issueDay);
       await checkLineAccounts(businessId, items, req.user.accountType === "staff");
-      let invoiceNumber;
-      if (manualNumber) {
-        if (await numberTaken(prisma, businessId, manualNumber)) {
-          throw Object.assign(new Error(`${manualNumber} is already used.`), {
-            status: 409, code: "NUMBER_IN_USE", number: manualNumber,
-          });
-        }
-        invoiceNumber = manualNumber;
-      } else {
-        invoiceNumber = await allocateInvoiceNumber(prisma, businessId, docType);
+      const lines = await readDocLines(businessId, items, docType, { mayRestock: canRestock(req) });
+      if (manualNumber && (await numberTaken(prisma, businessId, manualNumber))) {
+        throw Object.assign(new Error(`${manualNumber} is already used.`), {
+          status: 409, code: "NUMBER_IN_USE", number: manualNumber,
+        });
       }
-      return prisma.invoice.create({
-        data: {
-          businessId,
-          customerId: resolvedCustomerId,
-          userId,
-          invoiceNumber,
-          type: docType,
-          // A new document is a draft or sent. PAID and the rest come from
-          // payments, never from the create body.
-          status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
-          issueDate: issueDay,
-          dueDate: isCredit ? null : dueDate || null,
-          subtotal,
-          taxRate: Number(taxRate) || 0,
-          taxAmount,
-          discountType: discountType || null,
-          discountValue: Number(discountValue) || 0,
-          discountAmount,
-          total,
-          notes: notes || null,
-          terms: terms || null,
-          template,
-          ...details,
-          ...snapshot,
-          items: {
-            create: items.map((it) => ({
-              name: it.name,
-              description: it.description || null,
-              quantity: Number(it.quantity) || 1,
-              rate: Number(it.rate) || 0,
-              amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
-              accountId: it.accountId ? String(it.accountId) : null,
-            })),
+      return prisma.$transaction(async (px) => {
+        const invoiceNumber = manualNumber || (await allocateInvoiceNumber(px, businessId, docType));
+        const created = await px.invoice.create({
+          data: {
+            businessId,
+            customerId: resolvedCustomerId,
+            userId,
+            invoiceNumber,
+            type: docType,
+            // A new document is a draft or sent. PAID and the rest come from
+            // payments, never from the create body.
+            status: String(status).toUpperCase() === "SENT" ? "SENT" : "DRAFT",
+            issueDate: issueDay,
+            dueDate: isCredit ? null : dueDate || null,
+            subtotal,
+            taxRate: Number(taxRate) || 0,
+            taxAmount,
+            discountType: discountType || null,
+            discountValue: Number(discountValue) || 0,
+            discountAmount,
+            total,
+            notes: notes || null,
+            terms: terms || null,
+            template,
+            ...details,
+            ...snapshot,
+            items: { create: lines },
           },
-        },
-        include: INCLUDE,
-      });
+          include: { items: true },
+        });
+        const touched = movesStock(created) ? await moveDocStock(px, created, created.items, req.user.id) : new Set();
+        return {
+          invoice: await px.invoice.findUnique({ where: { id: created.id }, include: INCLUDE }),
+          inventory: await itemRows(px, touched),
+        };
+      }, TX);
     });
 
-    res.status(201).json(formatInvoice(invoice));
+    res.status(201).json({ ...formatInvoice(result.invoice, req), inventory: stockRows(req, result.inventory) });
   } catch (err) {
     if (err.status && err.code) {
       return res.status(err.status).json({ error: err.message, code: err.code, number: err.number, ...(err.extra || {}) });
@@ -549,7 +737,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
     if (!(await ownsBusiness(req, invoice.businessId)))
       return res.status(403).json({ error: "Access denied" });
-    res.json(formatInvoice(invoice));
+    res.json(formatInvoice(invoice, req));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch invoice" });
@@ -595,6 +783,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // saved with, exactly this day.
     const newIssueDay = issueDate ? readIssueDay(issueDate) : null;
     if (issueDate && !newIssueDay) return res.status(400).json(BAD_ISSUE_DATE);
+    if (!Array.isArray(items)) return res.status(400).json({ error: "items must be a list" });
 
     const { subtotal, taxAmount, discountAmount, total } = invoiceTotals({ items, taxRate, discountType, discountValue });
 
@@ -623,14 +812,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // are now (an issued VAT document never gets here: it is locked above).
     const snapshot = await snapshotFor(prisma, resolvedCustomerId);
 
-    // "Save and send" from the editor moves a draft to SENT. Nothing else can
-    // change status here: payments and voiding have their own routes.
-    const statusPatch =
-      typeof req.body.status === "string" &&
-      req.body.status.toUpperCase() === "SENT" &&
-      existing.status === "DRAFT"
-        ? { status: "SENT" }
-        : {};
+    // "Save and send" from the editor moves a draft to SENT (decided under the
+    // lock, on the status read there). Nothing else can change status here:
+    // payments and voiding have their own routes.
+    const sendNow = typeof req.body.status === "string" && req.body.status.toUpperCase() === "SENT";
 
     // A draft's number can be corrected (a typed number with a typo). Once
     // the invoice has gone out, its number is fixed.
@@ -657,48 +842,94 @@ router.put("/:id", authMiddleware, async (req, res) => {
     // and an account merge or delete takes it too (routes/ledger.js), so a new
     // number is still free and every account a line names is still there when
     // the lines are written. The saved lines are read under it as well: they
-    // say which accounts the document has already. The lines are replaced
-    // after every check, in one transaction, so a refusal or a failed write
-    // leaves the old ones.
-    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+    // say which accounts the document has already, and what stock each moved.
+    // The lines are replaced after every check, in one transaction, so a
+    // refusal or a failed write leaves the old ones.
+    //
+    // That transaction keeps the stock in step (release 3). A goods line the
+    // edit leaves as it was (the same item and quantity, and on a credit note
+    // still marked restock) keeps the movement it has and its cost: the
+    // movement moves to the new line, and to the document's new day when the
+    // day changed. The phone sends every line back on any edit, so an edit of
+    // the notes never costs the goods again at today's average. Only lines
+    // that changed move stock again: an invoice's leftover goods go back
+    // first, so a new line can take them again; a credit note's leftover
+    // returns come out last, after its new lines put theirs back, so goods
+    // sold since do not stop an edit that returns as many. An edit that sends
+    // a draft moves every line.
+    const savedType = existing.type === "quote" || existing.type === "credit_note" ? existing.type : "invoice";
+    if (savedType !== "credit_note" && items.some((it) => it && it.itemId)) await accountsFor(existing.businessId);
+    const result = await prisma.withBusinessLock(existing.businessId, async () => {
+      const cur = await prisma.invoice.findUnique({
+        where: { id: existing.id },
+        select: { id: true, businessId: true, type: true, status: true, issueDate: true },
+      });
+      if (!cur) throw Object.assign(new Error("Invoice not found"), { status: 404, code: "INVOICE_NOT_FOUND" });
+      if (cur.status === "VOID" || cur.status === "PAID") {
+        throw lineError(400, "INVOICE_CLOSED", "Cannot edit a PAID or VOID invoice");
+      }
+      const credit = (cur.type || "invoice") === "credit_note";
+      // Lines whose goods move stock on this document.
+      const moving = (l) => !!l.itemId && l.itemType === "goods" && (!credit || l.restock);
+      const saved = await savedLinesOf(existing.id);
       // The lock date: the document's day before and after the edit, and
       // every payment's or refund's day, whose VAT share and accounts follow
-      // the document's lines and totals. Read again under the lock.
-      const cur = await prisma.invoice.findUnique({ where: { id: existing.id }, select: { type: true, issueDate: true } });
-      if (!cur) throw Object.assign(new Error("Invoice not found"), { status: 404, code: "INVOICE_NOT_FOUND" });
+      // the document's lines and totals. Credit applied counts nowhere in the
+      // money, but on a document with goods it releases their cost ("when
+      // paid"), so its days count too when the document has goods lines before
+      // or after the edit. Read again under the lock.
       if (inBooks(cur)) {
+        const withGoods = saved.some(moving) || items.some((it) => it && it.itemId);
         const paid = await prisma.invoicePayment.findMany({
-          where: { invoiceId: existing.id, method: { notIn: SETTLEMENT_METHODS } },
+          where: { invoiceId: existing.id, ...(withGoods ? {} : { method: { notIn: SETTLEMENT_METHODS } }) },
           select: { date: true },
         });
         await assertUnlocked(existing.businessId, cur.issueDate, newIssueDay, paid.map((p) => p.date));
       }
-      const saved = await savedLinesOf(existing.id);
-      const lines = keepLineAccounts(items, saved);
+      const sent = keepLineAccounts(items, saved);
       const kept = new Set(saved.map((l) => l.accountId).filter(Boolean));
-      await checkLineAccounts(existing.businessId, lines, req.user.accountType === "staff", kept);
+      await checkLineAccounts(existing.businessId, sent, req.user.accountType === "staff", kept);
+      const lines = await readDocLines(existing.businessId, sent, cur.type || "invoice", { mayRestock: canRestock(req), saved });
       if (newNumber && (await numberTaken(prisma, existing.businessId, newNumber, existing.id))) {
         throw Object.assign(new Error(`${newNumber} is already used.`), {
           status: 409, code: "NUMBER_IN_USE", number: newNumber,
         });
       }
+      // "Save and send" moves only a draft, as it is now.
+      const statusPatch = sendNow && cur.status === "DRAFT" ? { status: "SENT" } : {};
 
       return prisma.$transaction(async (px) => {
-        // Replace all items
-        await px.invoiceItem.deleteMany({ where: { invoiceId: req.params.id } });
+        const before = movesStock(cur);
+        const after = movesStock({ ...cur, ...statusPatch });
+        // The new day, or else the one read under the lock above, which the
+        // lock date was checked against (the copy read before the lock may
+        // be stale).
+        const day = newIssueDay || cur.issueDate;
+        const touched = new Set();
+        const add = (ids) => ids.forEach((id) => touched.add(id));
 
-        return px.invoice.update({
-          where: { id: req.params.id },
+        // The saved line each new line keeps the movement of, if any.
+        const pool = before ? saved.filter(moving).map((l) => ({ ...l, taken: false })) : [];
+        const keeps = lines.map((l) => {
+          if (!after || !moving(l)) return null;
+          const same = pool.find((o) => !o.taken && o.itemId === l.itemId && milliOf(o.quantity) === milliOf(l.quantity));
+          if (same) same.taken = true;
+          return same || null;
+        });
+        const leftover = pool.filter((o) => !o.taken).map((o) => `inv:${o.id}`);
+        if (leftover.length && !credit) add((await stock.removeBySource(px, cur.businessId, leftover)).items.map((i) => i.id));
+
+        // Replace all items, one at a time, so each new line's id is known.
+        await px.invoiceItem.deleteMany({ where: { invoiceId: cur.id } });
+        await px.invoice.update({
+          where: { id: cur.id },
           data: {
             ...details,
             ...statusPatch,
             ...(newNumber ? { invoiceNumber: newNumber } : {}),
             customerId: resolvedCustomerId,
             ...snapshot,
-            // The new day, or else the one read under the lock above, which
-            // the lock date was checked against (the copy read before the
-            // lock may be stale).
-            issueDate: newIssueDay || cur.issueDate,
+            issueDate: day,
             dueDate: isCredit ? null : dueDate || null,
             subtotal,
             taxRate: Number(taxRate) || 0,
@@ -710,23 +941,45 @@ router.put("/:id", authMiddleware, async (req, res) => {
             notes: notes || null,
             terms: terms || null,
             template: template || existing.template,
-            items: {
-              create: lines.map((it) => ({
-                name: it.name,
-                description: it.description || null,
-                quantity: Number(it.quantity) || 1,
-                rate: Number(it.rate) || 0,
-                amount: (Number(it.quantity) || 1) * (Number(it.rate) || 0),
-                accountId: it.accountId ? String(it.accountId) : null,
-              })),
-            },
           },
-          include: INCLUDE,
         });
-      });
+        const rows = [];
+        for (const l of lines) rows.push(await px.invoiceItem.create({ data: { ...l, invoiceId: cur.id } }));
+
+        // A kept movement follows its new line (and the document's day), and
+        // the line keeps the cost it had; the other moving lines move now.
+        const fresh = [];
+        let date = null;
+        for (let i = 0; i < rows.length; i++) {
+          const old = keeps[i];
+          if (!old) {
+            if (after && moving(rows[i])) fresh.push(rows[i]);
+            continue;
+          }
+          date = date || stockDay({ issueDate: day });
+          const m = await px.stockMovement.findUnique({
+            where: { businessId_sourceKey: { businessId: cur.businessId, sourceKey: `inv:${old.id}` } },
+          });
+          if (!m || m.itemId !== rows[i].itemId) {
+            fresh.push(rows[i]);
+            continue;
+          }
+          await px.stockMovement.update({ where: { id: m.id }, data: { sourceKey: `inv:${rows[i].id}`, date } });
+          await px.invoiceItem.update({
+            where: { id: rows[i].id },
+            data: { unitCost: old.unitCost, costAmount: Math.abs(Math.round(m.value * 100)) / 100 },
+          });
+        }
+        if (fresh.length) add(await moveDocStock(px, { ...cur, issueDate: day }, fresh, req.user.id));
+        if (leftover.length && credit) add((await stock.removeBySource(px, cur.businessId, leftover)).items.map((i) => i.id));
+        return {
+          invoice: await px.invoice.findUnique({ where: { id: cur.id }, include: INCLUDE }),
+          inventory: await itemRows(px, touched),
+        };
+      }, TX);
     });
 
-    res.json(formatInvoice(invoice));
+    res.json({ ...formatInvoice(result.invoice, req), inventory: stockRows(req, result.inventory) });
   } catch (err) {
     if (err.status && err.code) {
       return res.status(err.status).json({ error: err.message, code: err.code, number: err.number, ...(err.extra || {}) });
@@ -756,7 +1009,7 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     // draft it would wipe PARTIAL or PAID, so it changes nothing there.
     if (newStatus === "SENT" && existing.status !== "DRAFT") {
       const same = await prisma.invoice.findUnique({ where: { id: existing.id }, include: INCLUDE });
-      return res.json(formatInvoice(same));
+      return res.json({ ...formatInvoice(same, req), inventory: [] });
     }
     // Money or credit already on a document pins it: a credit note that has
     // given credit cannot be voided or redrafted, an invoice that received
@@ -764,9 +1017,17 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
     // Otherwise the credit would vanish from one side of the link. Checked
     // under the business lock on a fresh read: the auto-matcher (same lock)
     // could otherwise record a payment between the check and the write.
+    // Sending takes the goods out of stock (or puts a credit note's restocked
+    // goods back); voiding or redrafting an issued document undoes that, in
+    // the transaction that changes the status.
     const biz = await prisma.business.findUnique({ where: { id: existing.businessId }, select: { vatEnabled: true } });
-    const invoice = await prisma.withBusinessLock(existing.businessId, async () => {
+    const result = await prisma.withBusinessLock(existing.businessId, async () => {
       const cur = await prisma.invoice.findUnique({ where: { id: existing.id } });
+      if (!cur) throw creditError(404, "INVOICE_NOT_FOUND", "Invoice not found.");
+      // Sent meanwhile: nothing changes, as above.
+      if (newStatus === "SENT" && cur.status !== "DRAFT") {
+        return { invoice: await prisma.invoice.findUnique({ where: { id: cur.id }, include: INCLUDE }), inventory: [] };
+      }
       if (cur.type === "credit_note" && (cur.amountPaid || 0) > 0 && newStatus !== "SENT") {
         throw creditError(409, "CREDIT_IN_USE", "This credit note has been used.");
       }
@@ -793,13 +1054,22 @@ router.patch("/:id/status", authMiddleware, async (req, res) => {
       // Sending, voiding or redrafting a document moves it in or out of the
       // books on its issue day.
       if (inBooks(cur)) await assertUnlocked(cur.businessId, cur.issueDate);
-      return prisma.invoice.update({
-        where: { id: cur.id },
-        data: { status: newStatus },
-        include: INCLUDE,
-      });
+      return prisma.$transaction(async (px) => {
+        const before = movesStock(cur);
+        const after = movesStock({ ...cur, status: newStatus });
+        let touched = new Set();
+        if (before && !after) {
+          touched = await releaseDocStock(px, cur);
+        } else if (!before && after) {
+          touched = await moveDocStock(px, cur, await px.invoiceItem.findMany({ where: { invoiceId: cur.id } }), req.user.id);
+        }
+        return {
+          invoice: await px.invoice.update({ where: { id: cur.id }, data: { status: newStatus }, include: INCLUDE }),
+          inventory: await itemRows(px, touched),
+        };
+      }, TX);
     });
-    res.json(formatInvoice(invoice));
+    res.json({ ...formatInvoice(result.invoice, req), inventory: stockRows(req, result.inventory) });
   } catch (err) {
     return sendCreditError(res, err, "Failed to update status");
   }
@@ -878,7 +1148,7 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
     // account the money went into is checked under the lock too, which an
     // account merge or delete also takes (routes/ledger.js), so it is still
     // there when the payment is saved with it.
-    const invoice = await prisma.withBusinessLock(existing.businessId, () =>
+    const paidResult = await prisma.withBusinessLock(existing.businessId, () =>
       prisma.$transaction(async (px) => {
         const deposit = method === "bank"
           ? null
@@ -935,18 +1205,31 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
           });
         }
         const paid = sameMoney(outstanding, amount) ? round2(inv.total) : round2(inv.amountPaid + amount);
-        return px.invoice.update({
-          where: { id: inv.id },
-          data: { amountPaid: paid, status: statusAfter(inv, paid) },
-          include: INCLUDE,
-        });
-      }),
+        const nextStatus = statusAfter(inv, paid);
+        // A payment on a draft sends it out, and its goods leave stock on its
+        // issue day, which must be open then.
+        let touched = new Set();
+        if (!movesStock(inv) && movesStock({ ...inv, status: nextStatus })) {
+          const lines = await px.invoiceItem.findMany({ where: { invoiceId: inv.id } });
+          if (lines.some((l) => l.itemId && l.itemType === "goods")) await assertUnlockedIn(px, inv.businessId, inv.issueDate);
+          touched = await moveDocStock(px, inv, lines, req.user.id);
+        }
+        return {
+          invoice: await px.invoice.update({
+            where: { id: inv.id },
+            data: { amountPaid: paid, status: nextStatus },
+            include: INCLUDE,
+          }),
+          inventory: await itemRows(px, touched),
+        };
+      }, TX),
     );
+    const invoice = paidResult.invoice;
 
     logMoney(req, "INVOICE_PAYMENT", invoice.id, {
       amount, method, transactionId: method === "bank" ? String(body.transactionId) : null,
     });
-    res.status(201).json(formatInvoice(invoice));
+    res.status(201).json({ ...formatInvoice(invoice, req), inventory: stockRows(req, paidResult.inventory) });
   } catch (err) {
     return sendCreditError(res, err, "Failed to record payment");
   }
@@ -1018,7 +1301,7 @@ router.delete("/:id/payments/:paymentId", authMiddleware, async (req, res) => {
       }),
     );
     logMoney(req, "INVOICE_PAYMENT_UNDO", existing.id, { paymentId: String(req.params.paymentId) });
-    res.json(formatInvoice(updated));
+    res.json(formatInvoice(updated, req));
   } catch (err) {
     return sendCreditError(res, err, "Failed to undo payment");
   }
@@ -1077,7 +1360,7 @@ router.post("/:id/payments/:paymentId/link", authMiddleware, async (req, res) =>
       }),
     );
     logMoney(req, "INVOICE_PAYMENT_LINK", existing.id, { paymentId: String(req.params.paymentId), transactionId });
-    res.json(formatInvoice(updated));
+    res.json(formatInvoice(updated, req));
   } catch (err) {
     return sendCreditError(res, err, "Failed to link the payment");
   }
@@ -1112,7 +1395,7 @@ router.post("/:id/write-off", authMiddleware, async (req, res) => {
       });
     });
     logMoney(req, "INVOICE_WRITE_OFF", existing.id, { amount: updated.writtenOffAmount });
-    res.json(formatInvoice(updated));
+    res.json(formatInvoice(updated, req));
   } catch (err) {
     return sendCreditError(res, err, "Failed to write off");
   }
@@ -1137,7 +1420,7 @@ router.delete("/:id/write-off", authMiddleware, async (req, res) => {
       });
     });
     logMoney(req, "INVOICE_WRITE_OFF_UNDO", existing.id, {});
-    res.json(formatInvoice(updated));
+    res.json(formatInvoice(updated, req));
   } catch (err) {
     return sendCreditError(res, err, "Failed to undo the write-off");
   }
@@ -1234,7 +1517,7 @@ router.post("/:id/apply-credit", authMiddleware, async (req, res) => {
       return { invoice: updatedInvoice, creditNote: updatedCredit };
     });
 
-    res.status(201).json({ creditNote: formatInvoice(result.creditNote), invoice: formatInvoice(result.invoice) });
+    res.status(201).json({ creditNote: formatInvoice(result.creditNote, req), invoice: formatInvoice(result.invoice, req) });
   } catch (err) {
     return sendCreditError(res, err, "Failed to apply credit");
   }
@@ -1338,7 +1621,7 @@ router.post("/:id/refund", authMiddleware, async (req, res) => {
     logMoney(req, "CREDIT_NOTE_REFUND", note.id, {
       amount, method, transactionId: method === "bank" ? String(body.transactionId) : null,
     });
-    res.status(201).json(formatInvoice(updated));
+    res.status(201).json(formatInvoice(updated, req));
   } catch (err) {
     return sendCreditError(res, err, "Failed to record refund");
   }
@@ -1413,7 +1696,7 @@ router.post("/:id/convert-to-invoice", authMiddleware, async (req, res) => {
         include: INCLUDE,
       });
     });
-    res.json(formatInvoice(invoice));
+    res.json(formatInvoice(invoice, req));
   } catch (err) {
     return sendCreditError(res, err, "Failed to convert quote");
   }
@@ -1432,9 +1715,9 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     // could otherwise record a payment between the checks and the delete, and
     // the cascade would take that payment while its bank credit still pointed
     // at the deleted invoice.
-    await prisma.withBusinessLock(existing.businessId, async () => {
+    const inventory = await prisma.withBusinessLock(existing.businessId, async () => {
       const cur = await prisma.invoice.findUnique({ where: { id: existing.id } });
-      if (!cur) return;
+      if (!cur) return [];
       if (cur.type === "credit_note" && (cur.amountPaid || 0) > 0) {
         throw creditError(409, "CREDIT_IN_USE", "This credit note has been used.");
       }
@@ -1454,9 +1737,15 @@ router.delete("/:id", authMiddleware, async (req, res) => {
       }
       // The lock date: the document's day, and a write-off's that goes with it.
       if (inBooks(cur)) await assertUnlocked(cur.businessId, cur.issueDate, cur.writtenOffAt);
-      await prisma.invoice.delete({ where: { id: cur.id } });
+      // Its goods come back (a credit note's restocked goods go out again) in
+      // the transaction that deletes it.
+      return prisma.$transaction(async (px) => {
+        const touched = await releaseDocStock(px, cur);
+        await px.invoice.delete({ where: { id: cur.id } });
+        return itemRows(px, touched);
+      }, TX);
     });
-    res.json({ ok: true });
+    res.json({ ok: true, inventory: stockRows(req, inventory) });
   } catch (err) {
     return sendCreditError(res, err, "Failed to delete invoice");
   }

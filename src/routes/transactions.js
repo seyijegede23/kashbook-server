@@ -13,6 +13,8 @@ const { EXPENSE_INCLUDE, publicExpense } = require("../utils/expenseView");
 const { cleanReference, expenseCustomerId } = require("../utils/expenseFields");
 const { destroyReceipts } = require("../utils/receiptStorage");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
+const { readSaleItems, saleChart, writeSaleItems, removeSaleStock, publicSale } = require("./sales").saleLines;
+const { canSeeCosts, publicItem } = require("./inventory").itemView;
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
 // match endpoints, so "Match to Sale or Debt" silently 404'd and reverted.
@@ -481,20 +483,28 @@ function resolveCappedAmount(body, tx) {
 // chains, so without this the description field is unbounded.
 const clampText = (s, max) => (typeof s === "string" ? s.trim().slice(0, max) : "");
 
-// POST /transactions/:id/create-sale  { amount?, description?, channel?, customerId? }
+// POST /transactions/:id/create-sale
+//   { amount?, description?, channel?, customerId?, accountId?, items? }
 // The transfer IS the sale — record it in one step, already matched, so the
 // income is counted exactly once. The DATE always comes from the credit (same
 // reporting period as the money); the AMOUNT may be composed in the full Add
-// form but is capped at the transfer (see resolveCappedAmount).
+// form but is capped at the transfer (see resolveCappedAmount). items: what
+// was sold, as on POST /sales (routes/sales.js): goods leave the stock on the
+// transfer's day, and the sale counts as its lines' accounts (accountId is
+// then not used). Answers 201 { sale (with items), transaction, remainder,
+// inventory: [the goods items as they now are] }.
 router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req, res) => {
   const { channel, customerId, accountId } = req.body || {};
   const description = clampText((req.body || {}).description, 500);
+  const isStaff = req.user.accountType === "staff";
   try {
     const pre = await loadMatchableCredit(req, res);
     if (!pre) return;
     // A quick answer; the cap that counts is taken again under the lock.
     resolveCappedAmount(req.body || {}, pre);
-    const account = await assertAccountUsable(pre.businessId, accountId, "income", { isStaff: req.user.accountType === "staff" });
+    // Every line read before anything is looked up (routes/sales.js).
+    const lines = readSaleItems((req.body || {}).items);
+    const account = lines ? null : await assertAccountUsable(pre.businessId, accountId, "income", { isStaff });
 
     if (customerId) {
       const customer = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -502,8 +512,10 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
         return res.status(404).json({ error: "Customer not found" });
     }
 
-    const result = await prisma.withBusinessLock(pre.businessId, () =>
-      prisma.$transaction(async (px) => {
+    const result = await prisma.withBusinessLock(pre.businessId, async () => {
+      // The chart, for the account each line counts as, read under the lock.
+      const chartIdx = lines ? await saleChart(pre.businessId) : null;
+      return prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
@@ -533,19 +545,28 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
             accountId: account ? account.id : null,
           },
         });
+        const written = lines
+          ? await writeSaleItems(px, { sale, lines, chartIdx, isStaff, createdById: req.user.id })
+          : { items: [], inventory: [] };
         const updatedTx = await px.transaction.update({
           where: { id: tx.id },
           data: { matchedSaleId: sale.id, matchedAmount: amount },
         });
-        return { sale, transaction: updatedTx, amount, remainder };
-      }),
-    );
+        return { sale, ...written, transaction: updatedTx, amount, remainder };
+      }, { timeout: 20000 });
+    });
 
     audit({
       req, action: "TX_MATCH_CREATE_SALE", resourceType: "transaction", resourceId: pre.id,
-      metadata: { saleId: result.sale.id, amount: result.amount, remainder: result.remainder },
+      metadata: { saleId: result.sale.id, amount: result.amount, remainder: result.remainder, lines: result.items.length },
     }).catch(() => {});
-    res.status(201).json({ sale: result.sale, transaction: result.transaction, remainder: result.remainder });
+    const canSee = canSeeCosts(req);
+    res.status(201).json({
+      sale: publicSale(result.sale, canSee, result.items),
+      transaction: result.transaction,
+      remainder: result.remainder,
+      inventory: result.inventory.map((i) => publicItem(i, canSee)),
+    });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to create sale from transfer");
   }
@@ -906,6 +927,10 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
         if (tx.matchedSaleId) {
           const sale = await px.sales.findUnique({ where: { id: tx.matchedSaleId } });
           if (sale && deleteSale) {
+            // The goods its lines took go back into stock first (release 3),
+            // as DELETE /sales/:id puts them back.
+            const restored = await removeSaleStock(px, sale.businessId, sale.id);
+            out.inventory = restored.map((i) => publicItem(i, canSeeCosts(req)));
             await px.sales.delete({ where: { id: sale.id } });
             out.saleDeleted = true;
           } else if (sale) {

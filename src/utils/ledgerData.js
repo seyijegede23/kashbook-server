@@ -129,15 +129,23 @@ async function ensureChart(businessId) {
   });
 }
 
-// The business's accounts, setting the chart up first if it has none.
+// The system accounts every chart has (a system account is never deleted).
+const SYSTEM_KEYS = chart.DEFAULT_CHART.filter((a) => a.sys).map((a) => a.sys);
+
+// The business's accounts, setting the chart up first if it has none, or
+// adding a system account a later release introduced (release 3: Service
+// Income, Cost of Services) the first time a chart without it is read.
 async function accountsFor(businessId) {
-  const count = await prisma.ledgerAccount.count({ where: { businessId } });
-  if (!count) await ensureChart(businessId);
-  return prisma.ledgerAccount.findMany({
+  const read = () => prisma.ledgerAccount.findMany({
     where: { businessId },
     select: ACCOUNT_FIELDS,
     orderBy: [{ createdAt: "asc" }, { name: "asc" }],
   });
+  const accounts = await read();
+  const have = new Set(accounts.map((a) => a.systemKey).filter(Boolean));
+  if (accounts.length && SYSTEM_KEYS.every((k) => have.has(k))) return accounts;
+  await ensureChart(businessId);
+  return read();
 }
 
 // An account a record is about to name: it must be this business's, active,

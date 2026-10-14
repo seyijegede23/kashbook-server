@@ -213,6 +213,9 @@ model Business {
   // plain day).
   journalCounter             Int       @default(0)
   booksLockDate              String?
+  // Release 3 (2026-10-13): what the business sells, goods | services | both
+  // (CHECK in the migration); null: not asked yet, shown as both.
+  sells                      String?
   createdAt                  DateTime  @default(now())
   updatedAt                  DateTime  @updatedAt
 
@@ -248,6 +251,8 @@ model Business {
   ledgerAccounts        LedgerAccount[]
   openingBalances       OpeningBalance[]
   manualJournals        ManualJournal[]
+  saleItems             SaleItem[]
+  stockMovements        StockMovement[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -679,6 +684,8 @@ model BusinessDebt {
   receivedViaAccount   LedgerAccount? @relation("BillReceivedVia", fields: [receivedViaAccountId], references: [id], onDelete: SetNull)
   createdById          String?
   payments             BillPayment[]
+  // Release 3: a restock's goods (its account is then Inventory Asset).
+  items                BillItem[]
 
   @@index([userId, businessId])
   @@index([userId, status])
@@ -715,6 +722,30 @@ model BillPayment {
   @@index([paidThroughAccountId])
 }
 
+// One line of a restock bill (release 3): a goods item, how many came in and
+// what one cost. amount is the line's value, quantity times unitCost to the
+// kobo (utils/stock.js lineCost); the bill's amount is the sum of its lines
+// and its account is Inventory Asset. Each line is one StockMovement
+// "bill:<id>". An item a line names is never deleted: the migration makes
+// that key NO ACTION, DEFERRABLE INITIALLY DEFERRED (Prisma does not show
+// it), so deleting an owner still removes their bills' lines and their items
+// in one statement.
+model BillItem {
+  id        String        @id @default(uuid())
+  billId    String
+  bill      BusinessDebt  @relation(fields: [billId], references: [id], onDelete: Cascade)
+  itemId    String
+  item      InventoryItem @relation(fields: [itemId], references: [id], onDelete: NoAction)
+  quantity  Float
+  unitCost  Float         @default(0)
+  amount    Float         @default(0)
+  position  Int           @default(0) // the order the lines were entered in
+  createdAt DateTime      @default(now())
+
+  @@index([billId])
+  @@index([itemId])
+}
+
 model Sales {
   id                   String    @id @default(uuid())
   userId               String
@@ -742,6 +773,8 @@ model Sales {
   depositAccountId     String?
   depositAccount       LedgerAccount? @relation("SaleDeposit", fields: [depositAccountId], references: [id], onDelete: SetNull)
   clientRef            String?
+  // Release 3: what was sold, line by line (fixed once saved).
+  items                SaleItem[]
 
   @@unique([businessId, clientRef])
   @@index([userId, businessId])
@@ -750,6 +783,40 @@ model Sales {
   @@index([businessId, channel])
   @@index([accountId])
   @@index([depositAccountId])
+}
+
+// One line of a sale (chart of accounts release 3, 2026-10-13), fixed once
+// saved: delete the sale and record it again. name is a snapshot of the
+// item's name; itemType: goods | service | other (a typed line that names no
+// item; CHECK in the migration). accountId: the income account the line
+// counts as (chart.incomeForItem when none was picked). unitCost is null
+// unless the line is goods with a known cost; costAmount is what the goods
+// that left cost (the StockMovement "sale:<id>" carries the same value,
+// negative). Quantities have at most three decimals.
+model SaleItem {
+  id         String         @id @default(uuid())
+  saleId     String
+  sale       Sales          @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  businessId String
+  business   Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  itemId     String?
+  item       InventoryItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  name       String
+  itemType   String         @default("other")
+  quantity   Float
+  rate       Float          @default(0)
+  amount     Float          @default(0)
+  accountId  String?
+  account    LedgerAccount? @relation("SaleItemAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  unitCost   Float?
+  costAmount Float          @default(0)
+  position   Int            @default(0) // the order the lines were entered in
+  createdAt  DateTime       @default(now())
+
+  @@index([saleId])
+  @@index([itemId])
+  @@index([businessId])
+  @@index([accountId])
 }
 
 model Expense {
@@ -1054,8 +1121,8 @@ model InventoryItem {
   description   String?
   unit          String    @default("piece")
   price         Float
-  cost          Float?
-  quantity      Int       @default(0)
+  cost          Float? // unused since release 3 (scripts/backfill-r3.js reads it once): stockValue and avgCost hold the cost
+  quantity      Float     @default(0) // at most three decimals (2.5 kg); never below 0 (CHECK in the migration)
   lowStockAlert Int       @default(5)
   category      String?
   sku           String?
@@ -1066,9 +1133,31 @@ model InventoryItem {
   createdByName String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+  // Chart of accounts, release 3 (2026-10-13). itemType: goods | service
+  // (CHECK in the migration). For goods, stockValue is what the stock on hand
+  // cost (naira, kobo-exact, never below 0) and avgCost the last known average
+  // cost of one unit (kept when the quantity reaches 0; null: never known);
+  // only utils/stock.js changes quantity, stockValue and avgCost, always with
+  // a StockMovement. incomeAccountId: the income account its sales count as
+  // (null: Sales for goods, Service Income for a service: chart.incomeForItem).
+  // lowStockNotifiedAt: the low-stock alert went out (cleared when the
+  // quantity rises above lowStockAlert). archivedAt: an item with history is
+  // archived, never deleted.
+  itemType           String         @default("goods")
+  stockValue         Float          @default(0)
+  avgCost            Float?
+  incomeAccountId    String?
+  incomeAccount      LedgerAccount? @relation("ItemIncomeAccount", fields: [incomeAccountId], references: [id], onDelete: SetNull)
+  lowStockNotifiedAt DateTime?
+  archivedAt         DateTime?
+  saleItems          SaleItem[]
+  invoiceItems       InvoiceItem[]
+  billItems          BillItem[]
+  movements          StockMovement[]
 
   @@index([userId, businessId])
   @@index([businessId, updatedAt])
+  @@index([incomeAccountId])
   // A barcode identifies ONE product within a business. Scoped per business,
   // not globally, because two shops legitimately stock the same product and a
   // global constraint would stop the second one recording it.
@@ -1265,8 +1354,20 @@ model InvoiceItem {
   // Chart of accounts: the income account this line counts as (null = Sales).
   accountId   String?
   account     LedgerAccount? @relation("InvoiceItemAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  // Release 3: the item the line is for (null: a typed line), its type
+  // (goods | service | other; null on older lines: other), what one unit cost
+  // (null unless goods with a known cost) and what the goods that left cost.
+  // On a credit note, restock: the goods come back into stock (costAmount is
+  // then the cost that came back, positive).
+  itemId      String?
+  item        InventoryItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  itemType    String?
+  unitCost    Float?
+  costAmount  Float          @default(0)
+  restock     Boolean        @default(false)
 
   @@index([accountId])
+  @@index([itemId])
 }
 
 // Credit from a credit note (an Invoice with type "credit_note") applied to an
@@ -1749,6 +1850,8 @@ model LedgerAccount {
   billsReceivedVia         BusinessDebt[]      @relation("BillReceivedVia")
   billPaymentsPaidThrough  BillPayment[]       @relation("BillPaymentPaidThrough")
   journalLines             ManualJournalLine[] @relation("JournalLineAccount")
+  itemsIncome              InventoryItem[]     @relation("ItemIncomeAccount")
+  saleItems                SaleItem[]          @relation("SaleItemAccount")
 
   @@unique([businessId, systemKey])
   @@unique([businessId, categorySlug])
@@ -1817,4 +1920,40 @@ model ManualJournalLine {
 
   @@index([journalId])
   @@index([accountId])
+}
+
+// A change to a goods item's stock (release 3), written only by
+// utils/stock.js. kind: opening | opening_value | purchase | sale | invoice |
+// credit_note | adjustment | revalue; reason (adjustments only, and always
+// there): damaged | expired | lost | used | counted | other (CHECKs in the
+// migration). date is the date of the record behind it. quantity and value
+// (naira, kobo-exact) are signed: in is more than zero, out less; the
+// value-only kinds (opening_value, revalue) move no quantity. qtyAfter and
+// valueAfter are what the item held right after (for the history; a later
+// removal does not rewrite them). sourceKey names the record line it belongs
+// to ("sale:<saleItemId>", "inv:<invoiceItemId>", "bill:<billItemId>",
+// "adj:<uuid>", "open:<itemId>:<n>"), once per business, so a retried request
+// finds its movement. An item's quantity and stockValue are the sums of its
+// movements.
+model StockMovement {
+  id          String        @id @default(uuid())
+  businessId  String
+  business    Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  itemId      String
+  item        InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  kind        String
+  reason      String?
+  date        DateTime      @default(now())
+  quantity    Float         @default(0)
+  value       Float         @default(0)
+  qtyAfter    Float         @default(0)
+  valueAfter  Float         @default(0)
+  sourceKey   String
+  note        String?
+  createdById String?
+  createdAt   DateTime      @default(now())
+
+  @@unique([businessId, sourceKey])
+  @@index([businessId, date])
+  @@index([itemId, createdAt])
 }

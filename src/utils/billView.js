@@ -7,7 +7,12 @@ const { dayKey } = require("./books");
 
 // A bill's payments, oldest first, with the bill wherever one is read:
 // prisma.businessDebt.findMany({ ..., include: BILL_INCLUDE }).
-const BILL_INCLUDE = Object.freeze({ payments: { orderBy: [{ date: "asc" }, { createdAt: "asc" }] } });
+// A restock's stock lines (release 3) come with it too, so the sync bundle
+// carries them as the bills routes do.
+const BILL_INCLUDE = Object.freeze({
+  payments: { orderBy: [{ date: "asc" }, { createdAt: "asc" }] },
+  items: { orderBy: [{ position: "asc" }, { createdAt: "asc" }] },
+});
 
 // Amounts are worked in kobo (whole numbers) and stored in naira.
 const naira = (kobo) => kobo / 100;

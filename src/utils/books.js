@@ -23,6 +23,15 @@
 // KashBook account carries its debit, which then stops counting) and when sold
 // on its bill date; a bill for a loan never counts. Published manual journals
 // count their lines on income and spending accounts, in both views.
+// Stock cost (release 3): the goods a sale or an issued invoice takes out of
+// stock are cost of goods sold. "When sold" on the document's date; "when
+// paid" with the money, in proportion to what the books count for that
+// document (a sale paid on the spot: all of it on its date), and to credit
+// from a credit note applied to it; an invoice written off releases all that
+// still waits, on the write-off date. A credit note
+// that puts goods back is a negative cost under the same rule. Stock counted
+// again (damaged, lost, found) or valued again is a stock adjustment, in
+// both views. A restock is a bill on Inventory Asset: never spending.
 
 const MONEY_IN_METHODS = ["cash", "card", "cheque", "transfer", "pos", "other"];
 // Paid into the business's own KashBook account: the payment must link the
@@ -207,6 +216,147 @@ function journalInBooks(journal, accounts) {
   return debit === credit;
 }
 
+// ── Stock cost (release 3) ──────────────────────────────────────────────────
+
+// The stock movements the books count: an adjustment (goods damaged, expired,
+// lost, used, found or counted) and stock valued again. Starting stock
+// (opening, opening_value) is on the balance sheet only: the ledger posts it
+// against Opening Balance Adjustments and the books leave it out.
+const COUNTED_MOVES = ["adjustment", "revalue"];
+
+// What the goods on a sale cost, in kobo: its lines' costAmount (a service or
+// a typed line carries none).
+function saleCostKobo(sale) {
+  let k = 0;
+  for (const it of (sale && sale.items) || []) k += koboOf(it && it.costAmount);
+  return k;
+}
+
+// What the goods on a document cost, in kobo, signed: an issued invoice's
+// goods leave stock (above zero), and an issued credit note's restocked lines
+// bring goods back (below zero). A draft, a void document or a quote moves no
+// stock, whatever its lines still say.
+function documentCostKobo(doc) {
+  const type = lower(doc && doc.type) || "invoice";
+  if (!doc || type === "quote" || ISSUED_EXCLUDED.includes(lower(doc.status))) return 0;
+  let k = 0;
+  for (const it of doc.items || []) {
+    if (type !== "credit_note") k += koboOf(it && it.costAmount);
+    else if (it && it.restock) k -= koboOf(it.costAmount);
+  }
+  return k;
+}
+
+// What a payment collects of its document, in kobo, toward it: money in (on
+// a credit note, money paid back), and credit from a credit note applied (on
+// the invoice it settles, and on the credit note it comes from). A bank
+// payment with no link collects nothing until it is linked (its credit counts
+// on its own until then).
+function collectedKobo(p, toward) {
+  if (paymentKind(p) === "settlement") return koboOf(p && p.amount);
+  return koboOf(paymentSalesAmount(p)) * toward;
+}
+
+// How `costK` kobo of goods on a document worth `totalK` is released as its
+// money (or credit) comes in. `steps` are { key, date, id, k } (the kobo each
+// collects, below zero when money goes back) and, for a write-off, { key,
+// date, all: true }: whatever is still waiting goes then. In date order (a
+// write-off after the payments of its day, then by id), each step takes the
+// cost of everything collected up to it less what the steps before it took;
+// what is collected is held between nothing and the whole document. So each
+// share is within a kobo of its proportion, a document collected in full (or
+// written off) releases exactly its cost, and a step never changes the share
+// of one dated before it (a locked month stays as it was). → Map key → kobo.
+function releaseShares(costK, totalK, steps) {
+  const upTo = (x) => (x <= 0 ? 0 : x >= totalK ? costK : Math.round((costK * x) / totalK));
+  const order = steps
+    .map((s, i) => ({ s, i, day: dayKey(s.date), last: s.all ? 1 : 0, id: String(s.id == null ? "" : s.id) }))
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : a.last - b.last || (a.id < b.id ? -1 : a.id > b.id ? 1 : a.i - b.i)));
+  const out = new Map();
+  let collected = 0;
+  for (const { s } of order) {
+    const before = upTo(collected);
+    collected = s.all ? Math.max(collected, totalK) : collected + s.k;
+    out.set(s.key, upTo(collected) - before);
+  }
+  return out;
+}
+
+// The cost of the goods on every sale and issued document, and when it
+// counts. → Map record → { via, doc, day, k, defer, releases, listed }:
+//   via       "sale" (doc: the sale) or "document" (an invoice or credit note);
+//   k         its cost in kobo, signed as documentCostKobo says;
+//   defer     "when paid" waits for the money: a credit sale a debt tracks
+//             (its repayments release the cost) and an issued document with
+//             an amount to collect (its payments and refunds, credit from a
+//             credit note applied, on both documents, and an invoice's
+//             write-off, which releases all that is still waiting). Anything
+//             else (a sale paid on the spot, a credit sale no debt tracks, a
+//             sale in another currency, whose money the naira books never
+//             count) counts its cost on its own date in both views;
+//   releases  when deferred, Map payment → the kobo of cost it releases (an
+//             invoice's write-off under the invoice itself);
+//   listed    false for a sale known only from its debt (below).
+// A debt may carry the credit sale it was opened for (`sale`: its lines'
+// costAmount, isCredit and currency are all this reads) when the loader read
+// only a period's sales: a repayment in the period still releases that
+// sale's cost. Every payment is read, whatever its date (one marked
+// outsideSpan too), so a share never depends on the period asked for.
+function stockCosts(input) {
+  const plans = new Map();
+  const sales = (input && input.sales) || [];
+  const debts = (input && input.debts) || [];
+  const debtsBySale = new Map();
+  for (const d of debts) {
+    if (!d || !d.saleId) continue;
+    if (!debtsBySale.has(d.saleId)) debtsBySale.set(d.saleId, []);
+    debtsBySale.get(d.saleId).push(d);
+  }
+  const known = new Set(sales.map((s) => s && s.id));
+  const records = sales.map((s) => ({ s, listed: true }));
+  for (const d of debts) {
+    if (!d || !d.sale || !d.saleId || known.has(d.saleId)) continue;
+    known.add(d.saleId);
+    records.push({ s: Object.assign({}, d.sale, { id: d.saleId }), listed: false });
+  }
+  for (const { s, listed } of records) {
+    const k = saleCostKobo(s);
+    if (!k) continue;
+    const owed = debtsBySale.get(s.id) || [];
+    const totalK = owed.reduce((t, d) => t + koboOf(d.amount), 0);
+    const defer = !s.foreignCurrency && !!s.isCredit && owed.length > 0 && totalK > 0;
+    const steps = [];
+    if (defer) {
+      for (const d of owed) for (const p of d.payments || []) steps.push({ key: p, date: p.date, id: p.id, k: koboOf(p.amount) });
+    }
+    plans.set(s, {
+      via: "sale", doc: s, day: dayKey(s.date), k, defer, releases: defer ? releaseShares(k, totalK, steps) : null, listed,
+    });
+  }
+  for (const inv of (input && input.invoices) || []) {
+    const k = documentCostKobo(inv);
+    if (!k) continue;
+    const totalK = koboOf(inv.total);
+    // A credit note collects what it pays back, or what of it is applied.
+    const type = lower(inv.type) || "invoice";
+    const toward = type === "credit_note" ? -1 : 1;
+    const defer = totalK > 0;
+    const steps = [];
+    if (defer) {
+      for (const p of inv.payments || []) {
+        const c = collectedKobo(p, toward);
+        if (c) steps.push({ key: p, date: p.date, id: p.id, k: c });
+      }
+      // Written off: nothing more will come, so what still waits goes.
+      if (type === "invoice" && inv.writtenOffAt) steps.push({ key: inv, date: inv.writtenOffAt, all: true });
+    }
+    plans.set(inv, {
+      via: "document", doc: inv, day: dayKey(inv.issueDate), k, defer, releases: defer ? releaseShares(k, totalK, steps) : null, listed: true,
+    });
+  }
+  return plans;
+}
+
 // ── The totals ──────────────────────────────────────────────────────────────
 
 function emptyLines() {
@@ -221,15 +371,16 @@ function addTo(line, amount, vat) {
 
 // The lines each view adds up; the others are information beside a total.
 // Release 2: bills (their payments when paid, the bill on its date when sold)
-// and published manual journals (both views).
+// and published manual journals (both views). Release 3: what the goods sold
+// cost (cogs) and stock adjustments, both views.
 const COUNTED_LINES = {
   paid: {
     sales: ["recorded", "invoicePayments", "debtPayments", "bank", "bankIncome", "refunds", "journals"],
-    expenses: ["recorded", "bank", "supplierRefunds", "bankCharges", "bills", "journals"],
+    expenses: ["recorded", "bank", "supplierRefunds", "bankCharges", "bills", "journals", "cogs", "stockAdjustments"],
   },
   sold: {
     sales: ["recorded", "invoiced", "creditNotes", "creditGiven", "bankIncome", "journals"],
-    expenses: ["recorded", "bank", "supplierRefunds", "badDebts", "bankCharges", "bills", "journals"],
+    expenses: ["recorded", "bank", "supplierRefunds", "badDebts", "bankCharges", "bills", "journals", "cogs", "stockAdjustments"],
   },
 };
 
@@ -282,6 +433,27 @@ function isBalanceSheetClass(cls) {
 //             expenses (debit less credit), in both views, on its date; lines
 //             on the balance sheet count nowhere (journalInBooks)
 //   bankRows[].matchedBillId: the bill a debit paid (isDebitMatched)
+// Since stock cost (release 3, 2026-10-13):
+//   sales[].items: [{ id, itemType, quantity, amount, accountId, costAmount }]
+//             what was sold, line by line (absent or empty: no lines). The
+//             goods' cost is the lines' costAmount (stockCosts); the ledger
+//             shares the sale's income over the lines' accounts
+//   invoices[].items[].costAmount, .restock: what an issued invoice's goods
+//             cost; on a credit note, a restocked line's goods coming back
+//   debts[].sale: the credit sale a debt was opened for, when the loader read
+//             only a period's sales (stockCosts)
+//   stockMoves: [{ id, kind, date, value, itemId, reason, note }] stock
+//             movements of kinds adjustment and revalue (counted: a stock
+//             adjustment is spending at minus its value, in both views) and
+//             opening and opening_value (the balance sheet only: the ledger
+//             posts them, the books leave them out)
+//   bills[].items: a restock's lines (a bill on Inventory Asset: never
+//             spending; the ledger puts the goods in stock on its bill date)
+//   payments[].outsideSpan (invoices' and debts'), and a document's
+//             issuedOutsideSpan and writtenOffOutsideSpan: set by the loader
+//             when it reads an exact span of time; such a payment, issue or
+//             write-off counts nowhere, but a payment or write-off still says
+//             how much of its document was settled before
 // opts: { from, to ("YYYY-MM-DD", inclusive, either may be empty),
 //         basis: "paid" | "sold", vat: { enabled, rate, inclusive } }
 //
@@ -290,9 +462,14 @@ function isBalanceSheetClass(cls) {
 // folds the events into its lines, and the ledger (server/src/utils/ledger.js)
 // turns the same events into its profit-and-loss entries, so a total and the
 // accounts behind it can never disagree. `src` names the record carrying the
-// amount ({ kind, rec, pay, doc, debt, item, bill, line }; item: the line of
-// an itemized expense; bill: the bill a payment is towards; line: the line of
-// a journal) so the ledger can find its accounts.
+// amount ({ kind, rec, pay, doc, debt, item, bill, line, via }; item: the line
+// of an itemized expense; bill: the bill a payment is towards; line: the line
+// of a journal) so the ledger can find its accounts. Release 3: a cost of
+// goods ({ kind: "cost", via, rec, doc, debt }: via "sale" or "document" on
+// the document's date; "debtPayment" or "invoicePayment" with the money (or
+// credit applied); "writeOff" on an invoice's write-off date; rec the record
+// whose event it rides with, doc the sale or the document)
+// and a stock adjustment ({ kind: "stockMove", rec: the movement }).
 function bookEvents(input, opts) {
   const o = opts || {};
   const basis = o.basis === "sold" ? "sold" : "paid";
@@ -306,6 +483,7 @@ function bookEvents(input, opts) {
   const debts = (input && input.debts) || [];
   const bills = (input && input.bills) || [];
   const journals = (input && input.journals) || [];
+  const stockMoves = (input && input.stockMoves) || [];
   // allDates: every record whatever its date (bookRows), else the period.
   const inPeriod = (d) => (o.allDates ? true : inRange(d, from, to));
 
@@ -319,16 +497,35 @@ function bookEvents(input, opts) {
     events.push({ side, line, gross: num(gross), vat: num(vatPart), day: dayKey(day), src });
   };
 
+  // What the goods sold cost (release 3): each sale's and issued document's,
+  // and the share of it each payment releases "when paid" (stockCosts).
+  const costs = stockCosts(input);
+  const costOfSale = new Map();
+  for (const plan of costs.values()) if (plan.via === "sale") costOfSale.set(plan.doc.id, plan);
+  // The cost a record counts on its own date in this view, or null (none, or
+  // "when paid" waits for its money).
+  const costNow = (rec) => {
+    const plan = costs.get(rec);
+    return plan && !(basis === "paid" && plan.defer) ? plan : null;
+  };
+  const addCost = (kobo, day, src) => add("expenses", "cogs", kobo / 100, 0, day, Object.assign({ kind: "cost" }, src));
+
   for (const s of sales) {
-    if (s.foreignCurrency || !inPeriod(s.date)) continue;
-    const a = num(s.amount);
-    const src = { kind: "sale", rec: s };
-    if (basis === "paid" && s.isCredit && salesWithDebt.has(s.id)) {
-      add("sales", "awaitingPayment", a, 0, s.date, src);
-      continue;
+    if (!inPeriod(s.date)) continue;
+    // A sale in another currency counts no money in the naira books, but its
+    // goods left stock all the same: their cost counts on its date.
+    if (!s.foreignCurrency) {
+      const a = num(s.amount);
+      const src = { kind: "sale", rec: s };
+      if (basis === "paid" && s.isCredit && salesWithDebt.has(s.id)) {
+        add("sales", "awaitingPayment", a, 0, s.date, src);
+      } else {
+        if (basis === "paid" && s.isCredit) add("sales", "creditUnlinked", a, 0, s.date, src);
+        add("sales", "recorded", a, vatInside(a, vat), s.date, src);
+      }
     }
-    if (basis === "paid" && s.isCredit) add("sales", "creditUnlinked", a, 0, s.date, src);
-    add("sales", "recorded", a, vatInside(a, vat), s.date, src);
+    const cost = costNow(s);
+    if (cost) addCost(cost.k, s.date, { via: "sale", rec: s, doc: s });
   }
 
   for (const e of expenses) {
@@ -394,28 +591,47 @@ function bookEvents(input, opts) {
     const type = lower(inv.type) || "invoice";
     const status = lower(inv.status);
     if (type === "quote") continue;
+    const plan = costs.get(inv) || null;
+    // Issued in the period (an exact span's loader marks a document issued
+    // outside it: issuedOutsideSpan).
+    const issuedHere = !inv.issuedOutsideSpan && inPeriod(inv.issueDate);
     if (basis === "paid") {
       // A void document's payments are reversed with it. (Since the rule, a
       // document with payments cannot be voided; this covers older voids.)
       if (status === "void") continue;
+      // Goods on a document with nothing to collect cost on its date.
+      if (plan && !plan.defer && issuedHere) addCost(plan.k, inv.issueDate, { via: "document", rec: inv, doc: inv });
       for (const p of inv.payments || []) {
-        if (!inPeriod(p.date)) continue;
+        if (p.outsideSpan || !inPeriod(p.date)) continue;
         const signed = paymentSalesAmount(p);
-        if (!signed) continue;
-        const v = vatShareOfDocument(Math.abs(signed), inv) * Math.sign(signed);
-        const src = { kind: "invoicePayment", rec: p, doc: inv };
-        if (signed < 0) add("sales", "refunds", signed, v, p.date, src);
-        else add("sales", "invoicePayments", signed, v, p.date, src);
+        if (signed) {
+          const v = vatShareOfDocument(Math.abs(signed), inv) * Math.sign(signed);
+          const src = { kind: "invoicePayment", rec: p, doc: inv };
+          if (signed < 0) add("sales", "refunds", signed, v, p.date, src);
+          else add("sales", "invoicePayments", signed, v, p.date, src);
+        }
+        // The share of the goods' cost this payment releases: money in, a
+        // refund on a credit note (of the goods that came back), or credit
+        // from a credit note applied (no money, but the document is settled
+        // by it as by money).
+        const share = plan && plan.defer ? plan.releases.get(p) || 0 : 0;
+        if (share) addCost(share, p.date, { via: "invoicePayment", rec: p, doc: inv });
       }
+      // Written off: what the goods cost and is still waiting is cost of
+      // goods sold on the write-off date (the unpaid money itself is never
+      // counted "when paid", so it is no bad debt here).
+      const off = plan && plan.defer && !inv.writtenOffOutsideSpan ? plan.releases.get(inv) || 0 : 0;
+      if (off && inPeriod(inv.writtenOffAt)) addCost(off, inv.writtenOffAt, { via: "writeOff", rec: inv, doc: inv });
       continue;
     }
     if (ISSUED_EXCLUDED.includes(status)) continue;
-    if (inPeriod(inv.issueDate)) {
+    if (issuedHere) {
       const src = { kind: "document", rec: inv, doc: inv };
       if (type === "credit_note") add("sales", "creditNotes", -num(inv.total), -num(inv.taxAmount), inv.issueDate, src);
       else add("sales", "invoiced", num(inv.total), num(inv.taxAmount), inv.issueDate, src);
+      if (plan) addCost(plan.k, inv.issueDate, { via: "document", rec: inv, doc: inv });
     }
-    if (type === "invoice" && inv.writtenOffAt && inPeriod(inv.writtenOffAt)) {
+    if (type === "invoice" && inv.writtenOffAt && !inv.writtenOffOutsideSpan && inPeriod(inv.writtenOffAt)) {
       // The whole unpaid balance is lost, VAT included: Nigeria gives no VAT
       // relief on bad debts, so the VAT is still owed although never received.
       const w = num(inv.writtenOffAmount);
@@ -425,13 +641,18 @@ function bookEvents(input, opts) {
 
   for (const d of debts) {
     if (basis === "paid") {
+      // The credit sale this debt was opened for, when its goods' cost waits
+      // for the money.
+      const plan = d.saleId ? costOfSale.get(d.saleId) : null;
       for (const p of d.payments || []) {
-        if (!inPeriod(p.date)) continue;
+        if (p.outsideSpan || !inPeriod(p.date)) continue;
         // A repayment settles a debt recorded like a sale (net when VAT is
         // added on top), so its VAT follows the recording mode, as the sale's
         // would have if it had been paid on the spot.
         const a = num(p.amount);
         add("sales", "debtPayments", a, vatInside(a, vat), p.date, { kind: "debtPayment", rec: p, debt: d });
+        const share = plan && plan.defer ? plan.releases.get(p) || 0 : 0;
+        if (share) addCost(share, p.date, { via: "debtPayment", rec: p, debt: d, doc: plan.doc });
       }
     } else if (!d.saleId && inPeriod(d.date)) {
       const a = num(d.amount);
@@ -470,6 +691,15 @@ function bookEvents(input, opts) {
     }
   }
 
+  // Stock adjustments, in both views on their date: goods lost or valued
+  // lower are spending, goods found or valued higher lower it (a movement's
+  // value is what it did to the stock's worth).
+  for (const m of stockMoves) {
+    if (!m || !COUNTED_MOVES.includes(lower(m.kind)) || !inPeriod(m.date)) continue;
+    const k = koboOf(m.value);
+    if (k) add("expenses", "stockAdjustments", -k / 100, 0, m.date, { kind: "stockMove", rec: m });
+  }
+
   return { basis, vat, from, to, events };
 }
 
@@ -502,6 +732,8 @@ function computeBooks(input, opts) {
     bankCharges: emptyLines(), // transfer fees (and a savings break fee)
     bills: emptyLines(), // paid view: payments towards bills; sold view: bills on their date
     journals: emptyLines(), // both views: manual journals on spending accounts (may be negative)
+    cogs: emptyLines(), // both views: what the goods sold cost (a credit note's goods back: negative)
+    stockAdjustments: emptyLines(), // both views: stock lost, found or valued again (may be negative)
   };
 
   for (const ev of events) addTo((ev.side === "sales" ? L : E)[ev.line], ev.gross, ev.vat);
@@ -651,13 +883,16 @@ function vatReturn(input, month, vatOpts) {
   }
   // Input VAT, an estimate: the VAT inside what the books rule counts as
   // spending, plus equipment bought (the Nigeria Tax Act 2025, s.156(5), lets a
-  // business claim the VAT on fixed assets used for taxable supplies). Never a
-  // VAT payment, a loan repaid, drawings or an advance: none of them is a
-  // purchase. An itemized expense counts line by line, each line by its own
-  // account, as the rule counts it; a record with no account, or one this input
-  // does not know, counts whole.
+  // business claim the VAT on fixed assets used for taxable supplies) and
+  // goods bought for stock (release 3: a restock is a bill on Inventory Asset,
+  // a purchase like any other, though its cost counts only once the goods are
+  // sold). Never a VAT payment, a loan repaid, drawings or an advance: none of
+  // them is a purchase. An itemized expense counts line by line, each line by
+  // its own account, as the rule counts it; a record with no account, or one
+  // this input does not know, counts whole. The cost of goods sold and stock
+  // adjustments carry no VAT: the goods' VAT was in their purchase.
   const accounts = input && input.accounts;
-  const claimable = (acc) => !acc || acc.cls === "expense" || acc.type === "fixed_asset";
+  const claimable = (acc) => !acc || acc.cls === "expense" || acc.type === "fixed_asset" || acc.type === "stock";
   let inputVat = 0;
   for (const e of expenses) {
     if (e.foreignCurrency || !inRange(e.date, from, to)) continue;
@@ -712,13 +947,22 @@ function billLabel(bill) {
 // source "bill", when sold) and a counted line of a manual journal
 // ("mj_<line>", source "journal", journalId) each carry the account they count
 // in (accountId; a bill's may be null, which reads as Other Expenses).
+// Release 3: what the goods sold cost (source "cogs", category "supplies",
+// the Cost of Goods Sold account's category) is a row per amount: on a sale's
+// date ("cogs_sale_<sale>", saleId), on a document's date ("cogs_doc_<doc>",
+// invoiceId), or with the money "when paid" ("cogs_dp_<repayment>", saleId,
+// debtId, paymentId; "cogs_ip_<payment>", invoiceId, paymentId, a credit
+// applied among them; "cogs_wo_<invoice>" on a write-off, invoiceId); a stock
+// adjustment is "sadj_<movement>" (source "stock_adjustment", category
+// "stock_adjustments", moveId, itemId, moveKind, reason). A sale's own row
+// keeps its lines (items), as it keeps every field of the sale.
 function bookRows(input, basis) {
   const view = basis === "sold" ? "sold" : "paid";
   const counted = COUNTED_LINES[view];
   const rows = [];
   for (const ev of bookEvents(input, { basis: view, allDates: true }).events) {
     if (!(ev.side === "sales" ? counted.sales : counted.expenses).includes(ev.line)) continue;
-    const { kind, rec, doc, debt, item, bill, line } = ev.src;
+    const { kind, rec, doc, debt, item, bill, line, via } = ev.src;
     const type = ev.side === "sales" ? "income" : "expense";
     if (kind === "expense" && item) {
       rows.push(Object.assign({}, rec, {
@@ -784,6 +1028,34 @@ function bookRows(input, basis) {
         description: line.description || rec.note || rec.number || "", accountId: line.accountId,
         journalId: rec.id, source: "journal",
       });
+    } else if (kind === "cost") {
+      const row = { type, amount: ev.gross, date: ev.day, category: "supplies", source: "cogs" };
+      if (via === "sale") {
+        rows.push(Object.assign(row, {
+          id: `cogs_sale_${rec.id}`, description: rec.notes || "", saleId: rec.id, customerId: rec.customerId || null,
+        }));
+      } else if (via === "document" || via === "writeOff") {
+        rows.push(Object.assign(row, {
+          id: `${via === "writeOff" ? "cogs_wo_" : "cogs_doc_"}${rec.id}`, description: rec.invoiceNumber, invoiceId: rec.id,
+          customerId: rec.customerId || null,
+        }));
+      } else if (via === "debtPayment") {
+        rows.push(Object.assign(row, {
+          id: `cogs_dp_${rec.id}`, description: debt.note || "", saleId: debt.saleId, debtId: debt.id, paymentId: rec.id,
+          customerId: debt.customerId || null,
+        }));
+      } else {
+        rows.push(Object.assign(row, {
+          id: `cogs_ip_${rec.id}`, description: doc.invoiceNumber, invoiceId: doc.id, paymentId: rec.id,
+          customerId: doc.customerId || null,
+        }));
+      }
+    } else if (kind === "stockMove") {
+      rows.push({
+        id: `sadj_${rec.id}`, type, amount: ev.gross, date: ev.day, description: rec.note || "",
+        category: "stock_adjustments", source: "stock_adjustment", moveId: rec.id, itemId: rec.itemId || null,
+        moveKind: lower(rec.kind), reason: rec.reason || null,
+      });
     }
   }
   return rows;
@@ -826,6 +1098,10 @@ module.exports = {
   billIsSpending,
   journalInBooks,
   billLabel,
+  COUNTED_MOVES,
+  saleCostKobo,
+  documentCostKobo,
+  stockCosts,
   COUNTED_LINES,
   bookEvents,
   computeBooks,

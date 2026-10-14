@@ -653,10 +653,12 @@ router.post("/conversations/:id/send-product", async (req, res) => {
     });
     if (!item) return res.status(404).json({ error: "Product not found." });
 
-    const price = ig.formatAmount(item.price, business.baseCurrency);
+    // A service priced 0 has a price that varies (release 3); only goods have
+    // stock to mention.
+    const price = Number(item.price) > 0 ? ig.formatAmount(item.price, business.baseCurrency) : "price on request";
     const lines = [`🛍️ ${item.name} — ${price}`];
     if (item.description) lines.push(item.description);
-    if (item.quantity > 0) lines.push(`In stock: ${item.quantity} ${item.unit || "pcs"}`);
+    if (item.itemType !== "service" && item.quantity > 0) lines.push(`In stock: ${item.quantity} ${item.unit || "pcs"}`);
     lines.push("", "Reply to order 👍");
     const text = lines.join("\n");
 

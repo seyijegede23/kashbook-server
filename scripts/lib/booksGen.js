@@ -14,7 +14,14 @@
 // { links: true } they are real instead (linkRecords): each linked record and
 // its bank row name each other, with amounts as the routes save them, so Bank
 // Matching, where the two meet in the ledger, must come back to zero.
+//
+// With { stock: true } (release 3, drawn after everything else, so books
+// drawn without it stay the same): goods and services on sales, invoices and
+// credit notes, restocks, stock counted and valued again, and starting stock,
+// with every cost as the stock engine (utils/stock.js) would write it
+// (randomStock).
 const chartLib = require("../../src/utils/chart");
+const { dayKey } = require("../../src/utils/books");
 
 // mulberry32: small, seeded, reproducible.
 function rng(seed) {
@@ -238,8 +245,251 @@ function randomInput(g, opts = {}) {
     for (const a of accounts) input.accounts[a.id] = { cls: chartLib.classOf(a.type), type: a.type };
     // Drawn after everything above, so books drawn without it stay the same.
     if (opts.links) linkRecords(g, input, moneyAccounts);
+    if (opts.stock) randomStock(g, input, accounts, moneyAccounts, !!opts.links);
   }
   return input;
+}
+
+// ── Release 3: stock ─────────────────────────────────────────────────────────
+// Goods and services, and everything that moves stock, as the routes save
+// them through the stock engine (utils/stock.js), worked out here by the same
+// rules in entry order (not date order: a record can be back-dated): goods
+// leave at the item's average, to the kobo (the last of the stock takes
+// whatever value is left), come in at their cost (a restock line's amount,
+// a credit note's return at the average, unknown cost at nothing), and are
+// never sold below zero. Writes, on the input:
+//   sales[].items          lines on about two sales in three (goods, services,
+//                          typed lines; amounts that share the sale's amount,
+//                          now and then not, now and then all nothing)
+//   invoices[].items[]     itemId, itemType, costAmount (an issued invoice's
+//                          goods), restock (a credit note's goods back); now
+//                          and then a draft or void one still carrying a cost
+//                          its lines no longer move
+//   bills                  restocks: on Inventory Asset, with lines, paid now,
+//                          later, in part or not at all
+//   stockMoves             adjustment, revalue, opening, opening_value
+// and, for the tests only (the books never read them):
+//   stockItems             each item's final quantity and stockValue
+//   stockLedger            every movement the records imply:
+//                          { kind, day, k (signed kobo), itemId }
+function randomStock(g, input, accounts, moneyAccounts, links) {
+  const sysId = (key) => (accounts.find((a) => a.systemKey === key) || {}).id;
+  const SALES = sysId(chartLib.SYS.SALES);
+  const SERVICE = sysId(chartLib.SYS.SERVICE_INCOME);
+  const STOCK = sysId(chartLib.SYS.STOCK);
+  const incomeAccounts = accounts.filter((a) => chartLib.pickerAllows("income", a));
+  // Thousandths of a unit and kobo, as the engine keeps them.
+  const goods = [];
+  for (let i = 0, n = g.int(1, 4); i < n; i++) goods.push({ id: g.id("gd"), itemType: "goods", qM: 0, vK: 0, avg: null });
+  const services = [];
+  for (let i = 0, n = g.int(0, 2); i < n; i++) services.push({ id: g.id("sv"), itemType: "service" });
+  const moves = [];
+  const ledger = [];
+  const note = (kind, day, k, itemId) => ledger.push({ kind, day: dayKey(day), k, itemId });
+  // a / b rounded, halves up (a ≥ 0, b > 0), as the engine rounds.
+  const roundDiv = (a, b) => Math.floor((2 * a + b) / (2 * b));
+  const qty = (max) => {
+    // Whole units mostly, a half or a quarter now and then (kg, litres).
+    const want = g.int(1, 4) * 1000 / (g.chance(0.2) ? g.pick([2, 4]) : 1);
+    return Math.max(1, Math.min(max, Math.round(want)));
+  };
+  const takeOut = (it, qM) => {
+    const outK = qM === it.qM ? it.vK : Math.min(it.vK, roundDiv(qM * it.vK, it.qM));
+    it.qM -= qM;
+    it.vK -= outK;
+    return outK;
+  };
+  const putIn = (it, qM, inK, known) => {
+    it.qM += qM;
+    it.vK += inK;
+    if (known || it.avg != null || it.vK) it.avg = it.vK / it.qM; // kobo a thousandth
+  };
+  const atAverage = (it, qM) => (it.avg == null ? null : Math.round(qM * it.avg));
+  const inStock = () => goods.filter((it) => it.qM > 0);
+  const incomeFor = (type) => {
+    const roll = g.int(1, 40);
+    if (roll <= 4 && incomeAccounts.length) return g.pick(incomeAccounts).id; // picked on the line
+    if (roll === 5) return null; // an older line, or one cut loose
+    if (roll === 6) return "acc-gone";
+    return type === "service" ? SERVICE : SALES;
+  };
+  const move = (kind, it, day, k, extra = {}) => {
+    const m = { id: g.id("mv"), kind, date: day, value: k / 100, itemId: it.id, reason: null, note: g.pick(["", "Shelf count"]), ...extra };
+    moves.push(m);
+    note(kind, day, k, it.id);
+  };
+
+  // Starting stock first: a count, at a cost or (unknown) at nothing.
+  for (const it of goods) {
+    if (!g.chance(0.6)) continue;
+    const qM = qty(20000) * g.int(1, 5);
+    const known = g.chance(0.75);
+    const k = known ? Math.round((qM * g.int(50, 500000)) / 1000) : 0;
+    putIn(it, qM, k, known);
+    move("opening", it, g.when(), k);
+  }
+
+  // Then every other record, in a random order of entry.
+  const tasks = [];
+  for (const s of input.sales) if (g.chance(0.65)) tasks.push(["sale", s]);
+  for (const inv of input.invoices) if (inv.type !== "quote" && g.chance(0.7)) tasks.push(["doc", inv]);
+  for (let i = 0, n = g.int(0, 3); i < n; i++) tasks.push(["restock"]);
+  for (let i = 0, n = g.int(0, 3); i < n; i++) tasks.push(["adjust"]);
+  for (let i = 0, n = g.int(0, 2); i < n; i++) tasks.push(["revalue"]);
+  for (let i = tasks.length - 1; i > 0; i--) {
+    const j = g.int(0, i);
+    [tasks[i], tasks[j]] = [tasks[j], tasks[i]];
+  }
+
+  // A line of what was sold: goods while any are in stock, else a service or
+  // a typed line. → { line, outK } (outK: the goods' cost, kobo).
+  const soldLine = (prefix) => {
+    const roll = g.int(1, 20);
+    const stocked = inStock();
+    if (roll <= 12 && stocked.length) {
+      const it = g.pick(stocked);
+      const qM = qty(it.qM);
+      const known = it.avg != null;
+      const outK = takeOut(it, qM);
+      return {
+        line: { id: g.id(prefix), itemId: it.id, itemType: "goods", quantity: qM / 1000, costAmount: outK / 100, unitCost: known ? outK / qM * 10 : null },
+        it, outK,
+      };
+    }
+    if (roll <= 17 && services.length) {
+      return { line: { id: g.id(prefix), itemId: g.pick(services).id, itemType: "service", quantity: g.int(1, 3), costAmount: 0, unitCost: null }, outK: 0 };
+    }
+    return { line: { id: g.id(prefix), itemId: null, itemType: "other", quantity: 1, costAmount: 0, unitCost: null }, outK: 0 };
+  };
+
+  for (const [what, rec] of tasks) {
+    if (what === "sale") {
+      const n = g.int(1, 3);
+      const total = Math.round(rec.amount * 100);
+      // The lines share the sale's amount, mostly; now and then they add up
+      // to more (a discount on the sale), or are all nothing (price varies).
+      const shape = g.int(1, 20);
+      const amounts = shape === 1 ? Array(n).fill(0)
+        : shape <= 4 ? Array.from({ length: n }, () => g.int(1, 2 * total))
+        : total >= n ? pieces(g, total, n) : Array(n).fill(total);
+      rec.items = [];
+      for (let i = 0; i < n; i++) {
+        const { line, outK } = soldLine("si");
+        line.amount = amounts[i] / 100;
+        line.accountId = incomeFor(line.itemType);
+        line.name = line.itemType;
+        rec.items.push(line);
+        if (outK || line.itemType === "goods") note("sale", rec.date, -outK, line.itemId);
+      }
+    } else if (what === "doc") {
+      const issued = !["draft", "void"].includes(rec.status);
+      const isCN = rec.type === "credit_note";
+      for (const line of rec.items || []) {
+        line.costAmount = 0;
+        line.restock = false;
+        if (isCN) {
+          // A line from a product that may go back into stock.
+          if (!g.chance(0.6)) continue;
+          const it = g.pick(goods);
+          line.itemId = it.id;
+          line.itemType = "goods";
+          if (!g.chance(0.75)) continue;
+          line.restock = true;
+          const qM = qty(5000);
+          if (issued) {
+            const inK = atAverage(it, qM);
+            putIn(it, qM, inK || 0, inK != null);
+            line.costAmount = (inK || 0) / 100;
+            note("credit_note", rec.issueDate, inK || 0, it.id);
+          } else if (g.chance(0.3)) {
+            line.costAmount = g.int(1, 50000) / 100; // a draft or void one: moves nothing
+          }
+          continue;
+        }
+        const roll = g.int(1, 10);
+        if (roll <= 6) {
+          const stocked = inStock();
+          if (issued && stocked.length) {
+            const it = g.pick(stocked);
+            const outK = takeOut(it, qty(it.qM));
+            Object.assign(line, { itemId: it.id, itemType: "goods", costAmount: outK / 100 });
+            note("invoice", rec.issueDate, -outK, it.id);
+          } else if (!issued && g.chance(0.3)) {
+            Object.assign(line, { itemId: g.pick(goods).id, itemType: "goods", costAmount: g.int(1, 50000) / 100 });
+          }
+        } else if (roll <= 8 && services.length) {
+          Object.assign(line, { itemId: g.pick(services).id, itemType: "service" });
+        }
+      }
+    } else if (what === "restock") {
+      const lines = [];
+      for (let i = 0, n = g.int(1, 3); i < n; i++) {
+        const it = g.pick(goods);
+        const qM = qty(10000) * g.int(1, 3);
+        const unitK = g.int(50, 300000);
+        const amountK = roundDiv(qM * unitK, 1000);
+        lines.push({ id: g.id("bi"), itemId: it.id, quantity: qM / 1000, unitCost: unitK / 100, amount: amountK / 100, it, qM, amountK });
+      }
+      const amountK = lines.reduce((s, l) => s + l.amountK, 0);
+      const bill = {
+        id: g.id("rb"), accountId: STOCK, billDate: g.when(), amount: amountK / 100, estimated: false,
+        vendorName: g.pick(["Ada Wholesale", "Mama Tunde", ""]), billNumber: g.chance(0.3) ? `RS-${tasks.length}` : null,
+        receivedViaAccountId: null, payments: [],
+        items: lines.map(({ id, itemId, quantity, unitCost, amount }) => ({ id, itemId, quantity, unitCost, amount })),
+      };
+      for (const l of lines) {
+        putIn(l.it, l.qM, l.amountK, true);
+        note("purchase", bill.billDate, l.amountK, l.it.id);
+      }
+      // Paid now (the Restock screen), in parts later, or not yet.
+      let left = amountK;
+      const shape = g.int(1, 3);
+      for (let j = 0, m = shape === 1 ? 1 : shape === 2 ? g.int(1, 3) : 0; j < m && left > 0; j++) {
+        const a = shape === 1 ? left : Math.min(left, Math.round(g.money() * 100));
+        left -= a;
+        const p = {
+          id: g.id("rp"), amount: a / 100, date: shape === 1 ? bill.billDate : g.when(),
+          method: g.pick(["cash", "transfer", "pos"]), transactionId: null, outsideBooks: false,
+          paidThroughAccountId: g.chance(0.2) && moneyAccounts.length ? g.pick(moneyAccounts).id : null,
+        };
+        if (!links && g.chance(0.15)) {
+          p.method = "bank";
+          p.transactionId = "t-bill";
+        }
+        bill.payments.push(p);
+      }
+      input.bills.push(bill);
+    } else if (what === "adjust") {
+      const it = g.pick(goods);
+      const out = it.qM > 0 && g.chance(0.6);
+      const day = g.when();
+      if (out) {
+        const outK = takeOut(it, qty(it.qM));
+        move("adjustment", it, day, -outK, { reason: g.pick(["damaged", "expired", "lost", "used", "counted"]) });
+      } else {
+        const qM = qty(5000);
+        const inK = atAverage(it, qM);
+        putIn(it, qM, inK || 0, inK != null);
+        move("adjustment", it, day, inK || 0, { reason: g.pick(["counted", "other"]) });
+      }
+    } else {
+      // Valued again (or, never valued, set up: opening_value).
+      const held = inStock();
+      if (!held.length) continue;
+      const it = g.pick(held);
+      const afterK = roundDiv(it.qM * g.int(50, 500000), 1000);
+      const diff = afterK - it.vK;
+      const kind = it.avg == null ? "opening_value" : "revalue";
+      it.vK = afterK;
+      it.avg = afterK / it.qM;
+      if (diff) move(kind, it, g.when(), diff);
+    }
+  }
+  input.stockMoves = moves;
+  input.stockItems = [...goods, ...services].map((it) => ({
+    id: it.id, itemType: it.itemType, quantity: (it.qM || 0) / 1000, stockValue: (it.vK || 0) / 100,
+  }));
+  input.stockLedger = ledger;
 }
 
 // Bills as routes/bills.js and scripts/backfill-r2.js save them (release 2):
