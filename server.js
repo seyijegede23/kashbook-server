@@ -300,6 +300,7 @@ app.use("/auth", authLimiter);
 app.use("/businesses", apiLimiter);
 app.use("/customers", apiLimiter);
 app.use("/inventory", apiLimiter);
+app.use("/item-groups", apiLimiter);
 app.use("/sales", apiLimiter);
 app.use("/expenses", apiLimiter);
 app.use("/bills", apiLimiter);
@@ -348,6 +349,8 @@ app.use("/businesses", require("./src/routes/foreignAccounts"));
 app.use("/businesses", businessRoutes);
 app.use("/customers", customerRoutes);
 app.use("/inventory", inventoryRoutes);
+// Items with variants (items like Zoho, 2026-10-14): each variant is an item.
+app.use("/item-groups", require("./src/routes/itemGroups"));
 app.use("/sales", salesRoutes);
 app.use("/expenses", expenseRoutes);
 app.use("/suggestions", suggestionRoutes);
@@ -504,7 +507,8 @@ cron.schedule(
 );
 
 // ── Background cron: low stock push notifications (every hour) ───────────────
-// Release 3 (2026-10-13): goods only (a service has no stock), never an
+// Release 3 (2026-10-13): goods only (a service has no stock), and only
+// goods whose stock is counted (items like Zoho, 2026-10-14), never an
 // archived item, never in a business that says it sells services only (it
 // sees no stock anywhere), and once per crossing. An item is alerted when
 // its quantity is at or below its low-stock level and it has not been
@@ -529,6 +533,7 @@ async function sendLowStockAlerts() {
     SELECT i.id, i."userId", i.name, i.quantity, i.unit
     FROM "InventoryItem" i
     WHERE i."itemType" = 'goods'
+      AND i."trackInventory"
       AND i."archivedAt" IS NULL
       AND i.quantity <= i."lowStockAlert"
       AND i."lowStockNotifiedAt" IS NULL
@@ -550,7 +555,7 @@ async function sendLowStockAlerts() {
     const claimed = await prisma.$executeRaw`
       UPDATE "InventoryItem" SET "lowStockNotifiedAt" = NOW()
       WHERE id = ${item.id} AND "lowStockNotifiedAt" IS NULL
-        AND "itemType" = 'goods' AND "archivedAt" IS NULL AND quantity <= "lowStockAlert"
+        AND "itemType" = 'goods' AND "trackInventory" AND "archivedAt" IS NULL AND quantity <= "lowStockAlert"
     `;
     if (claimed !== 1) continue;
     sent++;

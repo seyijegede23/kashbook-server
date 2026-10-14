@@ -159,7 +159,10 @@ const milli = (n) => Math.round(Number(n) * 1000);
       const it = await prisma.inventoryItem.create({
         data: {
           userId: userId || bizRow.userId, businessId: bizRow.id, name: `${name} ${tag}`, price: 500, quantity: 0,
-          lowStockAlert, itemType,
+          // A service's stock is never counted (items like Zoho, 2026-10-14),
+          // and goods made here are returnable, as every goods item from
+          // before that release is (new goods are not unless the owner says).
+          lowStockAlert, itemType, trackInventory: itemType === "goods", returnable: itemType === "goods",
         },
       });
       if (qty > 0) {
@@ -418,7 +421,14 @@ const milli = (n) => Math.round(Number(n) * 1000);
     const newCredit = (items, extra = {}) => newInvoice(items, { type: "credit_note", ...extra });
     let cn;
     await test("an issued credit note puts restocked goods back at the average cost", async () => {
-      const r = await newCredit([line(rice, 2, 300, { restock: true }), line(beans, 1, 300), line(haircut, 1, 100, { restock: true })], { status: "SENT" });
+      // A service marked restock is refused (items like Zoho, 2026-10-14:
+      // only counted goods go back into stock), naming the line.
+      const svc = await newCredit([line(rice, 2, 300, { restock: true }), line(haircut, 1, 100, { restock: true })], { status: "SENT" });
+      status(svc, 400);
+      eq(svc.body.code, "NOT_STOCKED");
+      eq(svc.body.line, 1);
+      eq(svc.body.itemId, haircut.id);
+      const r = await newCredit([line(rice, 2, 300, { restock: true }), line(beans, 1, 300), line(haircut, 1, 100)], { status: "SENT" });
       status(r, 201);
       cn = r.body;
       const riceL = cn.items.find((i) => i.itemId === rice.id);
@@ -888,7 +898,9 @@ const milli = (n) => Math.round(Number(n) * 1000);
       const fractional = await raw("Fractional", { quantity: 2.5, cost: 33.33 });
       const uncosted = await raw("Uncosted", { quantity: 3 });
       const empty = await raw("Empty", { quantity: 0, cost: 20 });
-      const service = await raw("Service", { quantity: 4, cost: 9, itemType: "service" });
+      // A service holds no stock (items like Zoho, 2026-10-14: its stock is
+      // never counted, a CHECK).
+      const service = await raw("Service", { quantity: 0, cost: 9, itemType: "service", trackInventory: false });
       const homeless = await prisma.inventoryItem.create({ data: { userId: bfOwner.id, name: `Homeless ${tag}`, price: 1, quantity: 2, cost: 5 } });
       // The window between the server going live and the backfill: an item
       // the new server already moved (two left at no known cost).

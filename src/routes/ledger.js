@@ -562,6 +562,10 @@ async function usageOf(acc) {
     prisma.manualJournalLine.count({ where: { accountId: id } }),
     prisma.saleItem.count({ where: { accountId: id } }),
     prisma.inventoryItem.count({ where: { incomeAccountId: id } }),
+    // Items like Zoho (2026-10-14): an item buying which counts as it, and
+    // an item group whose sales or buying count as it (SET NULL keys too).
+    prisma.inventoryItem.count({ where: { purchaseAccountId: id } }),
+    prisma.itemGroup.count({ where: { OR: [{ incomeAccountId: id }, { purchaseAccountId: id }] } }),
   ]);
   return counts.reduce((s, n) => s + n, 0);
 }
@@ -868,6 +872,11 @@ async function mergeInto(from, into) {
     // (stamped, so every phone's next sync brings them with the new account).
     await move("saleItem", "accountId");
     await px.inventoryItem.updateMany({ where: { incomeAccountId: from.id }, data: { incomeAccountId: into.id, ...touch } });
+    // Items like Zoho: the items and item groups whose buying or sales count
+    // as `from`, stamped the same way.
+    await px.inventoryItem.updateMany({ where: { purchaseAccountId: from.id }, data: { purchaseAccountId: into.id, ...touch } });
+    await px.itemGroup.updateMany({ where: { incomeAccountId: from.id }, data: { incomeAccountId: into.id, ...touch } });
+    await px.itemGroup.updateMany({ where: { purchaseAccountId: from.id }, data: { purchaseAccountId: into.id, ...touch } });
     if (byCategory) {
       // Records that reached it by their category now name the account: an
       // itemized expense never does (its lines do), so it keeps none.

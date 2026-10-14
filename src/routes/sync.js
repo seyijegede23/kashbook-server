@@ -15,6 +15,7 @@ const { BILL_INCLUDE, billFor, booksOnlyBill } = require("../utils/billView");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 const { SALE_ITEMS_INCLUDE, publicSale } = require("./sales").saleLines;
 const { canSeeCosts, publicItem } = require("./inventory").itemView;
+const { publicGroup, variantCounts } = require("../utils/items");
 
 // The stock movements the books read beside the records (release 3): stock
 // adjusted or valued again counts in the profit (utils/books.js), and the
@@ -82,7 +83,7 @@ router.get("/", async (req, res) => {
     const canSeeReports = req.user.permissions?.canViewReports === true;
     const billsForBooks = canSeeBills || canSeeBank || canSeeReports;
 
-    const [sales, expenses, transactions, customers, inventory, bills, invoices, recurring, journals, stockMoves] =
+    const [sales, expenses, transactions, customers, inventory, bills, invoices, recurring, journals, stockMoves, itemGroups] =
       await Promise.all([
         // With their lines (release 3), which never change once saved.
         prisma.sales.findMany({
@@ -166,7 +167,14 @@ router.get("/", async (req, res) => {
             orderBy: [{ date: "asc" }, { id: "asc" }],
           })
           : [],
+        // Items with variants (items like Zoho, 2026-10-14), archived ones
+        // too (archivedAt), as inventory comes: their variants are items.
+        prisma.itemGroup.findMany({
+          where: { ...userScope, ...incremental },
+          orderBy: sinceDate ? { updatedAt: "asc" } : { name: "asc" },
+        }),
       ]);
+    const groupCounts = await variantCounts(prisma, itemGroups.map((g) => g.id));
     // The chart of accounts, whole on every pull (a business has well under
     // a hundred): every member picks accounts, nobody gets amounts from it.
     const accounts = await accountsFor(businessId);
@@ -195,16 +203,20 @@ router.get("/", async (req, res) => {
     //                  journals routes.
     //
     //   costs        — what goods cost (an item's stockValue and avgCost, a
-    //                  sale line's unitCost and costAmount, stockMoves): the
-    //                  reports' figure, canViewReports. Others get the items
-    //                  and lines without them.
+    //                  sale line's unitCost and costAmount, stockMoves) and
+    //                  the purchase information of items and item groups
+    //                  (purchasePrice, purchaseDescription, purchaseAccountId,
+    //                  preferredSupplier): the reports' figure,
+    //                  canViewReports. Others get the items, groups and lines
+    //                  without them.
     //
     // Sales, expenses, customers, inventory and invoices are the bookkeeping a
     // staff member is employed to do, and stay.
     const isOwner = req.user.accountType !== "staff";
     const canSeeCost = canSeeCosts(req);
     res.json({
-      // Each with its lines ([] for a sale without).
+      // Each with its lines ([] for a sale without); a line of goods whose
+      // stock is not counted says so (tracked false), as an invoice line does.
       sales: sales.map((s) => publicSale(s, canSeeCost)),
       // A receipt's storage keys never leave the server (utils/expenseView.js).
       expenses: expenses.map(publicExpense),
@@ -213,6 +225,9 @@ router.get("/", async (req, res) => {
       // Archived items come too (archivedAt): the app keeps them out of its
       // lists and pickers.
       inventory: inventory.map((i) => publicItem(i, canSeeCost)),
+      // Items with variants, each with variantCount (its variants not
+      // archived); upserted by id like inventory.
+      itemGroups: itemGroups.map((g) => publicGroup(g, canSeeCost, groupCounts.get(g.id) || 0)),
       // Bills replace payables (release 2): each with its payments, in the
       // shape routes/bills.js answers with.
       // A member without the bank rows gets each payment from the KashBook

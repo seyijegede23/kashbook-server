@@ -67,6 +67,7 @@ model User {
   suggestions       Suggestion[]
   reminders         Reminder[]
   inventoryItems    InventoryItem[]
+  itemGroups        ItemGroup[]
   notifications     AppNotification[]
   recurringExpenses RecurringExpense[]
   recurringInvoices RecurringInvoice[]
@@ -253,6 +254,7 @@ model Business {
   manualJournals        ManualJournal[]
   saleItems             SaleItem[]
   stockMovements        StockMovement[]
+  itemGroups            ItemGroup[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -811,6 +813,10 @@ model SaleItem {
   unitCost   Float?
   costAmount Float          @default(0)
   position   Int            @default(0) // the order the lines were entered in
+  // Items like Zoho (2026-10-14): false only on a line of goods whose stock is
+  // not counted (InventoryItem.trackInventory off), which moves no stock and
+  // carries no cost. Always the item's own, since tracking is fixed once used.
+  tracked    Boolean        @default(true)
   createdAt  DateTime       @default(now())
 
   @@index([saleId])
@@ -1150,6 +1156,42 @@ model InventoryItem {
   incomeAccount      LedgerAccount? @relation("ItemIncomeAccount", fields: [incomeAccountId], references: [id], onDelete: SetNull)
   lowStockNotifiedAt DateTime?
   archivedAt         DateTime?
+  // Items like Zoho (2026-10-14). trackInventory: whether goods' stock is
+  // counted (always false for a service; goods not counted hold no stock, no
+  // value and no avgCost: CHECKs in the migration). Fixed once the item is
+  // used. returnable: counted goods may come back into stock on a credit
+  // note. Purchase information (purchasePrice for one unit, naira;
+  // purchaseDescription; purchaseAccountId, null: Cost of Goods Sold for goods,
+  // Cost of Services for a service; preferredSupplier) is a cost: only the
+  // owner and members with canViewReports see it. More information: brand,
+  // manufacturer, weight + weightUnit (kg | g | lb | oz), length, width,
+  // height + dimensionUnit (cm | m | in), upc, ean, isbn, mpn. A variant names
+  // its group (groupId), its option per attribute in the group's order
+  // (variantValues, a list of text) and the same lower-cased and joined with
+  // U+001F (variantKey, unique per group).
+  trackInventory      Boolean        @default(true)
+  returnable          Boolean        @default(false)
+  purchasePrice       Float?
+  purchaseDescription String?
+  purchaseAccountId   String?
+  purchaseAccount     LedgerAccount? @relation("ItemPurchaseAccount", fields: [purchaseAccountId], references: [id], onDelete: SetNull)
+  preferredSupplier   String?
+  brand               String?
+  manufacturer        String?
+  weight              Float?
+  weightUnit          String?
+  length              Float?
+  width               Float?
+  height              Float?
+  dimensionUnit       String?
+  upc                 String?
+  ean                 String?
+  isbn                String?
+  mpn                 String?
+  groupId             String?
+  group               ItemGroup?     @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  variantValues       Json?
+  variantKey          String?
   saleItems          SaleItem[]
   invoiceItems       InvoiceItem[]
   billItems          BillItem[]
@@ -1158,6 +1200,9 @@ model InventoryItem {
   @@index([userId, businessId])
   @@index([businessId, updatedAt])
   @@index([incomeAccountId])
+  @@index([purchaseAccountId])
+  @@index([groupId])
+  @@unique([groupId, variantKey])
   // A barcode identifies ONE product within a business. Scoped per business,
   // not globally, because two shops legitimately stock the same product and a
   // global constraint would stop the second one recording it.
@@ -1165,6 +1210,51 @@ model InventoryItem {
   // Postgres permits many NULLs in a unique index, so products without a
   // barcode — today that is all of them — are unaffected.
   @@unique([businessId, barcode])
+}
+
+// Items like Zoho (2026-10-14): an item with variants. What the variants of
+// one product share (type, unit, trackInventory, returnable, the
+// descriptions, the accounts, the preferred supplier, brand, manufacturer) is
+// kept here and copied to every variant, changed only through the group
+// (routes/itemGroups.js). attributes: [{ name, options: [text] }], 1 to 3, in
+// the order the variants' values follow. clientRef makes a retried create
+// safe. archivedAt: the group and its variants are archived together.
+// purchaseDescription, purchaseAccountId and preferredSupplier are costs, as
+// on an item. CHECKs in the migration as for items.
+model ItemGroup {
+  id                  String          @id @default(uuid())
+  businessId          String
+  business            Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId              String
+  user                User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name                String
+  itemType            String          @default("goods")
+  unit                String
+  trackInventory      Boolean         @default(true)
+  returnable          Boolean         @default(false)
+  description         String?
+  purchaseDescription String?
+  preferredSupplier   String?
+  brand               String?
+  manufacturer        String?
+  incomeAccountId     String?
+  incomeAccount       LedgerAccount?  @relation("ItemGroupIncomeAccount", fields: [incomeAccountId], references: [id], onDelete: SetNull)
+  purchaseAccountId   String?
+  purchaseAccount     LedgerAccount?  @relation("ItemGroupPurchaseAccount", fields: [purchaseAccountId], references: [id], onDelete: SetNull)
+  attributes          Json
+  image               String?
+  clientRef           String?
+  archivedAt          DateTime?
+  createdById         String?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+  items               InventoryItem[]
+
+  @@unique([businessId, clientRef])
+  @@index([businessId, updatedAt])
+  @@index([userId])
+  @@index([incomeAccountId])
+  @@index([purchaseAccountId])
 }
 
 // Recurring invoices — PREMIUM. A rule auto-creates a SENT invoice (+ share
@@ -1365,6 +1455,9 @@ model InvoiceItem {
   unitCost    Float?
   costAmount  Float          @default(0)
   restock     Boolean        @default(false)
+  // Items like Zoho (2026-10-14): false only on a line of goods whose stock is
+  // not counted, which never moves stock and carries no cost.
+  tracked     Boolean        @default(true)
 
   @@index([accountId])
   @@index([itemId])
@@ -1852,6 +1945,9 @@ model LedgerAccount {
   journalLines             ManualJournalLine[] @relation("JournalLineAccount")
   itemsIncome              InventoryItem[]     @relation("ItemIncomeAccount")
   saleItems                SaleItem[]          @relation("SaleItemAccount")
+  itemsPurchase            InventoryItem[]     @relation("ItemPurchaseAccount")
+  itemGroupsIncome         ItemGroup[]         @relation("ItemGroupIncomeAccount")
+  itemGroupsPurchase       ItemGroup[]         @relation("ItemGroupPurchaseAccount")
 
   @@unique([businessId, systemKey])
   @@unique([businessId, categorySlug])

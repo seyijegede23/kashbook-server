@@ -31,6 +31,12 @@ router.use(auth);
 //
 // What goods cost is the reports' figure: a member without canViewReports gets
 // unitCost null, costAmount 0 and costKnown null on every line.
+//
+// Goods whose stock is not counted (items like Zoho, 2026-10-14:
+// trackInventory off) are sold like a service: they take no stock, are never
+// refused for stock and carry no cost, and their line says so (tracked
+// false). Whether an item's stock is counted never changes once a line names
+// it, so the line's copy is always the item's.
 
 const MAX_SALE_ITEMS = 100;
 const MAX_LINE_NAME = 200;
@@ -135,7 +141,9 @@ async function writeSaleItems(px, { sale, lines, chartIdx, isStaff, createdById 
     const id = randomUUID();
     let unitCost = null;
     let costAmount = 0;
-    if (item && item.itemType === "goods") {
+    const goods = !!item && item.itemType === "goods";
+    const tracked = !goods || item.trackInventory !== false;
+    if (goods && tracked) {
       try {
         const out = await stock.takeOut(px, {
           businessId: sale.businessId, itemId: item.id, quantity: line.quantity, date: sale.date,
@@ -168,6 +176,7 @@ async function writeSaleItems(px, { sale, lines, chartIdx, isStaff, createdById 
         accountId: account ? account.id : null,
         unitCost,
         costAmount,
+        tracked,
         position: line.position,
       },
     }));
@@ -186,11 +195,14 @@ async function removeSaleStock(px, businessId, saleId) {
   return items;
 }
 
-// A line as the app receives it. costKnown: for goods, whether a cost was
-// known when they left (false: no cost price yet, sold at no cost); null for
-// a service or a typed line, and for a member without the reports.
+// A line as the app receives it. costKnown: for counted goods, whether a
+// cost was known when they left (false: no cost price yet, sold at no cost);
+// null for goods whose stock is not counted, a service or a typed line, and
+// for a member without the reports. tracked: false only for goods whose stock
+// is not counted.
 function publicSaleItem(l, canSee) {
-  const goods = l.itemType === "goods";
+  const tracked = l.tracked !== false;
+  const goods = l.itemType === "goods" && tracked;
   return {
     id: l.id,
     saleId: l.saleId,
@@ -205,6 +217,7 @@ function publicSaleItem(l, canSee) {
     unitCost: canSee ? l.unitCost : null,
     costAmount: canSee ? l.costAmount : 0,
     costKnown: canSee && goods ? l.unitCost !== null : null,
+    tracked,
   };
 }
 
@@ -214,10 +227,10 @@ function publicSale(sale, canSee, items = sale.items) {
   return { ...sale, items: lines.map((l) => publicSaleItem(l, canSee)) };
 }
 
-// The goods items a sale's lines name, as they are now (a retried create
-// answers with them).
+// The counted goods items a sale's lines name, as they are now (a retried
+// create answers with them).
 async function itemsOfLines(lines) {
-  const ids = [...new Set((lines || []).filter((l) => l.itemType === "goods" && l.itemId).map((l) => l.itemId))];
+  const ids = [...new Set((lines || []).filter((l) => l.itemType === "goods" && l.tracked !== false && l.itemId).map((l) => l.itemId))];
   return ids.length ? prisma.inventoryItem.findMany({ where: { id: { in: ids } } }) : [];
 }
 

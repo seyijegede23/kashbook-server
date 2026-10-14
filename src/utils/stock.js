@@ -163,11 +163,16 @@ async function lockedItem(px, businessId, itemId) {
   return item;
 }
 
-// A service has no stock, and an archived item takes no new movements (its
+// A service has no stock, nor have goods whose stock is not counted
+// (trackInventory off, items like Zoho 2026-10-14: they are sold and bought
+// without counting), and an archived item takes no new movements (its
 // history and value stay; removing a record's movements still works).
 function assertStocked(item) {
   if (item.itemType !== "goods") {
     throw stockError(400, "NOT_STOCKED", "A service has no stock to count.", { itemId: item.id });
+  }
+  if (item.trackInventory === false) {
+    throw stockError(400, "NOT_STOCKED", "This item's stock isn't counted.", { itemId: item.id });
   }
   if (item.archivedAt) {
     throw stockError(409, "ITEM_ARCHIVED", "That item is archived. Bring it back before using it.", { itemId: item.id });
@@ -237,9 +242,10 @@ function costOf(movement, costKnown) {
 // value is the movement's, negative: the goods' share of the stock value, to
 // the kobo, or all of it for the last of the stock. costAmount is the same,
 // positive (a line's costAmount); unitCost null unless the cost is known.
-// Refuses a service (400 NOT_STOCKED), an archived item (409 ITEM_ARCHIVED),
-// another business's item (404 ITEM_NOT_FOUND) and more than is in stock
-// (409 NOT_ENOUGH_STOCK { itemId, available }). avgCost does not change.
+// Refuses a service or goods whose stock is not counted (400 NOT_STOCKED),
+// an archived item (409 ITEM_ARCHIVED), another business's item (404
+// ITEM_NOT_FOUND) and more than is in stock (409 NOT_ENOUGH_STOCK { itemId,
+// available }). avgCost does not change.
 async function takeOut(px, args) {
   const { businessId, itemId, quantity, date, sourceKey, kind, reason, note, createdById } = args || {};
   readKind(kind, OUT_KINDS);
@@ -279,8 +285,8 @@ async function takeOut(px, args) {
 // what the goods cost in all (a bill line's amount); else unitCost (naira) for
 // one, valued with lineCost. With neither the cost is unknown: the goods come
 // in at no value and an unknown average stays unknown. avgCost becomes
-// stockValue / quantity. Refuses a service, an archived item and another
-// business's item as takeOut does.
+// stockValue / quantity. Refuses a service, goods whose stock is not
+// counted, an archived item and another business's item as takeOut does.
 async function putIn(px, args) {
   const { businessId, itemId, quantity, unitCost, value, date, sourceKey, kind, reason, note, createdById } = args || {};
   readKind(kind, IN_KINDS);

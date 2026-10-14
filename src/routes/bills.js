@@ -78,7 +78,8 @@
 //   400 BUSINESS_REQUIRED, VENDOR_REQUIRED, BAD_AMOUNT, BAD_DATE, BAD_ITEMS
 //       { line? }, BAD_QUANTITY { line }, BAD_COST { line }, AMOUNT_MISMATCH
 //       { amount: what the lines come to }, BAD_PAY_NOW, NOT_STOCKED { itemId,
-//       line } (a service),
+//       line } (a service, or goods whose stock is not counted: buying those
+//       is ordinary spending, an expense or a bill on a spending account),
 //       ACCOUNT_REQUIRED, BAD_METHOD, TRANSACTION_REQUIRED, NOT_OUTGOING
 //       (money in, or a row that is not a transfer out of the KashBook
 //       account), PAID_IN_FULL, EXCEEDS_BALANCE { balance }, EXCEEDS_TRANSFER
@@ -104,6 +105,7 @@ const { audit } = require("../utils/audit");
 const { toKobo } = require("../utils/money");
 const { BILL_INCLUDE, billFor } = require("../utils/billView");
 const stock = require("../utils/stock");
+const { publicItem } = require("../utils/items");
 const { PROVIDER_SOURCES, isLedgerBankRow } = require("../config/moneySources");
 
 router.use(auth);
@@ -138,14 +140,15 @@ const TX = { timeout: 20000 };
 const seesCosts = (req) => req.user.accountType !== "staff" || req.user.permissions?.canViewReports === true;
 
 // The items a request moved, as its reply carries them (the app replaces its
-// copies), in the shape of routes/inventory.js publicItem: without the old
-// cost column, and what the stock cost only for those who may see costs.
+// copies), as routes/inventory.js shows them (utils/items.js publicItem):
+// without the old cost column, and what the stock cost and the purchase
+// information only for those who may see costs.
 async function itemRows(req, px, ids) {
   const list = [...ids];
   if (!list.length) return [];
   const rows = await px.inventoryItem.findMany({ where: { id: { in: list } } });
   const costs = seesCosts(req);
-  return rows.map(({ cost: _unused, ...row }) => (costs ? row : { ...row, stockValue: null, avgCost: null }));
+  return rows.map((row) => publicItem(row, costs));
 }
 
 // ── Refusals ─────────────────────────────────────────────────────────────────
@@ -392,8 +395,9 @@ async function stockAccountOf(px, businessId) {
 
 // Writes a restock's lines and brings their goods into stock at each line's
 // amount on the bill's date (a "purchase" movement, "bill:<lineId>"). A
-// refusal names the line (an item of another business, a service, an archived
-// item). Returns the ids of the items it moved.
+// refusal names the line (an item of another business, a service or goods
+// whose stock is not counted, an archived item). Returns the ids of the items
+// it moved.
 async function writeItems(px, bill, lines, date, createdById) {
   const touched = new Set();
   for (let i = 0; i < lines.length; i++) {

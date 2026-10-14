@@ -22,6 +22,7 @@ const { assertAccountUsable, accountsFor } = require("../utils/ledgerData");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 const chart = require("../utils/chart");
 const stock = require("../utils/stock");
+const { publicItem } = require("../utils/items");
 
 // The lock date (chart of accounts release 2, utils/booksLock.js): nothing
 // dated on or before it is added, changed or removed. An invoice or a credit
@@ -96,6 +97,12 @@ async function checkLineAccounts(businessId, items, isStaff, kept = new Set()) {
 // account (chart.incomeForItem: the item's own, else Service Income for a
 // service, else Sales, kept as null). A credit note's line with no account is
 // Sales Returns, as before.
+//
+// Items like Zoho (2026-10-14): goods whose stock is not counted
+// (trackInventory off) move no stock on any document and carry no cost; their
+// line says so (tracked false, the item's own, fixed once a line names it).
+// A credit note's line may put goods back (restock) only for counted goods
+// (else 400 NOT_STOCKED) that are returnable (else 400 NOT_RETURNABLE).
 const TX = { timeout: 20000 };
 
 function lineError(status, code, message, extra) {
@@ -114,6 +121,10 @@ function movesStock(doc) {
 // member's the owner trusts with bills and stock bought (canManagePayables;
 // owner's call, 2026-10-14). Anyone else may still issue the credit note,
 // without restock.
+//
+// Whether a saved line moves stock in a document that moves stock: counted
+// goods (an invoice's go out, a credit note's restocked ones come back).
+const movingLine = (l, type) => !!l.itemId && l.itemType === "goods" && l.tracked !== false && (type !== "credit_note" || l.restock);
 const canRestock = (req) => req.user.accountType !== "staff" || req.user.permissions?.canManagePayables === true;
 
 // The quantity of a line in thousandths, as the stock engine counts it.
@@ -123,11 +134,15 @@ const milliOf = (q) => Math.round((Number(q) || 0) * 1000);
 // the lines as sent. An item must be this business's (404 ITEM_NOT_FOUND
 // { itemId, line }); a goods line's quantity is one the stock engine takes,
 // more than 0 with at most three decimals (400 BAD_QUANTITY { line }).
-// mayRestock: whether the caller may mark a credit note's goods line restock
-// (canRestock); without it such a line is refused (403 PERMISSION_DENIED
-// { permission: "canManagePayables", field: "items", line }), unless the
-// document has that restock line already (the same item and quantity, as
-// saved: `saved`), which an edit of other fields sends back as it was.
+// A credit note's line marked restock must name counted goods (400
+// NOT_STOCKED { itemId, field: "items", line }) that are returnable (400
+// NOT_RETURNABLE, likewise). mayRestock: whether the caller may mark such a
+// line restock (canRestock); without it the line is refused (403
+// PERMISSION_DENIED { permission: "canManagePayables", field: "items",
+// line }). Neither the returnable rule nor the permission refuses a restock
+// line the document has already (the same item and quantity, as saved:
+// `saved`), which an edit of other fields sends back as it was. A typed line
+// marked restock puts nothing back.
 async function readDocLines(businessId, items, docType, { mayRestock = true, saved = [] } = {}) {
   const isCredit = docType === "credit_note";
   const keptRestock = saved.filter((l) => l.restock && l.itemId).map((l) => ({ ...l, taken: false }));
@@ -135,7 +150,7 @@ async function readDocLines(businessId, items, docType, { mayRestock = true, sav
   const found = ids.length
     ? await prisma.inventoryItem.findMany({
         where: { id: { in: ids }, businessId },
-        select: { id: true, itemType: true, incomeAccountId: true },
+        select: { id: true, itemType: true, incomeAccountId: true, trackInventory: true, returnable: true },
       })
     : [];
   const byId = new Map(found.map((i) => [i.id, i]));
@@ -158,15 +173,21 @@ async function readDocLines(businessId, items, docType, { mayRestock = true, sav
       const acc = chart.incomeForItem(C, item);
       accountId = acc && acc.systemKey !== chart.SYS.SALES ? acc.id : null;
     }
-    const restock = isCredit && goods && it.restock === true;
-    if (restock && !mayRestock) {
+    const tracked = !goods || item.trackInventory !== false;
+    const restock = isCredit && !!item && it.restock === true;
+    if (restock) {
+      if (!goods || !tracked) {
+        throw lineError(400, "NOT_STOCKED", "This item's stock isn't counted, so it can't go back into stock.", { itemId: item.id, field: "items", line: i });
+      }
       const same = keptRestock.find((l) => !l.taken && l.itemId === item.id && milliOf(l.quantity) === milliOf(quantity));
-      if (!same) {
+      if (same) same.taken = true;
+      else if (!item.returnable) {
+        throw lineError(400, "NOT_RETURNABLE", "This item isn't returnable, so it can't go back into stock.", { itemId: item.id, field: "items", line: i });
+      } else if (!mayRestock) {
         throw lineError(403, "PERMISSION_DENIED", "Only the owner, or staff who manage bills, can put goods back into stock.", {
           permission: "canManagePayables", field: "items", line: i,
         });
       }
-      same.taken = true;
     }
     out.push({
       name: it.name,
@@ -178,6 +199,7 @@ async function readDocLines(businessId, items, docType, { mayRestock = true, sav
       itemId: item ? item.id : null,
       itemType: item ? item.itemType : "other",
       restock,
+      tracked,
     });
   }
   return out;
@@ -198,7 +220,7 @@ function stockDay(doc) {
 async function moveDocStock(px, doc, lines, createdById) {
   const type = doc.type || "invoice";
   const touched = new Set();
-  const moving = lines.filter((l) => l.itemId && l.itemType === "goods" && (type === "invoice" || l.restock));
+  const moving = lines.filter((l) => movingLine(l, type));
   if (!moving.length) return touched;
   const date = stockDay(doc);
   for (const line of moving) {
@@ -245,12 +267,10 @@ async function itemRows(px, ids) {
 const seesCosts = (req) => !!req && (req.user.accountType !== "staff" || req.user.permissions?.canViewReports === true);
 
 // An item a write moved, as its reply carries it (the app replaces its copy),
-// in the shape of routes/inventory.js publicItem: the row without the old
-// cost column, and what the stock cost only for those who may see costs.
-function stockRow(req, item) {
-  const { cost: _unused, ...row } = item;
-  return seesCosts(req) ? row : { ...row, stockValue: null, avgCost: null };
-}
+// as routes/inventory.js shows it (utils/items.js publicItem): the row
+// without the old cost column, and what the stock cost and the purchase
+// information only for those who may see costs.
+const stockRow = (req, item) => publicItem(item, seesCosts(req));
 const stockRows = (req, items) => (items || []).map((i) => stockRow(req, i));
 
 // A document's lines as they are saved now (an edit), with the account each
@@ -262,7 +282,7 @@ async function savedLinesOf(invoiceId) {
     where: { invoiceId },
     select: {
       id: true, name: true, accountId: true, itemId: true, itemType: true, quantity: true, restock: true,
-      unitCost: true, costAmount: true,
+      unitCost: true, costAmount: true, tracked: true,
     },
   });
 }
@@ -870,7 +890,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
       }
       const credit = (cur.type || "invoice") === "credit_note";
       // Lines whose goods move stock on this document.
-      const moving = (l) => !!l.itemId && l.itemType === "goods" && (!credit || l.restock);
+      const moving = (l) => movingLine(l, credit ? "credit_note" : "invoice");
       const saved = await savedLinesOf(existing.id);
       // The lock date: the document's day before and after the edit, and
       // every payment's or refund's day, whose VAT share and accounts follow
@@ -1211,7 +1231,7 @@ router.post("/:id/payments", authMiddleware, async (req, res) => {
         let touched = new Set();
         if (!movesStock(inv) && movesStock({ ...inv, status: nextStatus })) {
           const lines = await px.invoiceItem.findMany({ where: { invoiceId: inv.id } });
-          if (lines.some((l) => l.itemId && l.itemType === "goods")) await assertUnlockedIn(px, inv.businessId, inv.issueDate);
+          if (lines.some((l) => movingLine(l, inv.type || "invoice"))) await assertUnlockedIn(px, inv.businessId, inv.issueDate);
           touched = await moveDocStock(px, inv, lines, req.user.id);
         }
         return {

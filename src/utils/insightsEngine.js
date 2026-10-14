@@ -1259,7 +1259,8 @@ const HANDLERS = {
   },
 
   async stock({ business }) {
-    // Release 3: goods only (a service has no stock and is never low), never
+    // Release 3: goods only (a service has no stock and is never low), and
+    // only goods whose stock is counted (items like Zoho, 2026-10-14), never
     // an archived item, and what the stock on hand cost (stockValue).
     if ((await sellsOf(business)) === "services") {
       return { answer: "You sell services, so there's no stock to count." };
@@ -1267,12 +1268,12 @@ const HANDLERS = {
     const [low, agg] = await Promise.all([
       prisma.$queryRaw`
         SELECT name, quantity, "lowStockAlert" FROM "InventoryItem"
-        WHERE "businessId" = ${business.id} AND "itemType" = 'goods' AND "archivedAt" IS NULL
+        WHERE "businessId" = ${business.id} AND "itemType" = 'goods' AND "trackInventory" AND "archivedAt" IS NULL
           AND quantity <= "lowStockAlert"
         ORDER BY quantity ASC LIMIT 5
       `,
       prisma.inventoryItem.aggregate({
-        where: { businessId: business.id, itemType: "goods", archivedAt: null },
+        where: { businessId: business.id, itemType: "goods", trackInventory: true, archivedAt: null },
         _count: { _all: true },
         _sum: { stockValue: true },
       }),
@@ -1449,7 +1450,7 @@ const HANDLERS = {
       // match auto-links; similar names become tappable choices instead.
       const items = await prisma.inventoryItem.findMany({
         where: { businessId: business.id, archivedAt: null },
-        select: { id: true, name: true, quantity: true, itemType: true },
+        select: { id: true, name: true, quantity: true, itemType: true, trackInventory: true },
         take: 300,
       });
       const candidates = findInventoryCandidates(description, items);
@@ -1458,8 +1459,9 @@ const HANDLERS = {
       if (full.length === 1) {
         const item = full[0].item;
         action = { ...action, inventoryItemId: item.id, itemName: item.name, quantity };
-        // A service has no stock to take from.
-        if (item.itemType === "goods") {
+        // A service, or goods whose stock is not counted, has no stock to
+        // take from.
+        if (item.itemType === "goods" && item.trackInventory) {
           const short = item.quantity < quantity ? ` (your records showed only ${item.quantity})` : "";
           stockNote = ` Stock: ${item.name} ${item.quantity} → ${Math.max(0, item.quantity - quantity)}${short}.`;
         }
@@ -1508,9 +1510,9 @@ const HANDLERS = {
     if (detail) {
       // "i bought 20 bags of rice for 5000" — if the expense clearly names a
       // tracked product, the app offers to top up its stock after recording
-      // (goods only, never an archived item).
+      // (goods whose stock is counted only, never an archived item).
       const items = await prisma.inventoryItem.findMany({
-        where: { businessId: business.id, itemType: "goods", archivedAt: null },
+        where: { businessId: business.id, itemType: "goods", trackInventory: true, archivedAt: null },
         select: { id: true, name: true, quantity: true },
         take: 300,
       });
@@ -1543,10 +1545,10 @@ const HANDLERS = {
           : `Send the full command with the count — e.g. “restock ${detail} 20”.`,
       };
     }
-    // A stock count is for goods (a service has none); a price for any item.
-    // Never an archived item.
+    // A stock count is for goods whose stock is counted (a service, or goods
+    // not counted, have none); a price for any item. Never an archived item.
     const items = await prisma.inventoryItem.findMany({
-      where: { businessId: business.id, archivedAt: null, ...(mode === "price" ? {} : { itemType: "goods" }) },
+      where: { businessId: business.id, archivedAt: null, ...(mode === "price" ? {} : { itemType: "goods", trackInventory: true }) },
       select: { id: true, name: true, quantity: true },
       take: 300,
     });
@@ -1843,8 +1845,9 @@ async function generateInsightCards(business) {
   };
   const cards = [];
 
-  // Low stock: goods only (never a service), never an archived item, and no
-  // card at all for a business that sells services only.
+  // Low stock: goods whose stock is counted only (never a service), never an
+  // archived item, and no card at all for a business that sells services
+  // only.
   const servicesOnly = (await sellsOf(business)) === "services";
   const [inc, prevInc, spending, low, topDebtor, byChannel] = await Promise.all([
     sumIncome(business.id, thisMonth, null),
@@ -1854,7 +1857,7 @@ async function generateInsightCards(business) {
       ? []
       : prisma.$queryRaw`
           SELECT name, quantity FROM "InventoryItem"
-          WHERE "businessId" = ${business.id} AND "itemType" = 'goods' AND "archivedAt" IS NULL
+          WHERE "businessId" = ${business.id} AND "itemType" = 'goods' AND "trackInventory" AND "archivedAt" IS NULL
             AND quantity <= "lowStockAlert"
           ORDER BY quantity ASC LIMIT 3
         `,

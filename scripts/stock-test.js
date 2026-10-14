@@ -98,8 +98,9 @@ function rng(seed) {
     const rivalBiz = await prisma.business.create({ data: { userId: rival.id, name: `Rival ${tag}`, country: "NG", baseCurrency: "NGN" } });
 
     let n = 0;
+    // A service's stock is never counted (items like Zoho, 2026-10-14).
     const mkItem = (data = {}, b = biz, u = owner) => prisma.inventoryItem.create({
-      data: { userId: u.id, businessId: b.id, name: `Item ${tag} ${++n}`, price: 1000, ...data },
+      data: { userId: u.id, businessId: b.id, name: `Item ${tag} ${++n}`, price: 1000, ...(data.itemType === "service" ? { trackInventory: false } : {}), ...data },
     });
     // As a route writes: the business lock, then one transaction.
     const inLock = (fn, b = biz) => prisma.withBusinessLock(b.id, () => prisma.$transaction(fn, { timeout: 30000 }));
