@@ -169,7 +169,8 @@ async function linksOf(px, d) {
             },
           });
           return true;
-        }),
+        // A remote database's first round trips can pass Prisma's 5 s default.
+        }, { timeout: 30000, maxWait: 30000 }),
       );
       if (done) {
         removed++;
