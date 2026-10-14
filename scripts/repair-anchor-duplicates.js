@@ -7,8 +7,10 @@
 //
 // A pair is: a poller row (source anchor, income, reference anc_txn_, no
 // sender) and a webhook row (anc_pay_, not yet claimed by another list id) in
-// the same business, for the same exact amount, dated within five minutes of
-// each other (live pairs are 0 to 3 seconds apart). Pairs are made one to one,
+// the same business, for the same exact amount, made at the same moment: by
+// the times inside both Anchor ids (within ten seconds; live pairs are under
+// one second apart, even where a stored date was hours off on 2026-08-01),
+// else by the stored dates (within five minutes). Pairs are made one to one,
 // closest first, so a genuine second credit of the same amount is never taken
 // for a duplicate. For each pair, in one transaction under the business lock
 // and only if both rows are still as they were read:
@@ -33,7 +35,7 @@
 // Exits 1 when a pair failed, 2 on bad arguments.
 const prisma = require("../src/utils/db");
 const { dayKey } = require("../src/utils/books");
-const { TWIN_WINDOW_MS } = require("../src/utils/anchorReconcile");
+const { twinGap, isUnclaimed: unclaimed } = require("../src/utils/anchorReconcile");
 
 const args = process.argv.slice(2);
 const known = new Set(["--dry-run", "--include-locked"]);
@@ -55,7 +57,6 @@ const ROW = {
 // "YYYY-MM-DD"); one that cannot be read locks everything, so nothing is
 // removed by mistake.
 const lockDayOf = (v) => (v == null || v === "" ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? String(v) : "9999-12-31");
-const unclaimed = (w) => !w.providerTxnId || w.reference === `anc_pay_${w.providerTxnId}`;
 
 // What points at a poller row (it is left when anything does).
 async function linksOf(px, d) {
@@ -99,8 +100,10 @@ async function linksOf(px, d) {
   for (const d of dups) {
     for (const w of twins) {
       if (w.businessId !== d.businessId || w.amount !== d.amount || !unclaimed(w)) continue;
-      const gap = Math.abs(new Date(w.date).getTime() - new Date(d.date).getTime());
-      if (gap <= TWIN_WINDOW_MS) cands.push({ d, w, gap });
+      // By the times inside both Anchor ids when both carry one (a stored date
+      // can be hours off), else by the stored dates (utils/anchorReconcile).
+      const gap = twinGap({ listId: d.providerTxnId || d.reference, at: d.date }, w);
+      if (gap !== null) cands.push({ d, w, gap });
     }
   }
   cands.sort((a, b) => a.gap - b.gap);

@@ -87,14 +87,47 @@ function normalizeAmount(raw) {
 // How far apart the list's time and the webhook's paidAt may be for one
 // credit (live: a few seconds). The webhook's own repair uses the same window.
 const TWIN_WINDOW_MS = 5 * 60 * 1000;
+// How far apart the times inside Anchor's two ids may be for one credit. An
+// Anchor id starts with the moment it was made, in milliseconds (a payment
+// "17855825898516558-anc_inb_trsf" and its transaction
+// "178558259034078627-anc_txn" are 0.5 s apart); every live pair is under one
+// second apart, even when a stored paidAt was hours off (2026-08-01).
+const ID_WINDOW_MS = 10 * 1000;
+// Rows looked at around the list's time; the ids decide within it.
+const SEARCH_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+
+// The moment inside an Anchor id or a reference made from one (anc_pay_,
+// anc_txn_ or bare), NaN when it carries none.
+function anchorIdMs(ref) {
+  const m = /^(?:anc_(?:pay|txn|bk)_)?(\d{13})\d*-anc_/.exec(String(ref || ""));
+  return m ? Number(m[1]) : NaN;
+}
+
+// How far a webhook row is from a credit on the list, or null when it cannot
+// be that credit: by the times inside both ids when both carry one (the
+// stored dates are not trusted then), else by the stored dates.
+function twinGap({ listId, at }, row) {
+  const a = anchorIdMs(listId);
+  const b = anchorIdMs(row.reference);
+  if (Number.isFinite(a) && Number.isFinite(b)) {
+    const gap = Math.abs(a - b);
+    return gap <= ID_WINDOW_MS ? gap : null;
+  }
+  const when = at ? new Date(at).getTime() : NaN;
+  const gap = Math.abs(new Date(row.date).getTime() - when);
+  return Number.isFinite(gap) && gap <= TWIN_WINDOW_MS ? gap : null;
+}
+
+// Unclaimed: the webhook's own row still carries the payment id (or none).
+const isUnclaimed = (r) => !r.providerTxnId || r.reference === `anc_pay_${r.providerTxnId}`;
 
 // The webhook-booked row (anc_pay_) that a credit on Anchor's list stands for,
-// when the list cannot name its Payment: same business, same exact amount,
-// within TWIN_WINDOW_MS of the list's time, and not yet claimed by another
-// list credit. Claiming writes the list's id into providerTxnId (the payment
-// id stays in the reference), so each webhook row stands for ONE list credit:
-// two same-amount credits the webhook booked are claimed one each, and a third
-// it missed finds nothing free and is booked. The closest free row is taken;
+// when the list cannot name its Payment: same business, same exact amount, the
+// same moment by twinGap, and not yet claimed by another list credit.
+// Claiming writes the list's id into providerTxnId (the payment id stays in
+// the reference), so each webhook row stands for ONE list credit: two
+// same-amount credits the webhook booked are claimed one each, and a third it
+// missed finds nothing free and is booked. The closest free row is taken;
 // between two same-amount credits that only swaps which sender a row shows,
 // never the money. Under the business lock, as the webhook's repair is.
 async function claimWebhookTwin(biz, { amount, at, providerId }) {
@@ -108,15 +141,17 @@ async function claimWebhookTwin(biz, { amount, at, providerId }) {
         type: "income",
         amount,
         reference: { startsWith: "anc_pay_" },
-        date: { gte: new Date(when - TWIN_WINDOW_MS), lte: new Date(when + TWIN_WINDOW_MS) },
+        date: { gte: new Date(when - SEARCH_WINDOW_MS), lte: new Date(when + SEARCH_WINDOW_MS) },
       },
       select: { id: true, reference: true, providerTxnId: true, date: true },
     });
-    // Unclaimed: the webhook's own row still carries the payment id (or none).
-    const free = rows.filter((r) => !r.providerTxnId || r.reference === `anc_pay_${r.providerTxnId}`);
+    const free = rows
+      .filter(isUnclaimed)
+      .map((r) => ({ r, gap: twinGap({ listId: providerId, at }, r) }))
+      .filter((x) => x.gap !== null)
+      .sort((x, y) => x.gap - y.gap);
     if (!free.length) return null;
-    free.sort((x, y) => Math.abs(new Date(x.date).getTime() - when) - Math.abs(new Date(y.date).getTime() - when));
-    const twin = free[0];
+    const twin = free[0].r;
     await prisma.transaction.update({ where: { id: twin.id }, data: { providerTxnId: providerId } });
     return twin;
   });
@@ -376,6 +411,10 @@ function startReconciliationLoop(intervalMs = 2 * 60 * 1000) {
 
 module.exports = {
   TWIN_WINDOW_MS,
+  ID_WINDOW_MS,
+  anchorIdMs,
+  twinGap,
+  isUnclaimed,
   claimWebhookTwin,
   reconcileAll,
   reconcileBusiness,

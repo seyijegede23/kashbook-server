@@ -191,6 +191,35 @@ const run = () => reconcileBusiness(biz);
     assert.strictEqual((await rows()).length, 1);
   });
 
+  // Ids as Anchor makes them: the moment in milliseconds, then more digits.
+  const payId = (ms) => `${ms}4911771-anc_inb_trsf`;
+  const txnId = (ms) => `${ms}010669-anc_txn`;
+
+  await test("a webhook row stored hours off is still found by the times inside the ids (live 2026-08-01, ₦500,000)", async () => {
+    await reset();
+    const real = ago(30);
+    // The webhook row says 2h21m earlier than the money moved.
+    await webhookRow(payId(real.getTime()), 500000, new Date(real.getTime() - (2 * 60 + 21) * 60000));
+    LIST = [{ id: txnId(real.getTime() + 489), amount: 500000, at: real }];
+    assert.strictEqual(await run(), 0);
+    const all = await rows();
+    assert.strictEqual(all.length, 1);
+    assert.strictEqual(all[0].providerTxnId, txnId(real.getTime() + 489));
+  });
+
+  await test("close stored dates but ids far apart: a separate credit, booked (live 2026-07-30)", async () => {
+    await reset();
+    const t1 = ago(60);
+    const t2 = new Date(t1.getTime() + 22 * 60000);
+    // The webhook row is the 22-minutes-later payment but stored at t1.
+    await webhookRow(payId(t2.getTime()), 1000, t1);
+    LIST = [{ id: txnId(t1.getTime()), amount: 1000, at: t1 }];
+    assert.strictEqual(await run(), 1, "the earlier credit is its own money");
+    LIST = [{ id: txnId(t1.getTime()), amount: 1000, at: t1 }, { id: txnId(t2.getTime() + 279), amount: 1000, at: t2 }];
+    assert.strictEqual(await run(), 0, "the later credit claims the webhook row by its id");
+    assert.strictEqual((await rows()).length, 2);
+  });
+
   await test("a fresh credit (under 10 minutes) waits for the webhook", async () => {
     await reset();
     LIST = [{ id: "txn8-anc_txn", amount: 700, at: ago(3) }];
@@ -253,6 +282,30 @@ const run = () => reconcileBusiness(biz);
     LIST = [{ id: "rt1-anc_txn", amount: 6300, at: new Date(at.getTime() + 3000) }];
     assert.strictEqual(await run(), 0);
     assert.strictEqual(repair("--dry-run").result.wouldRemove, 0, "a second run finds nothing to remove");
+  });
+
+  await test("repair: pairs by the times inside the ids, whatever the stored dates say", async () => {
+    await reset();
+    await prisma.business.update({ where: { id: BIZ }, data: { booksLockDate: null } });
+    const real = ago(900);
+    // ₦500,000: the webhook row stored 2h21m early; its copy at the right time.
+    const w = await webhookRow(payId(real.getTime()), 500000, new Date(real.getTime() - 141 * 60000));
+    const d = await pollerRow(txnId(real.getTime() + 489), 500000, real);
+    // ₦1,000 twice, 22 minutes apart: the webhook row is the later payment
+    // stored at the earlier time; the earlier list credit is real money, the
+    // later one is the copy.
+    const t1 = new Date(real.getTime() + 60 * 60000);
+    const t2 = new Date(t1.getTime() + 22 * 60000);
+    const w2 = await webhookRow(payId(t2.getTime()), 1000, t1);
+    const early = await pollerRow(txnId(t1.getTime()), 1000, t1);
+    const late = await pollerRow(txnId(t2.getTime() + 279), 1000, t2);
+    const r = repair();
+    assert.strictEqual(r.status, 0, r.out);
+    assert.strictEqual(r.result.removed, 2);
+    assert.strictEqual(r.result.amount, 501000);
+    const ids = (await rows()).map((x) => x.id);
+    assert.ok(!ids.includes(d.id) && !ids.includes(late.id), "both copies gone");
+    for (const keep of [w.id, w2.id, early.id]) assert.ok(ids.includes(keep), "the money that came stays");
   });
 
   await test("repair: a copy dated inside the books lock is left unless --include-locked", async () => {
