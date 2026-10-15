@@ -18,6 +18,11 @@
 // its day can only move later while it is Unbreakable, or Breakable with money
 // in it (updatePot), so editing the lock is never a way round the fee.
 //
+// Every deposit costs a flat fee too (config/fees.js computeDepositFee, ₦250 by
+// the owner's word, 2026-10-15), on top of the amount: the pot gets what was
+// typed, the deposit needs the amount plus the fee free, and the fee is swept
+// and booked exactly like the early-withdrawal fee (collectSavingsFee).
+//
 // Interest-earning pots held at an external savings partner were built and
 // then removed on 2026-10-02 after the partner declined the API request. The
 // backup branch dated 2026-10-02 in both repos holds that code.
@@ -25,7 +30,7 @@ const crypto = require("crypto");
 const prisma = require("./db");
 const anchor = require("./anchor");
 const { getSpendableBalance } = require("./savingsReserve");
-const { computeBreakFee, breakFeeConfig, MONEY_EPS } = require("../config/fees");
+const { computeBreakFee, breakFeeConfig, computeDepositFee, depositFeeConfig, MONEY_EPS } = require("../config/fees");
 const { formatAmountForBusiness } = require("../config/amlLimits");
 const { audit } = require("./audit");
 const { toKobo, sameMoney, twoDecimals } = require("./money");
@@ -166,6 +171,13 @@ function breakFeeView() {
   const { bps, min, enabled } = breakFeeConfig();
   if (!enabled || !(bps > 0)) return { enabled: false, bps: 0, pct: 0, min: 0 };
   return { enabled: true, bps, pct: bps / 100, min };
+}
+
+// What each deposit costs, as GET /savings tells the app: { enabled, amount },
+// all zeros when no fee is charged.
+function depositFeeView() {
+  const { amount, enabled } = depositFeeConfig();
+  return enabled ? { enabled: true, amount } : { enabled: false, amount: 0 };
 }
 
 // At most two decimals, by the codebase's one money rule (utils/money.js
@@ -424,17 +436,24 @@ async function depositToPot({ biz, user, pot, amount, idempotencyKey, req = null
     }
 
     // The money stays put; the only check is that it exists and is not
-    // already promised. Fail closed if the bank cannot be read.
+    // already promised, with the deposit fee on top (the pot gets the amount
+    // typed; the fee leaves the money not set aside). Fail closed if the bank
+    // cannot be read.
+    const { fee } = computeDepositFee();
     let live;
     try { live = await getSpendableBalance(biz); }
     catch (e) {
       if (e.code === "ANCHOR_NOT_CONFIGURED") throw new SavingsError("Banking is not configured on this server.", "NO_BANKING", 503);
       throw new SavingsError("Could not read your bank balance right now. Try again shortly.", "BALANCE_UNAVAILABLE", 503);
     }
-    if (live.spendable + MONEY_EPS < amt) {
+    if (live.spendable + MONEY_EPS < amt + fee) {
+      // The most this deposit could be: what is free, less the fee.
+      const maxDeposit = Math.max(0, toKobo(live.spendable) - toKobo(fee)) / 100;
       throw new SavingsError(
-        `Only ${formatAmountForBusiness(biz, live.spendable)} is available to set aside${live.reserved > 0 ? ` (${formatAmountForBusiness(biz, live.reserved)} is already in savings)` : ""}.`,
-        "INSUFFICIENT_BALANCE", 400, { availableBalance: live.spendable, reserved: live.reserved },
+        fee > 0
+          ? `Only ${formatAmountForBusiness(biz, live.spendable)} is available. Each deposit costs ${formatAmountForBusiness(biz, fee)}, so you can save up to ${formatAmountForBusiness(biz, maxDeposit)}.`
+          : `Only ${formatAmountForBusiness(biz, live.spendable)} is available to set aside${live.reserved > 0 ? ` (${formatAmountForBusiness(biz, live.reserved)} is already in savings)` : ""}.`,
+        "INSUFFICIENT_BALANCE", 400, { availableBalance: live.spendable, reserved: live.reserved, fee, maxDeposit },
       );
     }
     const result = await prisma.$transaction(async (px) => {
@@ -444,12 +463,20 @@ async function depositToPot({ biz, user, pot, amount, idempotencyKey, req = null
       });
       if (claim.count !== 1) throw new SavingsError("Pot changed while saving. Try again.", "CONFLICT", 409);
       const movement = await px.savingsMovement.create({
-        data: { potId: fresh.id, businessId: biz.id, userId: user?.id || biz.userId, type: "deposit", amount: amt, status: "completed", reference, completedAt: new Date() },
+        data: { potId: fresh.id, businessId: biz.id, userId: user?.id || biz.userId, type: "deposit", amount: amt, fee, status: "completed", reference, completedAt: new Date() },
       });
       const updatedPot = await px.savingsPot.findUnique({ where: { id: fresh.id } });
       return { movement, pot: updatedPot };
     });
-    await audit({ req, action: "SAVINGS_DEPOSIT", resourceType: "savingsPot", resourceId: fresh.id, metadata: { amount: amt, reference } });
+    await audit({ req, action: "SAVINGS_DEPOSIT", resourceType: "savingsPot", resourceId: fresh.id, metadata: { amount: amt, reference, fee } });
+    // The fee is swept now, still under this business's lock, from money the
+    // gate just saw free. Best effort, as for a withdrawal: a fee that cannot
+    // be swept yet waits for the reconcile loop, a failed sweep alerts a
+    // human, and neither undoes the deposit.
+    if (fee > 0) {
+      await collectSavingsFee(result.movement.id).catch((e) => console.error(`[savings] deposit fee ${reference}:`, e.message));
+      result.movement = await prisma.savingsMovement.findUnique({ where: { id: result.movement.id } });
+    }
     return result;
   });
 }
@@ -486,8 +513,8 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
       }
       throw new SavingsError(
         breakFee.fee > 0
-          ? `This pot opens on ${when}. Taking ${formatAmountForBusiness(biz, amt)} out early costs ${formatAmountForBusiness(biz, breakFee.fee)}. Confirm to continue.`
-          : `This pot opens on ${when}. Confirm to take money out early.`,
+          ? `This pot opens on ${when}. Withdrawing ${formatAmountForBusiness(biz, amt)} early costs ${formatAmountForBusiness(biz, breakFee.fee)}. Confirm to continue.`
+          : `This pot opens on ${when}. Confirm to withdraw early.`,
         "EARLY_WITHDRAWAL_CONFIRM", 409,
         // feeBps is 0 when nothing will be charged (fees off), so a client that
         // derives the rate from it never shows 2% for a free withdrawal.
@@ -519,7 +546,7 @@ async function withdrawFromPot({ biz, user, pot, amount, idempotencyKey, confirm
     // swept yet waits for the reconcile loop, a failed sweep alerts a human,
     // and neither ever blocks the withdrawal the merchant just confirmed.
     if (fee > 0) {
-      await collectBreakFee(result.movement.id).catch((e) => console.error(`[savings] break fee ${reference}:`, e.message));
+      await collectSavingsFee(result.movement.id).catch((e) => console.error(`[savings] break fee ${reference}:`, e.message));
       result.movement = await prisma.savingsMovement.findUnique({ where: { id: result.movement.id } });
     }
     return result;
@@ -536,16 +563,31 @@ function bankRefused(e) {
   return e?.code === "ANCHOR_NOT_CONFIGURED" || REFUSED_STATUSES.includes(Number(e?.httpStatus || e?.status || 0));
 }
 
+// The two fees a movement can carry. A withdrawal's keeps the names it has
+// always had (references, alert keys, audit actions), so nothing booked or
+// alerted before changes meaning.
+const FEE_KINDS = {
+  withdrawal: {
+    suffix: "_bfee", words: "early-withdrawal fee", reason: "Savings early withdrawal fee",
+    title: "Savings break fee", alertKey: "savings-break-fee", audit: "SAVINGS_BREAK_FEE",
+  },
+  deposit: {
+    suffix: "_dfee", words: "deposit fee", reason: "Savings deposit fee",
+    title: "Savings deposit fee", alertKey: "savings-deposit-fee", audit: "SAVINGS_DEPOSIT_FEE",
+  },
+};
+const FEE_TYPES = Object.keys(FEE_KINDS);
+
 // The fee's ledger row: real money off the account (computeLedgerBalance
 // counts it) and a Bank Fees and Charges expense in the books
 // (utils/books.js). It names no pot: staff with bank access read every bank
 // row, and pots are the owner's alone (the reference ties it to the movement).
 // A write that fails is tried once more; the reference is unique per business,
 // so a second write of the same fee is a no-op (P2002), never a second row.
-async function bookBreakFee(biz, fee, reference, transferId) {
+async function bookSavingsFee(biz, fee, reference, transferId, kind = FEE_KINDS.withdrawal) {
   const data = {
     businessId: biz.id, userId: biz.userId, type: "expense", amount: fee,
-    description: `Savings early withdrawal fee · Ref: ${reference}`,
+    description: `${kind.reason} · Ref: ${reference}`,
     category: "transfer", paymentMethod: "bank", date: new Date(), source: "anchor",
     reference, providerTxnId: transferId || undefined, purpose: "savings_fee",
     currency: biz.baseCurrency || "NGN",
@@ -561,13 +603,14 @@ async function bookBreakFee(biz, fee, reference, transferId) {
   }
 }
 
-// Sweep the early-withdrawal fee to KashBook's fee account. The CALLER HOLDS
-// withBusinessLock for the movement's business: the withdrawal right after it
-// commits, and the reconcile loop for a fee still waiting.
+// Sweep a movement's fee (a deposit's, or an early withdrawal's) to KashBook's
+// fee account. The CALLER HOLDS withBusinessLock for the movement's business:
+// the deposit or withdrawal right after it commits, and the reconcile loop for
+// a fee still waiting.
 //
 // The fee comes only out of money that is not set aside: when what is
 // spendable does not cover it, it waits ("deferred") for a later sweep, so a
-// break fee never eats into another pot. A fee waiting over a day alerts a
+// fee never eats into another pot. A fee waiting over a day alerts a
 // human once a day. An account under review moves no money in any direction,
 // so its fee waits too, with no alert: the freeze is already with a human.
 //
@@ -584,9 +627,10 @@ async function bookBreakFee(biz, fee, reference, transferId) {
 //
 // Returns "collected" | "deferred" | "skipped" (nothing to sweep) | "failed"
 // (claimed, and a human has been alerted).
-async function collectBreakFee(movementId, { now = new Date() } = {}) {
+async function collectSavingsFee(movementId, { now = new Date() } = {}) {
   const mv = await prisma.savingsMovement.findUnique({ where: { id: movementId } });
-  if (!mv || mv.type !== "withdrawal" || mv.status !== "completed" || !(Number(mv.fee) > 0) || mv.feeCollectedAt) return "skipped";
+  if (!mv || !FEE_TYPES.includes(mv.type) || mv.status !== "completed" || !(Number(mv.fee) > 0) || mv.feeCollectedAt) return "skipped";
+  const kind = FEE_KINDS[mv.type];
   const feeAccount = process.env.ANCHOR_FEE_ACCOUNT_ID;
   if (!feeAccount) return "skipped";
   const biz = await prisma.business.findUnique({
@@ -602,7 +646,7 @@ async function collectBreakFee(movementId, { now = new Date() } = {}) {
   // Spendable first: an unreadable bank defers the fee too, never guesses.
   let live = null;
   try { live = await getSpendableBalance(biz); }
-  catch (e) { console.warn(`[savings] break fee ${mv.reference}: bank balance unreadable, the fee waits: ${e.message}`); }
+  catch (e) { console.warn(`[savings] ${kind.words} ${mv.reference}: bank balance unreadable, the fee waits: ${e.message}`); }
   if (!live || live.spendable + MONEY_EPS < fee) {
     await alertFeeWaiting(mv, biz, fee, now).catch((e) => console.error(`[savings] waiting fee alert ${mv.reference}:`, e.message));
     return "deferred";
@@ -610,8 +654,8 @@ async function collectBreakFee(movementId, { now = new Date() } = {}) {
 
   const claim = await prisma.savingsMovement.updateMany({ where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() } });
   if (claim.count !== 1) return "skipped";
-  const reference = `${mv.reference}_bfee`;
-  const alertKey = `savings-break-fee-${mv.id}`;
+  const reference = `${mv.reference}${kind.suffix}`;
+  const alertKey = `${kind.alertKey}-${mv.id}`;
   const fireAlert = (title, text) => require("./alerts").fireAlert(alertKey, title, text).catch(() => false);
 
   let book;
@@ -620,43 +664,43 @@ async function collectBreakFee(movementId, { now = new Date() } = {}) {
       fromAccountId: biz.anchorAccountId,
       toAccountId: feeAccount,
       amount: fee,
-      reason: "Savings early withdrawal fee",
+      reason: kind.reason,
       reference,
     });
   } catch (e) {
     const error = String(e?.message || "").slice(0, 200);
     if (bankRefused(e)) {
-      console.error(`[savings] break fee ${reference} refused by the bank:`, e.message);
-      await audit({ action: "SAVINGS_BREAK_FEE_FAILED", resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, error } });
-      await fireAlert("Savings break fee not collected", `The bank refused the ₦${fee} early-withdrawal fee ${reference} (${biz.name}), so nothing moved. It is marked collected so it is never charged twice: collect it by hand with that reference. The bank said: ${error.slice(0, 120)}`);
+      console.error(`[savings] ${kind.words} ${reference} refused by the bank:`, e.message);
+      await audit({ action: `${kind.audit}_FAILED`, resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, error } });
+      await fireAlert(`${kind.title} not collected`, `The bank refused the ₦${fee} ${kind.words} ${reference} (${biz.name}), so nothing moved. It is marked collected so it is never charged twice: collect it by hand with that reference. The bank said: ${error.slice(0, 120)}`);
       return "failed";
     }
     // The fee may have moved: book it, and let a human check the bank.
     let booked = true;
-    try { await bookBreakFee(biz, fee, reference, null); }
-    catch (rowErr) { booked = false; console.error(`[savings] break fee ${reference}: ledger row not written:`, rowErr.message); }
+    try { await bookSavingsFee(biz, fee, reference, null, kind); }
+    catch (rowErr) { booked = false; console.error(`[savings] ${kind.words} ${reference}: ledger row not written:`, rowErr.message); }
     try { balanceCache.bustBalance(biz.id); } catch { /* noop */ }
-    console.error(`[savings] break fee ${reference}: outcome unknown:`, e.message);
-    await audit({ action: "SAVINGS_BREAK_FEE_UNCONFIRMED", resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, booked, error } });
-    await fireAlert("Savings break fee unconfirmed", `The ₦${fee} early-withdrawal fee ${reference} (${biz.name}) may have moved. Check Anchor for that reference before collecting anything. ${booked
+    console.error(`[savings] ${kind.words} ${reference}: outcome unknown:`, e.message);
+    await audit({ action: `${kind.audit}_UNCONFIRMED`, resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, booked, error } });
+    await fireAlert(`${kind.title} unconfirmed`, `The ₦${fee} ${kind.words} ${reference} (${biz.name}) may have moved. Check Anchor for that reference before collecting anything. ${booked
       ? "The books already count the fee, so collect it by hand only if the transfer is not there."
       : "Its ledger row could not be written either: if the transfer is there, add the savings_fee row; if not, collect it by hand and add the row."} The bank said: ${error.slice(0, 120)}`);
     return "failed";
   }
 
   try {
-    await bookBreakFee(biz, fee, reference, book?.transferId);
+    await bookSavingsFee(biz, fee, reference, book?.transferId, kind);
   } catch (e) {
     // The fee WAS swept. Only its ledger row is missing.
     const error = String(e?.message || "").slice(0, 200);
-    console.error(`[savings] break fee ${reference} swept but not booked:`, e.message);
+    console.error(`[savings] ${kind.words} ${reference} swept but not booked:`, e.message);
     try { balanceCache.bustBalance(biz.id); } catch { /* noop */ }
-    await audit({ action: "SAVINGS_BREAK_FEE_BOOKKEEPING_FAILED", resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, transferId: book?.transferId || null, error } });
-    await fireAlert("Savings break fee not booked", `The ₦${fee} early-withdrawal fee ${reference} (${biz.name}) WAS swept (Anchor transfer ${book?.transferId || "with that reference"}), but its ledger row could not be written. Do not collect it again: add the savings_fee row. The error: ${error.slice(0, 120)}`);
+    await audit({ action: `${kind.audit}_BOOKKEEPING_FAILED`, resourceType: "savingsMovement", resourceId: mv.id, severity: "alert", metadata: { fee, reference, transferId: book?.transferId || null, error } });
+    await fireAlert(`${kind.title} not booked`, `The ₦${fee} ${kind.words} ${reference} (${biz.name}) WAS swept (Anchor transfer ${book?.transferId || "with that reference"}), but its ledger row could not be written. Do not collect it again: add the savings_fee row. The error: ${error.slice(0, 120)}`);
     return "failed";
   }
   try { balanceCache.adjustBalance(biz.id, -fee); } catch { /* noop */ }
-  await audit({ action: "SAVINGS_BREAK_FEE", resourceType: "savingsMovement", resourceId: mv.id, metadata: { fee, reference } });
+  await audit({ action: kind.audit, resourceType: "savingsMovement", resourceId: mv.id, metadata: { fee, reference } });
   return "collected";
 }
 
@@ -664,11 +708,11 @@ async function collectBreakFee(movementId, { now = new Date() } = {}) {
 // to the back (their updatedAt is the last time they were tried), so fees that
 // cannot be swept for a long while never hold the front against newer ones.
 // Only fees still unclaimed are touched.
-async function requeueBreakFees(ids, now = new Date()) {
+async function requeueSavingsFees(ids, now = new Date()) {
   const list = [...new Set((ids || []).filter(Boolean).map(String))];
   if (!list.length) return 0;
   const r = await prisma.savingsMovement.updateMany({
-    where: { id: { in: list }, type: "withdrawal", feeCollectedAt: null },
+    where: { id: { in: list }, type: { in: FEE_TYPES }, feeCollectedAt: null },
     data: { updatedAt: now },
   });
   return r.count;
@@ -679,13 +723,14 @@ async function requeueBreakFees(ids, now = new Date()) {
 async function alertFeeWaiting(mv, biz, fee, now = new Date()) {
   const since = new Date(mv.completedAt || mv.createdAt);
   if (!(now - since >= DAY_MS)) return false;
-  const key = `savings-break-fee-waiting-${mv.id}`;
+  const kind = FEE_KINDS[mv.type] || FEE_KINDS.withdrawal;
+  const key = `${kind.alertKey}-waiting-${mv.id}`;
   const last = await prisma.alertState.findUnique({ where: { key } });
   if (last && now - new Date(last.lastFiredAt) < DAY_MS) return false;
   return require("./alerts").fireAlert(
     key,
-    "Savings break fee waiting",
-    `The ₦${fee} early-withdrawal fee on ${mv.reference} (${biz.name}) has waited since ${dayWords(since)}: the money not set aside in pots does not cover it. It is swept by itself once it does.`,
+    `${kind.title} waiting`,
+    `The ₦${fee} ${kind.words} on ${mv.reference} (${biz.name}) has waited since ${dayWords(since)}: the money not set aside in pots does not cover it. It is swept by itself once it does.`,
   );
 }
 
@@ -769,6 +814,7 @@ module.exports = {
   validateAmount,
   validateTarget,
   breakFeeView,
+  depositFeeView,
   bankRefused,
   replayOutcome,
   pickBlockingPot,
@@ -784,8 +830,8 @@ module.exports = {
   closePot,
   depositToPot,
   withdrawFromPot,
-  collectBreakFee,
-  requeueBreakFees,
+  collectSavingsFee,
+  requeueSavingsFees,
   // deletion
   savingsBlockingDeletion,
 };

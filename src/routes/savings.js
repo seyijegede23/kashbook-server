@@ -1,20 +1,20 @@
 // Savings pots — owner only. Staff never see or move savings.
 //
-//   GET    /savings?businessId=              pots + totals + the break fee
+//   GET    /savings?businessId=              pots + totals + the fees
 //   POST   /savings/pots                     create
 //   PATCH  /savings/pots/:id                 rename, target, lock (PIN for a lock
 //                                            change; a pot that has not opened
 //                                            and is Unbreakable, or Breakable
 //                                            with money in it: later only)
 //   DELETE /savings/pots/:id                 close an empty pot
-//   POST   /savings/pots/:id/deposit         put money in (PIN)
-//   POST   /savings/pots/:id/withdraw        take money out (PIN)
+//   POST   /savings/pots/:id/deposit         deposit (PIN; a flat fee on top)
+//   POST   /savings/pots/:id/withdraw        withdraw (PIN; 2% if early)
 //   GET    /savings/pots/:id/movements       history, newest first
 //
 // Money paths live in utils/savings.js. This file does what every money route
 // does before the lock: ownership, input shape, and the PIN (audited on
-// failure). No AML pipeline here: a pot moves no money, and the only debit the
-// feature makes is KashBook's own break fee.
+// failure). No AML pipeline here: a pot moves no money, and the only debits the
+// feature makes are KashBook's own fees (each deposit, an early withdrawal).
 //
 // A lock is sent as lockUntil + lockMode. lockUntil is the day the pot opens,
 // "YYYY-MM-DD" (Lagos), or a timestamp, which is moved up to the next Lagos
@@ -91,6 +91,8 @@ router.get("/", async (req, res) => {
       // What breaking a Breakable pot early costs, so the app can say so up
       // front. The app's single source: all zeros when no fee is charged.
       breakFee: savings.breakFeeView(),
+      // What each deposit costs (on top of the amount), the same way.
+      depositFee: savings.depositFeeView(),
     });
   } catch (err) {
     sendError(res, err);

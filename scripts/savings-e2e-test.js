@@ -47,10 +47,13 @@ process.env.SAVINGS_ENABLED = "true";
 // Fees ON: a ₦50 fee + ₦50 stamp duty above ₦10k is part of what the spend
 // gate must cover, and the fee account is where the break fee is swept to.
 process.env.ANCHOR_FEE_ACCOUNT_ID = "fee-acct-e2e";
-// The break fee at its defaults (2%, minimum ₦100): the lock tests assert
-// those exact figures, so a value left in the shell must not leak in.
+// Sections 1 to 8 were written for a ₦100 minimum break fee and free deposits
+// and assert those exact figures, so they run with both pinned. Section 9 runs
+// on the live defaults (owner, 2026-10-15: exactly 2% with no minimum, ₦250 on
+// every deposit). A value left in the shell must not leak in.
 delete process.env.SAVINGS_BREAK_FEE_BPS;
-delete process.env.SAVINGS_BREAK_FEE_MIN;
+process.env.SAVINGS_BREAK_FEE_MIN = "100";
+process.env.SAVINGS_DEPOSIT_FEE = "0";
 process.env.DB_POOL_MAX = process.env.DB_POOL_MAX || "60";
 
 // ── Stub the bank BEFORE anything requires it ────────────────────────────────
@@ -973,8 +976,8 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
     assert.strictEqual(w1.body?.feeBps, 200);
     assert.strictEqual(w1.body?.lockUntil, pot.lockUntil);
     assert.ok(/costs/.test(w1.body.error), `the message states the price: ${w1.body.error}`);
-    assert.ok(w1.body.error.startsWith(`This pot opens on ${inWords(lagosDayOf(pot.lockUntil))}. Taking `), `the message names the day: ${w1.body.error}`);
-    assert.ok(/ out early costs .+\. Confirm to continue\.$/.test(w1.body.error), w1.body.error);
+    assert.ok(w1.body.error.startsWith(`This pot opens on ${inWords(lagosDayOf(pot.lockUntil))}. Withdrawing `), `the message names the day: ${w1.body.error}`);
+    assert.ok(/ early costs .+\. Confirm to continue\.$/.test(w1.body.error), w1.body.error);
     assert.strictEqual((await dbPot(pot.id)).balance, 5_000);
     assert.strictEqual(await dbMovementByRef("kb_svw_fw1"), null, "nothing is written before the merchant confirms");
     assert.strictEqual(bookCalls.length, 0, "no fee is swept before the merchant confirms");
@@ -1106,7 +1109,7 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
       assert.strictEqual(ask.body?.code, "EARLY_WITHDRAWAL_CONFIRM");
       assert.strictEqual(ask.body?.fee, 0, "a fee nothing can collect is not charged");
       assert.strictEqual(ask.body?.feeBps, 0);
-      assert.ok(/Confirm to take money out early\.$/.test(ask.body.error), ask.body.error);
+      assert.ok(/Confirm to withdraw early\.$/.test(ask.body.error), ask.body.error);
       const before = bookCalls.length;
       const ok = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "nfw1", confirmEarly: true });
       assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
@@ -1733,7 +1736,7 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
         assert.strictEqual(t.feesCollected, 0, `${what}: ${JSON.stringify(t)}`);
         assert.strictEqual(t.feesDeferred, 0, `${what}: a frozen account's fee is not even looked at`);
         // A freeze landing between the loop's list and its lock: the sweep itself waits.
-        const outcome = await prisma.withBusinessLock(BIZ_ID, () => savings.collectBreakFee(id));
+        const outcome = await prisma.withBusinessLock(BIZ_ID, () => savings.collectSavingsFee(id));
         assert.strictEqual(outcome, "deferred", what);
         assert.strictEqual(bookCalls.length, books, `${what}: nothing leaves a frozen account`);
         assert.strictEqual((await dbMovement(id)).feeCollectedAt, null, `${what}: nothing claimed`);
@@ -1962,6 +1965,151 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
       process.env.SAVINGS_ENABLED = "true";
     }
   });
+
+  // ══ 9. THE LIVE DEFAULTS (owner, 2026-10-15) ═════════════════════════════
+  section("9. each deposit costs ₦250 on top; an early withdrawal costs exactly 2%");
+  await seed({ gross: 10_000 });
+  delete process.env.SAVINGS_DEPOSIT_FEE;
+  delete process.env.SAVINGS_BREAK_FEE_MIN;
+  try {
+    await test("GET /savings names both fees: ₦250 a deposit, 2% with no minimum", async () => {
+      const r = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
+      assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+      assert.deepStrictEqual(r.body.depositFee, { enabled: true, amount: 250 });
+      assert.deepStrictEqual(r.body.breakFee, { enabled: true, bps: 200, pct: 2, min: 0 });
+    });
+
+    await test("a deposit puts the amount typed in the pot, sweeps ₦250 from the money not set aside, and books it as a bank charge", async () => {
+      const pot = (await mkPot({ name: "Rent", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+      const chargesBefore = await bankCharges();
+      const ledgerBefore = await computeRawLedger(BIZ_ID, "NGN");
+      const d = await depositTo(pot.id, { amount: 1_000, idempotencyKey: "df1" });
+      assert.strictEqual(d.status, 200, JSON.stringify(d.body));
+      assert.strictEqual(d.body.movement.type, "deposit");
+      assert.strictEqual(d.body.movement.fee, 250);
+      assert.strictEqual(d.body.pot.balance, 1_000, "the pot gets exactly what was typed");
+      assert.strictEqual(bookCalls.length, 1, JSON.stringify(bookCalls));
+      assert.strictEqual(bookCalls[0].fromAccountId, BIZ_ANCHOR_ID);
+      assert.strictEqual(bookCalls[0].toAccountId, FEE_ACCOUNT);
+      assert.strictEqual(bookCalls[0].amount, 250);
+      assert.strictEqual(bookCalls[0].reference, "kb_sv_df1_dfee");
+      assert.strictEqual(bookCalls[0].reason, "Savings deposit fee", "the transfer names no pot");
+      assert.strictEqual(anchorState.gross, 9_750, "only the fee left the bank");
+      const row = await dbTxnByRef("kb_sv_df1_dfee");
+      assert.ok(row, "fee Transaction row");
+      assert.strictEqual(row.purpose, "savings_fee");
+      assert.strictEqual(row.description, "Savings deposit fee · Ref: kb_sv_df1_dfee", "the bank row names no pot");
+      assert.strictEqual(row.type, "expense");
+      assert.strictEqual(row.amount, 250);
+      assert.ok((await dbMovementByRef("kb_sv_df1")).feeCollectedAt, "claimed as collected");
+      assert.strictEqual(await auditCount("SAVINGS_DEPOSIT_FEE"), 1);
+      assert.ok(sameKobo(await bankCharges(), chargesBefore + 250), "a Bank Fees and Charges expense of ₦250");
+      assert.ok(sameKobo(await computeRawLedger(BIZ_ID, "NGN"), ledgerBefore - 250), "real money off the ledger");
+      ctx.feePot = pot;
+    });
+
+    await test("the same request again charges nothing more", async () => {
+      const again = await depositTo(ctx.feePot.id, { amount: 1_000, idempotencyKey: "df1" });
+      assert.strictEqual(again.status, 200, JSON.stringify(again.body));
+      assert.strictEqual(again.body.replay, true);
+      assert.strictEqual(bookCalls.length, 1, "no second sweep");
+      assert.strictEqual(anchorState.gross, 9_750);
+      assert.strictEqual((await dbPot(ctx.feePot.id)).balance, 1_000);
+    });
+
+    await test("the amount AND the fee must be free: short by the fee, refused with the most that fits; exactly that fits", async () => {
+      // Free now: 9,750 − 1,000 = 8,750. ₦8,600 + ₦250 is ₦8,850.
+      const r = await depositTo(ctx.feePot.id, { amount: 8_600, idempotencyKey: "df2" });
+      assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+      assert.strictEqual(r.body.code, "INSUFFICIENT_BALANCE");
+      assert.strictEqual(r.body.fee, 250);
+      assert.strictEqual(r.body.maxDeposit, 8_500);
+      assert.ok(sameKobo(r.body.availableBalance, 8_750));
+      assert.ok(/Each deposit costs ₦250(\.00)?, so you can save up to ₦8,500(\.00)?\.$/.test(r.body.error), r.body.error);
+      assert.strictEqual(await dbMovementByRef("kb_sv_df2"), null, "nothing written");
+      assert.strictEqual(bookCalls.length, 1, "nothing swept");
+      const ok = await depositTo(ctx.feePot.id, { amount: 8_500, idempotencyKey: "df3" });
+      assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
+      assert.strictEqual(bookCalls.length, 2);
+      assert.strictEqual(anchorState.gross, 9_500);
+      assert.strictEqual((await dbPot(ctx.feePot.id)).balance, 9_500);
+    });
+
+    await test("an early withdrawal costs exactly 2%, no minimum: ₦20 on ₦1,000, ₦24.68 on ₦1,234", async () => {
+      const w1 = await withdrawFrom(ctx.feePot.id, { amount: 1_000, idempotencyKey: "dw1" });
+      assert.strictEqual(w1.status, 409, JSON.stringify(w1.body));
+      assert.strictEqual(w1.body.code, "EARLY_WITHDRAWAL_CONFIRM");
+      assert.strictEqual(w1.body.fee, 20);
+      assert.strictEqual(w1.body.feeBps, 200);
+      assert.ok(/Withdrawing ₦1,000(\.00)? early costs ₦20(\.00)?\. Confirm to continue\.$/.test(w1.body.error), w1.body.error);
+      const w2 = await withdrawFrom(ctx.feePot.id, { amount: 1_000, idempotencyKey: "dw1", confirmEarly: true });
+      assert.strictEqual(w2.status, 200, JSON.stringify(w2.body));
+      assert.strictEqual(w2.body.movement.fee, 20);
+      assert.strictEqual(bookCalls.length, 3);
+      assert.strictEqual(bookCalls[2].amount, 20);
+      assert.strictEqual(bookCalls[2].reference, "kb_svw_dw1_bfee");
+      assert.strictEqual(anchorState.gross, 9_480);
+      assert.strictEqual((await dbPot(ctx.feePot.id)).balance, 8_500);
+      const w3 = await withdrawFrom(ctx.feePot.id, { amount: 1_234, idempotencyKey: "dw2", confirmEarly: true });
+      assert.strictEqual(w3.status, 200, JSON.stringify(w3.body));
+      assert.strictEqual(w3.body.movement.fee, 24.68, "to the kobo");
+      assert.ok(sameKobo(anchorState.gross, 9_455.32), String(anchorState.gross));
+    });
+
+    await test("a deposit fee the bank refuses alerts a human in the deposit's words and is never charged twice; the deposit stands", async () => {
+      anchorState.bookMode = "reject";
+      try {
+        const d = await depositTo(ctx.feePot.id, { amount: 100, idempotencyKey: "df4" });
+        assert.strictEqual(d.status, 200, JSON.stringify(d.body));
+        const mv = await dbMovementByRef("kb_sv_df4");
+        assert.ok(mv.feeCollectedAt, "claimed before the transfer, so never charged twice");
+        assert.strictEqual(await dbTxnByRef("kb_sv_df4_dfee"), null, "no row for money that did not move");
+        assert.strictEqual(await auditCount("SAVINGS_DEPOSIT_FEE_FAILED"), 1);
+        const alert = await alertFired(`savings-deposit-fee-${mv.id}`);
+        assert.ok(alert && alert.lastValue.startsWith("The bank refused the ₦250 deposit fee kb_sv_df4_dfee (Ada Stores), so nothing moved."), alert && alert.lastValue);
+      } finally {
+        anchorState.bookMode = "ok";
+      }
+    });
+
+    await test("a deposit fee a crash left behind is swept once by the reconcile loop", async () => {
+      // As if the server died between the deposit's commit and its sweep.
+      await prisma.savingsPot.update({ where: { id: ctx.feePot.id }, data: { balance: { increment: 500 } } });
+      const mv = await prisma.savingsMovement.create({
+        data: { potId: ctx.feePot.id, businessId: BIZ_ID, userId: owner.id, type: "deposit", amount: 500, fee: 250, status: "completed", reference: "kb_sv_crash1", completedAt: new Date() },
+      });
+      const before = bookCalls.length;
+      const t = await reconcileSavings();
+      assert.strictEqual(t.feesCollected, 1, JSON.stringify(t));
+      assert.strictEqual(t.drift, 0, JSON.stringify(t));
+      assert.strictEqual(bookCalls.length, before + 1);
+      assert.strictEqual(bookCalls[before].reference, "kb_sv_crash1_dfee");
+      assert.strictEqual(bookCalls[before].amount, 250);
+      assert.ok((await dbMovement(mv.id)).feeCollectedAt);
+      assert.ok(await dbTxnByRef("kb_sv_crash1_dfee"));
+      const again = await reconcileSavings();
+      assert.strictEqual(again.feesCollected, 0, "never twice");
+      assert.strictEqual(bookCalls.length, before + 1);
+    });
+
+    await test("no fee account: deposits cost nothing and GET /savings says so", async () => {
+      delete process.env.ANCHOR_FEE_ACCOUNT_ID;
+      try {
+        const r = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
+        assert.deepStrictEqual(r.body.depositFee, { enabled: false, amount: 0 });
+        const before = bookCalls.length;
+        const d = await depositTo(ctx.feePot.id, { amount: 100, idempotencyKey: "df5" });
+        assert.strictEqual(d.status, 200, JSON.stringify(d.body));
+        assert.strictEqual(d.body.movement.fee, 0);
+        assert.strictEqual(bookCalls.length, before);
+      } finally {
+        process.env.ANCHOR_FEE_ACCOUNT_ID = FEE_ACCOUNT;
+      }
+    });
+  } finally {
+    process.env.SAVINGS_BREAK_FEE_MIN = "100";
+    process.env.SAVINGS_DEPOSIT_FEE = "0";
+  }
 
   // ── done ──
   console.log(`\n${passed} passed, ${failed} failed`);

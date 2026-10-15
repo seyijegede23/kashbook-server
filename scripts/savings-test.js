@@ -323,7 +323,7 @@ test("validateLock: the lock needs a mode, and no date means no lock", () => {
 section("3. breaking a flexible lock costs 2%, at least ₦100, never more than the amount");
 
 const withFeeEnv = (env, fn) => {
-  const keys = ["ANCHOR_FEE_ACCOUNT_ID", "SAVINGS_BREAK_FEE_BPS", "SAVINGS_BREAK_FEE_MIN"];
+  const keys = ["ANCHOR_FEE_ACCOUNT_ID", "SAVINGS_BREAK_FEE_BPS", "SAVINGS_BREAK_FEE_MIN", "SAVINGS_DEPOSIT_FEE"];
   const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   Object.assign(process.env, env);
@@ -340,17 +340,26 @@ test("2% of the amount, to the kobo", () => withFeeEnv(FEE_ENV, () => {
   assert.strictEqual(fees.computeBreakFee(1_000_000).fee, 20_000);
 }));
 
-test("floored at ₦100, capped at the amount itself", () => withFeeEnv(FEE_ENV, () => {
-  assert.strictEqual(fees.computeBreakFee(1_000).fee, 100);
-  assert.strictEqual(fees.computeBreakFee(4_999).fee, 100);
+test("exactly 2%, no minimum by default (owner, 2026-10-15), never more than the amount", () => withFeeEnv(FEE_ENV, () => {
+  assert.strictEqual(fees.computeBreakFee(1_000).fee, 20, "the owner's example: ₦20 on ₦1,000");
+  assert.strictEqual(fees.computeBreakFee(4_999).fee, 99.98);
   assert.strictEqual(fees.computeBreakFee(5_000).fee, 100);
   assert.strictEqual(fees.computeBreakFee(5_050).fee, 101);
-  assert.strictEqual(fees.computeBreakFee(60).fee, 60, "a ₦60 withdrawal cannot cost ₦100");
-  assert.strictEqual(fees.computeBreakFee(100).fee, 100);
-  assert.strictEqual(fees.computeBreakFee(0.01).fee, 0.01);
+  assert.strictEqual(fees.computeBreakFee(60).fee, 1.2);
+  assert.strictEqual(fees.computeBreakFee(100).fee, 2);
+  assert.strictEqual(fees.computeBreakFee(0.5).fee, 0.01);
+  assert.strictEqual(fees.computeBreakFee(0.01).fee, 0, "2% of a kobo rounds to nothing");
   assert.strictEqual(fees.computeBreakFee(0).fee, 0);
   assert.strictEqual(fees.computeBreakFee(-5).fee, 0);
   assert.strictEqual(fees.computeBreakFee("abc").fee, 0);
+  assert.strictEqual(fees.breakFeeConfig().min, 0);
+}));
+
+test("a minimum set in env still floors the fee, and is still capped at the amount", () => withFeeEnv({ ...FEE_ENV, SAVINGS_BREAK_FEE_MIN: "100" }, () => {
+  assert.strictEqual(fees.computeBreakFee(1_000).fee, 100);
+  assert.strictEqual(fees.computeBreakFee(5_050).fee, 101);
+  assert.strictEqual(fees.computeBreakFee(60).fee, 60, "a ₦60 withdrawal cannot cost ₦100");
+  assert.strictEqual(fees.computeBreakFee(0.01).fee, 0.01);
 }));
 
 test("the numbers come from env, within sane bounds", () => withFeeEnv({ ...FEE_ENV, SAVINGS_BREAK_FEE_BPS: "300", SAVINGS_BREAK_FEE_MIN: "50" }, () => {
@@ -364,7 +373,7 @@ test("the numbers come from env, within sane bounds", () => withFeeEnv({ ...FEE_
   process.env.SAVINGS_BREAK_FEE_BPS = "abc";
   assert.strictEqual(fees.computeBreakFee(10_000).bps, 200);
   process.env.SAVINGS_BREAK_FEE_MIN = "-5";
-  assert.strictEqual(fees.breakFeeConfig().min, 100);
+  assert.strictEqual(fees.breakFeeConfig().min, 0);
   process.env.SAVINGS_BREAK_FEE_MIN = "12.345";
   assert.strictEqual(fees.breakFeeConfig().min, 12.35, "the minimum is rounded to the kobo");
 }));
@@ -390,7 +399,7 @@ test("the fee is always a 2-dp number (never a float artefact the ledger would c
 
 test("breakFeeView (what GET /savings tells the app): the schedule when charged, all zeros when not", () => {
   withFeeEnv(FEE_ENV, () => {
-    assert.deepStrictEqual(savings.breakFeeView(), { enabled: true, bps: 200, pct: 2, min: 100 });
+    assert.deepStrictEqual(savings.breakFeeView(), { enabled: true, bps: 200, pct: 2, min: 0 });
   });
   withFeeEnv({ ...FEE_ENV, SAVINGS_BREAK_FEE_BPS: "250", SAVINGS_BREAK_FEE_MIN: "50" }, () => {
     assert.deepStrictEqual(savings.breakFeeView(), { enabled: true, bps: 250, pct: 2.5, min: 50 });
@@ -401,6 +410,25 @@ test("breakFeeView (what GET /savings tells the app): the schedule when charged,
   // The view and the charge agree: whenever the view says free, the charge is 0.
   for (const env of [{}, { ...FEE_ENV, SAVINGS_BREAK_FEE_BPS: "0" }]) {
     withFeeEnv(env, () => assert.strictEqual(fees.computeBreakFee(50_000).fee, 0));
+  }
+});
+
+test("the deposit fee: a flat ₦250 by default (owner, 2026-10-15), off without a fee account or at 0", () => {
+  withFeeEnv(FEE_ENV, () => {
+    assert.deepStrictEqual(fees.computeDepositFee(), { fee: 250, enabled: true });
+    assert.deepStrictEqual(fees.depositFeeConfig(), { amount: 250, enabled: true });
+    assert.deepStrictEqual(savings.depositFeeView(), { enabled: true, amount: 250 });
+  });
+  withFeeEnv({}, () => {
+    assert.deepStrictEqual(fees.computeDepositFee(), { fee: 0, enabled: false }, "no fee account: nothing is charged");
+    assert.deepStrictEqual(savings.depositFeeView(), { enabled: false, amount: 0 });
+  });
+  withFeeEnv({ ...FEE_ENV, SAVINGS_DEPOSIT_FEE: "0" }, () => {
+    assert.deepStrictEqual(fees.computeDepositFee(), { fee: 0, enabled: false }, "0 turns it off");
+    assert.deepStrictEqual(savings.depositFeeView(), { enabled: false, amount: 0 });
+  });
+  for (const [raw, want] of [["300", 300], ["99.999", 100], ["12.345", 12.35], ["", 250], ["  ", 250], ["abc", 250], ["-1", 250], ["200000", 250]]) {
+    withFeeEnv({ ...FEE_ENV, SAVINGS_DEPOSIT_FEE: raw }, () => assert.strictEqual(fees.computeDepositFee().fee, want, `SAVINGS_DEPOSIT_FEE=${JSON.stringify(raw)}`));
   }
 });
 
@@ -531,7 +559,7 @@ test("createPot and depositToPot are gated; withdrawals, closing, the reserve an
   assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function withdrawFromPot(")), "withdrawals must work with the switch off");
   assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function closePot(")), "closing must work with the switch off");
   assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function updatePot(")), "renaming or moving a lock later must work with the switch off");
-  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function collectBreakFee(")), "the fee sweep must run with the switch off");
+  assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function collectSavingsFee(")), "the fee sweep must run with the switch off");
   assert.ok(!/isEnabled\(\)/.test(fnBody(sv, "async function savingsBlockingDeletion(")), "the deletion guard must apply with the switch off");
   assert.ok(!/isEnabled\(\)|SAVINGS_ENABLED/.test(read("src/utils/savingsReconcile.js")), "the reconcile loop must run with the switch off");
   assert.ok(!/isEnabled\(\)|SAVINGS_ENABLED/.test(read("src/utils/savingsReserve.js")), "the reserve must apply with the switch off");
@@ -904,8 +932,8 @@ test("savings.js calls no transfer path: the only Anchor call is the fee sweep's
   assert.ok(!/require\([^)]*executeTransfer|executeTransfer\(|anchor\.createTransfer\(|createCounterparty|verifyCounterparty|transferToBank/.test(sv), "a pot must never move money");
   const anchorCalls = [...sv.matchAll(/\banchor\.(\w+)\(/g)].map((m) => m[1]);
   assert.deepStrictEqual(anchorCalls, ["createBookTransfer"], `anchor calls in savings.js: ${anchorCalls}`);
-  const fee = fnBody(sv, "async function collectBreakFee(");
-  assert.ok(/anchor\.createBookTransfer\(/.test(fee), "the one book transfer must live in collectBreakFee");
+  const fee = fnBody(sv, "async function collectSavingsFee(");
+  assert.ok(/anchor\.createBookTransfer\(/.test(fee), "the one book transfer must live in collectSavingsFee");
   assert.ok(!/anchor\.getAccountBalance/.test(fnBody(sv, "async function depositToPot(")), "the deposit reads the bank through getSpendableBalance only");
 });
 
@@ -920,7 +948,11 @@ test("depositToPot: lock → freeze check → idempotency → live spendable →
   assert.strictEqual(countOf(body, "px.savingsPot.updateMany("), 1, "one claim");
   assert.ok(/where: \{ id: fresh\.id, status: "active" \},\s*data: \{ balance: \{ increment: amt \} \}/.test(body), "deposit claim");
   assert.ok(/if \(claim\.count !== 1\) throw new SavingsError/.test(body), "the claim count is not checked");
-  assert.ok(/px\.savingsMovement\.create\(/.test(body) && /type: "deposit", amount: amt, status: "completed", reference, completedAt: new Date\(\)/.test(body), "the movement row is written in the same $transaction, completed");
+  assert.ok(/px\.savingsMovement\.create\(/.test(body) && /type: "deposit", amount: amt, fee, status: "completed", reference, completedAt: new Date\(\)/.test(body), "the movement row is written in the same $transaction, completed, with its fee");
+  assert.ok(/const \{ fee \} = computeDepositFee\(\);/.test(body), "the deposit fee comes from config/fees.js");
+  assert.ok(/if \(fee > 0\) \{\s*await collectSavingsFee\(result\.movement\.id\)\.catch\(/.test(body), "the deposit fee is swept right after the deposit and never fails it");
+  mustPrecede(body, "prisma.$transaction(async (px)", "await collectSavingsFee(result.movement.id)", "deposit");
+  assert.ok(/action: "SAVINGS_DEPOSIT", [^\n]*metadata: \{ amount: amt, reference, fee \} \}\);/.test(body), "the audit row names the fee");
   assert.ok(body.indexOf("px.savingsPot.updateMany(") < body.indexOf("px.savingsMovement.create("), "claim before the movement row");
 });
 
@@ -930,8 +962,9 @@ test("depositToPot: BALANCE_UNAVAILABLE fails closed, spendable gates the amount
   assert.ok(/"BALANCE_UNAVAILABLE", 503/.test(body), "an unreadable bank must refuse with 503, never deposit on a guess");
   assert.ok(/"NO_BANKING", 503/.test(body), "ANCHOR_NOT_CONFIGURED maps to NO_BANKING 503");
   mustPrecede(body, "BALANCE_UNAVAILABLE", "prisma.$transaction(async (px)", "deposit");
-  assert.ok(/if \(live\.spendable \+ MONEY_EPS < amt\)/.test(body), "deposit must refuse beyond spendable (with the kobo tolerance)");
-  assert.ok(/"INSUFFICIENT_BALANCE", 400, \{ availableBalance: live\.spendable, reserved: live\.reserved \}/.test(body), "INSUFFICIENT_BALANCE names spendable and reserved");
+  assert.ok(/if \(live\.spendable \+ MONEY_EPS < amt \+ fee\)/.test(body), "deposit must refuse beyond spendable, the fee on top (with the kobo tolerance)");
+  assert.ok(/const maxDeposit = Math\.max\(0, toKobo\(live\.spendable\) - toKobo\(fee\)\) \/ 100;/.test(body), "the refusal says the most that can be deposited, in kobo");
+  assert.ok(/"INSUFFICIENT_BALANCE", 400, \{ availableBalance: live\.spendable, reserved: live\.reserved, fee, maxDeposit \}/.test(body), "INSUFFICIENT_BALANCE names spendable, reserved, the fee and the most that fits");
   assert.ok(/return replayOutcome\(existing, amt, fresh\)/.test(body), "replay must go through replayOutcome");
   assert.ok(/IDEMPOTENCY_REUSED/.test(body), "a key reused on another pot is refused");
   mustPrecede(body, "IDEMPOTENCY_REUSED", "return replayOutcome(existing, amt, fresh)", "deposit");
@@ -967,33 +1000,37 @@ test("withdrawFromPot: the fee is charged on early withdrawals only, quoted in t
   // because nothing opens it early), worded with the day it opens.
   assert.ok(/throw new SavingsError\(`This pot is unbreakable\. It opens on \$\{when\}\.`, "POT_LOCKED", 423, \{ lockUntil: fresh\.lockUntil \}\)/.test(w), "POT_LOCKED: the words, 423, { lockUntil } only");
   assert.ok(/const when = dayWords\(lock\.until\)/.test(w), "the day is worded in Lagos time");
-  assert.ok(/This pot opens on \$\{when\}\. Taking \$\{[^}]+\} out early costs \$\{[^}]+\}\. Confirm to continue\./.test(w), "the Breakable confirmation names the day and what it costs");
-  assert.ok(/This pot opens on \$\{when\}\. Confirm to take money out early\./.test(w), "a free early withdrawal still asks");
+  assert.ok(/This pot opens on \$\{when\}\. Withdrawing \$\{[^}]+\} early costs \$\{[^}]+\}\. Confirm to continue\./.test(w), "the Breakable confirmation names the day and what it costs");
+  assert.ok(/This pot opens on \$\{when\}\. Confirm to withdraw early\./.test(w), "a free early withdrawal still asks");
   mustPrecede(w, 'lock.code === "POT_LOCKED"', "const fee = lock.early ? breakFee.fee : 0", "withdraw");
   mustPrecede(w, "if (!lock.ok) {", "const fee = lock.early ? breakFee.fee : 0", "withdraw");
-  assert.ok(/if \(fee > 0\) \{\s*await collectBreakFee\(result\.movement\.id\)\.catch\(/.test(w), "the sweep runs right after the withdrawal and never fails it");
-  mustPrecede(w, "prisma.$transaction(async (px)", "await collectBreakFee(result.movement.id)", "withdraw");
+  assert.ok(/if \(fee > 0\) \{\s*await collectSavingsFee\(result\.movement\.id\)\.catch\(/.test(w), "the sweep runs right after the withdrawal and never fails it");
+  mustPrecede(w, "prisma.$transaction(async (px)", "await collectSavingsFee(result.movement.id)", "withdraw");
   assert.ok(/early: !!lock\.early, fee \}/.test(w), "the audit row names early and the fee");
 });
 
-test("collectBreakFee: feeCollectedAt is claimed BEFORE the book transfer, the row is a savings_fee expense, a failure stays claimed", () => {
-  const body = fnBody(sv, "async function collectBreakFee(");
+test("collectSavingsFee: feeCollectedAt is claimed BEFORE the book transfer, the row is a savings_fee expense, a failure stays claimed", () => {
+  const body = fnBody(sv, "async function collectSavingsFee(");
   const claim = "where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() }";
   mustPrecede(body, claim, "anchor.createBookTransfer(", "break fee");
   assert.ok(/if \(claim\.count !== 1\) return "skipped"/.test(body), "the claim count is checked");
   assert.strictEqual(countOf(body, "anchor.createBookTransfer("), 1, "exactly one book transfer: a claimed fee is never re-sent by itself");
   // Nothing to collect, or nowhere to collect it → out before the claim.
-  mustPrecede(body, 'mv.type !== "withdrawal" || mv.status !== "completed" || !(Number(mv.fee) > 0) || mv.feeCollectedAt', claim, "break fee");
+  mustPrecede(body, '!FEE_TYPES.includes(mv.type) || mv.status !== "completed" || !(Number(mv.fee) > 0) || mv.feeCollectedAt', claim, "fee");
+  // The two kinds: a withdrawal's keeps every name it always had.
+  assert.ok(/withdrawal: \{\s*suffix: "_bfee", words: "early-withdrawal fee", reason: "Savings early withdrawal fee",\s*title: "Savings break fee", alertKey: "savings-break-fee", audit: "SAVINGS_BREAK_FEE",\s*\}/.test(sv), "the withdrawal fee's names are unchanged");
+  assert.ok(/deposit: \{\s*suffix: "_dfee", words: "deposit fee", reason: "Savings deposit fee",\s*title: "Savings deposit fee", alertKey: "savings-deposit-fee", audit: "SAVINGS_DEPOSIT_FEE",\s*\}/.test(sv), "the deposit fee has its own names");
+  assert.ok(/const FEE_TYPES = Object\.keys\(FEE_KINDS\);/.test(sv));
   mustPrecede(body, "process.env.ANCHOR_FEE_ACCOUNT_ID", claim, "break fee");
   mustPrecede(body, 'if (!biz?.anchorAccountId) return "skipped"', claim, "break fee");
   // The transfer: merchant → fee account, under the movement's own reference.
   const xfer = callArg(body, body.indexOf("(", body.indexOf("anchor.createBookTransfer(")));
   assert.ok(/fromAccountId: biz\.anchorAccountId/.test(xfer) && /toAccountId: feeAccount/.test(xfer) && /amount: fee/.test(xfer), "merchant → fee account, the fee");
-  assert.ok(/reference,/.test(xfer) && /const reference = `\$\{mv\.reference\}_bfee`/.test(body), "the sweep's reference derives from the movement's (Anchor dedups on it)");
-  assert.ok(/reason: "Savings early withdrawal fee",/.test(xfer), "the transfer's reason names no pot");
-  // The ledger row, written by bookBreakFee once the transfer is through.
-  mustPrecede(body, "anchor.createBookTransfer(", "await bookBreakFee(biz, fee, reference, book?.transferId)", "break fee");
-  const row = fnBody(sv, "async function bookBreakFee(");
+  assert.ok(/reference,/.test(xfer) && /const reference = `\$\{mv\.reference\}\$\{kind\.suffix\}`/.test(body), "the sweep's reference derives from the movement's (Anchor dedups on it)");
+  assert.ok(/reason: kind\.reason,/.test(xfer), "the transfer's reason names no pot");
+  // The ledger row, written by bookSavingsFee once the transfer is through.
+  mustPrecede(body, "anchor.createBookTransfer(", "await bookSavingsFee(biz, fee, reference, book?.transferId, kind)", "break fee");
+  const row = fnBody(sv, "async function bookSavingsFee(");
   assert.ok(/purpose: "savings_fee"/.test(row), "the fee row carries purpose savings_fee");
   assert.ok(/type: "expense"/.test(row) && /category: "transfer"/.test(row) && /paymentMethod: "bank"/.test(row) && /source: "anchor"/.test(row), "the fee row is a bank expense the ledger counts");
   assert.ok(/providerTxnId: transferId \|\| undefined/.test(row), "the fee row stores Anchor's transfer id");
@@ -1006,27 +1043,27 @@ test("collectBreakFee: feeCollectedAt is claimed BEFORE the book transfer, the r
   assert.ok(!/feeCollectedAt: null \}/.test(body.slice(body.indexOf(claim) + claim.length)), "a failed sweep must stay claimed (never charged twice)");
 });
 
-test("collectBreakFee: a refusal, an unknown outcome and a missing row are three different alerts", () => {
-  const body = fnBody(sv, "async function collectBreakFee(");
-  const transferCatch = body.slice(body.indexOf("} catch (e) {"), body.indexOf("await bookBreakFee(biz, fee, reference, book?.transferId)"));
+test("collectSavingsFee: a refusal, an unknown outcome and a missing row are three different alerts", () => {
+  const body = fnBody(sv, "async function collectSavingsFee(");
+  const transferCatch = body.slice(body.indexOf("} catch (e) {"), body.indexOf("await bookSavingsFee(biz, fee, reference, book?.transferId, kind)"));
   // The bank refused it: nothing moved, nothing is booked, collect it by hand.
   const refused = transferCatch.slice(transferCatch.indexOf("if (bankRefused(e)) {"), transferCatch.indexOf("// The fee may have moved"));
-  assert.ok(/SAVINGS_BREAK_FEE_FAILED/.test(refused) && /severity: "alert"/.test(refused), "a refused sweep is audited at alert severity");
+  assert.ok(/action: `\$\{kind\.audit\}_FAILED`/.test(refused) && /severity: "alert"/.test(refused), "a refused sweep is audited at alert severity");
   assert.ok(/collect it by hand/.test(refused) && /refused/.test(refused), "a refused sweep asks for the fee by hand");
-  assert.ok(!/bookBreakFee/.test(refused), "a refused sweep books nothing");
+  assert.ok(!/bookSavingsFee/.test(refused), "a refused sweep books nothing");
   assert.ok(/return "failed"/.test(refused));
   // Unknown: booked anyway (the safe side), and check the bank first.
   const unknown = transferCatch.slice(transferCatch.indexOf("// The fee may have moved"));
-  assert.ok(/await bookBreakFee\(biz, fee, reference, null\)/.test(unknown), "an unknown outcome is booked as charged");
-  assert.ok(/SAVINGS_BREAK_FEE_UNCONFIRMED/.test(unknown) && /severity: "alert"/.test(unknown));
+  assert.ok(/await bookSavingsFee\(biz, fee, reference, null, kind\)/.test(unknown), "an unknown outcome is booked as charged");
+  assert.ok(/action: `\$\{kind\.audit\}_UNCONFIRMED`/.test(unknown) && /severity: "alert"/.test(unknown));
   assert.ok(/may have moved\. Check Anchor for that reference before collecting anything\./.test(unknown), "the alert says to check the bank first");
   assert.ok(/return "failed"/.test(unknown));
   // The transfer went through but the row did not: never collect again.
-  const rowFail = body.slice(body.indexOf("await bookBreakFee(biz, fee, reference, book?.transferId)"));
-  assert.ok(/SAVINGS_BREAK_FEE_BOOKKEEPING_FAILED/.test(rowFail) && /transferId: book\?\.transferId \|\| null/.test(rowFail));
+  const rowFail = body.slice(body.indexOf("await bookSavingsFee(biz, fee, reference, book?.transferId, kind)"));
+  assert.ok(/action: `\$\{kind\.audit\}_BOOKKEEPING_FAILED`/.test(rowFail) && /transferId: book\?\.transferId \|\| null/.test(rowFail));
   assert.ok(/WAS swept/.test(rowFail) && /Do not collect it again: add the savings_fee row\./.test(rowFail), "a missing row is never collected again");
   // One alert key per fee, whichever it is.
-  assert.ok(/const alertKey = `savings-break-fee-\$\{mv\.id\}`/.test(body));
+  assert.ok(/const alertKey = `\$\{kind\.alertKey\}-\$\{mv\.id\}`/.test(body));
 });
 
 test("bankRefused: only a definite refusal (or no bank at all) means nothing moved", () => {
@@ -1041,8 +1078,8 @@ test("bankRefused: only a definite refusal (or no bank at all) means nothing mov
   }
 });
 
-test("collectBreakFee: an account under review waits, before the bank is read or anything claimed, with no alert", () => {
-  const body = fnBody(sv, "async function collectBreakFee(");
+test("collectSavingsFee: an account under review waits, before the bank is read or anything claimed, with no alert", () => {
+  const body = fnBody(sv, "async function collectSavingsFee(");
   const claim = "where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() }";
   assert.ok(/select: \{[^}]*accountStatus: true[^}]*\}/.test(body), "the business is read with its accountStatus (else the freeze test reads undefined and passes)");
   const frozen = 'if (await frozenSubject(biz)) return "deferred";';
@@ -1054,16 +1091,17 @@ test("collectBreakFee: an account under review waits, before the bank is read or
 });
 
 test("the fee's bank row names no pot: staff with bank access read it, and pots are the owner's", () => {
-  const body = fnBody(sv, "async function collectBreakFee(");
-  const row = fnBody(sv, "async function bookBreakFee(");
-  assert.ok(/description: `Savings early withdrawal fee · Ref: \$\{reference\}`/.test(row), "the row's description");
-  for (const [label, text] of [["collectBreakFee", body], ["bookBreakFee", row]]) {
+  const body = fnBody(sv, "async function collectSavingsFee(");
+  const row = fnBody(sv, "async function bookSavingsFee(");
+  assert.ok(/description: `\$\{kind\.reason\} · Ref: \$\{reference\}`/.test(row), "the row's description");
+  assert.ok(/reason: "Savings early withdrawal fee"/.test(sv) && /reason: "Savings deposit fee"/.test(sv), "both reasons name no pot");
+  for (const [label, text] of [["collectSavingsFee", body], ["bookSavingsFee", row]]) {
     assert.ok(!/pot\?\.name|mv\.pot|include: \{ pot/.test(text), `${label} must not read or write the pot's name`);
   }
 });
 
-test("collectBreakFee: the fee comes only out of spendable money; short or unreadable, it waits (deferred) and alerts once a day", () => {
-  const body = fnBody(sv, "async function collectBreakFee(");
+test("collectSavingsFee: the fee comes only out of spendable money; short or unreadable, it waits (deferred) and alerts once a day", () => {
+  const body = fnBody(sv, "async function collectSavingsFee(");
   const claim = "where: { id: mv.id, feeCollectedAt: null }, data: { feeCollectedAt: new Date() }";
   // Spendable (the bank minus every pot) is read BEFORE the claim, so a fee
   // that would eat into another pot is never claimed, let alone swept.
@@ -1078,24 +1116,26 @@ test("collectBreakFee: the fee comes only out of spendable money; short or unrea
   assert.deepStrictEqual([...new Set(answers)].sort(), ['"collected"', '"deferred"', '"failed"', '"skipped"'], `returns: ${answers}`);
   // The caller holds the business lock: taking it again here would deadlock
   // (withBusinessLock is not re-entrant), so the sweep never takes it.
-  assert.ok(!/withBusinessLock/.test(body), "collectBreakFee must not take the business lock itself");
+  assert.ok(!/withBusinessLock/.test(body), "collectSavingsFee must not take the business lock itself");
   // Once a day after a day of waiting: the alert engine's own cooldown is an hour.
   const wait = fnBody(sv, "async function alertFeeWaiting(");
   assert.ok(/if \(!\(now - since >= DAY_MS\)\) return false/.test(wait), "only after a day of waiting");
   assert.ok(/now - new Date\(last\.lastFiredAt\) < DAY_MS\) return false/.test(wait), "at most once a day");
-  assert.ok(/`savings-break-fee-waiting-\$\{mv\.id\}`/.test(wait), "one alert key per fee");
+  assert.ok(/`\$\{kind\.alertKey\}-waiting-\$\{mv\.id\}`/.test(wait), "one alert key per fee");
 });
 
-test("collectBreakFee runs only under the business lock: inside the withdrawal's lock and the loop's per-fee lock", () => {
-  const calls = [...sv.matchAll(/collectBreakFee\(/g)].length;
-  // The definition plus the one call in withdrawFromPot.
-  assert.strictEqual(calls, 2, `collectBreakFee( appears ${calls} times in savings.js`);
+test("collectSavingsFee runs only under the business lock: inside the withdrawal's lock and the loop's per-fee lock", () => {
+  const calls = [...sv.matchAll(/collectSavingsFee\(/g)].length;
+  // The definition plus one call each in depositToPot and withdrawFromPot.
+  assert.strictEqual(calls, 3, `collectSavingsFee( appears ${calls} times in savings.js`);
   const w = fnBody(sv, "async function withdrawFromPot(");
-  mustPrecede(w, "prisma.withBusinessLock(biz.id", "await collectBreakFee(result.movement.id)", "withdraw");
+  mustPrecede(w, "prisma.withBusinessLock(biz.id", "await collectSavingsFee(result.movement.id)", "withdraw");
+  const d = fnBody(sv, "async function depositToPot(");
+  mustPrecede(d, "prisma.withBusinessLock(biz.id", "await collectSavingsFee(result.movement.id)", "deposit");
   const recon = read("src/utils/savingsReconcile.js");
-  assert.ok(/await prisma\.withBusinessLock\(m\.businessId, \(\) => savings\.collectBreakFee\(m\.id\)\)/.test(recon), "the loop sweeps each fee under its business's lock");
+  assert.ok(/await prisma\.withBusinessLock\(m\.businessId, \(\) => savings\.collectSavingsFee\(m\.id\)\)/.test(recon), "the loop sweeps each fee under its business's lock");
   for (const f of walk(SRC).filter((p) => p.endsWith(".js") && !/[\\/]utils[\\/]savings(Reconcile)?\.js$/.test(p))) {
-    assert.ok(!/collectBreakFee\(/.test(fs.readFileSync(f, "utf8")), `${path.relative(ROOT, f)} calls collectBreakFee`);
+    assert.ok(!/collectSavingsFee\(/.test(fs.readFileSync(f, "utf8")), `${path.relative(ROOT, f)} calls collectSavingsFee`);
   }
 });
 
@@ -1336,27 +1376,27 @@ test("the loop heartbeats \"savings-reconcile\" on success and on error, and nev
   assert.ok(/module\.exports = \{ reconcileSavings, startSavingsReconcileLoop, SAVINGS_RECONCILE_LOCK \}/.test(rec));
 });
 
-test("the loop does exactly three things: uncollected break fees, pot drift, over-reserve", () => {
+test("the loop does exactly three things: uncollected fees, pot drift, over-reserve", () => {
   const body = fnBody(rec, "async function reconcileSavings(");
   assert.ok(/stats = \{ feesCollected: 0, feesDeferred: 0, drift: 0, overReserved: 0, errors: 0 \}/.test(body), "stats shape");
   // 1. fee backstop: waiting and orphaned fees of active accounts, least
   // recently tried first, 50 a tick, one at a time under each business's lock.
-  assert.ok(/type: "withdrawal", status: "completed", fee: \{ gt: 0 \}, feeCollectedAt: null,/.test(body), "backstop selects completed withdrawals with an unswept fee");
+  assert.ok(/type: \{ in: \["deposit", "withdrawal"\] \}, status: "completed", fee: \{ gt: 0 \}, feeCollectedAt: null,/.test(body), "backstop selects completed deposits and withdrawals with an unswept fee");
   assert.ok(/business: \{ accountStatus: "active", user: \{ accountStatus: "active" \} \}/.test(body), "a frozen or closed account's fee is not swept (and does not take a place in the 50)");
   assert.ok(/select: \{ id: true, businessId: true \}/.test(body), "the business is known, so its lock can be taken");
   assert.ok(/orderBy: \[\{ updatedAt: "asc" \}, \{ id: "asc" \}\]/.test(body), "least recently tried first");
   assert.ok(/take: 50/.test(body), "50 a tick");
-  assert.ok(/await prisma\.withBusinessLock\(m\.businessId, \(\) => savings\.collectBreakFee\(m\.id\)\)/.test(body), "each sweep under its business's lock, through collectBreakFee (which claims first)");
+  assert.ok(/await prisma\.withBusinessLock\(m\.businessId, \(\) => savings\.collectSavingsFee\(m\.id\)\)/.test(body), "each sweep under its business's lock, through collectSavingsFee (which claims first)");
   assert.ok(!/Promise\.all/.test(body), "one at a time");
   assert.ok(/if \(outcome === "collected"\) stats\.feesCollected\+\+/.test(body) && /if \(outcome === "deferred"\) \{\s*stats\.feesDeferred\+\+;/.test(body), "collected and deferred are counted apart");
   // The queue turns: a business whose fee waits is not read again this tick,
   // and every fee looked at that still waits goes to the back.
   assert.ok(/if \(waitingBusinesses\.has\(m\.businessId\)\) \{/.test(body) && /waitingBusinesses\.add\(m\.businessId\)/.test(body), "one bank read per waiting business a tick");
   assert.ok(/else stillWaiting\.push\(m\.id\)/.test(body), "a fee not collected is queued again");
-  assert.ok(/await savings\.requeueBreakFees\(stillWaiting\)/.test(body), "the fees still waiting go to the back");
-  mustPrecede(body, "for (const m of uncollected)", "savings.requeueBreakFees(stillWaiting)", "requeue after the sweep");
-  const requeue = fnBody(sv, "async function requeueBreakFees(");
-  assert.ok(/where: \{ id: \{ in: list \}, type: "withdrawal", feeCollectedAt: null \}/.test(requeue), "only fees still waiting are touched (a claimed one is never turned back)");
+  assert.ok(/await savings\.requeueSavingsFees\(stillWaiting\)/.test(body), "the fees still waiting go to the back");
+  mustPrecede(body, "for (const m of uncollected)", "savings.requeueSavingsFees(stillWaiting)", "requeue after the sweep");
+  const requeue = fnBody(sv, "async function requeueSavingsFees(");
+  assert.ok(/where: \{ id: \{ in: list \}, type: \{ in: FEE_TYPES \}, feeCollectedAt: null \}/.test(requeue), "only fees still waiting are touched (a claimed one is never turned back)");
   assert.ok(/data: \{ updatedAt: now \}/.test(requeue), "only the time it was last tried changes");
   // 2. drift, compared in kobo
   assert.ok(/inK - outK !== toKobo\(pot\.balance\)/.test(body), "drift compares in kobo");
@@ -1369,7 +1409,7 @@ test("the loop does exactly three things: uncollected break fees, pot drift, ove
   assert.ok(/e\.code === "ANCHOR_NOT_CONFIGURED"\) break/.test(body), "an unconfigured bank stops the reserve check, not the loop");
   // No partner: no verify, no inflow pairing, no interest, no wallet.
   assert.ok(!/verifyTransaction|pairInflows|interest|wallet|inflow|applyWithdrawalOutcome|activatePot/i.test(body), "a PiggyVest-era pass survived");
-  assert.ok(!/updateMany|\.update\(|\.create\(/.test(body), "the loop only reads, sweeps through collectBreakFee, and alerts; it never edits a pot");
+  assert.ok(!/updateMany|\.update\(|\.create\(/.test(body), "the loop only reads, sweeps through collectSavingsFee, and alerts; it never edits a pot");
 });
 
 test('healthCheck.js knows the "savings-reconcile" heartbeat at the loop\'s cadence', () => {

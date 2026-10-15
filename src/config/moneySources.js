@@ -53,7 +53,7 @@ function isLedgerBankRow(tx, currency = "NGN") {
 // ── Rows with a purpose ──────────────────────────────────────────────────────
 // A bank row whose `purpose` is set is something other than plain trade: a
 // customer or supplier refund, a cash deposit, money explained with an
-// account, the early-withdrawal fee on a savings pot. The books rule
+// account, a savings pot fee (a deposit or an early withdrawal). The books rule
 // (utils/books.js) decides what each one counts as; the savings fee, for one,
 // is a Bank Fees and Charges expense. A raw aggregate over bank rows that is
 // not the books (the admin revenue figures, the analytics snapshot, the

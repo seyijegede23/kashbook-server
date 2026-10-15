@@ -65,12 +65,13 @@ function computeTransferFee(amount, route) {
 // ── Savings: breaking a flexible lock ───────────────────────────────────────
 // Taking money out of a flexible-locked pot before its date costs a share of
 // the amount, floored at a minimum and never more than the amount itself.
-// Owner's numbers (2026-09-29): 2% (200 bps), minimum ₦100. Both live in env
-// so they can change without a deploy: SAVINGS_BREAK_FEE_BPS,
+// Owner's numbers: 2% (200 bps); the minimum was ₦100 (2026-09-29) and is
+// none since 2026-10-15 ("2% with no minimum": ₦20 on ₦1,000). Both live in
+// env so they can change without a deploy: SAVINGS_BREAK_FEE_BPS,
 // SAVINGS_BREAK_FEE_MIN. Off when there is no fee account to sweep into,
 // because a fee nothing can collect must not be charged.
 const BREAK_FEE_BPS_DEFAULT = 200;
-const BREAK_FEE_MIN_DEFAULT = 100;
+const BREAK_FEE_MIN_DEFAULT = 0;
 function breakFeeConfig() {
   const bps = Number(process.env.SAVINGS_BREAK_FEE_BPS);
   const min = Number(process.env.SAVINGS_BREAK_FEE_MIN);
@@ -90,6 +91,26 @@ function computeBreakFee(amount) {
   return { fee: Math.round(fee * 100) / 100, bps, min, enabled: true };
 }
 
+// ── Savings: each deposit ───────────────────────────────────────────────────
+// Owner (2026-10-15): every deposit into a pot costs a flat ₦250, ON TOP of the
+// amount: the pot gets exactly what was typed and the fee is swept from the
+// money not set aside (utils/savings.js depositToPot, collectSavingsFee). Env
+// SAVINGS_DEPOSIT_FEE (naira; 0 turns it off). Off, like the break fee, when
+// there is no fee account to sweep into.
+const DEPOSIT_FEE_DEFAULT = 250;
+const DEPOSIT_FEE_MAX = 100000;
+function depositFeeConfig() {
+  const raw = process.env.SAVINGS_DEPOSIT_FEE;
+  const n = Number(raw);
+  const set = raw !== undefined && String(raw).trim() !== "" && Number.isFinite(n) && n >= 0 && n <= DEPOSIT_FEE_MAX;
+  const amount = set ? Math.round(n * 100) / 100 : DEPOSIT_FEE_DEFAULT;
+  return { amount, enabled: feesEnabled() && amount > 0 };
+}
+function computeDepositFee() {
+  const { amount, enabled } = depositFeeConfig();
+  return { fee: enabled ? amount : 0, enabled };
+}
+
 module.exports = {
   MONEY_EPS,
   NIP_FEE,
@@ -100,4 +121,6 @@ module.exports = {
   computeTransferFee,
   breakFeeConfig,
   computeBreakFee,
+  depositFeeConfig,
+  computeDepositFee,
 };
