@@ -1,8 +1,13 @@
 // Savings integrity loop: the checks that keep the reserve honest.
 //
 // Runs every 30 minutes under withCronLock(4014), heartbeat "savings-reconcile".
-//   1. break fees     an early-withdrawal fee a crash left uncollected is swept
-//                     (collectBreakFee claims before it transfers, so never twice)
+//   1. break fees     an early-withdrawal fee still waiting (the money not set
+//                     aside did not cover it yet) or one a crash left behind is
+//                     swept, least recently tried first, each under its
+//                     business's lock (collectBreakFee claims before it
+//                     transfers, so never twice); an account under review or
+//                     closed is left out, and a fee that still waits goes to
+//                     the back of the queue, so no business holds up another
 //   2. pot drift      each open pot's balance equals the sum of its movements,
 //                     to the kobo, or an alert fires
 //   3. over-reserve   a business with more set aside than the bank holds means
@@ -19,22 +24,52 @@ const { MONEY_EPS } = require("../config/fees");
 const SAVINGS_RECONCILE_LOCK = 4014;
 
 async function reconcileSavings({ logger = console } = {}) {
-  const stats = { feesCollected: 0, drift: 0, overReserved: 0, errors: 0 };
+  const stats = { feesCollected: 0, feesDeferred: 0, drift: 0, overReserved: 0, errors: 0 };
 
-  // 1. Fees the withdrawal path did not get to sweep.
+  // 1. Fees the withdrawal could not sweep: one at a time, 50 a tick, each
+  // under the same business lock a withdrawal sweeps under, so the spendable
+  // figure the sweep reads cannot change before the transfer. Only accounts
+  // that are active: a frozen or closed account moves no money (collectBreakFee
+  // checks again under the lock, for a freeze that lands meanwhile). The least
+  // recently tried come first, and every fee looked at that still waits goes
+  // to the back (savings.requeueBreakFees), so fees that cannot be swept for a
+  // long while never keep newer ones, of any business, out of the 50. A
+  // business whose fee waits is not read again this tick: one bank read each.
   const uncollected = await prisma.savingsMovement.findMany({
-    where: { type: "withdrawal", status: "completed", fee: { gt: 0 }, feeCollectedAt: null },
-    select: { id: true },
+    where: {
+      type: "withdrawal", status: "completed", fee: { gt: 0 }, feeCollectedAt: null,
+      business: { accountStatus: "active", user: { accountStatus: "active" } },
+    },
+    select: { id: true, businessId: true },
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
     take: 50,
   });
+  const waitingBusinesses = new Set();
+  const stillWaiting = [];
   for (const m of uncollected) {
+    if (waitingBusinesses.has(m.businessId)) {
+      stats.feesDeferred++;
+      stillWaiting.push(m.id);
+      continue;
+    }
     try {
-      if (await savings.collectBreakFee(m.id)) stats.feesCollected++;
+      const outcome = await prisma.withBusinessLock(m.businessId, () => savings.collectBreakFee(m.id));
+      if (outcome === "collected") stats.feesCollected++;
+      else stillWaiting.push(m.id);
+      if (outcome === "deferred") {
+        stats.feesDeferred++;
+        waitingBusinesses.add(m.businessId);
+      }
+      // A failed sweep stays claimed and has already alerted a human.
+      else if (outcome === "failed") stats.errors++;
     } catch (e) {
       stats.errors++;
+      stillWaiting.push(m.id);
       logger.warn?.(`[savings-reconcile] break fee ${m.id}: ${e.message}`);
     }
   }
+  try { await savings.requeueBreakFees(stillWaiting); }
+  catch (e) { stats.errors++; logger.warn?.(`[savings-reconcile] requeue: ${e.message}`); }
 
   // 2. Pot balance vs its movements.
   const pots = await prisma.savingsPot.findMany({ where: { status: "active" } });

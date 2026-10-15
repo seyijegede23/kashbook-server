@@ -11,6 +11,8 @@ const authMiddleware = require("../middleware/auth");
 const { audit } = require("../utils/audit");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { isValidEmail, normalizeEmail } = require("../utils/email");
+const savings = require("../utils/savings");
+const { bankBalanceBlockingDeletion } = require("../utils/deletionGuard");
 
 // Hard ceiling on what an owner can delegate in a rolling 24h, in the business's
 // own currency. Not a security boundary — the owner's AML tier limits are still
@@ -596,6 +598,13 @@ router.get("/me", authMiddleware, async (req, res) => {
     // Strip raw secret-like fields before sending the user object.
     const { password: _, transactionPin: _pin, transactionPinFailedCount: _c, transactionPinLockedUntil: _l, staffPermission: _sp, ...safe } = user;
     const { permissions, dailyTransferCap } = resolvePermissions(user);
+    // Savings, for the owner only: shown while the switch is on, or while a
+    // pot still holds money, so turning the switch off never hides money.
+    const savingsPots = savings.isEnabled();
+    const savingsVisible = user.accountType !== "STAFF" && (savingsPots || !!(await prisma.savingsPot.findFirst({
+      where: { business: { userId: user.id }, status: "active", balance: savings.POT_HOLDS_MONEY },
+      select: { id: true },
+    })));
     res.json({
       user: {
         ...safe,
@@ -611,8 +620,14 @@ router.get("/me", authMiddleware, async (req, res) => {
         // so the tile and the API can never disagree.
         features: {
           fcy: process.env.FCY_ENABLED === "true",
-          // Savings pots: SAVINGS_ENABLED opens creation and deposits.
-          savings: process.env.SAVINGS_ENABLED === "true",
+          // The first savings switch, retired on 2026-10-15: always false, so
+          // an app copy from before Unbreakable pots (whose screens lack the
+          // "not even KashBook" warning) never shows savings.
+          savings: false,
+          // SAVINGS_ENABLED: new pots and deposits.
+          savingsPots,
+          // Whether the Savings screens show at all (owner only, see above).
+          savingsVisible,
         },
         accountType: safe.accountType.toLowerCase(),
         settings: {
@@ -753,7 +768,9 @@ router.post("/logout", authMiddleware, async (req, res) => {
 // are scrambled, every session (incl. staff) is revoked, businesses close,
 // and social connections (IG/WA) are severed so webhooks stop routing.
 // Refuses while any business NUBAN still holds funds (fail-closed if the
-// balance can't be verified).
+// balance can't be verified), and while a savings pot still holds money
+// (409 SAVINGS_REMAINING, naming the pot and, for an Unbreakable one, the
+// day it opens).
 // ─────────────────────────────────────────────
 router.post("/delete-account", authMiddleware, async (req, res) => {
   const { password } = req.body;
@@ -770,51 +787,21 @@ router.post("/delete-account", authMiddleware, async (req, res) => {
     const match = await bcrypt.verify(password, user.password);
     if (!match) return res.status(401).json({ error: "Password is incorrect." });
 
-    // Money-out guard: never delete around a bank balance. Fincra pools all VAs
-    // into one merchant wallet, so a Fincra business's cash-at-bank is its ledger
-    // (providerAccountId + pooledWallet), while Anchor exposes a per-account
-    // balance. Cover BOTH — a fail-closed guard that skipped Fincra would let a
-    // funded business be deleted (fail-open).
     const businesses = await prisma.business.findMany({
       where: { userId: user.id },
       select: { id: true, name: true, country: true, anchorAccountId: true, providerAccountId: true, baseCurrency: true },
     });
-    const anchor = require("../utils/anchor");
-    const { getProvider } = require("../providers");
-    const { computeLedgerBalance } = require("../utils/ledgerBalance");
     // Savings guard: a pot with money in it is money the deletion would
-    // strand (a reserve with no account behind it). Checked before the bank
-    // balance so the message names the right thing to do first.
-    const bizIds = businesses.map((b) => b.id);
-    if (bizIds.length) {
-      const potWithMoney = await prisma.savingsPot.findFirst({
-        where: { businessId: { in: bizIds }, status: { not: "closed" }, balance: { gt: 0.004 } },
-        select: { name: true },
-      });
-      if (potWithMoney) {
-        return res.status(400).json({
-          code: "SAVINGS_REMAINING",
-          error: `Your savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first, then delete your account.`,
-        });
-      }
-    }
-    for (const biz of businesses.filter((b) => b.providerAccountId || b.anchorAccountId)) {
-      try {
-        const provider = getProvider(biz);
-        const balance = provider.pooledWallet
-          ? await computeLedgerBalance(biz.id, biz.baseCurrency || "NGN")
-          : (await anchor.getAccountBalance(biz.anchorAccountId)).balance;
-        if (balance > 0) {
-          return res.status(400).json({
-            code: "BALANCE_REMAINING",
-            error: `${biz.name} still has money in its bank account. Transfer it out first, then delete your account.`,
-          });
-        }
-      } catch (err) {
-        if (err.code === "ANCHOR_NOT_CONFIGURED") continue; // no live banking in this environment
-        return res.status(503).json({ error: "We couldn't verify your bank balance right now — try again in a few minutes." });
-      }
-    }
+    // strand (a reserve with no account behind it), and an Unbreakable pot
+    // cannot be emptied by anyone before its day, so the refusal names that
+    // day. Checked before the bank balance so the message names the right
+    // thing to do first.
+    const block = await savings.savingsBlockingDeletion(businesses.map((b) => b.id));
+    if (block) return res.status(409).json(savings.savingsRemainingBody(block, "account"));
+    // Money-out guard: never delete around a bank balance, failing closed when
+    // it cannot be read. Shared with DELETE /businesses/:id (utils/deletionGuard.js).
+    const bankBlock = await bankBalanceBlockingDeletion(businesses, "account");
+    if (bankBlock) return res.status(bankBlock.status).json(bankBlock.body);
 
     const crypto = require("crypto");
     const scrambledPw = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 12);

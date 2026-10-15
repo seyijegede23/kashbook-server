@@ -330,12 +330,6 @@ async function loadMatchableCredit(req, res) {
     res.status(400).json({ error: "Matching is only for incoming transfers.", code: "NOT_INCOMING" });
     return null;
   }
-  // A savings withdrawal landing is the merchant's own money, not a payment:
-  // it can never be matched to a sale, a debt or an invoice.
-  if (isSavingsRow(tx)) {
-    res.status(409).json({ error: "This is money returning from your savings, not a customer payment.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
-    return null;
-  }
   // Marked as not income (cash already recorded, own transfer, a loan...), or
   // explained with an account (money in on an income account keeps no
   // purpose). Either way it is explained, and a match would count it twice.
@@ -615,10 +609,12 @@ async function loadMatchableDebit(req, res) {
     res.status(400).json({ error: "Recording an expense is only for outgoing transfers.", code: "NOT_OUTGOING" });
     return null;
   }
-  // A savings deposit is the merchant's own money moving into a pot, not an
-  // expense; recording one would double-count it against their profit.
+  // The only savings row is the fee for taking money out of a Breakable pot
+  // early (a pot moves no money of its own). The books already count it under
+  // Bank Fees and Charges, so recording it as an expense would count it twice.
+  // A credit never carries it, so only this side asks.
   if (isSavingsRow(tx)) {
-    res.status(409).json({ error: "This is a transfer into your savings, not an expense.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
+    res.status(409).json({ error: "This is the fee for taking money out of a savings pot early. It is already counted under Bank Fees and Charges.", code: "SAVINGS_ROW_NOT_MATCHABLE" });
     return null;
   }
   // A refund to a customer lowers sales; it is never an expense too. Nor is a

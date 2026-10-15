@@ -2,7 +2,10 @@
 //
 //   GET    /savings?businessId=              pots + totals + the break fee
 //   POST   /savings/pots                     create
-//   PATCH  /savings/pots/:id                 rename, target, lock (extend only)
+//   PATCH  /savings/pots/:id                 rename, target, lock (PIN for a lock
+//                                            change; a pot that has not opened
+//                                            and is Unbreakable, or Breakable
+//                                            with money in it: later only)
 //   DELETE /savings/pots/:id                 close an empty pot
 //   POST   /savings/pots/:id/deposit         put money in (PIN)
 //   POST   /savings/pots/:id/withdraw        take money out (PIN)
@@ -12,6 +15,11 @@
 // does before the lock: ownership, input shape, and the PIN (audited on
 // failure). No AML pipeline here: a pot moves no money, and the only debit the
 // feature makes is KashBook's own break fee.
+//
+// A lock is sent as lockUntil + lockMode. lockUntil is the day the pot opens,
+// "YYYY-MM-DD" (Lagos), or a timestamp, which is moved up to the next Lagos
+// midnight; a pot JSON's lockUntil is that opening moment. lockMode "strict" is
+// an Unbreakable pot, "flexible" a Breakable one.
 const router = require("express").Router();
 const prisma = require("../utils/db");
 const auth = require("../middleware/auth");
@@ -20,7 +28,6 @@ const { ownerOnly } = require("../middleware/requirePermission");
 const { verifyTransactionPin } = require("../utils/transactionPin");
 const { audit } = require("../utils/audit");
 const { getReservedBalance } = require("../utils/savingsReserve");
-const { breakFeeConfig } = require("../config/fees");
 const savings = require("../utils/savings");
 
 router.use(auth);
@@ -65,11 +72,6 @@ async function checkPin(req, res) {
   return true;
 }
 
-const breakFeeView = () => {
-  const brk = breakFeeConfig();
-  return { enabled: brk.enabled && brk.bps > 0, bps: brk.bps, pct: brk.bps / 100, min: brk.min };
-};
-
 // GET /savings?businessId=
 router.get("/", async (req, res) => {
   try {
@@ -86,8 +88,9 @@ router.get("/", async (req, res) => {
       pots: pots.map(savings.publicPot),
       totals: { saved, reserved },
       hasBankAccount: !!(biz.providerAccountId || biz.anchorAccountId),
-      // What breaking a flexible lock costs, so the app can say so up front.
-      breakFee: breakFeeView(),
+      // What breaking a Breakable pot early costs, so the app can say so up
+      // front. The app's single source: all zeros when no fee is charged.
+      breakFee: savings.breakFeeView(),
     });
   } catch (err) {
     sendError(res, err);
@@ -101,22 +104,38 @@ router.post("/pots", async (req, res) => {
     const biz = await loadBusiness(req, businessId);
     if (!biz) return res.status(404).json({ error: "Business not found" });
     const pot = await savings.createPot({ biz, name, targetAmount, lockUntil, lockMode });
-    await audit({ req, action: "SAVINGS_POT_CREATED", resourceType: "savingsPot", resourceId: pot.id, metadata: { lockMode: pot.lockMode || null } });
+    await audit({ req, action: "SAVINGS_POT_CREATED", resourceType: "savingsPot", resourceId: pot.id, metadata: { lockMode: pot.lockMode || null, lockUntil: pot.lockUntil || null } });
     res.status(201).json({ pot: savings.publicPot(pot) });
   } catch (err) {
     sendError(res, err);
   }
 });
 
-// PATCH /savings/pots/:id
+// PATCH /savings/pots/:id  { businessId, name?, targetAmount?, lockUntil?, lockMode?, pin? }
+// A lock change needs the PIN, like putting money in or taking it out: a lock
+// commits money, and an Unbreakable one cannot be undone by anyone, so a
+// session left open on a counter must not be enough. Renaming and the target
+// need no PIN. Ownership is checked first, so a caller who is not the owner
+// is refused for that, whatever PIN they send.
 router.patch("/pots/:id", async (req, res) => {
   try {
     const { pot, biz, error } = await loadPot(req, req.params.id, req.body?.businessId);
     if (error) return res.status(error.status).json(error.body);
     if (pot.status === "closed") return res.status(409).json({ error: "This pot is closed.", code: "POT_CLOSED" });
     const { name, targetAmount, lockUntil, lockMode } = req.body || {};
-    const updated = await savings.updatePot({ pot, name, targetAmount, lockUntil, lockMode });
-    await audit({ req, action: "SAVINGS_POT_UPDATED", resourceType: "savingsPot", resourceId: pot.id, metadata: { fields: Object.keys(req.body || {}).filter((k) => k !== "businessId") } });
+    // Any lock field asks for the PIN: { lockUntil } alone keeps the pot's mode.
+    const lockAsked = lockUntil !== undefined || lockMode !== undefined;
+    if (lockAsked && !(await checkPin(req, res))) return;
+    const { pot: updated, before } = await savings.updatePot({ pot, name, targetAmount, lockUntil, lockMode });
+    // Only the fields this route reads, never the body's own keys: the audit
+    // log is append-only, so nothing a client sends may grow it unbounded.
+    const fields = Object.entries({ name, targetAmount, lockUntil, lockMode }).filter(([, v]) => v !== undefined).map(([k]) => k);
+    const after = { lockUntil: updated.lockUntil, lockMode: updated.lockMode };
+    await audit({
+      req, action: "SAVINGS_POT_UPDATED", resourceType: "savingsPot", resourceId: pot.id,
+      severity: lockAsked && after.lockMode === "strict" ? "warn" : "info",
+      metadata: lockAsked ? { fields, before, after } : { fields },
+    });
     res.json({ pot: savings.publicPot(updated), businessId: biz.id });
   } catch (err) {
     sendError(res, err);

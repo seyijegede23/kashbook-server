@@ -465,7 +465,7 @@ require("./src/utils/anchorReconcile").startReconciliationLoop(5 * 60 * 1000);
 require("./src/utils/fincraReconcile").startFincraReconcileLoop(5 * 60 * 1000);
 
 // ── Background loop: savings integrity every 30 min ──────────────────────────
-// Sweeps any early-withdrawal fee a crash left uncollected, checks each pot's
+// Sweeps any early-withdrawal fee a crash left uncollected or that waited for spendable money, checks each pot's
 // balance against its movements, and alarms when a business has more set aside
 // than the bank holds. Leader-elected via withCronLock(4014); heartbeat
 // "savings-reconcile".

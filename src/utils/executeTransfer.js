@@ -170,9 +170,9 @@ async function executeTransfer({
     providerTransferId = book?.transferId || book?.id || null;
   } else {
     // Everything up to the transfer itself moves no money. Errors thrown here
-    // are stamped moneyMoved:false so a caller that books a movement row before
-    // calling (the savings service) can fail that row outright instead of
-    // parking it as "unknown" for the reconcile loop to resolve.
+    // are stamped moneyMoved:false so a caller can tell a refusal it may safely
+    // offer again (the staff approval route in routes/transfers.js) from a
+    // failure whose outcome at the bank is unknown.
     let cp;
     try {
       if (!resolvedName) {

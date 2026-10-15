@@ -12,7 +12,7 @@
 // affect anything else.
 
 const prisma = require("./db");
-const { NOT_SAVINGS } = require("../config/moneySources");
+const { NO_PURPOSE } = require("../config/moneySources");
 const { booksFor, vatReturnFor } = require("./booksData");
 const { spendingByAccount } = require("./insightsEngine");
 const { renderEmail, txnRow, escHtml } = require("./emailLayout");
@@ -80,13 +80,13 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     prisma.transaction.groupBy({
       by: ["businessId"],
       // matchedInvoiceId too: that credit's invoice payment is the entry.
-      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, date: dateThis, ...NOT_SAVINGS },
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, matchedInvoiceId: null, date: dateThis, ...NO_PURPOSE },
       _sum: { amount: true },
       _count: { _all: true },
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis, ...NOT_SAVINGS },
+      where: { ...bizScope, type: "expense", matchedExpenseId: null, date: dateThis, ...NO_PURPOSE },
       _sum: { amount: true },
       _count: { _all: true },
     }),
@@ -97,7 +97,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
     }),
     prisma.transaction.groupBy({
       by: ["businessId"],
-      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: datePrev, ...NOT_SAVINGS },
+      where: { ...bizScope, type: "income", matchedSaleId: null, matchedCustomerId: null, date: datePrev, ...NO_PURPOSE },
       _sum: { amount: true },
     }),
   ]);
@@ -107,7 +107,7 @@ async function computeMonthlyData(offset = 1, now = new Date()) {
   // still real money. NULL matchedAmount (pre-column matches) = fully matched.
   const remainderWhere = (type, date) => ({
     ...bizScope, type, date,
-    ...NOT_SAVINGS,
+    ...NO_PURPOSE,
     matchedAmount: { not: null },
     ...(type === "income"
       ? { OR: [{ matchedSaleId: { not: null } }, { matchedCustomerId: { not: null } }] }

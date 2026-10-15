@@ -28,6 +28,8 @@ const {
 } = require("../utils/kycMatch");
 const { isValidAnchorIndustry } = require("../data/anchorIndustries");
 const { pushTo } = require("../utils/pushNotification");
+const { savingsBlockingDeletion, savingsRemainingBody } = require("../utils/savings");
+const { bankBalanceBlockingDeletion } = require("../utils/deletionGuard");
 const {
   validateVirtualAccountInput,
   buildSubmissionSummary,
@@ -915,12 +917,20 @@ router.post("/:id/upload-cac", async (req, res) => {
 });
 
 // DELETE /businesses/:id
+// Ownership comes first: a business that is not the caller's answers 404 and
+// nothing about it (not even a pot's name) leaves the server.
 router.delete("/:id", async (req, res) => {
   if (req.user.accountType === "staff") {
     return res.status(403).json({ error: "Staff cannot delete businesses" });
   }
 
   try {
+    const biz = await prisma.business.findFirst({
+      where: { id: String(req.params.id), userId: req.user.id },
+      select: { id: true, name: true, country: true, anchorAccountId: true, providerAccountId: true, baseCurrency: true },
+    });
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
     const count = await prisma.business.count({ where: { userId: req.user.id } });
     if (count <= 1) {
       return res.status(400).json({ error: "Cannot delete your only business" });
@@ -928,24 +938,27 @@ router.delete("/:id", async (req, res) => {
 
     // Savings guard: deleting the business cascades its pots and movements
     // away, and money set aside in a pot would silently become spendable
-    // again. Refuse while any pot holds money.
-    const potWithMoney = await prisma.savingsPot.findFirst({
-      where: { businessId: req.params.id, status: { not: "closed" }, balance: { gt: 0.004 } },
-      select: { name: true },
-    });
-    if (potWithMoney) {
-      return res.status(400).json({
-        code: "SAVINGS_REMAINING",
-        error: `The savings pot "${potWithMoney.name}" still has money in it. Take it out and close the pot first.`,
+    // again. Refuse while any pot holds money. Then the bank-balance guard
+    // POST /auth/delete-account uses (utils/deletionGuard.js): the business's
+    // bank rows go with it, and money left in its account would stay at the
+    // bank with no business pointing at it. Both are checked, and the business
+    // deleted, under the business lock, the lock every deposit and send takes,
+    // so nothing can land between the checks and the delete.
+    const outcome = await prisma.withBusinessLock(biz.id, async () => {
+      const block = await savingsBlockingDeletion([biz.id]);
+      if (block) return { refusal: { status: 409, body: savingsRemainingBody(block, "business") } };
+      const bankBlock = await bankBalanceBlockingDeletion([biz], "business");
+      if (bankBlock) return { refusal: bankBlock };
+      const deleted = await prisma.business.deleteMany({
+        where: { id: biz.id, userId: req.user.id },
       });
-    }
-
-    const deleted = await prisma.business.deleteMany({
-      where: { id: req.params.id, userId: req.user.id },
+      return { deleted: deleted.count };
     });
-    if (deleted.count === 0)
+    if (outcome.refusal) return res.status(outcome.refusal.status).json(outcome.refusal.body);
+    if (outcome.deleted === 0)
       return res.status(404).json({ error: "Business not found" });
 
+    await audit({ req, action: "BUSINESS_DELETED", resourceType: "business", resourceId: biz.id, metadata: { name: biz.name, banked: !!(biz.anchorAccountId || biz.providerAccountId) } });
     res.json({ message: "Business deleted" });
   } catch (err) {
     res.status(500).json({ error: "Failed to delete business" });

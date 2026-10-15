@@ -2,21 +2,25 @@
 //
 // Runs the REAL /savings router, the REAL auth + ownerOnly + requireUnfrozen
 // middleware, the REAL AML pipeline, the REAL executeTransfer (with the savings
-// reserve gate), the REAL savings integrity loop and the REAL account/business
-// deletion guards over a REAL Postgres, driven through actual HTTP. Only the
-// bank is stubbed (utils/anchor), because the one thing this must not do is
-// move real money.
+// reserve gate), the REAL savings integrity loop, the REAL /auth/me flags, the
+// REAL account/business deletion guards and the REAL /sync read staff get,
+// over a REAL Postgres, driven through actual HTTP. Only the bank is stubbed
+// (utils/anchor), because the one thing this must not do is move real money.
 //
 // A pot moves no money: its balance is a reserve that every spend path
-// subtracts from the Anchor balance first. The only debit the feature makes is
-// KashBook's own break fee on a flexible lock, swept as a book transfer. Every
-// outbound bank call lands in nipCalls / bookCalls, so a double-send or a
-// double sweep is an array length rather than something you have to reason
+// subtracts from the Anchor balance first. A pot opens at 00:00 Lagos time on
+// its day. An Unbreakable pot (lockMode "strict") cannot be opened before then
+// by anyone; taking money out of a Breakable one ("flexible") early costs
+// KashBook's break fee, swept as a book transfer when the money not set aside
+// covers it, and counted in the books as a Bank Fees and Charges expense.
+// Every outbound bank call lands in nipCalls / bookCalls, so a double-send or
+// a double sweep is an array length rather than something you have to reason
 // about.
 //
-// Point TEST_DATABASE_URL at a SCRATCH database. It refuses hosted URLs.
+// LOCAL databases only: TEST_DATABASE_URL must point at localhost, and every
+// scenario starts by truncating every table there.
 //
-//   TEST_DATABASE_URL=postgresql://... node scripts/savings-e2e-test.js
+//   node <scratchpad>/with-local-db.js <scratch db> node scripts/savings-e2e-test.js
 //
 // The concurrency section fires 40 requests at once, each of which holds a
 // pooled connection while it waits for the business lock, so the pool is
@@ -28,8 +32,8 @@ if (!url) {
   console.error("Refusing to run without TEST_DATABASE_URL.");
   process.exit(1);
 }
-if (/render\.com|amazonaws|\.prod/.test(url)) {
-  console.error("TEST_DATABASE_URL looks hosted/production. Refusing — this test writes money rows.");
+if (/render\.com|amazonaws|\.prod/.test(url) || !/@(localhost|127\.0\.0\.1)(:\d+)?\//.test(url)) {
+  console.error("TEST_DATABASE_URL is not a local database. Refusing: this test truncates every table.");
   process.exit(1);
 }
 
@@ -59,17 +63,31 @@ const ANCHOR_BANKS = [
 ];
 // `gross` is what Anchor would report for the deposit account. Every NIP send
 // and every book transfer debits it, like the real one, so the stub's own
-// ledger can be checked against the reserve. `bookMode` = "ok" | "reject": a
-// definite refusal of a book transfer, for the failed-fee-sweep test.
-const anchorState = { gross: 10_000_000, bookMode: "ok" };
+// ledger can be checked against the reserve. `grossBy` gives one account its
+// own balance (a second business), `unreadable` makes an account's balance
+// read fail, and `reads` counts the reads per account. `bookMode` = "ok" |
+// "reject" (a definite refusal: nothing moves) | "moved-then-502" and
+// "moved-then-network" (the money moves, then the answer is lost), for the
+// failed-fee-sweep tests.
+const anchorState = { gross: 10_000_000, bookMode: "ok", grossBy: {}, unreadable: new Set(), reads: {} };
 const nipCalls = [];
 const bookCalls = [];
+const grossOf = (id) => (id in anchorState.grossBy ? anchorState.grossBy[id] : anchorState.gross);
+const debit = (id, amount) => {
+  if (id in anchorState.grossBy) anchorState.grossBy[id] = Math.round((anchorState.grossBy[id] - Number(amount)) * 100) / 100;
+  else anchorState.gross = Math.round((anchorState.gross - Number(amount)) * 100) / 100;
+};
 
 Module._load = function (request) {
   const resolved = origLoad.apply(this, arguments);
   if (/(^|[\\/])(utils[\\/])?anchor$/.test(request) && resolved && !resolved.__stubbed) {
     resolved.__stubbed = true;
-    resolved.getAccountBalance = async () => ({ balance: anchorState.gross, available: anchorState.gross, ledgerBalance: anchorState.gross, hold: 0, pending: 0 });
+    resolved.getAccountBalance = async (id) => {
+      anchorState.reads[id] = (anchorState.reads[id] || 0) + 1;
+      if (anchorState.unreadable.has(id)) throw Object.assign(new Error("Anchor 503 (stub)"), { httpStatus: 503 });
+      const g = grossOf(id);
+      return { balance: g, available: g, ledgerBalance: g, hold: 0, pending: 0 };
+    };
     resolved.verifyCounterparty = async ({ accountNumber }) => ({
       accountName: `BANK VERIFIED NAME ${String(accountNumber).slice(-4)}`,
     });
@@ -88,7 +106,11 @@ Module._load = function (request) {
       if (anchorState.bookMode === "reject") {
         throw Object.assign(new Error("Anchor rejected the book transfer"), { httpStatus: 422 });
       }
-      anchorState.gross = Math.round((anchorState.gross - Number(args.amount)) * 100) / 100;
+      debit(args.fromAccountId, args.amount);
+      if (anchorState.bookMode === "moved-then-502") {
+        throw Object.assign(new Error("Anchor request failed (502)"), { httpStatus: 502 });
+      }
+      if (anchorState.bookMode === "moved-then-network") throw new TypeError("fetch failed");
       return { transferId: `anc_bk_${bookCalls.length}`, raw: {} };
     };
   }
@@ -115,6 +137,8 @@ const { toKobo } = require("../src/utils/money");
 const { reconcileSavings } = require("../src/utils/savingsReconcile");
 const { computeRawLedger } = require("../src/utils/ledgerBalance");
 const { sumExpenses } = require("../src/utils/insightsEngine");
+const { booksFor } = require("../src/utils/booksData");
+const savings = require("../src/utils/savings");
 
 // Patch the provider SINGLETON in place (class instances; a spread would drop
 // the prototype and supportsBanking with it).
@@ -138,6 +162,8 @@ app.use("/auth", require("../src/routes/auth"));
 app.use("/transfers", require("../src/routes/transfers"));
 app.use("/businesses", require("../src/routes/businesses"));
 app.use("/savings", require("../src/routes/savings"));
+// Read only here: what staff with bank access are sent about the bank rows.
+app.use("/sync", require("../src/routes/sync"));
 
 let server, BASE;
 
@@ -191,6 +217,16 @@ const section = (s) => console.log(`\n── ${s} ${"─".repeat(Math.max(0, 58 
 const minutesAgo = (n) => new Date(Date.now() - n * 60 * 1000);
 const daysFromNow = (n) => new Date(Date.now() + n * 24 * 3600 * 1000);
 const sameKobo = (a, b) => toKobo(a) === toKobo(b);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Lagos days, worked out here on their own (not with the code under test):
+// Lagos is UTC+1 all year.
+const LAGOS_MS = 60 * 60 * 1000;
+const lagosDayPlus = (n) => new Date(Date.now() + LAGOS_MS + n * 86400000).toISOString().slice(0, 10);
+const lagosDayOf = (at) => new Date(new Date(at).getTime() + LAGOS_MS).toISOString().slice(0, 10);
+const lagosMidnightIso = (day) => new Date(`${day}T00:00:00.000+01:00`).toISOString();
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const inWords = (day) => { const [y, m, d] = day.split("-").map(Number); return `${d} ${MONTHS[m - 1]} ${y}`; };
 
 const PIN_OWNER = "1234";
 const PASSWORD = "Password123!";
@@ -206,37 +242,27 @@ let tOwner, tStaff;
 // fields, no backing: a pot is a name, a target, a balance and a lock.
 const POT_KEYS = ["balance", "businessId", "closedAt", "createdAt", "id", "lockMode", "lockUntil", "locked", "name", "status", "targetAmount"];
 const MOVEMENT_KEYS = ["amount", "completedAt", "createdAt", "fee", "id", "potId", "reference", "status", "type"];
+// What a deletion refusal carries, on both routes: the pot's name and day, and
+// the owner's own business it is in (the app opens that one's savings). The
+// refusal only ever reaches the pot's owner, and the pot id never leaves.
+const REFUSAL_KEYS = ["businessId", "businessName", "code", "error", "opensOn", "potName", "unbreakable"];
 
+// Every table but Prisma's migration history, in one statement. TRUNCATE
+// resolves the foreign keys itself (CASCADE), covers every table added since
+// this file was written, and never fires AuditLog's append-only row trigger
+// (migration 20260803170000), which refuses a DELETE.
 async function wipe() {
-  await prisma.savingsMovement.deleteMany({});
-  await prisma.savingsPot.deleteMany({});
-  await prisma.invoicePayment.deleteMany({});
-  await prisma.invoice.deleteMany({});
-  await prisma.salaryPayment.deleteMany({});
-  await prisma.salarySchedule.deleteMany({});
-  await prisma.staffTransferRequest.deleteMany({});
-  await prisma.staffPermission.deleteMany({});
-  await prisma.complianceFlag.deleteMany({});
-  await prisma.beneficiary.deleteMany({});
-  await prisma.transaction.deleteMany({});
-  await prisma.appNotification.deleteMany({});
-  await prisma.processedWebhook.deleteMany({});
-  await prisma.alertState.deleteMany({});
-  await prisma.cronHeartbeat.deleteMany({});
-  // AuditLog is append-only (trigger, migration 20260803170000). Its purge flag
-  // does not actually let a DELETE through (the trigger returns NULL, which
-  // skips the row silently), so a scratch reset truncates, which row triggers
-  // never see. The backup restore does the same.
-  await prisma.$executeRawUnsafe('TRUNCATE TABLE "AuditLog"');
-  await prisma.otpCode.deleteMany({});
-  await prisma.business.deleteMany({});
-  await prisma.user.deleteMany({});
+  const tables = await prisma.$queryRawUnsafe(
+    `SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> '_prisma_migrations'`,
+  );
+  await prisma.$executeRawUnsafe(`TRUNCATE TABLE ${tables.map((t) => `"${t.tablename}"`).join(", ")} CASCADE`);
 }
 
 async function seed({ gross = 10_000_000 } = {}) {
   await wipe();
   nipCalls.length = 0; bookCalls.length = 0;
   anchorState.gross = gross; anchorState.bookMode = "ok";
+  anchorState.grossBy = {}; anchorState.unreadable.clear(); anchorState.reads = {};
   balanceCache.bustBalance(BIZ_ID);
   process.env.SAVINGS_ENABLED = "true";
   process.env.ANCHOR_FEE_ACCOUNT_ID = FEE_ACCOUNT;
@@ -280,6 +306,27 @@ async function seed({ gross = 10_000_000 } = {}) {
   tStaff = signToken({ userId: staff.id, tokenVersion: 0 });
 }
 
+// Another account, for the tests where someone else knocks.
+async function mkUser(id, over = {}) {
+  const u = await prisma.user.create({
+    data: {
+      id, firstName: "Cid", lastName: "Other", businessName: "Other Co", country: "NG", currency: "NGN",
+      email: `${id}@savings.test`, password: await bcrypt.hash(PASSWORD, 4), transactionPin: await bcrypt.hash(PIN_OWNER, 4),
+      accountType: "OWNER", ...over,
+    },
+  });
+  return { user: u, token: signToken({ userId: u.id, tokenVersion: 0 }) };
+}
+
+// A second banked business of the owner's.
+const mkBiz = (id, nuban, name = "Second Shop") => prisma.business.create({
+  data: {
+    id, userId: owner.id, name, country: "NG", baseCurrency: "NGN",
+    anchorAccountId: `anchor-acct-${id}`, virtualAccountNumber: nuban,
+    virtualAccountBank: "Providus Bank", virtualAccountName: name.toUpperCase(), kycBusinessType: "limited_company",
+  },
+});
+
 // ── Route helpers ─────────────────────────────────────────────────────────────
 const mkPot = (over = {}) => POST("/savings/pots", tOwner, { businessId: BIZ_ID, name: "Rent", ...over });
 const depositTo = (potId, over = {}) => POST(`/savings/pots/${potId}/deposit`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, ...over });
@@ -289,6 +336,11 @@ const send = (over = {}) => POST("/transfers/send", tOwner, {
   businessId: BIZ_ID, accountNumber: "0123456789", bankCode: "058", accountName: "SUPPLIER LTD", bankName: "GTBank",
   narration: "supplier", pin: PIN_OWNER, ...over,
 });
+const meFeatures = async (token) => {
+  const r = await GET("/auth/me", token);
+  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+  return r.body.user.features;
+};
 const dbPot = (id) => prisma.savingsPot.findUnique({ where: { id } });
 const dbMovement = (id) => prisma.savingsMovement.findUnique({ where: { id } });
 const dbMovementByRef = (reference) => prisma.savingsMovement.findUnique({ where: { reference } });
@@ -296,6 +348,7 @@ const dbTxnByRef = (reference, businessId = BIZ_ID) => prisma.transaction.findFi
 const alertFired = (key) => prisma.alertState.findUnique({ where: { key } });
 const auditCount = (action) => prisma.auditLog.count({ where: { action } });
 const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new Date(Date.now() + 2 * 86400000) });
+const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2), to: lagosDayPlus(2) })).expenses.lines.bankCharges.gross;
 
 (async () => {
   server = app.listen(0);
@@ -342,10 +395,7 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
   await test("no token → 401; another owner → 403/404 on every pot route, never a movement", async () => {
     const anon = await GET(`/savings?businessId=${BIZ_ID}`);
     assert.strictEqual(anon.status, 401);
-    const other = await prisma.user.create({
-      data: { id: "sav_other", firstName: "Cid", lastName: "Other", businessName: "Other Co", country: "NG", currency: "NGN", email: "other@savings.test", password: await bcrypt.hash(PASSWORD, 4), transactionPin: await bcrypt.hash(PIN_OWNER, 4), accountType: "OWNER" },
-    });
-    const tOther = signToken({ userId: other.id, tokenVersion: 0 });
+    const { token: tOther } = await mkUser("sav_other");
     const list = await GET(`/savings?businessId=${BIZ_ID}`, tOther);
     assert.strictEqual(list.status, 404, JSON.stringify(list.body));
     const calls = [
@@ -732,6 +782,77 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual((await withdrawFrom(pages.id, { amount: 31, idempotencyKey: "pgall" })).status, 200);
   });
 
+  // ══ 2b. KOBO ══════════════════════════════════════════════════════════════
+  // About one kobo amount in eight used to be refused as having "more than 2
+  // decimal places" (19.99 * 100 is 1998.9999999999998), the pot's own balance
+  // among them, which then blocked closing the pot and deleting the account.
+  section("2b. every kobo amount is money: in, out, as a target, to the last kobo");
+  await seed();
+
+  await test("19.99, 4.35, 1.10, 0.07 and 2500.55 go in and come out; targets of 19.99 and 4.35 are kept to the kobo", async () => {
+    const created = await mkPot({ name: "Kobo", targetAmount: 19.99 });
+    assert.strictEqual(created.status, 201, JSON.stringify(created.body));
+    const pot = created.body.pot;
+    assert.strictEqual(pot.targetAmount, 19.99);
+    const t = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, targetAmount: "4.35" });
+    assert.strictEqual(t.status, 200, JSON.stringify(t.body));
+    assert.strictEqual(t.body.pot.targetAmount, 4.35);
+    let n = 0;
+    for (const amount of [19.99, 4.35, "1.10", 0.07, 2500.55]) {
+      const d = await depositTo(pot.id, { amount, idempotencyKey: `kd${n}` });
+      assert.strictEqual(d.status, 200, `deposit ${amount}: ${JSON.stringify(d.body)}`);
+      const w = await withdrawFrom(pot.id, { amount, idempotencyKey: `kw${n}` });
+      assert.strictEqual(w.status, 200, `withdraw ${amount}: ${JSON.stringify(w.body)}`);
+      n++;
+    }
+    assert.strictEqual((await dbPot(pot.id)).balance, 0);
+    assert.strictEqual((await dbMovementByRef("kb_sv_kd2")).amount, 1.1, "booked as whole kobo");
+    // Not money: a third decimal, and a target of Infinity in any spelling.
+    assert.strictEqual((await depositTo(pot.id, { amount: 10.005, idempotencyKey: "kbad" })).body?.code, "BAD_AMOUNT");
+    for (const targetAmount of ["1e999", "Infinity", 1e300]) {
+      const r = await mkPot({ name: "Too big", targetAmount });
+      assert.strictEqual(r.status, 400, `${targetAmount}: ${JSON.stringify(r.body)}`);
+      assert.strictEqual(r.body?.code, "BAD_AMOUNT");
+    }
+    assert.strictEqual(await prisma.savingsPot.count({ where: { name: "Too big" } }), 0);
+  });
+
+  await test("₦1,000.05 + ₦1,500.02 in: the pot shows ₦2,500.07, that figure comes out in one go, and the pot closes", async () => {
+    const pot = (await mkPot({ name: "Round trip" })).body.pot;
+    assert.strictEqual((await depositTo(pot.id, { amount: 1000.05, idempotencyKey: "rt1" })).status, 200);
+    const d2 = await depositTo(pot.id, { amount: 1500.02, idempotencyKey: "rt2" });
+    assert.strictEqual(d2.status, 200, JSON.stringify(d2.body));
+    assert.strictEqual(d2.body.pot.balance, 2500.07, "shown as whole kobo, never 2500.0699999999997");
+    const list = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
+    assert.strictEqual(list.body.pots.find((p) => p.id === pot.id).balance, 2500.07);
+    const all = await withdrawFrom(pot.id, { amount: d2.body.pot.balance, idempotencyKey: "rt3" });
+    assert.strictEqual(all.status, 200, JSON.stringify(all.body));
+    assert.strictEqual(all.body.pot.balance, 0);
+    assert.strictEqual((await dbPot(pot.id)).balance, 0, "no float residue is left behind");
+    assert.strictEqual((await closePot(pot.id)).status, 204);
+  });
+
+  await test("₦2,500 out of ₦2,500.07 leaves ₦0.07, shown and taken out as such; ₦35 + ₦0.02 comes out as ₦35.02", async () => {
+    const pot = (await mkPot({ name: "Leftover" })).body.pot;
+    assert.strictEqual((await depositTo(pot.id, { amount: 1000.05, idempotencyKey: "lo1" })).status, 200);
+    assert.strictEqual((await depositTo(pot.id, { amount: 1500.02, idempotencyKey: "lo2" })).status, 200);
+    const most = await withdrawFrom(pot.id, { amount: 2500, idempotencyKey: "lo3" });
+    assert.strictEqual(most.status, 200, JSON.stringify(most.body));
+    assert.strictEqual(most.body.pot.balance, 0.07, "the residue 0.06999999999970896 is shown as the 7 kobo it is");
+    const rest = await withdrawFrom(pot.id, { amount: most.body.pot.balance, idempotencyKey: "lo4" });
+    assert.strictEqual(rest.status, 200, JSON.stringify(rest.body));
+    assert.strictEqual((await dbPot(pot.id)).balance, 0);
+    assert.strictEqual((await closePot(pot.id)).status, 204);
+    const p2 = (await mkPot({ name: "Thirty five" })).body.pot;
+    assert.strictEqual((await depositTo(p2.id, { amount: 35, idempotencyKey: "tf1" })).status, 200);
+    assert.strictEqual((await depositTo(p2.id, { amount: 0.02, idempotencyKey: "tf2" })).status, 200);
+    const out = await withdrawFrom(p2.id, { amount: 35.02, idempotencyKey: "tf3" });
+    assert.strictEqual(out.status, 200, JSON.stringify(out.body));
+    assert.strictEqual((await closePot(p2.id)).status, 204);
+    const t = await reconcileSavings();
+    assert.strictEqual(t.drift, 0, `the movements agree with every pot: ${JSON.stringify(t)}`);
+  });
+
   // ══ 3. CONCURRENCY ════════════════════════════════════════════════════════
   section("3. concurrency — reserved + sent never exceed gross");
   await seed({ gross: 1_200_000 });
@@ -773,14 +894,15 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(stats.drift, 0, JSON.stringify(stats));
     assert.strictEqual(stats.overReserved, 0, JSON.stringify(stats));
     assert.strictEqual(stats.feesCollected, 0);
+    assert.strictEqual(stats.feesDeferred, 0);
     assert.strictEqual(stats.errors, 0);
   });
 
   // ══ 4. LOCKS ══════════════════════════════════════════════════════════════
-  section("4. locks — strict is server-enforced, flexible is a priced confirmation");
+  section("4. locks: Unbreakable is server-enforced, Breakable is a priced confirmation");
   await seed();
 
-  await test("strict lock → 423 POT_LOCKED on withdrawal, even with confirmEarly", async () => {
+  await test("Unbreakable lock → 423 POT_LOCKED on withdrawal, even with confirmEarly, naming the day it opens", async () => {
     const r = await mkPot({ name: "School fees", lockUntil: daysFromNow(30).toISOString(), lockMode: "strict" });
     assert.strictEqual(r.status, 201, JSON.stringify(r.body));
     const pot = r.body.pot;
@@ -791,30 +913,38 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     const w = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "sw1", confirmEarly: true });
     assert.strictEqual(w.status, 423, JSON.stringify(w.body));
     assert.strictEqual(w.body?.code, "POT_LOCKED");
-    assert.ok(w.body?.lockUntil, "the refusal says until when");
-    assert.strictEqual(w.body?.fee, 0, "a strict lock has no price");
+    assert.strictEqual(w.body?.lockUntil, pot.lockUntil, "the refusal says until when");
+    assert.strictEqual(w.body?.error, `This pot is unbreakable. It opens on ${inWords(lagosDayOf(pot.lockUntil))}.`);
+    assert.ok(!("fee" in w.body) && !("feeBps" in w.body), "an Unbreakable pot has no price: nothing opens it early");
     assert.strictEqual((await dbPot(pot.id)).balance, 10_000);
     assert.strictEqual(await dbMovementByRef("kb_svw_sw1"), null);
     ctx.strictPot = pot;
   });
 
-  await test("PATCH shortening, removing or relaxing a strict lock → 409 LOCK_CANNOT_SHORTEN; extending is allowed", async () => {
+  await test("PATCH shortening, removing or relaxing an Unbreakable lock → 409 LOCK_CANNOT_SHORTEN; extending is allowed; its own day again changes nothing", async () => {
     const pot = ctx.strictPot;
-    const shorter = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: daysFromNow(10).toISOString(), lockMode: "strict" });
+    const shorter = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: daysFromNow(10).toISOString(), lockMode: "strict" });
     assert.strictEqual(shorter.status, 409, JSON.stringify(shorter.body));
     assert.strictEqual(shorter.body?.code, "LOCK_CANNOT_SHORTEN");
-    const removed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: null });
-    assert.strictEqual(removed.status, 409);
-    assert.strictEqual(removed.body?.code, "LOCK_CANNOT_SHORTEN");
-    const relaxed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: daysFromNow(60).toISOString(), lockMode: "flexible" });
+    // Every empty value asks to remove the lock, and none gets round it.
+    for (const lockUntil of [null, "", 0, false]) {
+      const removed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil });
+      assert.strictEqual(removed.status, 409, `${JSON.stringify(lockUntil)}: ${JSON.stringify(removed.body)}`);
+      assert.strictEqual(removed.body?.code, "LOCK_CANNOT_SHORTEN");
+    }
+    const relaxed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: daysFromNow(60).toISOString(), lockMode: "flexible" });
     assert.strictEqual(relaxed.status, 409);
     assert.strictEqual(relaxed.body?.code, "LOCK_CANNOT_SHORTEN");
-    const longer = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: daysFromNow(60).toISOString(), lockMode: "strict" });
+    const same = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, name: "School fees 2027", lockUntil: lagosDayOf(pot.lockUntil), lockMode: "strict" });
+    assert.strictEqual(same.status, 200, JSON.stringify(same.body));
+    assert.strictEqual(same.body.pot.lockUntil, pot.lockUntil, "the same opening day is no change");
+    assert.strictEqual(same.body.pot.name, "School fees 2027");
+    const longer = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: daysFromNow(60).toISOString(), lockMode: "strict" });
     assert.strictEqual(longer.status, 200, JSON.stringify(longer.body));
     assert.strictEqual(longer.body.businessId, BIZ_ID);
     assert.ok(new Date(longer.body.pot.lockUntil) > daysFromNow(59));
     assert.strictEqual(longer.body.pot.lockMode, "strict");
-    const past = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: daysFromNow(-1).toISOString(), lockMode: "strict" });
+    const past = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: daysFromNow(-1).toISOString(), lockMode: "strict" });
     assert.strictEqual(past.status, 400, JSON.stringify(past.body));
     assert.strictEqual(past.body?.code, "BAD_LOCK");
     const row = await dbPot(pot.id);
@@ -822,7 +952,7 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(row.lockMode, "strict");
   });
 
-  await test("flexible lock → 409 EARLY_WITHDRAWAL_CONFIRM carrying the fee, then success with confirmEarly and ONE sweep", async () => {
+  await test("Breakable lock → 409 EARLY_WITHDRAWAL_CONFIRM carrying the fee and the day, then success with confirmEarly and ONE sweep", async () => {
     const r = await mkPot({ name: "Holiday", lockUntil: daysFromNow(30).toISOString(), lockMode: "flexible" });
     assert.strictEqual(r.status, 201, JSON.stringify(r.body));
     const pot = r.body.pot;
@@ -830,6 +960,7 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(pot.lockMode, "flexible");
     assert.strictEqual((await depositTo(pot.id, { amount: 5_000, idempotencyKey: "f1" })).status, 200);
     ctx.expBefore = await sumExpenses(BIZ_ID, wideRange());
+    ctx.chargesBefore = await bankCharges();
     ctx.ledgerBefore = await computeRawLedger(BIZ_ID, "NGN");
     const grossBefore = anchorState.gross;
 
@@ -840,8 +971,10 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     // floored at the ₦100 minimum.
     assert.strictEqual(w1.body?.fee, 100, JSON.stringify(w1.body));
     assert.strictEqual(w1.body?.feeBps, 200);
-    assert.ok(w1.body?.lockUntil);
+    assert.strictEqual(w1.body?.lockUntil, pot.lockUntil);
     assert.ok(/costs/.test(w1.body.error), `the message states the price: ${w1.body.error}`);
+    assert.ok(w1.body.error.startsWith(`This pot opens on ${inWords(lagosDayOf(pot.lockUntil))}. Taking `), `the message names the day: ${w1.body.error}`);
+    assert.ok(/ out early costs .+\. Confirm to continue\.$/.test(w1.body.error), w1.body.error);
     assert.strictEqual((await dbPot(pot.id)).balance, 5_000);
     assert.strictEqual(await dbMovementByRef("kb_svw_fw1"), null, "nothing is written before the merchant confirms");
     assert.strictEqual(bookCalls.length, 0, "no fee is swept before the merchant confirms");
@@ -860,16 +993,18 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(w2.body.pot.balance, 4_000, "the fee comes off the bank account, not the pot");
     assert.ok(sameKobo(w2.body.reserved, reservedBefore - 1_000), `reserved ${reservedBefore} → ${w2.body.reserved}`);
     // The fee is swept from the Anchor account to the fee account at once, and
-    // booked as a savings_fee row: real money for the ledger, invisible to reports.
+    // booked as a savings_fee row.
     assert.strictEqual(bookCalls.length, 1, JSON.stringify(bookCalls));
     assert.strictEqual(bookCalls[0].fromAccountId, BIZ_ANCHOR_ID);
     assert.strictEqual(bookCalls[0].toAccountId, FEE_ACCOUNT);
     assert.strictEqual(bookCalls[0].amount, 100);
     assert.strictEqual(bookCalls[0].reference, "kb_svw_fw1_bfee");
+    assert.strictEqual(bookCalls[0].reason, "Savings early withdrawal fee", "the transfer names no pot");
     assert.ok(sameKobo(anchorState.gross, grossBefore - 100), "only the fee left the bank");
     const feeRow = await dbTxnByRef("kb_svw_fw1_bfee");
     assert.ok(feeRow, "fee Transaction row");
     assert.strictEqual(feeRow.purpose, "savings_fee");
+    assert.strictEqual(feeRow.description, "Savings early withdrawal fee · Ref: kb_svw_fw1_bfee", "the bank row names no pot: staff with bank access read it");
     assert.strictEqual(feeRow.type, "expense");
     assert.strictEqual(feeRow.category, "transfer");
     assert.strictEqual(feeRow.paymentMethod, "bank");
@@ -884,10 +1019,12 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     ctx.flexPot = pot;
   });
 
-  await test("the fee row is real money for the ledger and invisible to the reports", async () => {
+  await test("the fee row is real money for the ledger and a Bank Fees and Charges expense of ₦100", async () => {
+    const charges = await bankCharges();
+    assert.ok(sameKobo(charges, ctx.chargesBefore + 100), `Bank Fees and Charges moved from ${ctx.chargesBefore} to ${charges}`);
     const exp = await sumExpenses(BIZ_ID, wideRange());
-    assert.ok(sameKobo(exp.total, ctx.expBefore.total), `expenses moved from ${ctx.expBefore.total} to ${exp.total}`);
-    assert.strictEqual(exp.count, ctx.expBefore.count);
+    assert.ok(sameKobo(exp.total, ctx.expBefore.total + 100), `expenses moved from ${ctx.expBefore.total} to ${exp.total}`);
+    assert.strictEqual(exp.count, ctx.expBefore.count + 1, "one more expense record: the fee");
     const ledger = await computeRawLedger(BIZ_ID, "NGN");
     assert.ok(sameKobo(ledger, ctx.ledgerBefore - 100), `ledger ${ctx.ledgerBefore} → ${ledger}`);
   });
@@ -918,13 +1055,16 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual((await dbMovementByRef("kb_svw_fw3")).feeCollectedAt, null);
   });
 
-  await test("a lock needs a mode, a mode needs a date, and the date must be real, future and within 5 years", async () => {
+  await test("a lock needs a mode, a mode needs a date, and the day must be real, after today and within 5 years", async () => {
     const cases = [
       ["no mode", { name: "X", lockUntil: daysFromNow(3).toISOString() }],
       ["mode without a date", { name: "X", lockMode: "strict" }],
       ["unknown mode", { name: "X", lockUntil: daysFromNow(3).toISOString(), lockMode: "forever" }],
       ["not a date", { name: "X", lockUntil: "next tuesday", lockMode: "strict" }],
+      ["a day the calendar lacks", { name: "X", lockUntil: "2027-02-30", lockMode: "strict" }],
       ["past", { name: "X", lockUntil: daysFromNow(-3).toISOString(), lockMode: "flexible" }],
+      ["today (Lagos)", { name: "X", lockUntil: lagosDayPlus(0), lockMode: "strict" }],
+      ["yesterday (Lagos)", { name: "X", lockUntil: lagosDayPlus(-1), lockMode: "flexible" }],
       ["beyond 5 years", { name: "X", lockUntil: daysFromNow(5 * 366 + 2).toISOString(), lockMode: "strict" }],
     ];
     for (const [label, body] of cases) {
@@ -933,38 +1073,40 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
       assert.strictEqual(r.body?.code, "BAD_LOCK", label);
     }
     assert.strictEqual(await prisma.savingsPot.count({ where: { name: "X" } }), 0);
-    const modeOnly = await PATCH(`/savings/pots/${ctx.strictPot.id}`, tOwner, { businessId: BIZ_ID, lockMode: "flexible" });
+    const modeOnly = await PATCH(`/savings/pots/${ctx.strictPot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockMode: "flexible" });
     assert.strictEqual(modeOnly.status, 400, JSON.stringify(modeOnly.body));
     assert.strictEqual(modeOnly.body?.code, "BAD_LOCK");
     assert.strictEqual((await dbPot(ctx.strictPot.id)).lockMode, "strict");
   });
 
-  await test("a flexible lock may be shortened or removed; only strict is one-way", async () => {
+  await test("an EMPTY Breakable pot's lock may be shortened or removed: nothing in it can come out early (a pot with money: section 4b)", async () => {
     const r = await mkPot({ name: "Soft", lockUntil: daysFromNow(30).toISOString(), lockMode: "flexible" });
     assert.strictEqual(r.status, 201, JSON.stringify(r.body));
     const pot = r.body.pot;
-    const shorter = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: daysFromNow(5).toISOString() });
+    const shorter = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: daysFromNow(5).toISOString() });
     assert.strictEqual(shorter.status, 200, JSON.stringify(shorter.body));
     assert.strictEqual(shorter.body.pot.lockMode, "flexible", "the mode carries over when only the date changes");
     assert.ok(new Date(shorter.body.pot.lockUntil) < daysFromNow(6));
-    const removed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, lockUntil: null });
+    const removed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null });
     assert.strictEqual(removed.status, 200, JSON.stringify(removed.body));
     assert.strictEqual(removed.body.pot.lockUntil, null);
     assert.strictEqual(removed.body.pot.lockMode, null);
     assert.strictEqual(removed.body.pot.locked, false);
   });
 
-  await test("with no fee account the break fee is ₦0: confirmation still asked, nothing swept", async () => {
+  await test("with no fee account the break fee is ₦0: GET /savings shows all zeros, confirmation still asked, nothing swept", async () => {
     const pot = (await mkPot({ name: "Free break", lockUntil: daysFromNow(30).toISOString(), lockMode: "flexible" })).body.pot;
     assert.strictEqual((await depositTo(pot.id, { amount: 10_000, idempotencyKey: "nf1" })).status, 200);
     delete process.env.ANCHOR_FEE_ACCOUNT_ID;
     try {
       const cfg = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
-      assert.strictEqual(cfg.body.breakFee.enabled, false);
+      assert.deepStrictEqual(cfg.body.breakFee, { enabled: false, bps: 0, pct: 0, min: 0 }, "the app shows no rate and no minimum for a free withdrawal");
       const ask = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "nfw1" });
       assert.strictEqual(ask.status, 409, JSON.stringify(ask.body));
       assert.strictEqual(ask.body?.code, "EARLY_WITHDRAWAL_CONFIRM");
       assert.strictEqual(ask.body?.fee, 0, "a fee nothing can collect is not charged");
+      assert.strictEqual(ask.body?.feeBps, 0);
+      assert.ok(/Confirm to take money out early\.$/.test(ask.body.error), ask.body.error);
       const before = bookCalls.length;
       const ok = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "nfw1", confirmEarly: true });
       assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
@@ -974,6 +1116,13 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
       assert.strictEqual((await dbMovementByRef("kb_svw_nfw1")).feeCollectedAt, null);
     } finally {
       process.env.ANCHOR_FEE_ACCOUNT_ID = FEE_ACCOUNT;
+    }
+    process.env.SAVINGS_BREAK_FEE_BPS = "0";
+    try {
+      const cfg = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
+      assert.deepStrictEqual(cfg.body.breakFee, { enabled: false, bps: 0, pct: 0, min: 0 }, "a rate of 0 is no fee either");
+    } finally {
+      delete process.env.SAVINGS_BREAK_FEE_BPS;
     }
   });
 
@@ -993,11 +1142,322 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     assert.strictEqual(await dbTxnByRef("kb_svw_rs1_bfee"), null, "no ledger row for money that did not move");
     const row = await dbMovementByRef("kb_svw_rs1");
     assert.ok(row.feeCollectedAt, "claimed before the transfer, so it can never be charged twice");
-    assert.ok(await alertFired(`savings-break-fee-${row.id}`), "a human is told to collect it by hand");
+    const alert = await alertFired(`savings-break-fee-${row.id}`);
+    assert.ok(alert, "a human is told to collect it by hand");
+    assert.ok(alert.lastValue.startsWith("The bank refused the ₦100 early-withdrawal fee kb_svw_rs1_bfee (Ada Stores), so nothing moved."), alert.lastValue);
+    assert.ok(/collect it by hand with that reference/.test(alert.lastValue), alert.lastValue);
     assert.strictEqual(await auditCount("SAVINGS_BREAK_FEE_FAILED"), 1);
+    assert.strictEqual(await auditCount("SAVINGS_BREAK_FEE_UNCONFIRMED"), 0);
     const stats = await reconcileSavings();
     assert.strictEqual(stats.feesCollected, 0, JSON.stringify(stats));
+    assert.strictEqual(stats.feesDeferred, 0, JSON.stringify(stats));
     assert.strictEqual(bookCalls.length, before + 1, "the loop does not retry a claimed fee");
+  });
+
+  await test("a pot opens at 00:00 Lagos on its day: a bare day as sent, a timestamp moved up to the next midnight", async () => {
+    const day1 = lagosDayPlus(1);
+    const r = await mkPot({ name: "Day pot", lockUntil: day1, lockMode: "flexible" });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.body));
+    assert.strictEqual(r.body.pot.lockUntil, lagosMidnightIso(day1), "opens at the start of the chosen day, Lagos time");
+    assert.strictEqual(r.body.pot.locked, true);
+    assert.strictEqual((await dbPot(r.body.pot.id)).lockUntil.toISOString(), lagosMidnightIso(day1), "stored as that moment");
+    // A timestamp mid-afternoon in three days opens at the start of the fourth.
+    const t = await mkPot({ name: "Timestamp pot", lockUntil: `${lagosDayPlus(3)}T15:30:00.000+01:00`, lockMode: "strict" });
+    assert.strictEqual(t.status, 201, JSON.stringify(t.body));
+    assert.strictEqual(t.body.pot.lockUntil, lagosMidnightIso(lagosDayPlus(4)), "never earlier than asked");
+    // The old app's "until 15 Mar" (23:59:59 that day) opens on 16 Mar.
+    const old = await mkPot({ name: "Old app pot", lockUntil: new Date(`${lagosDayPlus(5)}T23:59:59.000+01:00`).toISOString(), lockMode: "flexible" });
+    assert.strictEqual(old.body.pot.lockUntil, lagosMidnightIso(lagosDayPlus(6)));
+    // PATCH takes a bare day the same way.
+    const moved = await PATCH(`/savings/pots/${r.body.pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: lagosDayPlus(2) });
+    assert.strictEqual(moved.status, 200, JSON.stringify(moved.body));
+    assert.strictEqual(moved.body.pot.lockUntil, lagosMidnightIso(lagosDayPlus(2)));
+    // GET /savings shows the same moment.
+    const list = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
+    assert.strictEqual(list.body.pots.find((p) => p.id === r.body.pot.id).lockUntil, lagosMidnightIso(lagosDayPlus(2)));
+    for (const p of [r.body.pot, t.body.pot, old.body.pot]) assert.strictEqual((await closePot(p.id)).status, 204);
+  });
+
+  await test("an Unbreakable pot is refused until its very moment, however asked, and opens at it", async () => {
+    const r = await mkPot({ name: "Timed", lockUntil: lagosDayPlus(1), lockMode: "strict" });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.body));
+    const pot = r.body.pot;
+    assert.strictEqual((await depositTo(pot.id, { amount: 2_000, idempotencyKey: "tm0" })).status, 200);
+    // The API cannot set a pot's day this close; the moment is moved here, as
+    // if the clock had run on to just before the pot's midnight.
+    const opensAt = new Date(Date.now() + 3_000);
+    await prisma.savingsPot.update({ where: { id: pot.id }, data: { lockUntil: opensAt } });
+    const books = bookCalls.length;
+    for (const [key, confirmEarly] of [["tm1", true], ["tm2", false]]) {
+      const w = await withdrawFrom(pot.id, { amount: 500, idempotencyKey: key, confirmEarly });
+      assert.strictEqual(w.status, 423, `${key}: ${JSON.stringify(w.body)}`);
+      assert.strictEqual(w.body?.code, "POT_LOCKED");
+      assert.strictEqual(w.body?.lockUntil, opensAt.toISOString());
+    }
+    // Neither removing the lock nor relaxing it opens it either.
+    assert.strictEqual((await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null })).body?.code, "LOCK_CANNOT_SHORTEN");
+    assert.strictEqual((await dbPot(pot.id)).balance, 2_000);
+    assert.strictEqual(await prisma.savingsMovement.count({ where: { potId: pot.id, type: "withdrawal" } }), 0);
+    const wait = opensAt.getTime() - Date.now();
+    assert.ok(wait > 0, `the refusals must land before the moment (${wait} ms left)`);
+    await sleep(wait + 50);
+    const open = await withdrawFrom(pot.id, { amount: 500, idempotencyKey: "tm3" });
+    assert.strictEqual(open.status, 200, JSON.stringify(open.body));
+    assert.strictEqual(open.body.movement.fee, 0, "an opened pot costs nothing to empty");
+    assert.strictEqual(open.body.pot.locked, false);
+    assert.strictEqual(open.body.pot.balance, 1_500);
+    assert.strictEqual(bookCalls.length, books, "no sweep");
+    ctx.timedPot = pot;
+  });
+
+  await test("a KashBook admin is just another user to a pot: no route opens, relaxes or empties it", async () => {
+    const pot = ctx.strictPot;
+    const { token: tAdmin } = await mkUser("sav_admin", { role: "ADMIN" });
+    const calls = [
+      await POST(`/savings/pots/${pot.id}/withdraw`, tAdmin, { businessId: BIZ_ID, amount: 1_000, pin: PIN_OWNER, confirmEarly: true }),
+      await PATCH(`/savings/pots/${pot.id}`, tAdmin, { businessId: BIZ_ID, lockUntil: null }),
+      await PATCH(`/savings/pots/${pot.id}`, tAdmin, { businessId: BIZ_ID, lockUntil: lagosDayPlus(1), lockMode: "flexible" }),
+      // The admin's own correct PIN changes nothing: the pot is not theirs.
+      await PATCH(`/savings/pots/${pot.id}`, tAdmin, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null }),
+      await DEL(`/savings/pots/${pot.id}?businessId=${BIZ_ID}`, tAdmin),
+      await GET(`/savings?businessId=${BIZ_ID}`, tAdmin),
+    ];
+    for (const r of calls) assert.ok([403, 404].includes(r.status), `expected 403/404, got ${r.status} ${JSON.stringify(r.body)}`);
+    const row = await dbPot(pot.id);
+    assert.strictEqual(row.balance, 10_000);
+    assert.strictEqual(row.lockMode, "strict");
+    assert.ok(new Date(row.lockUntil) > daysFromNow(59));
+  });
+
+  // ══ 4b. LOCK EDITS ════════════════════════════════════════════════════════
+  // Taking money out of a Breakable pot before its day costs the fee, so its
+  // lock is no way round it: while it holds money and has not opened, its day
+  // stays or moves later. And a lock commits money (an Unbreakable one for up
+  // to five years, with no way back), so changing one needs the PIN.
+  section("4b. lock edits: a Breakable pot with money keeps its day; a lock change needs the PIN");
+  await seed();
+
+  await test("a Breakable pot with money cannot drop its lock or move it earlier, however asked: 409 BREAKABLE_LOCK_KEPT, nothing changes", async () => {
+    const day = lagosDayPlus(60);
+    const pot = (await mkPot({ name: "Holiday", lockUntil: day, lockMode: "flexible" })).body.pot;
+    assert.ok(pot?.id, "fixture");
+    assert.strictEqual((await depositTo(pot.id, { amount: 10_000, idempotencyKey: "kp0" })).status, 200);
+    const tries = [
+      ["removed (null)", { lockUntil: null }],
+      ['removed ("")', { lockUntil: "" }],
+      ["removed (0)", { lockUntil: 0 }],
+      ["removed (false)", { lockUntil: false }],
+      ["moved to tomorrow", { lockUntil: lagosDayPlus(1) }],
+      ["moved earlier, as a timestamp", { lockUntil: daysFromNow(10).toISOString(), lockMode: "flexible" }],
+      ["made Unbreakable on an earlier day", { lockUntil: lagosDayPlus(1), lockMode: "strict" }],
+    ];
+    let last;
+    for (const [label, change] of tries) {
+      last = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, ...change });
+      assert.strictEqual(last.status, 409, `${label}: ${JSON.stringify(last.body)}`);
+      assert.strictEqual(last.body?.code, "BREAKABLE_LOCK_KEPT", label);
+      assert.strictEqual(last.body?.lockUntil, lagosMidnightIso(day), `${label}: the refusal carries the day`);
+    }
+    assert.strictEqual(last.body.error, `This pot holds money and opens on ${inWords(day)}. Until then its day can move later but not earlier. To take money out sooner, take it out early and pay the early withdrawal fee.`);
+    const row = await dbPot(pot.id);
+    assert.strictEqual(row.lockUntil.toISOString(), lagosMidnightIso(day), "the lock is as it was");
+    assert.strictEqual(row.lockMode, "flexible");
+    // The way out before the day is still the priced one.
+    const ask = await withdrawFrom(pot.id, { amount: 10_000, idempotencyKey: "kp1" });
+    assert.strictEqual(ask.status, 409, JSON.stringify(ask.body));
+    assert.strictEqual(ask.body?.code, "EARLY_WITHDRAWAL_CONFIRM");
+    assert.strictEqual(ask.body?.fee, 200, "2% of ₦10,000");
+    assert.strictEqual(bookCalls.length, 0);
+    ctx.keptPot = pot;
+  });
+
+  await test("its day can move later, and it can become Unbreakable on its own day or a later one", async () => {
+    const pot = ctx.keptPot;
+    const later = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: lagosDayPlus(90) });
+    assert.strictEqual(later.status, 200, JSON.stringify(later.body));
+    assert.strictEqual(later.body.pot.lockUntil, lagosMidnightIso(lagosDayPlus(90)));
+    assert.strictEqual(later.body.pot.lockMode, "flexible");
+    const strict = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: lagosDayPlus(90), lockMode: "strict" });
+    assert.strictEqual(strict.status, 200, JSON.stringify(strict.body));
+    assert.strictEqual(strict.body.pot.lockMode, "strict");
+    assert.strictEqual(strict.body.pot.lockUntil, lagosMidnightIso(lagosDayPlus(90)));
+    const w = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "kp2", confirmEarly: true });
+    assert.strictEqual(w.status, 423, "Unbreakable now: nothing opens it early");
+  });
+
+  await test("once it opens, or once it is emptied (fee paid), a Breakable pot's lock may go", async () => {
+    const opened = (await mkPot({ name: "Opened", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+    assert.strictEqual((await depositTo(opened.id, { amount: 5_000, idempotencyKey: "op0" })).status, 200);
+    await prisma.savingsPot.update({ where: { id: opened.id }, data: { lockUntil: minutesAgo(1) } });
+    const off = await PATCH(`/savings/pots/${opened.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null });
+    assert.strictEqual(off.status, 200, JSON.stringify(off.body));
+    assert.strictEqual(off.body.pot.lockUntil, null);
+    const emptied = (await mkPot({ name: "Emptied", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+    assert.strictEqual((await depositTo(emptied.id, { amount: 5_000, idempotencyKey: "em0" })).status, 200);
+    const out = await withdrawFrom(emptied.id, { amount: 5_000, idempotencyKey: "em1", confirmEarly: true });
+    assert.strictEqual(out.status, 200, JSON.stringify(out.body));
+    assert.strictEqual(out.body.movement.fee, 100, "the fee was paid on the way out");
+    const free = await PATCH(`/savings/pots/${emptied.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null });
+    assert.strictEqual(free.status, 200, JSON.stringify(free.body));
+    assert.strictEqual(free.body.pot.lockMode, null);
+  });
+
+  await test("a lock change needs the owner's PIN: none → 400, wrong → 401 PIN_WRONG, each audited, the pot unchanged; a rename needs none", async () => {
+    const day = lagosDayPlus(20);
+    const pot = (await mkPot({ name: "Rent", lockUntil: day, lockMode: "flexible" })).body.pot;
+    assert.strictEqual((await depositTo(pot.id, { amount: 10_000, idempotencyKey: "pn0" })).status, 200);
+    const fails = await auditCount("PIN_FAILED");
+    const far = lagosDayPlus(5 * 365);
+    const attempts = [
+      ["Unbreakable for five years, no PIN", { lockUntil: far, lockMode: "strict" }, 400],
+      ["Unbreakable for five years, a wrong PIN", { lockUntil: far, lockMode: "strict", pin: "0000" }, 401],
+      ["a later day alone, no PIN", { lockUntil: far }, 400],
+      ["a mode alone, no PIN", { lockMode: "strict" }, 400],
+    ];
+    for (const [label, change, status] of attempts) {
+      const r = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, ...change });
+      assert.strictEqual(r.status, status, `${label}: ${JSON.stringify(r.body)}`);
+      if (status === 401) assert.strictEqual(r.body?.code, "PIN_WRONG", label);
+    }
+    assert.strictEqual(await auditCount("PIN_FAILED"), fails + attempts.length, "every refused PIN is audited");
+    const row = await dbPot(pot.id);
+    assert.strictEqual(row.lockMode, "flexible", "nothing changed");
+    assert.strictEqual(row.lockUntil.toISOString(), lagosMidnightIso(day));
+    // A rename and a new target lock nothing: no PIN.
+    const rename = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, name: "Rent 2027", targetAmount: 500_000 });
+    assert.strictEqual(rename.status, 200, JSON.stringify(rename.body));
+    assert.strictEqual(rename.body.pot.name, "Rent 2027");
+    assert.strictEqual(rename.body.pot.lockMode, "flexible");
+    // With the PIN the same change goes through.
+    const ok = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: far, lockMode: "strict" });
+    assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
+    assert.strictEqual(ok.body.pot.lockMode, "strict");
+  });
+
+  await test("the audit rows keep the whole lock (before and after) and only the fields read: junk keys never reach the log", async () => {
+    const day = lagosDayPlus(10);
+    const pot = (await mkPot({ name: "Audit me", lockUntil: day, lockMode: "flexible" })).body.pot;
+    const created = await prisma.auditLog.findFirst({ where: { action: "SAVINGS_POT_CREATED", resourceId: pot.id } });
+    assert.deepStrictEqual(created.metadata, { lockMode: "flexible", lockUntil: lagosMidnightIso(day) });
+    const junk = Object.fromEntries(Array.from({ length: 2_000 }, (_, i) => [`junk${i}`, i]));
+    const r = await PATCH(`/savings/pots/${pot.id}`, tOwner, { ...junk, businessId: BIZ_ID, pin: PIN_OWNER, name: "Audited", lockUntil: lagosDayPlus(40), lockMode: "strict" });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    const latest = () => prisma.auditLog.findFirst({ where: { action: "SAVINGS_POT_UPDATED", resourceId: pot.id }, orderBy: { createdAt: "desc" } });
+    const row = await latest();
+    assert.deepStrictEqual(row.metadata, {
+      fields: ["name", "lockUntil", "lockMode"],
+      before: { lockUntil: lagosMidnightIso(day), lockMode: "flexible" },
+      after: { lockUntil: lagosMidnightIso(lagosDayPlus(40)), lockMode: "strict" },
+    });
+    assert.strictEqual(row.severity, "warn", "an Unbreakable lock is audited at warn");
+    const onlyJunk = await PATCH(`/savings/pots/${pot.id}`, tOwner, { ...junk, businessId: BIZ_ID });
+    assert.strictEqual(onlyJunk.status, 200, JSON.stringify(onlyJunk.body));
+    const row2 = await latest();
+    assert.notStrictEqual(row2.id, row.id);
+    assert.deepStrictEqual(row2.metadata, { fields: [] });
+    assert.strictEqual(row2.severity, "info");
+  });
+
+  // ══ 4c. A FEE SWEEP THAT FAILS ════════════════════════════════════════════
+  // The bank refused it (nothing moved: section 4), the answer was lost after
+  // the money moved, or the money moved and its row would not write: three
+  // different truths, three different alerts, and the books follow the bank.
+  section("4c. a fee sweep that fails tells a human what is true; the fee's bank row names no pot");
+  await seed();
+  const wedding = (await mkPot({ name: "Secret Wedding Fund", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+  assert.strictEqual((await depositTo(wedding.id, { amount: 100_000, idempotencyKey: "wd0" })).status, 200, "fixture deposit");
+
+  for (const [mode, key] of [["moved-then-502", "wd1"], ["moved-then-network", "wd2"]]) {
+    await test(`the fee moved but the answer was lost (${mode}): booked anyway, claimed once, and a human told to check the bank first`, async () => {
+      const ledgerBefore = await computeRawLedger(BIZ_ID, "NGN");
+      const grossBefore = anchorState.gross;
+      const callsBefore = bookCalls.length;
+      anchorState.bookMode = mode;
+      let w;
+      try { w = await withdrawFrom(wedding.id, { amount: 1_000, idempotencyKey: key, confirmEarly: true }); }
+      finally { anchorState.bookMode = "ok"; }
+      assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+      assert.strictEqual(w.body.movement.fee, 100);
+      assert.strictEqual(bookCalls.length, callsBefore + 1, "one attempt");
+      assert.ok(sameKobo(anchorState.gross, grossBefore - 100), "the bank moved the fee");
+      const feeRow = await dbTxnByRef(`kb_svw_${key}_bfee`);
+      assert.ok(feeRow, "the fee is booked: the safe side");
+      assert.strictEqual(feeRow.purpose, "savings_fee");
+      assert.strictEqual(feeRow.amount, 100);
+      assert.strictEqual(feeRow.providerTxnId, null, "no transfer id came back");
+      assert.ok(sameKobo(await computeRawLedger(BIZ_ID, "NGN"), ledgerBefore - 100), "the books moved with the bank");
+      const mv = await dbMovementByRef(`kb_svw_${key}`);
+      assert.ok(mv.feeCollectedAt, "claimed: never swept twice");
+      const alert = await alertFired(`savings-break-fee-${mv.id}`);
+      assert.ok(alert, "a human is alerted");
+      assert.ok(alert.lastValue.startsWith(`The ₦100 early-withdrawal fee kb_svw_${key}_bfee (Ada Stores) may have moved. Check Anchor for that reference before collecting anything.`), alert.lastValue);
+      assert.ok(!/refused|could not be swept/.test(alert.lastValue), "never the alert for money that did not move");
+      const a = await prisma.auditLog.findFirst({ where: { action: "SAVINGS_BREAK_FEE_UNCONFIRMED", resourceId: mv.id } });
+      assert.ok(a, "audited");
+      assert.strictEqual(a.severity, "alert");
+      assert.strictEqual(a.metadata.booked, true);
+      assert.strictEqual(await prisma.auditLog.count({ where: { action: { in: ["SAVINGS_BREAK_FEE_FAILED", "SAVINGS_BREAK_FEE"] }, resourceId: mv.id } }), 0);
+      const t = await reconcileSavings();
+      assert.strictEqual(t.feesCollected, 0, JSON.stringify(t));
+      assert.strictEqual(bookCalls.length, callsBefore + 1, "the loop never re-sends a claimed fee");
+    });
+  }
+
+  await test("the fee was swept but its row would not write (twice): the alert says never to collect it again", async () => {
+    const realCreate = prisma.transaction.create;
+    let failures = 0;
+    prisma.transaction.create = async (args) => {
+      if (String(args?.data?.reference || "").endsWith("_bfee")) { failures++; throw new Error("database went away (injected)"); }
+      return realCreate.call(prisma.transaction, args);
+    };
+    const callsBefore = bookCalls.length;
+    const grossBefore = anchorState.gross;
+    let w;
+    try { w = await withdrawFrom(wedding.id, { amount: 1_000, idempotencyKey: "wd3", confirmEarly: true }); }
+    finally { prisma.transaction.create = realCreate; }
+    assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+    assert.strictEqual(failures, 2, "the row write is tried twice");
+    assert.strictEqual(bookCalls.length, callsBefore + 1);
+    assert.ok(sameKobo(anchorState.gross, grossBefore - 100), "the fee moved");
+    assert.strictEqual(await dbTxnByRef("kb_svw_wd3_bfee"), null, "its row is missing");
+    const mv = await dbMovementByRef("kb_svw_wd3");
+    assert.ok(mv.feeCollectedAt, "claimed");
+    const alert = await alertFired(`savings-break-fee-${mv.id}`);
+    assert.ok(alert.lastValue.startsWith(`The ₦100 early-withdrawal fee kb_svw_wd3_bfee (Ada Stores) WAS swept (Anchor transfer anc_bk_${callsBefore + 1}), but its ledger row could not be written.`), alert.lastValue);
+    assert.ok(/Do not collect it again: add the savings_fee row\./.test(alert.lastValue), alert.lastValue);
+    const a = await prisma.auditLog.findFirst({ where: { action: "SAVINGS_BREAK_FEE_BOOKKEEPING_FAILED", resourceId: mv.id } });
+    assert.strictEqual(a?.metadata?.transferId, `anc_bk_${callsBefore + 1}`, JSON.stringify(a?.metadata));
+    assert.strictEqual(await prisma.auditLog.count({ where: { action: "SAVINGS_BREAK_FEE", resourceId: mv.id } }), 0);
+  });
+
+  await test("a row write that fails once is written on the second try: one row, collected, no alert", async () => {
+    const realCreate = prisma.transaction.create;
+    let failures = 0;
+    prisma.transaction.create = async (args) => {
+      if (String(args?.data?.reference || "").endsWith("_bfee") && failures === 0) { failures++; throw new Error("connection reset (injected)"); }
+      return realCreate.call(prisma.transaction, args);
+    };
+    let w;
+    try { w = await withdrawFrom(wedding.id, { amount: 1_000, idempotencyKey: "wd4", confirmEarly: true }); }
+    finally { prisma.transaction.create = realCreate; }
+    assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+    assert.strictEqual(failures, 1);
+    assert.strictEqual(await prisma.transaction.count({ where: { businessId: BIZ_ID, reference: "kb_svw_wd4_bfee" } }), 1);
+    const mv = await dbMovementByRef("kb_svw_wd4");
+    assert.strictEqual(await prisma.auditLog.count({ where: { action: "SAVINGS_BREAK_FEE", resourceId: mv.id } }), 1);
+    assert.strictEqual(await alertFired(`savings-break-fee-${mv.id}`), null);
+  });
+
+  await test("no fee row names the pot, and staff with every permission find no pot name in what /sync sends them", async () => {
+    const rows = await prisma.transaction.findMany({ where: { businessId: BIZ_ID, purpose: "savings_fee" }, select: { description: true, reference: true } });
+    assert.ok(rows.length >= 3, `fixture: fee rows ${rows.length}`);
+    for (const r of rows) assert.strictEqual(r.description, `Savings early withdrawal fee · Ref: ${r.reference}`);
+    for (const c of bookCalls.filter((b) => b.reference?.endsWith("_bfee"))) assert.ok(!/Wedding/.test(c.reason), c.reason);
+    const s = await GET(`/sync?businessId=${BIZ_ID}`, tStaff);
+    assert.strictEqual(s.status, 200, s.raw.slice(0, 300));
+    assert.ok(/kb_svw_wd4_bfee/.test(s.raw), "the fee rows are in what staff are sent (the check is not blind)");
+    assert.ok(!/Secret Wedding Fund/.test(s.raw), "the pot's name never reaches staff");
+    assert.strictEqual((await GET(`/savings?businessId=${BIZ_ID}`, tStaff)).status, 403);
   });
 
   // ══ 5. RECONCILE ══════════════════════════════════════════════════════════
@@ -1019,6 +1479,7 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
 
     const t1 = await reconcileSavings();
     assert.strictEqual(t1.feesCollected, 1, JSON.stringify(t1));
+    assert.strictEqual(t1.feesDeferred, 0);
     assert.strictEqual(t1.errors, 0);
     assert.strictEqual(bookCalls.length, 1);
     assert.strictEqual(bookCalls[0].reference, "kb_svw_rw1_bfee");
@@ -1062,7 +1523,139 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
       anchorState.gross = before;
     }
     const quiet = await reconcileSavings();
-    assert.deepStrictEqual(quiet, { feesCollected: 0, drift: 0, overReserved: 0, errors: 0 });
+    assert.deepStrictEqual(quiet, { feesCollected: 0, feesDeferred: 0, drift: 0, overReserved: 0, errors: 0 });
+  });
+
+  // ══ 5b. A FEE THAT MUST WAIT ══════════════════════════════════════════════
+  section("5b. a break fee never comes out of another pot: it waits for money");
+  await seed({ gross: 20_000 });
+  const vault = (await mkPot({ name: "Vault", lockUntil: lagosDayPlus(30), lockMode: "strict" })).body.pot;
+  const trip = (await mkPot({ name: "Trip", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+  assert.strictEqual((await depositTo(vault.id, { amount: 15_000, idempotencyKey: "v1" })).status, 200, "fixture deposit");
+  assert.strictEqual((await depositTo(trip.id, { amount: 5_000, idempotencyKey: "t1" })).status, 200, "fixture deposit");
+
+  await test("short of spendable money, the fee is deferred: the withdrawal succeeds, nothing is claimed or swept", async () => {
+    // Every naira is in a pot, then ₦1,000 leaves by a path the reserve does
+    // not gate (a bank charge, a legal debit): the bank now holds less than
+    // the pots promise.
+    anchorState.gross = 19_000;
+    const w = await withdrawFrom(trip.id, { amount: 1_000, idempotencyKey: "tw1", confirmEarly: true });
+    assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+    assert.strictEqual(w.body.movement.fee, 100, "the fee is owed");
+    assert.strictEqual(w.body.pot.balance, 4_000);
+    // Spendable after the withdrawal: 19,000 − (15,000 + 4,000) = 0. Sweeping
+    // the ₦100 now would take it from the money set aside in "Vault".
+    assert.strictEqual(bookCalls.length, 0, "no sweep");
+    const row = await dbMovementByRef("kb_svw_tw1");
+    assert.strictEqual(row.feeCollectedAt, null, "not claimed: it is still to collect");
+    assert.strictEqual(await dbTxnByRef("kb_svw_tw1_bfee"), null, "no fee row for money that did not move");
+    assert.strictEqual(anchorState.gross, 19_000);
+    assert.strictEqual((await dbPot(vault.id)).balance, 15_000, "the other pot is whole");
+    ctx.waitingFee = row;
+  });
+
+  await test("the loop defers it while short, alerts once a day after a day of waiting, and never sweeps it into another pot's money", async () => {
+    const t1 = await reconcileSavings();
+    assert.strictEqual(t1.feesDeferred, 1, JSON.stringify(t1));
+    assert.strictEqual(t1.feesCollected, 0);
+    assert.strictEqual(t1.errors, 0);
+    assert.strictEqual(t1.overReserved, 0, "19,000 set aside, 19,000 at the bank: not over");
+    const key = `savings-break-fee-waiting-${ctx.waitingFee.id}`;
+    assert.strictEqual(await alertFired(key), null, "no alert in the first day");
+    // A day and an hour later.
+    const old = new Date(Date.now() - 25 * 3600 * 1000);
+    await prisma.savingsMovement.update({ where: { id: ctx.waitingFee.id }, data: { createdAt: old, completedAt: old } });
+    const t2 = await reconcileSavings();
+    assert.strictEqual(t2.feesDeferred, 1, JSON.stringify(t2));
+    const first = await alertFired(key);
+    assert.ok(first, "a fee waiting over a day pages a human");
+    const t3 = await reconcileSavings();
+    assert.strictEqual(t3.feesDeferred, 1, JSON.stringify(t3));
+    assert.strictEqual((await alertFired(key)).lastFiredAt.getTime(), first.lastFiredAt.getTime(), "not every tick");
+    // Two hours on, the alert engine's own cooldown (an hour) has passed but
+    // the day has not: still quiet.
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600 * 1000);
+    await prisma.alertState.update({ where: { key }, data: { lastFiredAt: twoHoursAgo } });
+    assert.strictEqual((await reconcileSavings()).feesDeferred, 1);
+    assert.strictEqual((await alertFired(key)).lastFiredAt.getTime(), twoHoursAgo.getTime(), "once a day, not once an hour");
+    // A day on, while it still waits, it pages again.
+    const dayAgo = new Date(Date.now() - 25 * 3600 * 1000);
+    await prisma.alertState.update({ where: { key }, data: { lastFiredAt: dayAgo } });
+    assert.strictEqual((await reconcileSavings()).feesDeferred, 1);
+    assert.ok((await alertFired(key)).lastFiredAt > dayAgo, "and again the next day");
+    assert.strictEqual(bookCalls.length, 0, "still no sweep");
+  });
+
+  await test("once money arrives the loop sweeps it, once", async () => {
+    anchorState.gross += 5_000; // a customer pays in
+    const t1 = await reconcileSavings();
+    assert.strictEqual(t1.feesCollected, 1, JSON.stringify(t1));
+    assert.strictEqual(t1.feesDeferred, 0);
+    assert.strictEqual(bookCalls.length, 1);
+    assert.strictEqual(bookCalls[0].reference, "kb_svw_tw1_bfee");
+    assert.strictEqual(bookCalls[0].amount, 100);
+    assert.strictEqual(bookCalls[0].toAccountId, FEE_ACCOUNT);
+    assert.ok((await dbMovementByRef("kb_svw_tw1")).feeCollectedAt);
+    const feeRow = await dbTxnByRef("kb_svw_tw1_bfee");
+    assert.strictEqual(feeRow?.purpose, "savings_fee");
+    assert.strictEqual(feeRow?.amount, 100);
+    assert.strictEqual(anchorState.gross, 23_900);
+    assert.ok(anchorState.gross >= 19_000, "the pots are still covered");
+    const t2 = await reconcileSavings();
+    assert.deepStrictEqual(t2, { feesCollected: 0, feesDeferred: 0, drift: 0, overReserved: 0, errors: 0 });
+    assert.strictEqual(bookCalls.length, 1, "one sweep, ever");
+  });
+
+  // ══ 5c. THE QUEUE TURNS ═══════════════════════════════════════════════════
+  section("5c. fees that cannot be swept go to the back: no business holds up another");
+  await seed();
+
+  await test("50 old fees that cannot be swept never keep a newer fee of another business out: one bank read each a tick, swept on the second", async () => {
+    // The main business owes 50 old fees and its bank holds nothing, so every
+    // one of them waits. They hang off a closed pot, which the drift check
+    // passes by.
+    anchorState.grossBy[BIZ_ANCHOR_ID] = 0;
+    const dead = (await mkPot({ name: "Old pot" })).body.pot;
+    assert.strictEqual((await closePot(dead.id)).status, 204);
+    const old = new Date(Date.now() - 3600_000);
+    await prisma.savingsMovement.createMany({
+      data: Array.from({ length: 50 }, (_, i) => ({
+        potId: dead.id, businessId: BIZ_ID, userId: owner.id, type: "withdrawal", amount: 1, fee: 1,
+        status: "completed", reference: `kb_svw_stuck${i}`, createdAt: old, completedAt: old, updatedAt: old,
+      })),
+    });
+    // Another business's newer fee, deferred while its bank could not be read.
+    const shop = await mkBiz("sav_biz_q", "9990009996", "Queue Shop");
+    anchorState.grossBy[shop.anchorAccountId] = 100_000;
+    const potQ = (await mkPot({ name: "Q pot", businessId: shop.id, lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+    assert.strictEqual((await depositTo(potQ.id, { businessId: shop.id, amount: 10_000, idempotencyKey: "q0" })).status, 200);
+    anchorState.unreadable.add(shop.anchorAccountId);
+    let w;
+    try { w = await withdrawFrom(potQ.id, { businessId: shop.id, amount: 1_000, idempotencyKey: "q1", confirmEarly: true }); }
+    finally { anchorState.unreadable.delete(shop.anchorAccountId); }
+    assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+    assert.strictEqual((await dbMovementByRef("kb_svw_q1")).feeCollectedAt, null, "the newer fee waits");
+    const books = bookCalls.length;
+
+    anchorState.reads = {};
+    const t1 = await reconcileSavings();
+    assert.deepStrictEqual([t1.feesCollected, t1.feesDeferred, t1.errors], [0, 50, 0], JSON.stringify(t1));
+    assert.strictEqual(anchorState.reads[BIZ_ANCHOR_ID], 1, "one bank read for fifty fees of one business");
+    assert.strictEqual((await dbMovementByRef("kb_svw_q1")).feeCollectedAt, null, "the 50 older fees fill the first tick");
+    anchorState.reads = {};
+    const t2 = await reconcileSavings();
+    assert.strictEqual(t2.feesCollected, 1, `the newer fee is swept on the second tick: ${JSON.stringify(t2)}`);
+    assert.strictEqual(t2.feesDeferred, 49);
+    assert.strictEqual(anchorState.reads[BIZ_ANCHOR_ID], 1, "still one read");
+    assert.strictEqual(bookCalls.length, books + 1);
+    assert.strictEqual(bookCalls[books].reference, "kb_svw_q1_bfee");
+    assert.strictEqual(bookCalls[books].fromAccountId, shop.anchorAccountId);
+    assert.ok((await dbMovementByRef("kb_svw_q1")).feeCollectedAt);
+    // The 50 still wait, unclaimed, and keep taking their turn.
+    assert.strictEqual(await prisma.savingsMovement.count({ where: { businessId: BIZ_ID, fee: { gt: 0 }, feeCollectedAt: null } }), 50);
+    const t3 = await reconcileSavings();
+    assert.deepStrictEqual([t3.feesCollected, t3.feesDeferred, t3.errors], [0, 50, 0], JSON.stringify(t3));
+    assert.strictEqual(bookCalls.length, books + 1, "nothing swept from an empty account");
   });
 
   // ══ 6. FROZEN ═════════════════════════════════════════════════════════════
@@ -1115,50 +1708,183 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     }
   });
 
+  await test("a fee still waiting when the owner or the business is frozen is never swept: it waits for the freeze to lift, then goes once", async () => {
+    // A fee deferred while the bank could not be read.
+    const pot = (await mkPot({ name: "Frozen fee", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
+    assert.strictEqual((await depositTo(pot.id, { amount: 10_000, idempotencyKey: "ff0" })).status, 200);
+    anchorState.unreadable.add(BIZ_ANCHOR_ID);
+    let w;
+    try { w = await withdrawFrom(pot.id, { amount: 1_000, idempotencyKey: "ff1", confirmEarly: true }); }
+    finally { anchorState.unreadable.delete(BIZ_ANCHOR_ID); }
+    assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+    assert.strictEqual(w.body.movement.fee, 100);
+    const id = w.body.movement.id;
+    assert.strictEqual((await dbMovement(id)).feeCollectedAt, null, "deferred, not claimed");
+    // Waiting over a day, so a sweep that defers for money would page a human.
+    const dayAndHour = new Date(Date.now() - 25 * 3600 * 1000);
+    await prisma.savingsMovement.update({ where: { id }, data: { createdAt: dayAndHour, completedAt: dayAndHour } });
+    const books = bookCalls.length;
+    const setOwner = (s) => prisma.user.update({ where: { id: owner.id }, data: { accountStatus: s } });
+    const setBiz = (s) => prisma.business.update({ where: { id: BIZ_ID }, data: { accountStatus: s } });
+    for (const [what, set] of [["owner", setOwner], ["business", setBiz]]) {
+      await set("frozen");
+      try {
+        const t = await reconcileSavings();
+        assert.strictEqual(t.feesCollected, 0, `${what}: ${JSON.stringify(t)}`);
+        assert.strictEqual(t.feesDeferred, 0, `${what}: a frozen account's fee is not even looked at`);
+        // A freeze landing between the loop's list and its lock: the sweep itself waits.
+        const outcome = await prisma.withBusinessLock(BIZ_ID, () => savings.collectBreakFee(id));
+        assert.strictEqual(outcome, "deferred", what);
+        assert.strictEqual(bookCalls.length, books, `${what}: nothing leaves a frozen account`);
+        assert.strictEqual((await dbMovement(id)).feeCollectedAt, null, `${what}: nothing claimed`);
+        assert.strictEqual(await dbTxnByRef("kb_svw_ff1_bfee"), null);
+      } finally {
+        await set("active");
+      }
+    }
+    assert.strictEqual(await alertFired(`savings-break-fee-waiting-${id}`), null, "no fee-waiting alert: the freeze is already with a human");
+    const t = await reconcileSavings();
+    assert.strictEqual(t.feesCollected, 1, JSON.stringify(t));
+    assert.strictEqual(bookCalls.length, books + 1);
+    assert.strictEqual(bookCalls[books].reference, "kb_svw_ff1_bfee");
+    assert.ok((await dbMovement(id)).feeCollectedAt);
+    assert.strictEqual((await reconcileSavings()).feesCollected, 0, "once");
+  });
+
   // ══ 7. DELETION ═══════════════════════════════════════════════════════════
   section("7. deleting a business or an account — never around a pot with money");
   await seed();
 
-  await test("DELETE /businesses/:id with a pot balance → 400 SAVINGS_REMAINING; allowed once emptied and closed, pots cascade away", async () => {
-    const biz2 = await prisma.business.create({
-      data: {
-        id: "sav_biz2", userId: owner.id, name: "Second Shop", country: "NG", baseCurrency: "NGN",
-        anchorAccountId: "anchor-acct-sav2", virtualAccountNumber: "9990009998",
-        virtualAccountBank: "Providus Bank", virtualAccountName: "SECOND SHOP", kycBusinessType: "limited_company",
-      },
-    });
+  await test("DELETE /businesses/:id of ANOTHER owner's business → 404, and not a word about its pots", async () => {
+    const biz2 = await mkBiz("sav_biz2", "9990009998");
     const pot = (await mkPot({ name: "Van", businessId: biz2.id })).body.pot;
     assert.ok(pot?.id, "fixture: pot on the second business");
     assert.strictEqual((await depositTo(pot.id, { businessId: biz2.id, amount: 5_000, idempotencyKey: "b2d1" })).status, 200);
-    const staffTry = await DEL(`/businesses/${biz2.id}`, tStaff);
-    assert.strictEqual(staffTry.status, 403);
-    const r = await DEL(`/businesses/${biz2.id}`, tOwner);
-    assert.strictEqual(r.status, 400, JSON.stringify(r.body));
-    assert.strictEqual(r.body?.code, "SAVINGS_REMAINING");
-    assert.ok(/Van/.test(r.body.error), `names the pot: ${r.body.error}`);
+    const { user: other, token: tOther } = await mkUser("sav_other7");
+    // Two businesses of their own, so "your only business" is not what answers.
+    for (const id of ["sav_other7_a", "sav_other7_b"]) {
+      await prisma.business.create({ data: { id, userId: other.id, name: id, country: "NG", baseCurrency: "NGN" } });
+    }
+    const r = await DEL(`/businesses/${biz2.id}`, tOther);
+    assert.strictEqual(r.status, 404, JSON.stringify(r.body));
+    assert.ok(!/Van/.test(r.raw), `the pot's name must not leave the server: ${r.raw}`);
+    assert.ok(!("potName" in (r.body || {})) && r.body?.code !== "SAVINGS_REMAINING", JSON.stringify(r.body));
+    assert.strictEqual((await DEL("/businesses/no-such-business", tOwner)).status, 404);
     assert.ok(await prisma.business.findUnique({ where: { id: biz2.id } }), "nothing was deleted");
     assert.strictEqual((await dbPot(pot.id)).balance, 5_000);
-    assert.strictEqual((await withdrawFrom(pot.id, { businessId: biz2.id, amount: 5_000, idempotencyKey: "b2w1" })).status, 200);
-    assert.strictEqual((await closePot(pot.id, { businessId: biz2.id })).status, 204);
-    const ok = await DEL(`/businesses/${biz2.id}`, tOwner);
-    assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
-    assert.strictEqual(await prisma.business.findUnique({ where: { id: biz2.id } }), null);
-    assert.strictEqual(await prisma.savingsPot.count({ where: { businessId: biz2.id } }), 0, "pots go with the business");
-    assert.strictEqual(await prisma.savingsMovement.count({ where: { businessId: biz2.id } }), 0);
-    assert.ok(await prisma.business.findUnique({ where: { id: BIZ_ID } }), "the other business is untouched");
+    ctx.vanPot = pot;
   });
 
-  await test("delete-account with a pot balance → 400 SAVINGS_REMAINING, nothing deleted", async () => {
-    const pot = (await mkPot({ name: "Rent" })).body.pot;
-    assert.strictEqual((await depositTo(pot.id, { amount: 5_000, idempotencyKey: "del1" })).status, 200);
+  await test("DELETE /businesses/:id with a pot balance → 409 SAVINGS_REMAINING naming the pot; allowed once emptied and closed, pots cascade away", async () => {
+    const pot = ctx.vanPot;
+    const staffTry = await DEL("/businesses/sav_biz2", tStaff);
+    assert.strictEqual(staffTry.status, 403);
+    const r = await DEL("/businesses/sav_biz2", tOwner);
+    assert.strictEqual(r.status, 409, JSON.stringify(r.body));
+    assert.deepStrictEqual(Object.keys(r.body).sort(), REFUSAL_KEYS);
+    assert.strictEqual(r.body.code, "SAVINGS_REMAINING");
+    assert.strictEqual(r.body.potName, "Van");
+    assert.strictEqual(r.body.opensOn, null, "an unlocked pot has no opening day");
+    assert.strictEqual(r.body.unbreakable, false);
+    assert.strictEqual(r.body.error, 'The savings pot "Van" still has money in it. Take it out and close the pot first, then delete this business.');
+    assert.ok(await prisma.business.findUnique({ where: { id: "sav_biz2" } }), "nothing was deleted");
+    assert.strictEqual((await dbPot(pot.id)).balance, 5_000);
+    assert.strictEqual((await withdrawFrom(pot.id, { businessId: "sav_biz2", amount: 5_000, idempotencyKey: "b2w1" })).status, 200);
+    assert.strictEqual((await closePot(pot.id, { businessId: "sav_biz2" })).status, 204);
+    // The pots are empty; the bank-balance guard /auth/delete-account uses
+    // answers next. Money in the account stops the delete, and so does a
+    // bank that cannot be read (fail closed).
+    const acct = "anchor-acct-sav_biz2";
+    anchorState.grossBy[acct] = 5_000;
+    const funded = await DEL("/businesses/sav_biz2", tOwner);
+    assert.strictEqual(funded.status, 400, JSON.stringify(funded.body));
+    assert.strictEqual(funded.body?.code, "BALANCE_REMAINING");
+    assert.strictEqual(funded.body?.error, "Second Shop still has money in its bank account. Transfer it out first, then delete this business.");
+    anchorState.unreadable.add(acct);
+    let down;
+    try { down = await DEL("/businesses/sav_biz2", tOwner); }
+    finally { anchorState.unreadable.delete(acct); }
+    assert.strictEqual(down.status, 503, JSON.stringify(down.body));
+    assert.strictEqual(down.body?.code, "BALANCE_UNAVAILABLE");
+    assert.ok(await prisma.business.findUnique({ where: { id: "sav_biz2" } }), "neither refusal deleted anything");
+    assert.strictEqual(await auditCount("BUSINESS_DELETED"), 0);
+    anchorState.grossBy[acct] = 0;
+    const ok = await DEL("/businesses/sav_biz2", tOwner);
+    assert.strictEqual(ok.status, 200, JSON.stringify(ok.body));
+    assert.strictEqual(await prisma.business.findUnique({ where: { id: "sav_biz2" } }), null);
+    assert.strictEqual(await prisma.savingsPot.count({ where: { businessId: "sav_biz2" } }), 0, "pots go with the business");
+    assert.strictEqual(await prisma.savingsMovement.count({ where: { businessId: "sav_biz2" } }), 0);
+    assert.ok(await prisma.business.findUnique({ where: { id: BIZ_ID } }), "the other business is untouched");
+    const a = await prisma.auditLog.findFirst({ where: { action: "BUSINESS_DELETED", resourceId: "sav_biz2" } });
+    assert.ok(a, "a deletion is audited");
+    assert.deepStrictEqual(a.metadata, { name: "Second Shop", banked: true });
+  });
+
+  await test("an Unbreakable pot refuses DELETE /businesses/:id with the day it opens: nobody, not even KashBook", async () => {
+    const biz3 = await mkBiz("sav_biz3", "9990009997", "Third Shop");
+    const day = lagosDayPlus(40);
+    const pot = (await mkPot({ name: "School fees", businessId: biz3.id, lockUntil: day, lockMode: "strict" })).body.pot;
+    assert.ok(pot?.id, "fixture: Unbreakable pot");
+    assert.strictEqual((await depositTo(pot.id, { businessId: biz3.id, amount: 3_000, idempotencyKey: "b3d1" })).status, 200);
+    const r = await DEL(`/businesses/${biz3.id}`, tOwner);
+    assert.strictEqual(r.status, 409, JSON.stringify(r.body));
+    assert.deepStrictEqual(Object.keys(r.body).sort(), REFUSAL_KEYS);
+    assert.strictEqual(r.body.code, "SAVINGS_REMAINING");
+    assert.strictEqual(r.body.potName, "School fees");
+    assert.strictEqual(r.body.opensOn, day);
+    assert.strictEqual(r.body.unbreakable, true);
+    assert.strictEqual(r.body.error, `The savings pot "School fees" is unbreakable and opens on ${inWords(day)}. Nobody, not even KashBook, can take the money out before then. After that, take it out and close the pot, then delete this business.`);
+    const out = await withdrawFrom(pot.id, { businessId: biz3.id, amount: 3_000, idempotencyKey: "b3w0", confirmEarly: true });
+    assert.strictEqual(out.status, 423, "and it cannot be emptied to get round the refusal");
+    assert.ok(await prisma.business.findUnique({ where: { id: biz3.id } }));
+    ctx.schoolPot = pot;
+    ctx.schoolDay = day;
+  });
+
+  await test("delete-account with an Unbreakable pot → 409 naming it and its day, before an older plain pot; nothing deleted", async () => {
+    // An older pot with money in the main business: the Unbreakable one is
+    // still the one named, because it is the one nobody can empty.
+    const float = (await mkPot({ name: "Float" })).body.pot;
+    await prisma.savingsPot.update({ where: { id: float.id }, data: { createdAt: new Date(Date.now() - 86400000) } });
+    assert.strictEqual((await depositTo(float.id, { amount: 1_000, idempotencyKey: "fl1" })).status, 200);
     const staffTry = await POST("/auth/delete-account", tStaff, { password: PASSWORD });
     assert.strictEqual(staffTry.status, 403);
     const wrongPw = await POST("/auth/delete-account", tOwner, { password: "not-it" });
     assert.strictEqual(wrongPw.status, 401);
     const r = await POST("/auth/delete-account", tOwner, { password: PASSWORD });
-    assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+    assert.strictEqual(r.status, 409, JSON.stringify(r.body));
+    assert.deepStrictEqual(Object.keys(r.body).sort(), REFUSAL_KEYS);
+    assert.strictEqual(r.body.potName, "School fees");
+    assert.strictEqual(r.body.opensOn, ctx.schoolDay);
+    assert.strictEqual(r.body.unbreakable, true);
+    assert.strictEqual(r.body.error, `Your savings pot "School fees" is unbreakable and opens on ${inWords(ctx.schoolDay)}. Nobody, not even KashBook, can take the money out before then. After that, take it out and close the pot, then delete your account.`);
+    const u = await prisma.user.findUnique({ where: { id: owner.id } });
+    assert.strictEqual(u.accountStatus, "active", "nothing was deleted");
+    assert.strictEqual(u.tokenVersion, 0);
+    // Its day comes: emptied and closed, the business can go, and the plain pot is next in line.
+    await prisma.savingsPot.update({ where: { id: ctx.schoolPot.id }, data: { lockUntil: minutesAgo(1) } });
+    assert.strictEqual((await withdrawFrom(ctx.schoolPot.id, { businessId: "sav_biz3", amount: 3_000, idempotencyKey: "b3w1" })).status, 200);
+    assert.strictEqual((await closePot(ctx.schoolPot.id, { businessId: "sav_biz3" })).status, 204);
+    anchorState.grossBy["anchor-acct-sav_biz3"] = 0; // its account is empty too
+    assert.strictEqual((await DEL("/businesses/sav_biz3", tOwner)).status, 200);
+    const next = await POST("/auth/delete-account", tOwner, { password: PASSWORD });
+    assert.strictEqual(next.status, 409, JSON.stringify(next.body));
+    assert.strictEqual(next.body.potName, "Float");
+    assert.strictEqual(next.body.unbreakable, false);
+    assert.strictEqual((await withdrawFrom(float.id, { amount: 1_000, idempotencyKey: "fl2" })).status, 200);
+    assert.strictEqual((await closePot(float.id)).status, 204);
+  });
+
+  await test("delete-account with a pot balance → 409 SAVINGS_REMAINING, nothing deleted", async () => {
+    const pot = (await mkPot({ name: "Rent" })).body.pot;
+    assert.strictEqual((await depositTo(pot.id, { amount: 5_000, idempotencyKey: "del1" })).status, 200);
+    const r = await POST("/auth/delete-account", tOwner, { password: PASSWORD });
+    assert.strictEqual(r.status, 409, JSON.stringify(r.body));
     assert.strictEqual(r.body?.code, "SAVINGS_REMAINING");
-    assert.ok(/Rent/.test(r.body.error), `names the pot: ${r.body.error}`);
+    assert.strictEqual(r.body.potName, "Rent");
+    assert.strictEqual(r.body.opensOn, null);
+    assert.strictEqual(r.body.unbreakable, false);
+    assert.strictEqual(r.body.error, 'Your savings pot "Rent" still has money in it. Take it out and close the pot first, then delete your account.');
     const u = await prisma.user.findUnique({ where: { id: owner.id } });
     assert.strictEqual(u.accountStatus, "active", "nothing was deleted");
     assert.strictEqual(u.tokenVersion, 0);
@@ -1185,6 +1911,56 @@ const wideRange = () => ({ start: new Date(Date.now() - 2 * 86400000), end: new 
     const after = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
     assert.strictEqual(after.status, 401, "the old token is dead");
     assert.strictEqual(await auditCount("ACCOUNT_DELETED"), 1);
+  });
+
+  // ══ 8. /auth/me FLAGS ═════════════════════════════════════════════════════
+  section("8. /auth/me: the retired flag, the switch, and who sees savings");
+  await seed();
+
+  await test("switch on: savings stays false (older apps never show it), savingsPots true, the owner sees savings and staff do not", async () => {
+    const o = await meFeatures(tOwner);
+    assert.strictEqual(o.savings, false, "the first flag is retired for good");
+    assert.strictEqual(o.savingsPots, true);
+    assert.strictEqual(o.savingsVisible, true, "the owner sees savings, pots or not");
+    assert.strictEqual(typeof o.fcy, "boolean");
+    const s = await meFeatures(tStaff);
+    assert.strictEqual(s.savings, false);
+    assert.strictEqual(s.savingsPots, true, "the switch itself is no secret");
+    assert.strictEqual(s.savingsVisible, false, "staff never see pots");
+  });
+
+  await test("switch off: savings shows only while an owner's pot still holds money, never another owner's", async () => {
+    const pot = (await mkPot({ name: "Kept", lockUntil: lagosDayPlus(10), lockMode: "strict" })).body.pot;
+    const empty = (await mkPot({ name: "Empty" })).body.pot;
+    assert.ok(pot?.id && empty?.id, "fixtures");
+    const { token: tOther } = await mkUser("sav_other8");
+    delete process.env.SAVINGS_ENABLED;
+    try {
+      const o = await meFeatures(tOwner);
+      assert.deepStrictEqual([o.savings, o.savingsPots, o.savingsVisible], [false, false, false], "empty pots hide nothing: no money to show");
+    } finally { process.env.SAVINGS_ENABLED = "true"; }
+    assert.strictEqual((await depositTo(pot.id, { amount: 2_500, idempotencyKey: "me1" })).status, 200);
+    delete process.env.SAVINGS_ENABLED;
+    try {
+      const o = await meFeatures(tOwner);
+      assert.strictEqual(o.savingsPots, false);
+      assert.strictEqual(o.savingsVisible, true, "turning the switch off never hides money");
+      assert.strictEqual(o.savings, false);
+      assert.strictEqual((await meFeatures(tStaff)).savingsVisible, false, "not even then for staff");
+      assert.strictEqual((await meFeatures(tOther)).savingsVisible, false, "another owner's pot is not this owner's");
+      // The pot stays readable and its lock holds with the switch off.
+      const list = await GET(`/savings?businessId=${BIZ_ID}`, tOwner);
+      assert.strictEqual(list.status, 200);
+      assert.strictEqual(list.body.enabled, false);
+      assert.ok(list.body.pots.some((p) => p.id === pot.id && p.balance === 2_500));
+      assert.strictEqual((await withdrawFrom(pot.id, { amount: 2_500, idempotencyKey: "me2", confirmEarly: true })).status, 423);
+      // Its day comes; emptied, savings is hidden again.
+      await prisma.savingsPot.update({ where: { id: pot.id }, data: { lockUntil: minutesAgo(1) } });
+      assert.strictEqual((await withdrawFrom(pot.id, { amount: 2_500, idempotencyKey: "me3" })).status, 200);
+      assert.strictEqual((await meFeatures(tOwner)).savingsVisible, false);
+    } finally {
+      process.env.SAVINGS_ENABLED = "true";
+    }
   });
 
   // ── done ──

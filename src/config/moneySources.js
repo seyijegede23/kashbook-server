@@ -50,27 +50,32 @@ function isLedgerBankRow(tx, currency = "NGN") {
   return tx.type === "expense" && tx.category === "transfer";
 }
 
-// ── Savings rows ─────────────────────────────────────────────────────────────
-// A bank row whose `purpose` is set was created by the savings feature. Today
-// that is only "savings_fee": the early-withdrawal charge swept to KashBook's
-// fee account when a merchant breaks a flexible lock. It is not trade, so it
-// is neither an expense nor income for REPORTING (Insights, the monthly and
-// daily reports, the admin revenue chart), and every such aggregate must carry
-// NOT_SAVINGS (Prisma) or SQL_NOT_SAVINGS (raw SQL), exactly as they already
-// leave out the transfer fee on an ordinary send.
+// ── Rows with a purpose ──────────────────────────────────────────────────────
+// A bank row whose `purpose` is set is something other than plain trade: a
+// customer or supplier refund, a cash deposit, money explained with an
+// account, the early-withdrawal fee on a savings pot. The books rule
+// (utils/books.js) decides what each one counts as; the savings fee, for one,
+// is a Bank Fees and Charges expense. A raw aggregate over bank rows that is
+// not the books (the admin revenue figures, the analytics snapshot, the
+// monthly report's entry counts) counts only rows with NO purpose: spread
+// NO_PURPOSE (Prisma) or append SQL_NO_PURPOSE (raw SQL). The name says what
+// it leaves out: every purpose, not only the savings one.
 //
-// It IS real money for the LEDGER: computeLedgerBalance, the AML money-out
-// windows, the staff transfer cap and the drift alarm must keep counting these
-// rows, because the bank account did move by that amount. Never add the
-// exclusion there.
+// Every such row IS real money for the LEDGER: computeLedgerBalance, the AML
+// money-out windows, the staff transfer cap and the drift alarm must keep
+// counting them, because the bank account did move by that amount. Never add
+// the exclusion there.
+const NO_PURPOSE = Object.freeze({ purpose: null });
+const SQL_NO_PURPOSE = 'AND "purpose" IS NULL';
+
+// The purposes the savings feature writes: only "savings_fee", the charge for
+// taking money out of a Breakable pot early, swept to KashBook's fee account.
 const SAVINGS_PURPOSES = Object.freeze(["savings_fee"]);
-const NOT_SAVINGS = Object.freeze({ purpose: null });
-const SQL_NOT_SAVINGS = 'AND "purpose" IS NULL';
 
 function isSavingsRow(tx) {
   return !!(tx && tx.purpose && SAVINGS_PURPOSES.includes(tx.purpose));
 }
 
 module.exports = {
-  PROVIDER_SOURCES, isBankLedgerRow, isLedgerBankRow, SAVINGS_PURPOSES, NOT_SAVINGS, SQL_NOT_SAVINGS, isSavingsRow,
+  PROVIDER_SOURCES, isBankLedgerRow, isLedgerBankRow, NO_PURPOSE, SQL_NO_PURPOSE, SAVINGS_PURPOSES, isSavingsRow,
 };
