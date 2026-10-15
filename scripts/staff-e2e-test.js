@@ -109,6 +109,7 @@ app.use("/recurring-expenses", require("../src/routes/recurringExpenses").router
 app.use("/sync", require("../src/routes/sync"));
 app.use("/bills", require("../src/routes/bills"));
 app.use("/insights", require("../src/routes/insights"));
+app.use("/instagram", require("../src/routes/instagram"));
 
 let server, BASE;
 
@@ -226,7 +227,7 @@ async function wipe() {
 const grant = (perms, cap) =>
   PATCH(`/auth/staff/${staff.id}/permissions`, tOwner, { pin: PIN_OWNER, permissions: perms, dailyTransferCap: cap });
 
-const ALL_OFF = { canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false };
+const ALL_OFF = { canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false, canUseInstagram: false };
 
 const send = (amount, over = {}) =>
   POST("/transfers/send", tStaff, {
@@ -688,6 +689,60 @@ const send = (amount, over = {}) =>
   await test("a refused staff send leaves a trail", async () => {
     const denied = await prisma.auditLog.count({ where: { action: "STAFF_PERMISSION_DENIED" } });
     assert.ok(denied > 0, "probing the money endpoint must be visible");
+  });
+
+  // ══ 7. INSTAGRAM MESSAGES (owner, 2026-10-15) ══════════════════════════════
+  section("7. Instagram messages: only the staff the owner lets answer them");
+  // Section 5 deleted the staff member: fresh fixtures.
+  await wipe();
+  await seed();
+  const igGet = (p, t) => GET(`/instagram/${p}${p.includes("?") ? "&" : "?"}businessId=${biz.id}`, t);
+  await test("without the grant a staff member reaches none of the business's Instagram messages", async () => {
+    assert.strictEqual((await grant(ALL_OFF, 0)).status, 200);
+    for (const p of ["conversations", "unread-count", "status", "quick-replies", "auto-replies"]) {
+      const r = await igGet(p, tStaff);
+      assert.strictEqual(r.status, 403, `${p}: ${r.status} ${JSON.stringify(r.body)}`);
+      assert.strictEqual(r.body?.code, "PERMISSION_DENIED", p);
+      assert.strictEqual(r.body?.permission, "canUseInstagram", p);
+    }
+    const reply = await POST("/instagram/conversations/any/reply", tStaff, { text: "hi" });
+    assert.strictEqual(reply.status, 403, "no reply either");
+    const me = await GET("/auth/me", tStaff);
+    assert.strictEqual(me.body.user.permissions.canUseInstagram, false, "off by default");
+    assert.strictEqual((await GET("/auth/me", tOwner)).body.user.permissions.canUseInstagram, true, "the owner holds it");
+  });
+  await test("granted, they read the inbox like the owner; the grant shows on /me and in the staff list", async () => {
+    const g = await grant({ ...ALL_OFF, canUseInstagram: true }, 0);
+    assert.strictEqual(g.status, 200, JSON.stringify(g.body));
+    assert.strictEqual(g.body.permissions.canUseInstagram, true);
+    assert.strictEqual((await GET("/auth/me", tStaff)).body.user.permissions.canUseInstagram, true);
+    const row = (await GET("/auth/staff", tOwner)).body.find((x) => x.id === staff.id);
+    assert.strictEqual(row.permissions.canUseInstagram, true);
+    for (const t of [tStaff, tOwner]) {
+      const r = await igGet("conversations", t);
+      assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+      assert.ok(Array.isArray(r.body.conversations));
+    }
+    assert.strictEqual((await igGet("unread-count", tStaff)).body.count, 0);
+    assert.strictEqual((await igGet("status", tStaff)).status, 200);
+  });
+  await test("the grant opens the inbox only: no connecting, no DM-to-sale figures without Reports, no payment details without bank access", async () => {
+    assert.notStrictEqual((await igGet("connect-url", tStaff)).status, 200, "connecting stays the owner's");
+    assert.strictEqual((await POST("/instagram/disconnect", tStaff, { businessId: biz.id })).status, 403);
+    const an = await igGet("analytics", tStaff);
+    assert.strictEqual(an.status, 403, JSON.stringify(an.body));
+    assert.strictEqual(an.body?.permission, "canViewReports");
+    const pay = await POST("/instagram/conversations/any/send-payment", tStaff, {});
+    assert.strictEqual(pay.status, 403, JSON.stringify(pay.body));
+    assert.strictEqual(pay.body?.permission, "canViewBalance");
+    await grant({ ...ALL_OFF, canUseInstagram: true, canViewReports: true }, 0);
+    assert.strictEqual((await igGet("analytics", tStaff)).status, 200, "with Reports the figures open");
+  });
+  await test("taken away, the inbox shuts on the very next request", async () => {
+    await grant(ALL_OFF, 0);
+    assert.strictEqual((await igGet("conversations", tStaff)).status, 403);
+    const audits = await prisma.auditLog.findMany({ where: { action: "STAFF_PERMISSION_GRANTED", actorId: owner.id }, select: { metadata: true } });
+    assert.ok(audits.some((a) => JSON.stringify(a.metadata).includes("canUseInstagram")), "the grant and its removal are audited by name");
   });
 
   await wipe();

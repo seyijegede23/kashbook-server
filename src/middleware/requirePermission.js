@@ -14,6 +14,7 @@ const PERMISSIONS = Object.freeze([
   "canTransfer",
   "canViewReports",
   "canManagePayables",
+  "canUseInstagram",
 ]);
 
 // Written for the person who hits the wall, so they know who can lift it.
@@ -26,6 +27,8 @@ const MESSAGES = {
     "You don't have access to reports and insights. Ask the business owner to turn it on for you.",
   canManagePayables:
     "You don't have access to bills and payables. Ask the business owner to turn it on for you.",
+  canUseInstagram:
+    "You don't have access to the business's Instagram messages. Ask the business owner to turn it on for you.",
 };
 
 /**

@@ -29,10 +29,10 @@ const MAX_STAFF_DAILY_CAP = 50_000_000;
 // refuses produces a button that fails, and a client that believes it lacks one
 // produces a feature the owner paid for and cannot find.
 const NO_PERMISSIONS = Object.freeze({
-  canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false,
+  canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false, canUseInstagram: false,
 });
 const ALL_PERMISSIONS = Object.freeze({
-  canViewBalance: true, canTransfer: true, canViewReports: true, canManagePayables: true,
+  canViewBalance: true, canTransfer: true, canViewReports: true, canManagePayables: true, canUseInstagram: true,
 });
 function resolvePermissions(user) {
   if (String(user.accountType).toUpperCase() !== "STAFF") {
@@ -54,6 +54,7 @@ function resolvePermissions(user) {
       canTransfer: usable.canTransfer === true,
       canViewReports: usable.canViewReports === true,
       canManagePayables: usable.canManagePayables === true,
+      canUseInstagram: usable.canUseInstagram === true,
     },
     dailyTransferCap: Number(usable.dailyTransferCap ?? 0) || 0,
   };
@@ -1175,7 +1176,7 @@ router.get("/staff", authMiddleware, async (req, res) => {
         staffPermission: {
           select: {
             canViewBalance: true, canTransfer: true, canViewReports: true,
-            canManagePayables: true, dailyTransferCap: true, employerId: true,
+            canManagePayables: true, canUseInstagram: true, dailyTransferCap: true, employerId: true,
           },
         },
       },
@@ -1194,6 +1195,7 @@ router.get("/staff", authMiddleware, async (req, res) => {
             canTransfer: g?.canTransfer === true,
             canViewReports: g?.canViewReports === true,
             canManagePayables: g?.canManagePayables === true,
+            canUseInstagram: g?.canUseInstagram === true,
           },
           dailyTransferCap: Number(g?.dailyTransferCap ?? 0) || 0,
         };
@@ -1261,7 +1263,7 @@ router.post("/staff", authMiddleware, async (req, res) => {
     const { password: _pw, ...safe } = newStaff;
     res.status(201).json({
       ...safe,
-      permissions: { canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false },
+      permissions: { canViewBalance: false, canTransfer: false, canViewReports: false, canManagePayables: false, canUseInstagram: false },
       dailyTransferCap: 0,
     });
   } catch (err) {
@@ -1314,6 +1316,7 @@ router.patch("/staff/:id/permissions", authMiddleware, async (req, res) => {
       canTransfer: permissions.canTransfer === true,
       canViewReports: permissions.canViewReports === true,
       canManagePayables: permissions.canManagePayables === true,
+      canUseInstagram: permissions.canUseInstagram === true,
     };
 
     // A cap is meaningless without the permission it bounds, and a negative or

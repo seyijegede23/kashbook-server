@@ -1603,6 +1603,7 @@ model StaffPermission {
   canTransfer       Boolean @default(false) // send money, subject to dailyTransferCap
   canViewReports    Boolean @default(false) // reports and insights
   canManagePayables Boolean @default(false) // add suppliers, record payments
+  canUseInstagram   Boolean @default(false) // read the business's Instagram messages and reply (2026-10-15)
 
   // Autonomous spend ceiling over a ROLLING 24 hours (not a calendar day — a
   // midnight reset would let a staff member spend the cap twice inside two

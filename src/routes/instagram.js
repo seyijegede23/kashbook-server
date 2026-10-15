@@ -218,6 +218,11 @@ router.get("/callback", async (req, res) => {
 
 // ── Everything below requires auth ───────────────────────────────────────────
 router.use(auth);
+// Staff read and answer the business's Instagram messages only when the owner
+// has turned it on for them (canUseInstagram, owner 2026-10-15); the owner
+// always can. Connecting and disconnecting stay the owner's alone (below), and
+// sending payment details also needs bank access (canViewBalance).
+router.use(requirePermission("canUseInstagram"));
 
 // GET /instagram/connect-url?businessId= → { url }
 router.get("/connect-url", async (req, res) => {
@@ -681,7 +686,8 @@ router.get("/unread-count", async (req, res) => {
 });
 
 // GET /instagram/analytics?businessId= → inbox + DM→sale conversion stats
-router.get("/analytics", async (req, res) => {
+// The DM-to-sale figures are sales totals: report data (canViewReports).
+router.get("/analytics", requirePermission("canViewReports"), async (req, res) => {
   try {
     const business = await resolveBusiness(req, req.query.businessId);
     if (!business) return res.status(404).json({ error: "Business not found." });

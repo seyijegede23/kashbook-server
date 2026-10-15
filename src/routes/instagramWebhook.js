@@ -136,6 +136,13 @@ router.post("/", async (req, res) => {
         const who = convo?.participantUsername ? `@${convo.participantUsername}` : "an Instagram customer";
         const preview = (text || (attachmentUrl ? "sent a photo 📷" : "sent you a message")).slice(0, 140);
         await pushTo(business.userId, "📩 New Instagram message", `${who}: ${preview}`).catch(() => {});
+        // And the staff the owner lets answer them (canUseInstagram), with the
+        // same employer cross-check authMiddleware makes.
+        const answerers = await prisma.staffPermission.findMany({
+          where: { employerId: business.userId, canUseInstagram: true, user: { employerId: business.userId } },
+          select: { userId: true },
+        }).catch(() => []);
+        for (const s of answerers) await pushTo(s.userId, "📩 New Instagram message", `${who}: ${preview}`).catch(() => {});
 
         // Automated reply (greeting / keyword / away) — fire-and-forget, outside the lock.
         require("../utils/igAutoReply")

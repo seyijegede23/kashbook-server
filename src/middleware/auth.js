@@ -9,6 +9,7 @@ const OWNER_PERMISSIONS = Object.freeze({
   canTransfer: true,
   canViewReports: true,
   canManagePayables: true,
+  canUseInstagram: true,
 });
 
 async function authMiddleware(req, res, next) {
@@ -60,7 +61,7 @@ async function authMiddleware(req, res, next) {
           select: {
             employerId: true, dailyTransferCap: true,
             canViewBalance: true, canTransfer: true,
-            canViewReports: true, canManagePayables: true,
+            canViewReports: true, canManagePayables: true, canUseInstagram: true,
           },
         }),
       ]);
@@ -79,6 +80,7 @@ async function authMiddleware(req, res, next) {
         canTransfer:       usable?.canTransfer       === true,
         canViewReports:    usable?.canViewReports    === true,
         canManagePayables: usable?.canManagePayables === true,
+        canUseInstagram:   usable?.canUseInstagram   === true,
       });
       dailyTransferCap = Number(usable?.dailyTransferCap ?? 0) || 0;
     }

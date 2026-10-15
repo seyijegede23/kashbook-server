@@ -271,7 +271,8 @@ const dbSchedule = (id) => prisma.salarySchedule.findUnique({ where: { id } });
     const { PERMISSIONS } = require("../src/middleware/requirePermission");
     assert.deepStrictEqual(
       [...PERMISSIONS].sort(),
-      ["canManagePayables", "canTransfer", "canViewBalance", "canViewReports"],
+      // canUseInstagram (owner, 2026-10-15) reads and answers Instagram messages: not pay.
+      ["canManagePayables", "canTransfer", "canUseInstagram", "canViewBalance", "canViewReports"],
       "adding a payroll permission would let a staff member schedule their own pay",
     );
   });
