@@ -1139,6 +1139,15 @@ test("collectSavingsFee runs only under the business lock: inside the withdrawal
   }
 });
 
+test("every pot is Breakable or Unbreakable (owner, 2026-10-15): none is made without a lock, and none loses it", () => {
+  const create = fnBody(sv, "async function createPot(");
+  assert.ok(/if \(!lockUntil && !lockMode\) throw new SavingsError\("Choose Breakable or Unbreakable and the day the pot opens\.", "LOCK_REQUIRED", 400\);/.test(create), "a pot with neither is refused");
+  mustPrecede(create, '"LOCK_REQUIRED", 400', "prisma.savingsPot.create(", "create");
+  const update = fnBody(sv, "async function updatePot(");
+  assert.ok(!/data\.lockUntil = null/.test(update) && !/data\.lockMode = null/.test(update), "an edit never clears a lock");
+  assert.ok(/"LOCK_REQUIRED", 400\);/.test(update), "removing a lock is refused with its own code");
+});
+
 test("updatePot decides under the business lock, from the pot as it is now", () => {
   const body = fnBody(sv, "async function updatePot(");
   mustPrecede(body, "prisma.withBusinessLock(pot.businessId", "prisma.savingsPot.findUnique({ where: { id: pot.id } })", "update");

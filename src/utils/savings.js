@@ -299,6 +299,10 @@ async function createPot({ biz, name, targetAmount, lockUntil, lockMode }) {
   if (cleanName.length < 1) throw new SavingsError("Give the pot a name.", "BAD_NAME", 400);
   let target = null;
   if (targetAmount !== undefined && targetAmount !== null && targetAmount !== "") target = validateTarget(targetAmount);
+  // Every pot is Breakable or Unbreakable, with the day it opens (owner,
+  // 2026-10-15): a pot with no lock was money that came out free at any time.
+  // Neither has a default; both are asked for.
+  if (!lockUntil && !lockMode) throw new SavingsError("Choose Breakable or Unbreakable and the day the pot opens.", "LOCK_REQUIRED", 400);
   if (!lockUntil && lockMode) throw new SavingsError("Pick the day the pot opens.", "BAD_LOCK", 400);
   const lock = validateLock({ lockUntil, lockMode });
   if (!(biz.providerAccountId || biz.anchorAccountId)) {
@@ -364,7 +368,9 @@ async function updatePot({ pot, name, targetAmount, lockUntil, lockMode }) {
           throw new SavingsError(`This pot is unbreakable. It opens on ${dayWords(current)}, and its lock cannot be removed before then.`, "LOCK_CANNOT_SHORTEN", 409);
         }
         if (kept) throw breakableLockKept(current);
-        data.lockUntil = null; data.lockMode = null;
+        // Every pot stays Breakable or Unbreakable (owner, 2026-10-15): a lock
+        // is never removed. An empty Breakable pot may still move its day.
+        throw new SavingsError("Every pot is Breakable or Unbreakable, so its lock stays. You can move its day instead.", "LOCK_REQUIRED", 400);
       } else {
         const lock = validateLock({ lockUntil, lockMode: lockMode || fresh.lockMode || "flexible" }, { now });
         if (unbreakable && lock.lockMode !== "strict") {

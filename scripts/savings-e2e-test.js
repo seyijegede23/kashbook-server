@@ -331,7 +331,19 @@ const mkBiz = (id, nuban, name = "Second Shop") => prisma.business.create({
 });
 
 // ── Route helpers ─────────────────────────────────────────────────────────────
-const mkPot = (over = {}) => POST("/savings/pots", tOwner, { businessId: BIZ_ID, name: "Rent", ...over });
+// Every pot is Breakable or Unbreakable with its day (owner, 2026-10-15). A
+// test that asks for no lock gets a Breakable pot whose day has come: money
+// in it comes out free at any time, as an unlocked pot's did.
+const mkPot = async (over = {}) => {
+  const lockAsked = "lockUntil" in over || "lockMode" in over;
+  const r = await POST("/savings/pots", tOwner, {
+    businessId: BIZ_ID, name: "Rent", ...(lockAsked ? {} : { lockUntil: lagosDayPlus(1), lockMode: "flexible" }), ...over,
+  });
+  if (lockAsked || r.status !== 201) return r;
+  const opened = await prisma.savingsPot.update({ where: { id: r.body.pot.id }, data: { lockUntil: new Date(Date.now() - 60_000) } });
+  r.body.pot = { ...r.body.pot, lockUntil: opened.lockUntil.toISOString(), locked: false };
+  return r;
+};
 const depositTo = (potId, over = {}) => POST(`/savings/pots/${potId}/deposit`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, ...over });
 const withdrawFrom = (potId, over = {}) => POST(`/savings/pots/${potId}/withdraw`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, ...over });
 const closePot = (potId, over = {}) => DEL(`/savings/pots/${potId}?businessId=${over.businessId || BIZ_ID}`, over.token || tOwner);
@@ -369,12 +381,27 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
     assert.strictEqual(potA.balance, 0);
     assert.strictEqual(potA.name, "Rent");
     assert.strictEqual(potA.targetAmount, 250_000);
+    // mkPot's default: a Breakable pot whose day has come.
     assert.strictEqual(potA.locked, false);
-    assert.strictEqual(potA.lockUntil, null);
-    assert.strictEqual(potA.lockMode, null);
+    assert.strictEqual(potA.lockMode, "flexible");
     assert.strictEqual(potA.businessId, BIZ_ID);
     assert.deepStrictEqual(Object.keys(potA).sort(), POT_KEYS, "no partner or backing field leaves the server");
     assert.strictEqual(await auditCount("SAVINGS_POT_CREATED"), 1);
+  });
+
+  await test("a pot needs Breakable or Unbreakable and its day: none of either is refused, nothing made", async () => {
+    const before = await prisma.savingsPot.count({ where: { businessId: BIZ_ID } });
+    const r = await POST("/savings/pots", tOwner, { businessId: BIZ_ID, name: "No lock" });
+    assert.strictEqual(r.status, 400, JSON.stringify(r.body));
+    assert.strictEqual(r.body?.code, "LOCK_REQUIRED");
+    assert.strictEqual(r.body?.error, "Choose Breakable or Unbreakable and the day the pot opens.");
+    const dayOnly = await POST("/savings/pots", tOwner, { businessId: BIZ_ID, name: "Day only", lockUntil: lagosDayPlus(10) });
+    assert.strictEqual(dayOnly.status, 400, JSON.stringify(dayOnly.body));
+    assert.strictEqual(dayOnly.body?.code, "BAD_LOCK", "a day needs a kind");
+    const modeOnly = await POST("/savings/pots", tOwner, { businessId: BIZ_ID, name: "Kind only", lockMode: "strict" });
+    assert.strictEqual(modeOnly.status, 400, JSON.stringify(modeOnly.body));
+    assert.strictEqual(modeOnly.body?.code, "BAD_LOCK", "a kind needs a day");
+    assert.strictEqual(await prisma.savingsPot.count({ where: { businessId: BIZ_ID } }), before, "nothing was made");
   });
 
   await test("a staff member with EVERY permission gets 403 OWNER_ONLY on every /savings route", async () => {
@@ -1082,7 +1109,7 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
     assert.strictEqual((await dbPot(ctx.strictPot.id)).lockMode, "strict");
   });
 
-  await test("an EMPTY Breakable pot's lock may be shortened or removed: nothing in it can come out early (a pot with money: section 4b)", async () => {
+  await test("an EMPTY Breakable pot's day may move earlier, but its lock is never removed (a pot with money: section 4b)", async () => {
     const r = await mkPot({ name: "Soft", lockUntil: daysFromNow(30).toISOString(), lockMode: "flexible" });
     assert.strictEqual(r.status, 201, JSON.stringify(r.body));
     const pot = r.body.pot;
@@ -1091,10 +1118,11 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
     assert.strictEqual(shorter.body.pot.lockMode, "flexible", "the mode carries over when only the date changes");
     assert.ok(new Date(shorter.body.pot.lockUntil) < daysFromNow(6));
     const removed = await PATCH(`/savings/pots/${pot.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null });
-    assert.strictEqual(removed.status, 200, JSON.stringify(removed.body));
-    assert.strictEqual(removed.body.pot.lockUntil, null);
-    assert.strictEqual(removed.body.pot.lockMode, null);
-    assert.strictEqual(removed.body.pot.locked, false);
+    assert.strictEqual(removed.status, 400, JSON.stringify(removed.body));
+    assert.strictEqual(removed.body?.code, "LOCK_REQUIRED");
+    const row = await dbPot(pot.id);
+    assert.strictEqual(row.lockMode, "flexible", "every pot stays Breakable or Unbreakable");
+    assert.ok(new Date(row.lockUntil) < daysFromNow(6) && new Date(row.lockUntil) > new Date(), "the shorter day stands");
   });
 
   await test("with no fee account the break fee is ₦0: GET /savings shows all zeros, confirmation still asked, nothing swept", async () => {
@@ -1288,21 +1316,27 @@ const bankCharges = async () => (await booksFor(BIZ_ID, { from: lagosDayPlus(-2)
     assert.strictEqual(w.status, 423, "Unbreakable now: nothing opens it early");
   });
 
-  await test("once it opens, or once it is emptied (fee paid), a Breakable pot's lock may go", async () => {
+  await test("an opened or emptied Breakable pot keeps its kind (the lock never goes) but may be locked again", async () => {
     const opened = (await mkPot({ name: "Opened", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
     assert.strictEqual((await depositTo(opened.id, { amount: 5_000, idempotencyKey: "op0" })).status, 200);
     await prisma.savingsPot.update({ where: { id: opened.id }, data: { lockUntil: minutesAgo(1) } });
     const off = await PATCH(`/savings/pots/${opened.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null });
-    assert.strictEqual(off.status, 200, JSON.stringify(off.body));
-    assert.strictEqual(off.body.pot.lockUntil, null);
+    assert.strictEqual(off.status, 400, JSON.stringify(off.body));
+    assert.strictEqual(off.body?.code, "LOCK_REQUIRED");
+    assert.strictEqual((await dbPot(opened.id)).lockMode, "flexible");
+    const again = await PATCH(`/savings/pots/${opened.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: lagosDayPlus(40), lockMode: "strict" });
+    assert.strictEqual(again.status, 200, JSON.stringify(again.body));
+    assert.strictEqual(again.body.pot.locked, true, "an opened pot may be locked again");
+    assert.strictEqual(again.body.pot.lockMode, "strict");
     const emptied = (await mkPot({ name: "Emptied", lockUntil: lagosDayPlus(30), lockMode: "flexible" })).body.pot;
     assert.strictEqual((await depositTo(emptied.id, { amount: 5_000, idempotencyKey: "em0" })).status, 200);
     const out = await withdrawFrom(emptied.id, { amount: 5_000, idempotencyKey: "em1", confirmEarly: true });
     assert.strictEqual(out.status, 200, JSON.stringify(out.body));
     assert.strictEqual(out.body.movement.fee, 100, "the fee was paid on the way out");
     const free = await PATCH(`/savings/pots/${emptied.id}`, tOwner, { businessId: BIZ_ID, pin: PIN_OWNER, lockUntil: null });
-    assert.strictEqual(free.status, 200, JSON.stringify(free.body));
-    assert.strictEqual(free.body.pot.lockMode, null);
+    assert.strictEqual(free.status, 400, JSON.stringify(free.body));
+    assert.strictEqual(free.body?.code, "LOCK_REQUIRED");
+    assert.strictEqual((await dbPot(emptied.id)).lockMode, "flexible");
   });
 
   await test("a lock change needs the owner's PIN: none → 400, wrong → 401 PIN_WRONG, each audited, the pot unchanged; a rename needs none", async () => {
