@@ -135,6 +135,11 @@ const BILL_FULL = Object.freeze({ ...BILL_INCLUDE, items: { orderBy: [{ position
 // Long enough for a restock of a hundred lines and its payment.
 const TX = { timeout: 20000 };
 
+// Every bank row the server sends says which cash deposit it is (cashDepositId,
+// utils/cashDeposits.js withDepositIds). The debits a bill names never are:
+// only a credit brings a deposit in.
+const asDebit = (t) => (t && typeof t === "object" ? { ...t, cashDepositId: null } : t);
+
 // Whether the caller may see what stock cost (an item's stockValue and
 // avgCost): the owner, or staff with the reports.
 const seesCosts = (req) => req.user.accountType !== "staff" || req.user.permissions?.canViewReports === true;
@@ -654,7 +659,7 @@ router.post("/", requirePermission("canManagePayables"), async (req, res) => {
     res.status(201).json({
       bill: viewBill(req, bill),
       payment: result.payment,
-      transaction: result.transaction,
+      transaction: asDebit(result.transaction),
       inventory: result.inventory,
     });
   } catch (err) {
@@ -857,7 +862,7 @@ router.delete("/:id", ownerOnly("Only the business owner can delete a bill."), a
       freedTransactions: result.transactions.map((t) => t.id),
       lines: result.bill.items.length,
     });
-    res.json({ deleted: found.id, transactions: result.transactions, inventory: result.inventory });
+    res.json({ deleted: found.id, transactions: result.transactions.map(asDebit), inventory: result.inventory });
   } catch (err) {
     sendError(res, err, "Failed to delete the bill");
   }
@@ -897,7 +902,7 @@ router.post("/:id/payments", requirePermission("canManagePayables"), async (req,
     logBill(req, "BILL_PAYMENT", found.id, {
       paymentId: result.payment.id, amount: result.payment.amount, method: pay.method, transactionId: result.payment.transactionId,
     });
-    res.status(201).json({ bill: viewBill(req, result.bill), payment: result.payment, transaction: result.transaction });
+    res.status(201).json({ bill: viewBill(req, result.bill), payment: result.payment, transaction: asDebit(result.transaction) });
   } catch (err) {
     sendError(res, err, "Failed to record the payment");
   }
@@ -941,7 +946,7 @@ router.delete("/:id/payments/:paymentId", ownerOnly("Only the business owner can
       paymentId, amount: result.payment.amount, method: result.payment.method,
       freedTransaction: result.transaction ? result.transaction.id : null,
     });
-    res.json({ bill: viewBill(req, result.bill), transaction: result.transaction });
+    res.json({ bill: viewBill(req, result.bill), transaction: asDebit(result.transaction) });
   } catch (err) {
     sendError(res, err, "Failed to remove the payment");
   }

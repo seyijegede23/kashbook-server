@@ -210,7 +210,7 @@ async function loadLedger(businessId, { basis = "sold" } = {}) {
   // Noted before the first read (see epoch).
   const startEpoch = epoch;
   const accounts = await accountsFor(businessId);
-  const [loaded, biz, openings, recurring] = await Promise.all([
+  const [loaded, biz, openings, recurring, cashDeposits] = await Promise.all([
     loadBooksInput(businessId, {}),
     prisma.business.findUnique({
       where: { id: businessId },
@@ -218,6 +218,15 @@ async function loadLedger(businessId, { basis = "sold" } = {}) {
     }),
     prisma.openingBalance.findMany({ where: { businessId }, select: { accountId: true, debit: true, credit: true } }),
     prisma.recurringExpense.findMany({ where: { businessId }, select: { id: true, category: true, accountId: true } }),
+    // Cash taken to a bank (2026-10-14): never in the books rule's input,
+    // only on the balance sheet. A cancelled one posts nothing.
+    // In a fixed order: a link or undo rewrites a deposit's row, and on a
+    // locked day its entry must keep its place among the others.
+    prisma.cashDeposit.findMany({
+      where: { businessId, status: { not: "cancelled" } },
+      select: { id: true, amount: true, date: true, into: true, intoAccountId: true, status: true, transactionId: true, note: true },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    }),
   ]);
   if (!loaded || !biz) return null;
   const C = chart.indexChart(accounts);
@@ -229,6 +238,9 @@ async function loadLedger(businessId, { basis = "sold" } = {}) {
     recurring: new Map(recurring.map((r) => [r.id, r])),
     openingDate: biz.openingBalanceDate,
     openings,
+    cashDeposits,
+    // The credits that brought a KashBook deposit in.
+    depositCredits: new Set(cashDeposits.filter((d) => d.status === "arrived" && d.transactionId).map((d) => d.transactionId)),
   });
   const value = { business: biz, accounts, chart: C, entries, basis: view };
   if (epoch === startEpoch) cache.set(key, { at: Date.now(), ownerId: biz.userId, value });

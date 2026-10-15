@@ -16,6 +16,7 @@ const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 const { SALE_ITEMS_INCLUDE, publicSale } = require("./sales").saleLines;
 const { canSeeCosts, publicItem } = require("./inventory").itemView;
 const { publicGroup, variantCounts } = require("../utils/items");
+const { DEPOSIT_INCLUDE, publicDeposit, withDepositIds, assertNotDeposit } = require("../utils/cashDeposits");
 
 // The stock movements the books read beside the records (release 3): stock
 // adjusted or valued again counts in the profit (utils/books.js), and the
@@ -175,6 +176,16 @@ router.get("/", async (req, res) => {
         }),
       ]);
     const groupCounts = await variantCounts(prisma, itemGroups.map((g) => g.id));
+    // Cash deposits (2026-10-14), the owner's only, every status, changed
+    // since the last pull like the lists above (a business keeps few).
+    const isOwner = req.user.accountType !== "staff";
+    const cashDeposits = isOwner
+      ? await prisma.cashDeposit.findMany({
+        where: { businessId, ...incremental },
+        include: DEPOSIT_INCLUDE,
+        orderBy: sinceDate ? { updatedAt: "asc" } : [{ date: "desc" }, { createdAt: "desc" }],
+      })
+      : null;
     // The chart of accounts, whole on every pull (a business has well under
     // a hundred): every member picks accounts, nobody gets amounts from it.
     const accounts = await accountsFor(businessId);
@@ -212,7 +223,6 @@ router.get("/", async (req, res) => {
     //
     // Sales, expenses, customers, inventory and invoices are the bookkeeping a
     // staff member is employed to do, and stay.
-    const isOwner = req.user.accountType !== "staff";
     const canSeeCost = canSeeCosts(req);
     res.json({
       // Each with its lines ([] for a sale without); a line of goods whose
@@ -220,7 +230,9 @@ router.get("/", async (req, res) => {
       sales: sales.map((s) => publicSale(s, canSeeCost)),
       // A receipt's storage keys never leave the server (utils/expenseView.js).
       expenses: expenses.map(publicExpense),
-      transactions: canSeeBank ? transactions : [],
+      // Each with cashDepositId: the cash deposit a credit is, else null
+      // (staff who see the bank rows get no deposits, and tell one by this).
+      transactions: canSeeBank ? await withDepositIds(prisma, transactions) : [],
       customers,
       // Archived items come too (archivedAt): the app keeps them out of its
       // lists and pickers.
@@ -243,6 +255,9 @@ router.get("/", async (req, res) => {
       // The stock movements the books count (see above): the app replaces
       // its list; null for a member without the reports.
       stockMoves: canSeeReports ? stockMoves : null,
+      // Cash deposits (owner only; null for staff), each with its linked
+      // transfer while it has arrived.
+      cashDeposits: cashDeposits ? cashDeposits.map(publicDeposit) : null,
       // Told, not silently emptied — the client can distinguish "no bank
       // activity" from "not yours to see" instead of rendering a confident zero.
       bankWithheld: !canSeeBank,
@@ -286,7 +301,7 @@ router.get("/pull", async (req, res) => {
     const canSeeBank = req.user.permissions?.canViewBalance === true;
     const canSeeCost = canSeeCosts(req);
     res.json({
-      transactions: canSeeBank ? transactions : [],
+      transactions: canSeeBank ? await withDepositIds(prisma, transactions) : [],
       customers,
       inventory: inventory.map((i) => publicItem(i, canSeeCost)),
       bankWithheld: !canSeeBank,
@@ -446,6 +461,8 @@ async function processOp(op, userId, userName, accountType) {
           if (cur.matchedBillId) {
             throw Object.assign(new Error("This transfer paid a bill. Remove the payment from the bill before deleting it."), { code: "BILL_LINKED" });
           }
+          // A cash deposit's credit is the deposit's (DEPOSIT_LINKED).
+          await assertNotDeposit(prisma, cur.id);
           if (cur.purpose === "customer_refund" || cur.matchedSaleId || cur.matchedCustomerId || cur.matchedExpenseId || cur.matchedInvoiceId) {
             throw Object.assign(new Error("This transaction is linked to a record. Remove that link before deleting it."), { code: "MATCHED_ROW_LOCKED" });
           }

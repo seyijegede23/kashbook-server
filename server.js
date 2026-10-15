@@ -320,6 +320,7 @@ app.use("/instagram", apiLimiter);
 app.use("/whatsapp", apiLimiter);
 app.use("/savings", apiLimiter);
 app.use("/ledger", apiLimiter);
+app.use("/cash-deposits", apiLimiter);
 app.use("/admin-api", authLimiter);
 
 // The chart of accounts' ledger is derived from the records and cached a
@@ -330,7 +331,7 @@ app.use("/admin-api", authLimiter);
   const { ownerIdOf } = require("./src/utils/scope");
   const ledgerWrites = ["/sales", "/expenses", "/transactions", "/invoices", "/customers",
     "/recurring-expenses", "/recurring-invoices", "/payroll", "/transfers", "/businesses", "/sync", "/ledger", "/instagram",
-    "/bills", "/journals"];
+    "/bills", "/journals", "/cash-deposits"];
   app.use(ledgerWrites, (req, res, next) => {
     if (req.method !== "GET") {
       res.on("finish", () => {
@@ -378,6 +379,8 @@ app.use("/ledger", require("./src/routes/ledger"));
 // payables, and manual journals (Adjustments in the app).
 app.use("/bills", require("./src/routes/bills"));
 app.use("/journals", require("./src/routes/journals"));
+// Deposit cash (2026-10-14): cash at hand taken to a bank (the owner's).
+app.use("/cash-deposits", require("./src/routes/cashDeposits"));
 
 // ── Public hosted invoice page (no auth) ──────────────────────────────────────
 // GET /i/:token — what merchants share with customers via WhatsApp / link.

@@ -45,6 +45,15 @@
 //     date, owed in Accounts Payable, and each payment settles it. Stock
 //     counted or valued again moves Inventory Asset against Stock
 //     Adjustments; starting stock against Opening Balance Adjustments;
+//   - cash deposits (2026-10-14): cash taken from the till to a bank, never
+//     profit, in both views on the deposit's date: into another bank, that
+//     bank / Cash at Hand; into the KashBook account, Undeposited Funds /
+//     Cash at Hand while the cash is on its way, and the credit it is linked
+//     to posts KashBook Account / Undeposited Funds when it arrives, whatever
+//     account that credit carries (a cash_deposit credit no deposit names
+//     still posts against Cash at Hand). A deposit's own entry is the same
+//     whether it waits or has arrived: a link moves only its credit's entry,
+//     on the credit's day. A cancelled deposit posts nothing;
 //   - opening balances post the difference between what the merchant says an
 //     account held when the books start and what the records already put
 //     there, bills and journals included (the opening entry is built last).
@@ -80,13 +89,18 @@ function allocate(total, weights) {
 
 // ctx: { chart (chart.indexChart of the business's accounts), basis, vat,
 //        baseCurrency, recurring (Map id → recurring rule), openingDate,
-//        openings: [{ accountId, debit, credit }] }
+//        openings: [{ accountId, debit, credit }],
+//        cashDeposits: [{ id, amount, date, into, intoAccountId, status, note }]
+//          (the business's cash deposits; a cancelled one is skipped),
+//        depositCredits: Set of the ids of the credits an arrived KashBook
+//          deposit names }
 // input: loadBooksInput(...).input (the books rule's input, every date).
 function buildLedger(input, ctx) {
   const basis = ctx.basis === "sold" ? "sold" : "paid";
   const vat = books.vatSettings(ctx.vat);
   const C = ctx.chart;
   const base = ctx.baseCurrency || "NGN";
+  const depositCredits = ctx.depositCredits instanceof Set ? ctx.depositCredits : new Set(ctx.depositCredits || []);
   const sys = (key) => {
     const a = chart.sysAccount(C, key);
     if (!a) throw new Error(`chart has no "${key}" account (run ensureChart)`);
@@ -371,12 +385,17 @@ function buildLedger(input, ctx) {
 
     // What no profit-and-loss line carries: the part a record carries (through
     // Bank Matching), a purpose or balance-sheet account, or (when sold) a
-    // credit nobody has explained yet.
+    // credit nobody has explained yet. The credit a cash deposit names brings
+    // the deposit's cash out of Undeposited Funds, where the deposit put it,
+    // whatever account it carries (tested first): a credit the owner had
+    // marked as cash banked through Cash at Hand before a deposit took it
+    // must never take the same cash out of Cash at Hand a second time.
     let rest = amount - covered;
     if (!rest) continue;
     const ownBS = own && !chart.isProfitClass(chart.classOf(own.type));
     let target;
-    if (ownBS) target = own;
+    if (isIn && tx.purpose === "cash_deposit" && depositCredits.has(tx.id)) target = sys(SYS.UNDEPOSITED);
+    else if (ownBS) target = own;
     else if (tx.purpose === "customer_refund") target = sys(SYS.BANK_MATCH);
     else if (tx.purpose && chart.PURPOSE_ACCOUNT[tx.purpose]) target = sys(chart.PURPOSE_ACCOUNT[tx.purpose]);
     else if (tx.purpose) target = sys(SYS.SUSPENSE);
@@ -602,6 +621,22 @@ function buildLedger(input, ctx) {
     const k = K(m.value);
     if (!k) continue;
     entry(`stock:${m.id}`, m.date, `stock_${mk}`, m.note, m.itemId || null).dr(sys(SYS.STOCK), k).cr(sys(SYS.OPENING), k);
+  }
+
+  // ── Cash deposits: cash taken from the till to a bank ────────────────────
+  // On the deposit's date, in both views, and never profit: out of Cash at
+  // Hand into the bank it went into (another bank's account, else Other Bank
+  // Account should that account be gone), or for the KashBook account into
+  // Undeposited Funds, which the credit it is linked to empties when it
+  // arrives (above). Entry kind "cash_deposit", its ref the deposit's id.
+  for (const d of ctx.cashDeposits || []) {
+    if (!d || lower(d.status) === "cancelled") continue;
+    const k = K(d.amount);
+    if (!k) continue;
+    const into = d.into === "kashbook"
+      ? sys(SYS.UNDEPOSITED)
+      : chart.explicitAccount(C, d.intoAccountId) || sys(SYS.OTHER_BANK);
+    entry(`deposit:${d.id}`, d.date, "cash_deposit", d.note, d.id).dr(into, k).cr(sys(SYS.CASH), k);
   }
 
   // ── Opening balances: what the merchant says each account held ───────────

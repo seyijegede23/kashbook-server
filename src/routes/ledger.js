@@ -21,10 +21,12 @@
 // rows. The words on a bill (its supplier, its number, its notes and its
 // payments' notes) need the bills permission, as in the sync bundle: a
 // statement or the general ledger sends a bill's entries without their memo
-// to anyone else (readableBy). The ledger itself is derived from the records
-// (utils/ledger.js): nothing here posts to it, and the reports read the
-// cached ledger, which other requests share, so they copy what they sort or
-// reshape. Nothing posts Retained Earnings either: the profit of past
+// to anyone else (readableBy). A cash deposit's note is the owner's alone in
+// this release (the sync bundle sends staff no deposits): every staff member
+// reads a deposit's entries without it. The ledger itself is derived from
+// the records (utils/ledger.js): nothing here posts to it, and the reports
+// read the cached ledger, which other requests share, so they copy what they
+// sort or reshape. Nothing posts Retained Earnings either: the profit of past
 // financial years is worked out where it is read (balances, its statement),
 // as the balance sheet works it out.
 const router = require("express").Router();
@@ -78,14 +80,21 @@ function needsBankAccess(req, res, next) {
 // utils/ledger.js billMemo). So a member without that permission reads those
 // entries with an empty memo, and the app titles them by their kind alone;
 // everything else about them (amounts, accounts, the bill's id) is what the
-// sync bundle already gives that member. `list` is the entries of an answer,
-// or a statement's lines, each with its kind and memo. The entries come from
-// the cached ledger the owner reads too, so the memo is left out of a copy,
-// never out of the entry itself.
+// sync bundle already gives that member. A cash deposit's entry is named by
+// the owner's note (utils/ledger.js), and deposits are the owner's alone in
+// this release (staff get none in the sync bundle and a 403 from
+// /cash-deposits), so every staff member, the bills permission or not, reads
+// it with an empty memo; its amount, day, accounts and the deposit's id stay,
+// as staff are told which credit is a deposit's (cashDepositId). `list` is the
+// entries of an answer, or a statement's lines, each with its kind and memo.
+// The entries come from the cached ledger the owner reads too, so the memo is
+// left out of a copy, never out of the entry itself.
 const BILL_KINDS = new Set(["bill", "bill_payment"]);
+const OWNER_KINDS = new Set(["cash_deposit"]);
 function readableBy(req, list) {
-  if (req.user.accountType !== "staff" || req.user.permissions?.canManagePayables === true) return list;
-  return list.map((e) => (BILL_KINDS.has(e.kind) ? { ...e, memo: "" } : e));
+  if (req.user.accountType !== "staff") return list;
+  const bills = req.user.permissions?.canManagePayables === true;
+  return list.map((e) => (OWNER_KINDS.has(e.kind) || (!bills && BILL_KINDS.has(e.kind)) ? { ...e, memo: "" } : e));
 }
 
 const basisOf = (v, fallback) => (v === "paid" || v === "sold" ? v : fallback);
@@ -566,6 +575,10 @@ async function usageOf(acc) {
     // an item group whose sales or buying count as it (SET NULL keys too).
     prisma.inventoryItem.count({ where: { purchaseAccountId: id } }),
     prisma.itemGroup.count({ where: { OR: [{ incomeAccountId: id }, { purchaseAccountId: id }] } }),
+    // Deposit cash (2026-10-14): a deposit that went into it, cancelled ones
+    // too (its key refuses the delete, deferred to the end of the
+    // transaction).
+    prisma.cashDeposit.count({ where: { intoAccountId: id } }),
   ]);
   return counts.reduce((s, n) => s + n, 0);
 }
@@ -792,6 +805,14 @@ router.post("/accounts/:id/merge", owner, async (req, res) => {
       if (into.systemKey && chart.CONTROLLED.includes(into.systemKey) && into.systemKey !== chart.SYS.RETAINED) {
         throw accountError("Choose an account you can record to.", "BAD_TARGET");
       }
+      // Cash deposited into `from` goes with it, so `into` must be a bank the
+      // cash could have gone into (as a deposit's own account must be). A
+      // code of its own, so the app can say why (any other bank will do),
+      // and a deposit since cancelled still counts, as it keeps the account
+      // in use.
+      if (into.type !== "bank" && (await prisma.cashDeposit.count({ where: { intoAccountId: from.id } }))) {
+        throw accountError("Cash deposits went into this account. Merge it into another bank account.", "DEPOSIT_TARGET");
+      }
       const bothOpen = await prisma.openingBalance.count({ where: { accountId: { in: [from.id, into.id] } } });
       if (bothOpen > 1) throw accountError("Both accounts have a starting balance. Remove one first.", "BOTH_OPENING", 409);
       try {
@@ -877,6 +898,9 @@ async function mergeInto(from, into) {
     await px.inventoryItem.updateMany({ where: { purchaseAccountId: from.id }, data: { purchaseAccountId: into.id, ...touch } });
     await px.itemGroup.updateMany({ where: { incomeAccountId: from.id }, data: { incomeAccountId: into.id, ...touch } });
     await px.itemGroup.updateMany({ where: { purchaseAccountId: from.id }, data: { purchaseAccountId: into.id, ...touch } });
+    // Deposit cash (2026-10-14): the deposits that went into `from`, stamped
+    // too, so the owner's next sync brings them with the new account.
+    await px.cashDeposit.updateMany({ where: { intoAccountId: from.id }, data: { intoAccountId: into.id, ...touch } });
     if (byCategory) {
       // Records that reached it by their category now name the account: an
       // itemized expense never does (its lines do), so it keeps none.

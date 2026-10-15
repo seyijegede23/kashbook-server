@@ -51,6 +51,25 @@
 //      views, owed in Accounts Payable until paid; Stock Adjustments holds
 //      exactly what adjustments and new values took off stock;
 //
+// and, since deposit cash (2026-10-14: cash taken from the till to another
+// bank, or to the KashBook account and linked to the credit that brings it
+// in), on the same random books with deposits of every status added:
+//
+//  17. every entry still balances and the profit and loss still equals
+//      computeBooks (a deposit is never profit; its credit is not a sale);
+//  18. Cash at Hand falls by each live deposit on its date, and nothing else
+//      moves it (a deposit's credit that kept Cash at Hand's account, as one
+//      the owner had marked as cash banked through it, included); a
+//      cancelled deposit posts nothing;
+//  19. Undeposited Funds holds each KashBook deposit from its date until its
+//      credit arrives: in the end, exactly the waiting ones;
+//  20. another bank's account rises by each deposit into it; the KashBook
+//      Account still equals the bank ledger;
+//  21. a link moves only its credit's own entry: with every arrived deposit
+//      waiting and its credit unexplained, every other entry (each deposit's
+//      own among them) is exactly the same (so the books lock asks a link
+//      about the credit's day alone, routes/cashDeposits.js);
+//
 // plus fixtures with exact expected entries, and checks that a deliberately
 // broken engine fails them.
 //
@@ -1759,6 +1778,284 @@ test("the real engine keeps every release 3 invariant on the same books", () => 
     const wrong = stockHolds(ledger.buildLedger, { links, seed, n: 150 });
     assert.ok(!wrong, `${links ? "with links" : "one-sided links"}: ${wrong}`);
   }
+});
+
+// ── Deposit cash (2026-10-14) ────────────────────────────────────────────────
+console.log("\nLEDGER — CASH DEPOSITS");
+const CASH_ID = sysId(chart.SYS.CASH);
+const UNDEP_ID = sysId(chart.SYS.UNDEPOSITED);
+const KB_ID = sysId(chart.SYS.KASHBOOK);
+const OTHER_BANK_ID = sysId(chart.SYS.OTHER_BANK);
+// The banks a deposit may go into: every bank but the KashBook Account.
+const DEPOSIT_BANKS = ACCOUNTS.filter((a) => a.type === "bank" && a.systemKey !== chart.SYS.KASHBOOK);
+const shiftDay = (day, n) => {
+  const d = new Date(`${day}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const MATCHES = ["matchedSaleId", "matchedCustomerId", "matchedInvoiceId", "matchedExpenseId", "matchedBillId"];
+const creditRow = (over) => ({ type: "income", source: "anchor", paymentMethod: "bank", category: "transfer", currency: "NGN", purpose: null, ...over });
+const depositCtx = (basis, deposits, vat) => ({
+  ...ctxFor(basis, vat),
+  cashDeposits: deposits,
+  depositCredits: new Set(deposits.filter((d) => d.status === "arrived").map((d) => d.transactionId)),
+});
+
+test("a deposit into another bank: that bank / Cash at Hand on its date, never profit, both views alike", () => {
+  const input = { sales: [{ id: "s1", amount: 80000, date: "2026-10-01", paymentMethod: "cash" }], accounts: CLASSES };
+  const deps = [{ id: "d1", amount: 50000, date: "2026-10-02", into: "account", intoAccountId: OTHER_BANK_ID, status: "done", note: "Monday's takings" }];
+  for (const basis of ["paid", "sold"]) {
+    const L = ledger.buildLedger(input, depositCtx(basis, deps));
+    const e = by(L, "deposit:d1");
+    assert.deepStrictEqual(legsOf(e), { "Other Bank Account": 50000, "Cash at Hand": -50000 }, basis);
+    eq(e.kind, "cash_deposit", "kind");
+    eq(e.ref, "d1", "ref");
+    eq(e.day, "2026-10-02", "day");
+    eq(e.memo, "Monday's takings", "memo");
+    eq((ledger.sumByAccount(L.entries).get(CASH_ID) || 0) / 100, 30000, `${basis}: cash left`);
+    eq(ledger.profitAndLoss(L.entries, C).profit, 80000, `${basis}: profit untouched`);
+    eq(ledger.unbalanced(L.entries).length, 0);
+  }
+});
+
+test("a KashBook deposit waits in Undeposited Funds; its credit empties it into the KashBook Account", () => {
+  const credit = creditRow({ id: "t1", amount: 45000, date: "2026-10-04", purpose: "cash_deposit" });
+  const input = { bankRows: [credit], accounts: CLASSES };
+  const waiting = [{ id: "d1", amount: 45000, date: "2026-10-02", into: "kashbook", intoAccountId: null, status: "waiting" }];
+  const arrived = [{ ...waiting[0], status: "arrived", transactionId: "t1" }];
+  // Before it arrives (no credit yet): on its way.
+  const W = ledger.buildLedger({ bankRows: [], accounts: CLASSES }, depositCtx("sold", waiting));
+  assert.deepStrictEqual(legsOf(by(W, "deposit:d1")), { "Undeposited Funds": 45000, "Cash at Hand": -45000 });
+  eq((ledger.sumByAccount(W.entries).get(UNDEP_ID) || 0) / 100, 45000, "waiting: Undeposited Funds");
+  for (const basis of ["paid", "sold"]) {
+    const L = ledger.buildLedger(input, depositCtx(basis, arrived));
+    assert.deepStrictEqual(legsOf(by(L, "bank:t1")), { "KashBook Account": 45000, "Undeposited Funds": -45000 }, basis);
+    eq(by(L, "bank:t1").kind, "bank_in", "the credit keeps its own kind");
+    eq((ledger.sumByAccount(L.entries, { to: "2026-10-03" }).get(UNDEP_ID) || 0) / 100, 45000, `${basis}: on its way`);
+    eq(ledger.sumByAccount(L.entries).get(UNDEP_ID) || 0, 0, `${basis}: arrived`);
+    eq((ledger.sumByAccount(L.entries).get(CASH_ID) || 0) / 100, -45000, `${basis}: cash out once`);
+    eq(ledger.sumByAccount(L.entries).get(KB_ID) || 0, rawLedgerKobo(input.bankRows), `${basis}: KashBook = bank ledger`);
+    const pl = ledger.profitAndLoss(L.entries, C);
+    const b = books.computeBooks(input, { basis });
+    eq(pl.totalIncome, 0, `${basis}: no income`);
+    eq(kobo(pl.totalIncome), kobo(b.sales.total), `${basis}: the books agree`);
+  }
+});
+
+test("a cash_deposit credit no deposit names still comes out of Cash at Hand; a cancelled deposit posts nothing", () => {
+  const input = { bankRows: [creditRow({ id: "t1", amount: 3000, date: "2026-10-01", purpose: "cash_deposit" })], accounts: CLASSES };
+  const deps = [
+    { id: "d1", amount: 3000, date: "2026-10-01", into: "kashbook", intoAccountId: null, status: "cancelled" },
+    { id: "d2", amount: 700, date: "2026-10-01", into: "account", intoAccountId: OTHER_BANK_ID, status: "cancelled" },
+  ];
+  const L = ledger.buildLedger(input, depositCtx("sold", deps));
+  assert.deepStrictEqual(legsOf(by(L, "bank:t1")), { "KashBook Account": 3000, "Cash at Hand": -3000 });
+  eq(by(L, "deposit:d1"), undefined, "cancelled");
+  eq(by(L, "deposit:d2"), undefined, "cancelled");
+});
+
+test("a deposit into an account this chart lacks lands in Other Bank Account", () => {
+  const deps = [{ id: "d1", amount: 1200.5, date: "2026-10-01", into: "account", intoAccountId: "acc-gone", status: "done" }];
+  const L = ledger.buildLedger({ accounts: CLASSES }, depositCtx("paid", deps));
+  assert.deepStrictEqual(legsOf(by(L, "deposit:d1")), { "Other Bank Account": 1200.5, "Cash at Hand": -1200.5 });
+});
+
+test("a deposit's credit is the deposit's whatever account it carries: one still on Cash at Hand's never takes the cash from it twice", () => {
+  // As the owner marked it through Cash at Hand before the deposit took it.
+  const credit = creditRow({ id: "t1", amount: 10000, date: "2026-10-04", purpose: "cash_deposit", accountId: CASH_ID });
+  const input = { bankRows: [credit], accounts: CLASSES };
+  const arrived = [{ id: "d1", amount: 10000, date: "2026-10-03", into: "kashbook", intoAccountId: null, status: "arrived", transactionId: "t1" }];
+  for (const basis of ["paid", "sold"]) {
+    const L = ledger.buildLedger(input, depositCtx(basis, arrived));
+    assert.deepStrictEqual(legsOf(by(L, "bank:t1")), { "KashBook Account": 10000, "Undeposited Funds": -10000 }, basis);
+    const sums = ledger.sumByAccount(L.entries);
+    eq((sums.get(CASH_ID) || 0) / 100, -10000, `${basis}: Cash at Hand falls once`);
+    eq(sums.get(UNDEP_ID) || 0, 0, `${basis}: nothing left in Undeposited Funds`);
+    eq(ledger.unbalanced(L.entries).length, 0);
+    const pl = ledger.profitAndLoss(L.entries, C);
+    const b = books.computeBooks(input, { basis });
+    eq(kobo(pl.totalIncome), kobo(b.sales.total), `${basis}: the books agree`);
+    eq(pl.totalIncome, 0, `${basis}: no income`);
+  }
+  // No deposit names it: the marking alone takes it from Cash at Hand.
+  const M = ledger.buildLedger(input, depositCtx("sold", []));
+  assert.deepStrictEqual(legsOf(by(M, "bank:t1")), { "KashBook Account": 10000, "Cash at Hand": -10000 });
+});
+
+test("a link moves only its credit's entry, on the credit's day: the deposit's own entry is the same waiting or arrived", () => {
+  const unexplained = creditRow({ id: "t1", amount: 45000, date: "2026-10-04", purpose: null });
+  const dep = { id: "d1", amount: 45000, date: "2026-10-02", into: "kashbook", intoAccountId: null };
+  // Something on the days before, so there is more than the deposit to keep.
+  const sales = [{ id: "s1", amount: 3000, date: "2026-10-01", paymentMethod: "cash" }];
+  for (const basis of ["paid", "sold"]) {
+    const W = ledger.buildLedger({ sales, bankRows: [unexplained], accounts: CLASSES }, depositCtx(basis, [{ ...dep, status: "waiting", transactionId: null }]));
+    const A = ledger.buildLedger(
+      { sales, bankRows: [{ ...unexplained, purpose: "cash_deposit" }], accounts: CLASSES },
+      depositCtx(basis, [{ ...dep, status: "arrived", transactionId: "t1" }]),
+    );
+    assert.deepStrictEqual(by(A, "deposit:d1"), by(W, "deposit:d1"), `${basis}: the deposit's own entry`);
+    const json = (L) => new Set(L.entries.map((e) => JSON.stringify(e)));
+    const w = json(W);
+    const moved = A.entries.filter((e) => !w.has(JSON.stringify(e))).map((e) => e.id);
+    assert.deepStrictEqual(moved, ["bank:t1"], `${basis}: only the credit's entry moves`);
+    eq(by(A, "bank:t1").day, "2026-10-04", `${basis}: on the credit's day`);
+    eq(A.entries.length, W.entries.length, `${basis}: nothing added or dropped`);
+  }
+});
+
+// Random books (lib/booksGen.js) with deposits added: about half of the
+// credits nothing explains become a KashBook deposit's (marked cash_deposit,
+// the deposit dated up to three days before; a quarter of those keep Cash at
+// Hand's account, as a credit the owner had marked through it would if a link
+// left it there), and a few more deposits of every kind and status. Returns
+// the books before and after, and the deposits.
+function withDeposits(g, input) {
+  const deposits = [];
+  const bankRows = input.bankRows.map((t) => {
+    if (t.type !== "income" || t.purpose || t.accountId || t.foreignCurrency || MATCHES.some((k) => t[k])) return t;
+    if (!isLedgerBankRow(t, "NGN") || !g.chance(0.5)) return t;
+    deposits.push({
+      id: g.id("dep"), amount: t.amount, date: shiftDay(books.dayKey(t.date), -g.int(0, 3)), into: "kashbook",
+      intoAccountId: null, status: "arrived", transactionId: t.id, note: g.chance(0.5) ? "to the bank" : null,
+    });
+    return { ...t, purpose: "cash_deposit", ...(g.chance(0.25) ? { accountId: CASH_ID } : {}) };
+  });
+  for (let i = 0, k = g.int(0, 4); i < k; i++) {
+    const toKashbook = g.chance(0.5);
+    deposits.push({
+      id: g.id("dep"), amount: g.money(), date: g.when(), into: toKashbook ? "kashbook" : "account",
+      intoAccountId: toKashbook ? null : g.pick(DEPOSIT_BANKS).id,
+      status: g.chance(0.2) ? "cancelled" : toKashbook ? "waiting" : "done", transactionId: null, note: null,
+    });
+  }
+  return { before: input, after: { ...input, bankRows }, deposits };
+}
+
+// What is wrong with an engine (`build`) on deposits (17 to 20), or null.
+// The books before the deposits are built by the real engine.
+function depositsWrong(build, { seed, n = 300 }) {
+  const g = gen.makeGen(gen.rng(seed));
+  for (let i = 0; i < n; i++) {
+    const { before, after, deposits } = withDeposits(g, gen.randomInput(g, { chart: true, accounts: ACCOUNTS, links: g.chance(0.5) }));
+    const opts = gen.randomOpts(g);
+    const asOf = g.day();
+    const live = deposits.filter((d) => d.status !== "cancelled");
+    const upTo = (list, to) => list.filter((d) => !to || books.dayKey(d.date) <= to);
+    const sumK = (list) => list.reduce((s, d) => s + ledger.K(d.amount), 0);
+    const sums = {};
+    for (const basis of ["paid", "sold"]) {
+      const at = `iteration ${i} (${basis})`;
+      const L0 = ledger.buildLedger(before, ctxFor(basis, opts.vat));
+      const L = build(after, depositCtx(basis, deposits, opts.vat));
+      if (ledger.unbalanced(L.entries).length) return `${at}: unbalanced`;
+      const pl = ledger.profitAndLoss(L.entries, C, { from: opts.from, to: opts.to });
+      const b = books.computeBooks(after, { ...opts, basis });
+      if (kobo(pl.totalIncome) !== kobo(b.sales.total) || kobo(pl.totalExpenses) !== kobo(b.expenses.total)) {
+        return `${at}: ledger ${pl.totalIncome}/${pl.totalExpenses} ≠ books ${b.sales.total}/${b.expenses.total}`;
+      }
+      for (const to of [asOf, ""]) {
+        const s0 = ledger.sumByAccount(L0.entries, { to });
+        const s1 = ledger.sumByAccount(L.entries, { to });
+        const moved = (id) => (s1.get(id) || 0) - (s0.get(id) || 0);
+        const when = to ? `at ${to}` : "in the end";
+        if (moved(CASH_ID) !== -sumK(upTo(live, to))) return `${at}: Cash at Hand moved ${moved(CASH_ID) / 100} ${when}, not ${-sumK(upTo(live, to)) / 100}`;
+        const credits = after.bankRows.filter((t) => deposits.some((d) => d.status === "arrived" && d.transactionId === t.id) && (!to || books.dayKey(t.date) <= to));
+        const wantU = sumK(upTo(live.filter((d) => d.into === "kashbook"), to)) - sumK(credits);
+        if (moved(UNDEP_ID) !== wantU) return `${at}: Undeposited Funds moved ${moved(UNDEP_ID) / 100} ${when}, not ${wantU / 100}`;
+        if (!to && moved(UNDEP_ID) !== sumK(deposits.filter((d) => d.status === "waiting"))) return `${at}: Undeposited Funds is not the waiting deposits`;
+        for (const bank of DEPOSIT_BANKS) {
+          const want = sumK(upTo(live.filter((d) => d.into === "account" && d.intoAccountId === bank.id), to));
+          if (moved(bank.id) !== want) return `${at}: ${bank.name} moved ${moved(bank.id) / 100} ${when}, not ${want / 100}`;
+        }
+        if ((s1.get(KB_ID) || 0) !== rawLedgerKobo(after.bankRows, to)) return `${at}: KashBook Account ≠ bank ledger ${when}`;
+      }
+      for (const d of deposits) {
+        const e = L.entries.filter((x) => x.id === `deposit:${d.id}`);
+        if (e.length !== (d.status === "cancelled" ? 0 : 1)) return `${at}: deposit ${d.id} (${d.status}) has ${e.length} entries`;
+        if (e[0] && (e[0].kind !== "cash_deposit" || e[0].ref !== d.id || e[0].day !== books.dayKey(d.date))) return `${at}: deposit ${d.id}'s entry is ${e[0].kind} on ${e[0].day}`;
+      }
+      // 21. The same books with every arrived deposit waiting and its credit
+      // unexplained: every entry but those credits' own is exactly the same.
+      const linkedIds = new Set(deposits.filter((d) => d.status === "arrived").map((d) => d.transactionId));
+      const unlinked = { ...after, bankRows: after.bankRows.map((t) => (linkedIds.has(t.id) ? { ...t, purpose: null, accountId: null } : t)) };
+      const waiting = deposits.map((d) => (d.status === "arrived" ? { ...d, status: "waiting", transactionId: null } : d));
+      const W = build(unlinked, depositCtx(basis, waiting, opts.vat));
+      const rest = (Lx) => Lx.entries.filter((e) => !(e.id.startsWith("bank:") && linkedIds.has(e.id.slice(5)))).map((e) => JSON.stringify(e)).sort().join("\n");
+      if (rest(L) !== rest(W)) return `${at}: a link moved more than its credit's own entry`;
+      const all = ledger.sumByAccount(L.entries);
+      sums[basis] = [CASH_ID, UNDEP_ID, ...DEPOSIT_BANKS.map((a) => a.id)].map((id) => all.get(id) || 0);
+    }
+    if (sums.paid.join() !== sums.sold.join()) return `iteration ${i}: cash and banks differ between the views`;
+  }
+  return null;
+}
+
+const DEPOSITED = Math.max(300, Math.round(ITER / 3));
+test(`random books with cash deposits (${DEPOSITED} businesses, both views): invariants 17 to 21`, () => {
+  const wrong = depositsWrong(ledger.buildLedger, { seed: SEED + 53, n: DEPOSITED });
+  assert.ok(!wrong, wrong);
+});
+
+test("those books have deposits of every kind: arrived, waiting, into another bank, cancelled; credits that kept Cash at Hand's account", () => {
+  const g = gen.makeGen(gen.rng(SEED + 53));
+  const n = { arrived: 0, waiting: 0, done: 0, cancelled: 0, pos: 0, keptCash: 0 };
+  for (let i = 0; i < DEPOSITED; i++) {
+    const { after, deposits } = withDeposits(g, gen.randomInput(g, { chart: true, accounts: ACCOUNTS, links: g.chance(0.5) }));
+    gen.randomOpts(g);
+    g.day();
+    for (const d of deposits) {
+      n[d.status]++;
+      if (d.intoAccountId && d.intoAccountId !== OTHER_BANK_ID) n.pos++;
+    }
+    n.keptCash += after.bankRows.filter((t) => t.purpose === "cash_deposit" && t.accountId === CASH_ID).length;
+  }
+  const { keptCash, ...kinds } = n;
+  for (const [k, v] of Object.entries(kinds)) assert.ok(v >= DEPOSITED / 10, `only ${v} ${k} in ${DEPOSITED} businesses`);
+  // A quarter of the arrived ones' credits.
+  assert.ok(keptCash >= DEPOSITED / 20, `only ${keptCash} credits kept Cash at Hand's account in ${DEPOSITED} businesses`);
+});
+
+console.log("\nLEDGER — A BROKEN DEPOSIT ENGINE MUST FAIL");
+const relabel = (from, to, onlyKind) => (input, ctx) => {
+  const L = ledger.buildLedger(input, ctx);
+  for (const e of L.entries) {
+    if (onlyKind && e.kind !== onlyKind) continue;
+    for (const l of e.lines) if (from(l.accountId)) l.accountId = to;
+  }
+  return L;
+};
+const depositMutants = {
+  "deposits left out": (input, ctx) => ledger.buildLedger(input, { ...ctx, cashDeposits: [] }),
+  "a deposit's credit still taken from Cash at Hand": (input, ctx) => ledger.buildLedger(input, { ...ctx, depositCredits: new Set() }),
+  "a cancelled deposit posted": (input, ctx) =>
+    ledger.buildLedger(input, { ...ctx, cashDeposits: ctx.cashDeposits.map((d) => (d.status === "cancelled" ? { ...d, status: d.into === "kashbook" ? "waiting" : "done" } : d)) }),
+  "a KashBook deposit put straight in the KashBook Account": relabel((id) => id === UNDEP_ID, KB_ID, "cash_deposit"),
+  "every deposit into another bank put in Other Bank Account": relabel((id) => DEPOSIT_BANKS.some((a) => a.id === id), OTHER_BANK_ID, "cash_deposit"),
+  "a deposit counted as a sale": relabel((id) => id === CASH_ID, sysId(chart.SYS.SALES), "cash_deposit"),
+  "a deposit's credit counted as income": (input, ctx) =>
+    ledger.buildLedger({ ...input, bankRows: input.bankRows.map((t) => (ctx.depositCredits.has(t.id) ? { ...t, purpose: null } : t)) }, ctx),
+  "a deposit posted on its credit's day": (input, ctx) => {
+    const dayOf = new Map(input.bankRows.map((t) => [t.id, t.date]));
+    return ledger.buildLedger(input, { ...ctx, cashDeposits: ctx.cashDeposits.map((d) => (d.transactionId ? { ...d, date: dayOf.get(d.transactionId) } : d)) });
+  },
+  // The order before the review: a credit's own account came first.
+  "a deposit's credit that kept Cash at Hand's account taken from it again": (input, ctx) => {
+    const withAccount = new Set(input.bankRows.filter((t) => t.accountId).map((t) => t.id));
+    return ledger.buildLedger(input, { ...ctx, depositCredits: new Set([...ctx.depositCredits].filter((id) => !withAccount.has(id))) });
+  },
+  "an arrived deposit posted otherwise than a waiting one": (input, ctx) => {
+    const L = ledger.buildLedger(input, ctx);
+    const arrivedIds = new Set(ctx.cashDeposits.filter((d) => d.status === "arrived").map((d) => `deposit:${d.id}`));
+    for (const e of L.entries) if (arrivedIds.has(e.id)) e.memo = `${e.memo} (arrived)`;
+    return L;
+  },
+};
+for (const [name, build] of Object.entries(depositMutants)) {
+  test(`mutant caught (deposits): ${name}`, () => assert.ok(depositsWrong(build, { seed: SEED + 59, n: 150 }), "every invariant still held"));
+}
+test("the real engine keeps every deposit invariant on the same books", () => {
+  const wrong = depositsWrong(ledger.buildLedger, { seed: SEED + 59, n: 150 });
+  assert.ok(!wrong, wrong);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -787,24 +787,36 @@ router.post("/", async (req, res) => {
         throw createErr;
       }
 
-      const { title, body } = buildInboundNotification({
-        business: biz,
-        amount,
-        sender,
-        narration,
-      });
-      await pushTo(biz.userId, title, body);
+      // Cash the owner deposited into this account (2026-10-14): the oldest
+      // waiting KashBook deposit of this amount takes the credit first, and
+      // then it is nobody else's (utils/cashDeposits.js). It never throws;
+      // the credit is booked whatever it answers. Asked before the owner is
+      // told, so a deposit's credit makes one notification, the deposit's
+      // own (sent there), and any other credit the usual one below.
+      const isDeposit = await require("../utils/cashDeposits")
+        .matchArrivingCredit(biz, createdRow)
+        .catch(() => false);
 
-      // Auto-confirm a matching Instagram/WhatsApp payment request, and an
-      // open invoice whose remaining balance equals the credit (all
-      // fire-and-forget). The invoice matcher used to run only on
-      // poller-booked credits — which the webhook beats almost every time —
-      // so it never actually fired.
-      require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
-      require("../utils/waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
-      require("../utils/invoiceMatch")
-        .tryMatchInvoice(biz, amount, sessionId || reference || "", { transactionId: createdRow?.id })
-        .catch(() => {});
+      if (!isDeposit) {
+        const { title, body } = buildInboundNotification({
+          business: biz,
+          amount,
+          sender,
+          narration,
+        });
+        await pushTo(biz.userId, title, body);
+
+        // Auto-confirm a matching Instagram/WhatsApp payment request, and an
+        // open invoice whose remaining balance equals the credit (all
+        // fire-and-forget). The invoice matcher used to run only on
+        // poller-booked credits, which the webhook beats almost every time,
+        // so it never actually fired.
+        require("../utils/igPaymentMatch").tryMatchIgPayment(biz, amount).catch(() => {});
+        require("../utils/waPaymentMatch").tryMatchWaPayment(biz, amount).catch(() => {});
+        require("../utils/invoiceMatch")
+          .tryMatchInvoice(biz, amount, sessionId || reference || "", { transactionId: createdRow?.id })
+          .catch(() => {});
+      }
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }
@@ -927,21 +939,33 @@ router.post("/", async (req, res) => {
         throw createErr;
       }
 
-      const { title, body } = buildInboundNotification({
-        business: destBiz,
-        amount,
-        sender,
-        narration,
-      });
-      await pushTo(destBiz.userId, title, body);
+      // Cash the owner deposited into this account (2026-10-14), as for a
+      // NIP credit above: a KashBook to KashBook transfer (a neighbour's cash
+      // swap, say) can bring a waiting deposit's cash in too, and the poller
+      // and a deposit's own look-back already treat such a credit so. Asked
+      // first; a deposit's credit makes one notification (the deposit's own)
+      // and is nobody else's.
+      const isDeposit = await require("../utils/cashDeposits")
+        .matchArrivingCredit(destBiz, bookRow)
+        .catch(() => false);
 
-      // Auto-confirm a matching Instagram/WhatsApp payment request or open
-      // invoice (fire-and-forget).
-      require("../utils/igPaymentMatch").tryMatchIgPayment(destBiz, amount).catch(() => {});
-      require("../utils/waPaymentMatch").tryMatchWaPayment(destBiz, amount).catch(() => {});
-      require("../utils/invoiceMatch")
-        .tryMatchInvoice(destBiz, amount, dbReference, { transactionId: bookRow?.id })
-        .catch(() => {});
+      if (!isDeposit) {
+        const { title, body } = buildInboundNotification({
+          business: destBiz,
+          amount,
+          sender,
+          narration,
+        });
+        await pushTo(destBiz.userId, title, body);
+
+        // Auto-confirm a matching Instagram/WhatsApp payment request or open
+        // invoice (fire-and-forget).
+        require("../utils/igPaymentMatch").tryMatchIgPayment(destBiz, amount).catch(() => {});
+        require("../utils/waPaymentMatch").tryMatchWaPayment(destBiz, amount).catch(() => {});
+        require("../utils/invoiceMatch")
+          .tryMatchInvoice(destBiz, amount, dbReference, { transactionId: bookRow?.id })
+          .catch(() => {});
+      }
 
       // Reflect the inbound credit in cash-at-bank immediately (display cache).
       try { require("../utils/balanceCache").adjustBalance(destBiz.id, Number(amount) || 0); } catch { /* noop */ }

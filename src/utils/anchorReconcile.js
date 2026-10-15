@@ -298,29 +298,38 @@ async function reconcileBusiness(biz, { onCreate } = {}) {
       });
     }
 
-    const { title, body } = buildInboundNotification({
-      business: biz,
-      amount,
-      sender,
-      narration,
-    });
-    await pushTo(biz.userId, title, body);
+    // Cash the owner deposited into this account (2026-10-14): the oldest
+    // waiting KashBook deposit of this amount takes the credit first, and then
+    // it is nobody else's (utils/cashDeposits.js). It never throws. Asked
+    // before the owner is told, so a deposit's credit makes one notification,
+    // the deposit's own (sent there), and any other credit the usual one.
+    const isDeposit = await require("./cashDeposits").matchArrivingCredit(biz, txn).catch(() => false);
 
-    // Auto-reconcile: if exactly one open invoice matches the credited amount
-    // within the last 90 days, record a payment and recalc status.
-    await tryMatchInvoice(biz, amount, reference, { transactionId: txn?.id }).catch((err) =>
-      console.warn(`[reconcile] invoice match failed for ${biz.name}: ${err.message}`),
-    );
+    if (!isDeposit) {
+      const { title, body } = buildInboundNotification({
+        business: biz,
+        amount,
+        sender,
+        narration,
+      });
+      await pushTo(biz.userId, title, body);
 
-    // Auto-confirm a matching Instagram payment request (fire-and-forget).
-    await require("./igPaymentMatch").tryMatchIgPayment(biz, amount).catch((err) =>
-      console.warn(`[reconcile] ig payment match failed for ${biz.name}: ${err.message}`),
-    );
+      // Auto-reconcile: if exactly one open invoice matches the credited amount
+      // within the last 90 days, record a payment and recalc status.
+      await tryMatchInvoice(biz, amount, reference, { transactionId: txn?.id }).catch((err) =>
+        console.warn(`[reconcile] invoice match failed for ${biz.name}: ${err.message}`),
+      );
 
-    // Auto-confirm a matching WhatsApp payment request (fire-and-forget).
-    await require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch((err) =>
-      console.warn(`[reconcile] wa payment match failed for ${biz.name}: ${err.message}`),
-    );
+      // Auto-confirm a matching Instagram payment request (fire-and-forget).
+      await require("./igPaymentMatch").tryMatchIgPayment(biz, amount).catch((err) =>
+        console.warn(`[reconcile] ig payment match failed for ${biz.name}: ${err.message}`),
+      );
+
+      // Auto-confirm a matching WhatsApp payment request (fire-and-forget).
+      await require("./waPaymentMatch").tryMatchWaPayment(biz, amount).catch((err) =>
+        console.warn(`[reconcile] wa payment match failed for ${biz.name}: ${err.message}`),
+      );
+    }
 
     // Reflect the inbound credit in cash-at-bank immediately (display cache).
     try { require("./balanceCache").adjustBalance(biz.id, Number(amount) || 0); } catch { /* noop */ }

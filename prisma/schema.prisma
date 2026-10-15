@@ -255,6 +255,7 @@ model Business {
   saleItems             SaleItem[]
   stockMovements        StockMovement[]
   itemGroups            ItemGroup[]
+  cashDeposits          CashDeposit[]
 
   @@index([userId])
   @@index([virtualAccountRef])
@@ -969,6 +970,9 @@ model Transaction {
   // payroll / auto-debit reference, or unexplained (utils/chart.js).
   accountId         String?
   account           LedgerAccount? @relation("TransactionAccount", fields: [accountId], references: [id], onDelete: SetNull)
+  // A credit that brought a cash deposit into the KashBook account (purpose
+  // "cash_deposit"): the deposit names it (CashDeposit.transactionId).
+  cashDeposit       CashDeposit? @relation("CashDepositCredit")
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
@@ -1948,6 +1952,7 @@ model LedgerAccount {
   itemsPurchase            InventoryItem[]     @relation("ItemPurchaseAccount")
   itemGroupsIncome         ItemGroup[]         @relation("ItemGroupIncomeAccount")
   itemGroupsPurchase       ItemGroup[]         @relation("ItemGroupPurchaseAccount")
+  cashDeposits             CashDeposit[]       @relation("CashDepositInto")
 
   @@unique([businessId, systemKey])
   @@unique([businessId, categorySlug])
@@ -2052,4 +2057,51 @@ model StockMovement {
   @@unique([businessId, sourceKey])
   @@index([businessId, date])
   @@index([itemId, createdAt])
+}
+
+// A cash deposit (2026-10-14): cash at hand the owner took to a bank. Never a
+// sale and never spending (the books rule does not read it); the ledger posts
+// it on its date (utils/ledger.js): into another bank ("account", status
+// done) that bank / Cash at Hand; into the KashBook account ("kashbook",
+// status waiting, then arrived) Undeposited Funds / Cash at Hand, and the
+// bank credit it is linked to (transactionId, purpose "cash_deposit") posts
+// KashBook Account / Undeposited Funds; cancelled, nothing. The server links
+// an arriving credit by itself (utils/cashDeposits.js); a credit the owner
+// unlinked is kept in rejectedTransactionIds (a JSON array of ids) and never
+// linked by itself again. CHECKs in the migration: amount above zero and
+// kobo-exact; into kashbook | account, intoAccountId exactly for account;
+// status by into; transactionId exactly while arrived. The account and the
+// transfer keys are DEFERRABLE INITIALLY DEFERRED (Prisma does not show it),
+// as a journal line's account key is.
+model CashDeposit {
+  id                     String         @id @default(uuid())
+  businessId             String
+  business               Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  amount                 Float
+  date                   DateTime       @default(now())
+  into                   String
+  intoAccountId          String?
+  intoAccount            LedgerAccount? @relation("CashDepositInto", fields: [intoAccountId], references: [id], onDelete: NoAction)
+  status                 String
+  transactionId          String?        @unique
+  transaction            Transaction?   @relation("CashDepositCredit", fields: [transactionId], references: [id], onDelete: NoAction)
+  rejectedTransactionIds Json           @default("[]")
+  note                   String?
+  clientRef              String?
+  autoLinked             Boolean        @default(false)
+  // A transfer the owner had marked as cash banked before this deposit took
+  // it (migration 20261015100000): what it was, for an undo to give back.
+  // Set only while the deposit has arrived (a CHECK keeps it so).
+  adoptedPurpose         String?
+  adoptedAccountId       String?
+  createdById            String?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+  arrivedAt              DateTime?
+  cancelledAt            DateTime?
+
+  @@unique([businessId, clientRef])
+  @@index([businessId, status])
+  @@index([businessId, date])
+  @@index([intoAccountId])
 }

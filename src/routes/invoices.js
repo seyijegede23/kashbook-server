@@ -20,6 +20,7 @@ const { PAYMENT_TERMS: PAYMENT_TERM_CODES } = require("../utils/paymentTerms");
 const { snapshotFor } = require("../utils/customerFields");
 const { assertAccountUsable, accountsFor } = require("../utils/ledgerData");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
+const { assertNotDeposit } = require("../utils/cashDeposits");
 const chart = require("../utils/chart");
 const stock = require("../utils/stock");
 const { publicItem } = require("../utils/items");
@@ -1124,6 +1125,9 @@ async function linkableCredit(px, transactionId, businessId) {
   if (tx.type !== "income") {
     throw creditError(400, "NOT_INCOMING", "Pick money that came in.");
   }
+  // A cash deposit's credit is the deposit's (409 DEPOSIT_LINKED, with its
+  // id), until the owner undoes it on the deposit.
+  await assertNotDeposit(px, tx.id);
   if (tx.purpose || tx.accountId || tx.matchedSaleId || tx.matchedCustomerId) {
     throw creditError(409, "TRANSACTION_TAKEN", "That bank payment is already explained.");
   }

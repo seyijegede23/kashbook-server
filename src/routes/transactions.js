@@ -14,6 +14,7 @@ const { cleanReference, expenseCustomerId } = require("../utils/expenseFields");
 const { destroyReceipts } = require("../utils/receiptStorage");
 const { assertUnlocked, assertUnlockedIn } = require("../utils/booksLock");
 const { readSaleItems, saleChart, writeSaleItems, removeSaleStock, publicSale } = require("./sales").saleLines;
+const { assertNotDeposit, depositOfCredit, withDepositIds, DEPOSIT_LINKED, LINKED_MESSAGE } = require("../utils/cashDeposits");
 const { canSeeCosts, publicItem } = require("./inventory").itemView;
 
 // MOUNTED as of Aug 2026 — it sat unmounted for months while the app called its
@@ -30,8 +31,26 @@ const { canSeeCosts, publicItem } = require("./inventory").itemView;
 // also asks with the days of the records it moves (a matched sale's, a
 // repayment's), and a manual row is a dated record of its own. Each asks
 // under the business lock, which the lock date is set under.
+//
+// Deposit cash (2026-10-14): a credit linked to a cash deposit is the
+// deposit's (utils/cashDeposits.js). Every route here that changes what a
+// credit is refuses it with 409 DEPOSIT_LINKED until the owner undoes it on
+// the deposit, and every bank row sent carries cashDepositId (the deposit's
+// id, else null). A row these matching routes answer with is never a
+// deposit's (they refuse one), so it carries null (notDeposit).
 
 router.use(auth);
+
+const notDeposit = (t) => (t && typeof t === "object" ? { ...t, cashDepositId: null } : t);
+
+// The refusal for a credit that is a cash deposit, answered here; true when
+// it was (the caller returns).
+async function refusedAsDeposit(res, tx) {
+  const dep = await depositOfCredit(prisma, tx.id);
+  if (!dep) return false;
+  res.status(409).json({ error: LINKED_MESSAGE, code: DEPOSIT_LINKED, depositId: dep.id });
+  return true;
+}
 
 const getTargetUserId = (req) =>
   req.user.accountType === "staff" ? req.user.employerId : req.user.id;
@@ -82,7 +101,7 @@ router.get("/", requirePermission("canViewBalance"), async (req, res) => {
       take: since ? undefined : Number(limit),
     });
 
-    res.json(rows);
+    res.json(await withDepositIds(prisma, rows));
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch transactions" });
   }
@@ -131,7 +150,8 @@ router.post("/", async (req, res) => {
         },
       });
     });
-    res.status(201).json(tx);
+    // A manual row is never a deposit's.
+    res.status(201).json(notDeposit(tx));
   } catch (err) {
     if (err && err.status && err.code) return respondMatchFailure(res, err, "Failed to create transaction");
     res.status(500).json({ error: "Failed to create transaction" });
@@ -220,7 +240,8 @@ router.patch("/:id", async (req, res) => {
         },
       });
     });
-    res.json(updated);
+    // Only a manual row is edited here, and it is never a deposit's.
+    res.json(notDeposit(updated));
   } catch (err) {
     if (err && err.status && err.code) return respondMatchFailure(res, err, "Failed to update transaction");
     res.status(500).json({ error: "Failed to update transaction" });
@@ -302,6 +323,9 @@ async function loadMatchableCredit(req, res) {
     res.status(403).json({ error: "Forbidden" });
     return null;
   }
+  // A cash deposit's credit is the deposit's (the quick answer; each route
+  // asks again under its lock).
+  if (await refusedAsDeposit(res, tx)) return null;
   if (tx.type !== "income") {
     res.status(400).json({ error: "Matching is only for incoming transfers.", code: "NOT_INCOMING" });
     return null;
@@ -399,6 +423,7 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
         // Re-check both sides under the lock. Two phones matching at once each
         // pass the outer read; only one may pass here.
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        await assertNotDeposit(px, tx.id);
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         const sale = await px.sales.findUnique({ where: { id: saleId } });
@@ -430,7 +455,7 @@ router.post("/:id/match", requirePermission("canViewBalance"), async (req, res) 
         const updatedSale = await px.sales.update({
           where: { id: saleId }, data: { matchedTransactionId: tx.id },
         });
-        return { transaction: updatedTx, sale: updatedSale };
+        return { transaction: notDeposit(updatedTx), sale: updatedSale };
       }),
     );
 
@@ -517,6 +542,7 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
       const chartIdx = lines ? await saleChart(pre.businessId) : null;
       return prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        await assertNotDeposit(px, tx.id);
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         // The cap on the transfer as it is now: a manual row's amount can
@@ -563,7 +589,7 @@ router.post("/:id/create-sale", requirePermission("canViewBalance"), async (req,
     const canSee = canSeeCosts(req);
     res.status(201).json({
       sale: publicSale(result.sale, canSee, result.items),
-      transaction: result.transaction,
+      transaction: notDeposit(result.transaction),
       remainder: result.remainder,
       inventory: result.inventory.map((i) => publicItem(i, canSee)),
     });
@@ -584,6 +610,7 @@ async function loadMatchableDebit(req, res) {
     res.status(403).json({ error: "Forbidden" });
     return null;
   }
+  if (await refusedAsDeposit(res, tx)) return null;
   if (tx.type !== "expense") {
     res.status(400).json({ error: "Recording an expense is only for outgoing transfers.", code: "NOT_OUTGOING" });
     return null;
@@ -676,6 +703,7 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
       }
       return prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        await assertNotDeposit(px, tx.id);
         if (tx.matchedExpenseId || tx.matchedBillId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already recorded as an expense.");
         // The cap on the transfer as it is now, as for a sale: the expense
@@ -717,7 +745,7 @@ router.post("/:id/create-expense", requirePermission("canViewBalance"), async (r
     }).catch(() => {});
     // As every expense response: lines ([] here) and receipts without their
     // storage keys (utils/expenseView.js).
-    res.status(201).json({ expense: publicExpense(result.expense), transaction: result.transaction, remainder: result.remainder });
+    res.status(201).json({ expense: publicExpense(result.expense), transaction: notDeposit(result.transaction), remainder: result.remainder });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to record expense from transfer");
   }
@@ -747,6 +775,7 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
         // old handler never looked at matchedCustomerId, so calling it twice
         // paid the debt down twice.
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        await assertNotDeposit(px, tx.id);
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         // The lock date: the repayments are dated the transfer's day.
@@ -810,7 +839,7 @@ router.post("/:id/match-debt", requirePermission("canViewBalance"), async (req, 
           amountApplied: Number(tx.amount) - remaining,
           remainder: remaining,
           customer: updatedCustomer,
-          transaction: updatedTx,
+          transaction: notDeposit(updatedTx),
         };
       }),
     );
@@ -877,6 +906,7 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     if (!tx0) return res.status(404).json({ error: "Transaction not found" });
     if (!(await ownsBusiness(req, tx0.businessId)))
       return res.status(403).json({ error: "Forbidden" });
+    if (await refusedAsDeposit(res, tx0)) return;
     if (tx0.matchedBillId) return res.status(409).json({ error: BILL_LINKED, code: "BILL_LINKED" });
     if (!tx0.matchedSaleId && !tx0.matchedCustomerId && !tx0.matchedExpenseId && !tx0.matchedInvoiceId)
       return res.json({ matched: false }); // idempotent no-op
@@ -888,6 +918,7 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
     const result = await prisma.withBusinessLock(tx0.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
+        await assertNotDeposit(px, tx.id);
         if (tx.matchedBillId) throw matchError(409, "BILL_LINKED", BILL_LINKED);
         // The lock date, before anything is undone.
         await assertUnlockedIn(px, tx.businessId, await unmatchDays(px, tx));
@@ -1014,13 +1045,13 @@ router.delete("/:id/match", requirePermission("canViewBalance"), async (req, res
           });
         }
 
-        out.transaction = await px.transaction.update({
+        out.transaction = notDeposit(await px.transaction.update({
           where: { id: tx.id },
           data: {
             matchedSaleId: null, matchedCustomerId: null, matchedExpenseId: null,
             matchedInvoiceId: null, matchedAmount: null,
           },
-        });
+        }));
         return out;
       }),
     );
@@ -1056,6 +1087,7 @@ router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async
     const result = await prisma.withBusinessLock(pre.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: pre.id } });
+        await assertNotDeposit(px, tx.id);
         if (tx.matchedSaleId || tx.matchedCustomerId || tx.matchedInvoiceId || tx.purpose || tx.accountId)
           throw matchError(409, "ALREADY_MATCHED", "This transfer is already matched.");
         const payment = await px.debtPayment.findUnique({
@@ -1086,7 +1118,7 @@ router.post("/:id/link-debt-payment", requirePermission("canViewBalance"), async
       req, action: "TX_LINK_DEBT_PAYMENT", resourceType: "transaction", resourceId: pre.id,
       metadata: { debtPaymentId },
     }).catch(() => {});
-    res.json({ transaction: result });
+    res.json({ transaction: notDeposit(result) });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to link the repayment");
   }
@@ -1123,6 +1155,8 @@ router.post("/:id/classify", requirePermission("canViewBalance"), async (req, re
     const updated = await prisma.withBusinessLock(tx0.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
+        // A cash deposit's credit is changed on the deposit (undo there).
+        await assertNotDeposit(px, tx.id);
         if (tx.purpose && !CREDIT_OUTCOMES.includes(tx.purpose)) {
           throw matchError(409, "PURPOSE_LOCKED", "This transfer can't be changed here.");
         }
@@ -1141,7 +1175,7 @@ router.post("/:id/classify", requirePermission("canViewBalance"), async (req, re
       req, action: "TX_CLASSIFY", resourceType: "transaction", resourceId: tx0.id,
       metadata: { from: tx0.purpose || null, to: purpose },
     }).catch(() => {});
-    res.json({ transaction: updated });
+    res.json({ transaction: notDeposit(updated) });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to update the transfer");
   }
@@ -1183,6 +1217,8 @@ router.post("/:id/categorize", requirePermission("canViewBalance"), async (req, 
     const updated = await prisma.withBusinessLock(tx0.businessId, () =>
       prisma.$transaction(async (px) => {
         const tx = await px.transaction.findUnique({ where: { id: tx0.id } });
+        // A cash deposit's credit is changed on the deposit (undo there).
+        await assertNotDeposit(px, tx.id);
         if (tx.purpose && !CREDIT_OUTCOMES.includes(tx.purpose) && tx.purpose !== "account") {
           throw matchError(409, "PURPOSE_LOCKED", "This transfer can't be changed here.");
         }
@@ -1202,7 +1238,7 @@ router.post("/:id/categorize", requirePermission("canViewBalance"), async (req, 
       req, action: "TX_CATEGORIZE", resourceType: "transaction", resourceId: tx0.id,
       metadata: { from: tx0.accountId || null, to: account ? account.id : null, purpose },
     }).catch(() => {});
-    res.json({ transaction: updated });
+    res.json({ transaction: notDeposit(updated) });
   } catch (err) {
     respondMatchFailure(res, err, "Failed to update the transfer");
   }
